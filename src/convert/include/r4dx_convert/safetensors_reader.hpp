@@ -173,6 +173,27 @@ inline std::wstring Utf8ToWide(const std::string& s) {
   return w;
 }
 
+// Tensors layered over a checkpoint's own (awq_source.hpp's virtual dequantised linears). With none
+// installed ShardedModel is exactly what it was. An overlay tensor is an ordinary read-only 2-D (or
+// N-D) tensor to every user of ShardedModel; its bytes are produced on demand.
+class TensorOverlay {
+ public:
+  virtual ~TensorOverlay() = default;
+  virtual bool Provides(const std::string& name) const = 0;
+  // Provides(name) only. Shape/dtype of the tensor as the rest of the converter sees it.
+  virtual const TensorMeta& Meta(const std::string& name) const = 0;
+  // Provides(name) only. The whole tensor's bytes in a buffer owned by the overlay: valid only until
+  // the next Data()/DataRows() of an overlay tensor on the SAME thread, and private to the calling
+  // thread (any number of threads may call concurrently). Copy it before asking for another.
+  virtual const uint8_t* Data(const std::string& name) const = 0;
+  // Provides(name) only, 2-D: the row-major bytes of rows [row0, row0 + nrows), same lifetime rule
+  // as Data(); `scratch` is the caller's buffer to build them in.
+  virtual const uint8_t* DataRows(const std::string& name, int64_t row0, int64_t nrows,
+                                  std::vector<uint8_t>& scratch) const = 0;
+  // AllNames(): drop the checkpoint names the overlay replaces, add the ones it provides.
+  virtual void RewriteNames(std::vector<std::string>& names) const = 0;
+};
+
 // Follows model.safetensors.index.json across every shard it names, opening each shard's mapping
 // the first time one of its tensors is requested. A directory with no index but a single
 // model.safetensors opens that file instead (all tensors, mapped at construction).
@@ -207,16 +228,47 @@ class ShardedModel {
     }
   }
 
-  bool Has(const std::string& name) const { return name_to_shard_.count(name) != 0; }
+  // Installed once, before any worker thread reads (the overlay is read-only afterwards).
+  void SetOverlay(std::shared_ptr<const TensorOverlay> overlay) { overlay_ = std::move(overlay); }
 
-  const TensorMeta& Meta(const std::string& name) { return Shard(name).Meta(name); }
-  const uint8_t* Data(const std::string& name) { return Shard(name).Data(name); }
+  bool Has(const std::string& name) const {
+    return name_to_shard_.count(name) != 0 || (overlay_ && overlay_->Provides(name));
+  }
 
-  // Every top-level tensor name in the checkpoint (all shards), for enumeration/mapping checks.
+  const TensorMeta& Meta(const std::string& name) {
+    if (overlay_ && overlay_->Provides(name)) return overlay_->Meta(name);
+    return Shard(name).Meta(name);
+  }
+  // Whole-tensor bytes; an overlay tensor's live only until this thread's next overlay read
+  // (TensorOverlay::Data).
+  const uint8_t* Data(const std::string& name) {
+    if (overlay_ && overlay_->Provides(name)) return overlay_->Data(name);
+    return Shard(name).Data(name);
+  }
+  // Rows [row0, row0 + nrows) of a 2-D tensor, row-major: straight out of the mapping for a
+  // checkpoint tensor (scratch untouched), built into `scratch` for an overlay tensor. Safe from
+  // several threads once the tensor's shard has been opened (a prior Meta() does that).
+  const uint8_t* DataRows(const std::string& name, int64_t row0, int64_t nrows,
+                          std::vector<uint8_t>& scratch) {
+    if (overlay_ && overlay_->Provides(name)) return overlay_->DataRows(name, row0, nrows, scratch);
+    const TensorMeta& m = Shard(name).Meta(name);
+    if (m.shape.size() != 2 || row0 < 0 || nrows < 0 || row0 + nrows > m.shape[0])
+      throw std::runtime_error("ShardedModel::DataRows: rows [" + std::to_string(row0) + ", " +
+                               std::to_string(row0 + nrows) + ") are not inside the 2-D tensor " + name);
+    const uint64_t row_bytes = static_cast<uint64_t>(m.shape[1]) * SafetensorsDtypeSize(m.dtype);
+    return Shard(name).Data(name) + static_cast<uint64_t>(row0) * row_bytes;
+  }
+  // The checkpoint's own tensor, the overlay bypassed (what an overlay builds its tensors from).
+  const TensorMeta& RawMeta(const std::string& name) { return Shard(name).Meta(name); }
+  const uint8_t* RawData(const std::string& name) { return Shard(name).Data(name); }
+
+  // Every top-level tensor name in the checkpoint (all shards), for enumeration/mapping checks; with
+  // an overlay, the names the overlay replaces are replaced by the ones it provides.
   std::vector<std::string> AllNames() const {
     std::vector<std::string> names;
     names.reserve(name_to_shard_.size());
     for (auto& kv : name_to_shard_) names.push_back(kv.first);
+    if (overlay_) overlay_->RewriteNames(names);
     return names;
   }
 
@@ -237,6 +289,7 @@ class ShardedModel {
   std::string model_dir_;
   std::unordered_map<std::string, std::string> name_to_shard_;
   std::unordered_map<std::string, std::unique_ptr<SafetensorsReader>> open_shards_;
+  std::shared_ptr<const TensorOverlay> overlay_;
 };
 
 }  // namespace r4dx_convert

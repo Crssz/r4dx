@@ -133,6 +133,109 @@ void TestResolve() {
   fs::remove_all(root);
 }
 
+// qwen4_exp (docs/qwen4exp.md): the Qwen3.5 text surface under its own name. The container-header half (arch string,
+// synthetic safetensors shell) is tests/server/test_q4exp_dialect.cpp, which links the arch library.
+void TestQwen4Exp() {
+  const auto& q = Qwen35Dialect();
+  const auto& e = Qwen4ExpDialect();
+  CHECK(e.kind == DialectKind::kQwen4Exp);
+  CHECK(std::string(e.name) == "qwen4_exp");
+  CHECK(&DialectFor(DialectKind::kQwen4Exp) == &e && &e != &q);
+  // everything except kind/name is the Qwen3.5 table
+  CHECK(e.reasoning.open == q.reasoning.open && e.reasoning.close == q.reasoning.close &&
+        e.reasoning.skip_blank_after_close == q.reasoning.skip_blank_after_close);
+  CHECK(e.prompt_reasoning_open == "<think>\n" && e.prompt_reasoning_closed.empty());
+  CHECK(e.tool_open == "<tool_call>" && e.tool_close == "</tool_call>");
+  CHECK(e.keep_special_on_decode.empty());
+  CHECK(e.chat_template_polyfills && !e.bos_on_raw_prompt && e.has_reasoning_effort);
+  // EOS and tokenizer directory come from the tokenizer directory / the Qwen default, as for qwen35
+  CHECK(e.eos_ids.empty() && e.default_tokenizer_dir.empty());
+  CHECK(ResolveTokenizerDir(e, "") == QwenDefaultTokenizerDir());
+  CHECK(ResolveTokenizerDir(e, "X:/tok") == "X:/tok");
+
+  const std::string qthink = "<|im_start|>assistant\n<think>\n";
+  CHECK(e.ReasoningStart(true, qthink) == Start::kInReasoning);
+  CHECK(e.ReasoningStart(false, "<|im_start|>assistant\n<think>\n\n</think>\n\n") == Start::kAnswer);
+  CHECK(e.ReasoningOpenInPrompt(true, qthink) && !e.ReasoningOpenInPrompt(false, qthink));
+  CHECK(e.CheckpointSuffix(true, qthink) == q.CheckpointSuffix(true, qthink));
+
+  DialectKind k;
+  CHECK(ParseDialectName("qwen4_exp", &k) && k == DialectKind::kQwen4Exp);
+  CHECK(!ParseDialectName("Qwen4_exp", &k) && !ParseDialectName("qwen4exp", &k));
+
+  // arch cross-check: a gemma container is refused (and told what to pass), everything else passes
+  CHECK(CheckDialectAgainstArch(e, "qwen4_exp").empty());
+  CHECK(CheckDialectAgainstArch(e, "").empty());
+  CHECK(CheckDialectAgainstArch(e, "qwen3_5").empty());
+  CHECK(CheckDialectAgainstArch(q, "qwen4_exp").empty());
+  const std::string err = CheckDialectAgainstArch(e, "gemma4_unified");
+  CHECK(err.find("qwen4_exp") != std::string::npos && err.find("--dialect gemma4") != std::string::npos);
+  const std::string err2 = CheckDialectAgainstArch(Gemma4Dialect(), "qwen4_exp");
+  CHECK(err2.find("gemma4") != std::string::npos && err2.find("qwen4_exp") != std::string::npos);
+
+  // ResolveDialectKindForArch: no tokenizer dir -> the container's arch decides; an explicit request wins
+  CHECK(ResolveDialectKindForArch(std::nullopt, "", "qwen4_exp") == DialectKind::kQwen4Exp);
+  CHECK(ResolveDialectKindForArch(std::nullopt, "", "qwen3_5") == DialectKind::kQwen35);
+  CHECK(ResolveDialectKindForArch(std::nullopt, "", "") == DialectKind::kQwen35);
+  CHECK(ResolveDialectKindForArch(std::nullopt, "", "gemma4_unified") == DialectKind::kGemma4);
+  CHECK(ResolveDialectKindForArch(DialectKind::kQwen35, "", "qwen4_exp") == DialectKind::kQwen35);
+  CHECK(ResolveDialectKindForArch(DialectKind::kQwen4Exp, "", "gemma4_unified") == DialectKind::kQwen4Exp);
+  // the bool overload is unchanged
+  CHECK(ResolveDialectKind(std::nullopt, "", false) == DialectKind::kQwen35);
+  CHECK(ResolveDialectKind(std::nullopt, "", true) == DialectKind::kGemma4);
+
+  // flags a qwen4_exp container refuses
+  Qwen4ExpFlags f;
+  CHECK(CheckQwen4ExpFlags(f).empty());
+  f.tp = 2;
+  CHECK(CheckQwen4ExpFlags(f).find("--tp 2") != std::string::npos);
+  f = Qwen4ExpFlags{};
+  f.pp = 2;
+  CHECK(CheckQwen4ExpFlags(f).find("--pp 2") != std::string::npos);
+  f.pp = 1;
+  CHECK(CheckQwen4ExpFlags(f).empty());
+  f.pp = -1;
+  CHECK(CheckQwen4ExpFlags(f).empty());
+  f = Qwen4ExpFlags{};
+  f.mtp = 3;
+  CHECK(CheckQwen4ExpFlags(f).find("--mtp 3") != std::string::npos);
+  f = Qwen4ExpFlags{};
+  f.dflash = true;
+  CHECK(CheckQwen4ExpFlags(f).find("--dflash") != std::string::npos);
+  f = Qwen4ExpFlags{};
+  f.images = true;
+  CHECK(CheckQwen4ExpFlags(f).find("--image") != std::string::npos);
+  f = Qwen4ExpFlags{};
+  f.vision_on = true;
+  CHECK(CheckQwen4ExpFlags(f).find("--vision on") != std::string::npos);
+  // every refused flag is named in the one message
+  f.tp = 2;
+  f.pp = 2;
+  f.mtp = 1;
+  f.dflash = true;
+  f.images = true;
+  const std::string all = CheckQwen4ExpFlags(f);
+  for (const char* want : {"--tp 2", "--pp 2", "--mtp 1", "--dflash", "--vision on", "--image"}) {
+    CHECK(all.find(want) != std::string::npos);
+  }
+
+  // the default tokenizer directory must exist for qwen4_exp, with an actionable message when it does not
+  namespace fs = std::filesystem;
+  const fs::path root = fs::temp_directory_path() / "r4dx_test_dialect_q4exp_tok";
+  fs::remove_all(root);
+  fs::create_directories(root / "has");
+  std::ofstream(root / "has" / "tokenizer.json") << "{}";
+  const std::string has = (root / "has").string();
+  const std::string missing = (root / "missing").string();
+  const std::string miss_err = CheckDefaultTokenizerDir(e, missing, /*user_given=*/false);
+  CHECK(miss_err.find("--tokenizer-dir") != std::string::npos && miss_err.find(missing) != std::string::npos);
+  CHECK(CheckDefaultTokenizerDir(e, has, false).empty());
+  CHECK(CheckDefaultTokenizerDir(e, missing, /*user_given=*/true).empty());  // the loader names that one itself
+  CHECK(CheckDefaultTokenizerDir(q, missing, false).empty());                // other dialects: unchanged
+  CHECK(CheckDefaultTokenizerDir(Gemma4Dialect(), missing, false).empty());
+  fs::remove_all(root);
+}
+
 }  // namespace
 
 int main() {
@@ -142,6 +245,7 @@ int main() {
   TestDetect();
   TestArchCheck();
   TestPromptState();
+  TestQwen4Exp();
   if (g_failures != 0) {
     std::fprintf(stderr, "%d failure(s)\n", g_failures);
     return 1;

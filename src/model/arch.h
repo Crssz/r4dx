@@ -1,8 +1,9 @@
 // r4dx::model::Arch -- which text-model family a container holds, decided from its header alone
-// (docs/gemma4-plan.md 3.2, task M1-1 / M1-24).
+// (docs/gemma4-plan.md 3.2, task M1-1 / M1-24; docs/qwen4exp-plan.md 4.1, task M1-1).
 //
 // LoadTextModel (tp_model.cpp) calls DetectArch(container_path) before it builds anything: kQwen35
-// goes down the unchanged Model / TpModel branches, kGemma4 to LoadGemmaTextModel. The enum is also
+// goes down the unchanged Model / TpModel branches, kGemma4 to LoadGemmaTextModel, kQwen4Exp is
+// refused until its loader lands (docs/qwen4exp-plan.md M1-3). The enum is also
 // carried on ModelConfig::arch (model_config.h), so a TextModel's Config() tells the server which
 // family it loaded (server dialect cross-check, CheckDialectAgainstArch).
 //
@@ -18,19 +19,32 @@
 namespace r4dx::model {
 
 enum class Arch {
-  kQwen35,  // Qwen3.5/3.8 hybrid GDN + full attention (every container before Gemma support)
-  kGemma4,  // gemma4_unified: sliding + full attention, sandwich norms, GeGLU, tied head
+  kQwen35,    // Qwen3.5/3.8 hybrid GDN + full attention (every container before Gemma support)
+  kGemma4,    // gemma4_unified: sliding + full attention, sandwich norms, GeGLU, tied head
+  kQwen4Exp,  // qwen4_exp (Qwen3.8-Flash-Next): GDN + QSA, 512-expert MoE, hyper-connections, PLE
 };
 
-// Stable on-disk / log spelling: `__metadata__.model_arch` for Gemma, "qwen3_5" for Qwen (which
-// carries no such key). server/dialect.cpp's CheckDialectAgainstArch keys off the "gemma" prefix.
-inline const char* ArchName(Arch a) { return a == Arch::kGemma4 ? "gemma4_unified" : "qwen3_5"; }
+// Stable on-disk / log spelling: `__metadata__.model_arch` for Gemma and qwen4_exp, "qwen3_5" for
+// Qwen (which carries no such key). server/dialect.cpp's CheckDialectAgainstArch keys off the
+// "gemma" prefix, so "qwen4_exp" pairs with the Qwen dialect (docs/qwen4exp-plan.md 4.9).
+inline const char* ArchName(Arch a) {
+  switch (a) {
+    case Arch::kQwen35:
+      return "qwen3_5";
+    case Arch::kGemma4:
+      return "gemma4_unified";
+    case Arch::kQwen4Exp:
+      return "qwen4_exp";
+  }
+  return "qwen3_5";  // unreachable: every enumerator is handled above
+}
 
 // The arch a `__metadata__` object describes:
-//   1. `model_arch` present: "gemma4_unified" -> kGemma4, "qwen3_5" -> kQwen35, anything else throws
-//      std::runtime_error (an unknown family must not be loaded as Qwen);
+//   1. `model_arch` present: "gemma4_unified" -> kGemma4, "qwen4_exp" -> kQwen4Exp, "qwen3_5" ->
+//      kQwen35, anything else throws std::runtime_error (an unknown family must not be loaded as Qwen);
 //   2. otherwise `model_config.model_type` / `model_config.architectures` naming Gemma 4
-//      ("gemma4_unified", "Gemma4UnifiedForConditionalGeneration") -> kGemma4;
+//      ("gemma4_unified", "Gemma4UnifiedForConditionalGeneration") -> kGemma4, or naming qwen4_exp
+//      ("qwen4_exp", "Qwen4ExpForConditionalGeneration") -> kQwen4Exp;
 //   3. otherwise kQwen35: every container written before `model_arch` existed (and the selftest
 //      containers, which have no model_config at all).
 Arch DetectArchFromMetadata(const nlohmann::json& metadata);
@@ -46,8 +60,9 @@ nlohmann::json ReadContainerMetadata(const std::string& container_path);
 
 // The `max_ctx` a run on `container_path` gets (docs/gemma4-plan.md section 9.1, task M1-14), shared by
 // r4dx-cli and r4dx-server so the two cannot drift:
-//   * kQwen35: `requested` unchanged -- the callers' own default (262144) and every explicit value
-//     behave exactly as before this function existed;
+//   * kQwen35 and kQwen4Exp: `requested` unchanged -- the callers' own default (262144, which is
+//     also qwen4_exp's max_position_embeddings) and every explicit value behave exactly as before
+//     this function existed; the file is not read;
 //   * kGemma4: GemmaConfig::ResolveMaxCtx on the container's text_config. `requested_given` false means
 //     the user passed no --max-ctx: the default is the checkpoint's max_position_embeddings (131072
 //     for Huihui), or kExtendedMaxCtx (262144) when `extended_ctx` (the opt-in flag) is set. An explicit

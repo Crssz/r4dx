@@ -181,8 +181,8 @@ struct RingTables {
 };
 
 inline RingTables MakeRingTables(int kb) {
-  if (kb != 4 && kb != 5)
-    throw std::runtime_error("trellis: KB=" + std::to_string(kb) + " is not 4 or 5");
+  if (kb != 3 && kb != 4 && kb != 5)
+    throw std::runtime_error("trellis: KB=" + std::to_string(kb) + " is not 3, 4 or 5");
   RingTables t;
   t.kb = kb;
   t.nw = WordsPerTile(kb);
@@ -198,10 +198,11 @@ inline RingTables MakeRingTables(int kb) {
 }
 
 inline const RingTables& Ring(int kb) {
-  static const RingTables r4 = MakeRingTables(4), r5 = MakeRingTables(5);
+  static const RingTables r3 = MakeRingTables(3), r4 = MakeRingTables(4), r5 = MakeRingTables(5);
+  if (kb == 3) return r3;
   if (kb == 4) return r4;
   if (kb == 5) return r5;
-  throw std::runtime_error("trellis: KB=" + std::to_string(kb) + " is not 4 or 5");
+  throw std::runtime_error("trellis: KB=" + std::to_string(kb) + " is not 3, 4 or 5");
 }
 
 // One tile's 8 KB ring words -> its 256 values, ROW-MAJOR (out[r * 16 + c], r = k, c = n inside the
@@ -800,10 +801,12 @@ class TrellisSource {
     };
     std::vector<Item> items;
     std::vector<const Linear*> lins;
-    // The checkpoint weights, looked up here, single-threaded (ShardedModel opens shards lazily and
-    // is not thread-safe); the workers only read through these pointers.
+    // The checkpoint weights: shard lookups (Meta) happen here, single-threaded (ShardedModel opens shards
+    // lazily and is not thread-safe); the workers then read each 128-row block through DataRows -- straight
+    // out of the mapping for a checkpoint tensor, dequantized into the worker's scratch for a virtual one
+    // (the AWQ source: ShardedModel's overlay), so no pointer into a virtual tensor outlives its block.
     struct Src {
-      const uint8_t* data;
+      std::string name;
       bool bf16;
     };
     std::vector<std::vector<Src>> wsrc;  // [linear][part]
@@ -819,7 +822,7 @@ class TrellisSource {
         if ((m.dtype != "BF16" && m.dtype != "F32") || m.shape != std::vector<int64_t>{r.n, r.k})
           throw std::runtime_error("trellis verify: checkpoint tensor " + r.name + " is " +
                                    m.dtype + " " + nlohmann::json(m.shape).dump());
-        wsrc.back().push_back({model.Data(r.name), m.dtype == "BF16"});
+        wsrc.back().push_back({r.name, m.dtype == "BF16"});
         for (int64_t b = 0; b < r.n / kHad; ++b) items.push_back({lins.size(), p, b});
       }
       lins.push_back(&L);
@@ -844,6 +847,8 @@ class TrellisSource {
         sv[row] = r4dx::core::F16ToFloat(hv) * (1.0f / 128.0f);  // both Hadamards' 1/sqrt(128)
       }
       const Src& src = wsrc[it.li][it.part];
+      std::vector<uint8_t> scratch;
+      const uint8_t* rows = model.DataRows(src.name, it.block * kHad, kHad, scratch);  // [kHad, K], row-major
       uint32_t words[40];
       float vals[kTile];
       double e2 = 0.0, w2 = 0.0;
@@ -853,14 +858,13 @@ class TrellisSource {
       if (fold) {
         folded.resize(static_cast<size_t>(kHad * K));
         for (int64_t row = 0; row < kHad; ++row) {
-          const int64_t wrow = it.block * kHad + row;
           for (int64_t k = 0; k < K; ++k) {
             if (src.bf16) {
               uint16_t b;
-              std::memcpy(&b, src.data + (wrow * K + k) * 2, 2);
+              std::memcpy(&b, rows + (row * K + k) * 2, 2);
               folded[static_cast<size_t>(row * K + k)] = r4dx::core::Bf16ToFloat(b);
             } else {
-              std::memcpy(&folded[static_cast<size_t>(row * K + k)], src.data + (wrow * K + k) * 4, 4);
+              std::memcpy(&folded[static_cast<size_t>(row * K + k)], rows + (row * K + k) * 4, 4);
             }
           }
         }
@@ -889,8 +893,6 @@ class TrellisSource {
           su[k] = r4dx::core::F16ToFloat(h);
         }
         for (int64_t row = 0; row < kHad; ++row) {
-          const int64_t wrow =
-              it.block * kHad + row;  // row inside the checkpoint tensor (this part)
           const float* br = blk.data() + row * kHad;
           for (int64_t k = 0; k < kHad; ++k) {
             float wv;
@@ -898,10 +900,10 @@ class TrellisSource {
               wv = folded[static_cast<size_t>(row * K + k0 + k)];
             } else if (src.bf16) {
               uint16_t b;
-              std::memcpy(&b, src.data + (wrow * K + k0 + k) * 2, 2);
+              std::memcpy(&b, rows + (row * K + k0 + k) * 2, 2);
               wv = r4dx::core::Bf16ToFloat(b);
             } else {
-              std::memcpy(&wv, src.data + (wrow * K + k0 + k) * 4, 4);
+              std::memcpy(&wv, rows + (row * K + k0 + k) * 4, 4);
             }
             const double d = static_cast<double>(br[k] * su[k] * sv[row]) - wv;
             e2 += d * d;
@@ -1105,7 +1107,7 @@ class TrellisSource {
       fail("encoding is '" + StrOr(rec, "encoding", "(absent)") + "', expected 'trellis-exl3'");
     if (!rec.contains("K") || !rec["K"].is_number()) fail("no numeric K");
     const double K = rec["K"].get<double>();
-    if (K != 4.0 && K != 5.0) fail("K=" + Num(K) + " is not a rate the kernel instantiates (4, 5)");
+    if (K != 3.0 && K != 4.0 && K != 5.0) fail("K=" + Num(K) + " is not a rate the kernel instantiates (3, 4, 5)");
     r.kb = static_cast<int>(K);
     if (StrOr(rec, "codebook", "(absent)") != "mul1") fail("codebook is not 'mul1'");
     if (rec.contains("hessian_basis") && StrOr(rec, "hessian_basis", "") != basis_)

@@ -135,6 +135,16 @@ inline void GdnChunkScan(const void* q, const void* k, const void* v, const void
                                                         Hg, K, V, bt, scale, stream));
 }
 
+// The span-safe variant (r4d.h: right at any chunk gate span; the shipped scan is exact only under ~160). Same arguments.
+inline void GdnChunkScanStable(const void* q, const void* k, const void* v, const void* A,
+                                const void* g, const void* beta, const void* h0, void* o, void* ht,
+                                const void* cu, int N, int H, int Hg, int K, int V, int bt,
+                                float scale, hipStream_t stream) {
+  R4DX_R4D_CHECK("gdn_chunk_scan_stable_k128_v128_c64_bf16",
+                 r4d_gdn_chunk_scan_stable_k128_v128_c64_bf16(q, k, v, A, g, beta, h0, o, ht, cu, N, H,
+                                                              Hg, K, V, bt, scale, stream));
+}
+
 // k [T,Hg,K] bf16; beta,g [T,H] fp32 (g already chunk-local-cumsum'd); A [T,H,64] bf16 out;
 // cu [N+1] int32.
 inline void GdnKktSolve(const void* k, const void* beta, const void* g, void* A, const void* cu,

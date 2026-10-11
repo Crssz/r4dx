@@ -28,6 +28,18 @@ foreach(t ${R4DX_SERVER_TESTS})
   add_test(NAME ${t} COMMAND ${t})
 endforeach()
 
+# qwen4_exp (docs/qwen4exp.md), CPU only. test_q4exp_dialect: dialect resolution / arch refusal from synthetic
+# container headers (needs the arch library). test_q4exp_template: the Swift chat_template.jinja renders
+# byte-identically to the 27B's through ChatTemplate; exits 77 (SKIPPED) when either checkpoint directory is absent.
+add_executable(test_q4exp_dialect test_q4exp_dialect.cpp)
+target_link_libraries(test_q4exp_dialect PRIVATE r4dx_server_core r4dx_model_arch)
+add_test(NAME test_q4exp_dialect COMMAND test_q4exp_dialect)
+
+add_executable(test_q4exp_template test_q4exp_template.cpp)
+target_link_libraries(test_q4exp_template PRIVATE r4dx_server_core r4dx_tokenizer)
+add_test(NAME test_q4exp_template COMMAND test_q4exp_template)
+set_tests_properties(test_q4exp_template PROPERTIES SKIP_RETURN_CODE 77)
+
 # test_engine_recovery: Engine::RunRequest's error path (docs/tp.md 2.4, 8.4), through engine.cpp
 # itself, against CPU fakes of TpModel's state machine and of the TP=1 model
 # (EngineOptions::model_loader). It makes no GPU call, but engine.cpp is HIP-dependent, so it links

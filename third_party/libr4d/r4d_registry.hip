@@ -97,11 +97,11 @@ static const R4DConstraint cGemmNtW4[] = {
 // short of the linear, so it gets its own op and a caller selecting "gemm_nt" is never handed it.
 static const R4DConstraint cGemmNtTrellis[] = {
     C_LE("M", 64), C_DIV("K", 128), C_DIV("N", 128),
-    C_IN("dtype", "trellis_mul1_k4 trellis_mul1_k5"),
+    C_IN("dtype", "trellis_mul1_k3 trellis_mul1_k4 trellis_mul1_k5"),
 };
 static const R4DConstraint cGemmNtTrellisRaw[] = {
     C_LE("M", 64), C_DIV("K", 128), C_DIV("N", 128),
-    C_IN("dtype", "trellis_mul1_k4 trellis_mul1_k5"),
+    C_IN("dtype", "trellis_mul1_k3 trellis_mul1_k4 trellis_mul1_k5"),
 };
 // The M = 128 / 256 sibling is its own op: a caller selecting "gemm_nt" (M <= 64) is never handed it.
 static const R4DConstraint cGemmNtTrellisM256[] = {
@@ -115,7 +115,7 @@ static const R4DConstraint cGemmNtTrellisI8[] = {
     C_IN("dtype", "trellis_mul1_k4 trellis_mul1_k5"),
 };
 static const R4DConstraint cTrellisReconstruct[] = {
-    C_DIV("K", 16), C_DIV("N", 32), C_IN("dtype", "trellis_mul1_k4 trellis_mul1_k5"),
+    C_DIV("K", 16), C_DIV("N", 32), C_IN("dtype", "trellis_mul1_k3 trellis_mul1_k4 trellis_mul1_k5"),
 };
 
 #define ROW(arr) arr, (int)(sizeof(arr) / sizeof(arr[0]))
@@ -169,6 +169,12 @@ static const R4DKernelInfo kKernels[] = {
     {"gdn_chunk_scan_k128_v128_c64_bf16", "gdn", "gdn_chunk_scan",
      "gated delta net chunked scan: WY recompute, state recurrence and output in one kernel",
      "head_k 128, head_v 128, chunk 64, varlen, state resident in WMMA accumulators",
+     "bf16 q/k/v/A, fp32 gate/beta/state, bf16 out, fp32 final state",
+     ROW(cGdnChunkScan)},
+    {"gdn_chunk_scan_stable_k128_v128_c64_bf16", "gdn", "gdn_chunk_scan_stable",
+     "gated delta net chunked scan, span-safe: the shipped scan's arithmetic with the pair decay e^{G_i-G_j} applied per element",
+     "head_k 128, head_v 128, chunk 64, varlen, right at any chunk gate span (the shipped scan is exact only under ~160); "
+     "its own op, so a caller selecting gdn_chunk_scan is never handed it",
      "bf16 q/k/v/A, fp32 gate/beta/state, bf16 out, fp32 final state",
      ROW(cGdnChunkScan)},
     {"gdn_conv_prep_w4_h128_bf16", "gdn", "gdn_conv_prep",

@@ -128,9 +128,9 @@ void Engine::LoadAndStart() {
   // Dialect (docs/gemma4-plan.md 5.3, task M1-14), resolved once, BEFORE the tokenizer/template load
   // because it decides their options and the default directory: an explicit --dialect wins; auto looks
   // at the tokenizer directory when one was given, else at the container's architecture.
-  const DialectKind kind = ResolveDialectKind(
-      opts_.dialect, opts_.tokenizer_dir,
-      r4dx::model::DetectArch(opts_.model_opts.container_path) == r4dx::model::Arch::kGemma4);
+  const r4dx::model::Arch container_arch = r4dx::model::DetectArch(opts_.model_opts.container_path);
+  const DialectKind kind = ResolveDialectKindForArch(opts_.dialect, opts_.tokenizer_dir,
+                                                     r4dx::model::ArchName(container_arch));
   dialect_ = &DialectFor(kind);
   // Fail fast, before a multi-GB model load, when the container's header already says the dialect is
   // wrong. A container that cannot be read (a test's fake model path) says nothing here; the check
@@ -143,7 +143,23 @@ void Engine::LoadAndStart() {
       if (!err.empty()) throw std::runtime_error(err);
     }
   }
+  // qwen4_exp (docs/qwen4exp.md): the flags it cannot serve are refused here, with the precise message, before
+  // the tokenizer and the model load (which would throw its own, later and less precisely).
+  if (container_arch == r4dx::model::Arch::kQwen4Exp) {
+    Qwen4ExpFlags flags;
+    flags.tp = opts_.tp.world;
+    flags.pp = opts_.model_opts.pp;
+    flags.mtp = opts_.model_opts.mtp_draft_k;
+    flags.dflash = !opts_.model_opts.dflash_container.empty();
+    flags.vision_on = opts_.model_opts.vision == r4dx::model::ModelOptions::VisionMode::kOn;
+    const std::string err = CheckQwen4ExpFlags(flags);
+    if (!err.empty()) throw std::invalid_argument(err);
+  }
   tokenizer_dir_ = ResolveTokenizerDir(*dialect_, opts_.tokenizer_dir);
+  {
+    const std::string err = CheckDefaultTokenizerDir(*dialect_, tokenizer_dir_, !opts_.tokenizer_dir.empty());
+    if (!err.empty()) throw std::runtime_error(err);
+  }
   // Both stay at their defaults for Qwen (empty keep-list, polyfills on): byte-identical loading.
   tok_options.keep_special_on_decode = dialect_->keep_special_on_decode;
   r4dx::ChatTemplateOptions tmpl_options;
@@ -480,7 +496,7 @@ void Engine::RunRequest(PendingRequest& req) {
       {
         const std::string suffix = dialect.CheckpointSuffix(enable_thinking, rendered);
         if (!suffix.empty()) {
-          ckpt_back = dialect.kind == DialectKind::kQwen35
+          ckpt_back = dialect.kind != DialectKind::kGemma4
                           ? 1
                           : static_cast<int64_t>(tok_->encode(suffix, /*parse_special=*/true).size());
         }

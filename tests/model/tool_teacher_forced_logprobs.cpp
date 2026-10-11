@@ -332,6 +332,12 @@ int main(int argc, char** argv) {
       std::printf("[gemma] kv=%s resid=%s attn=%s (R4DX_GEMMA_KV/RESID/ATTN)\n", kv, rs,
                   at != nullptr && *at != '\0' ? at : "default");
     }
+    if (model.Config().arch == r4dx::model::Arch::kQwen4Exp) {
+      // The model owns its own two-stage split over both cards. TextModel exposes no split/devices accessor, so only
+      // the arch is reported; add `split=.. devices=..` here when the model grows a diagnostics interface.
+      std::printf("[qwen4exp] arch=%s (text only; split/devices not exposed by TextModel)\n",
+                  r4dx::model::ArchName(model.Config().arch));
+    }
     if (tp == 1) {
       std::printf("[vram]  %.2f GiB after load (delta %.2f GiB)\n", vram_after_load,
                   vram_after_load - vram_before);

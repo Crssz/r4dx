@@ -664,94 +664,16 @@ int32_t Qwen4ExpModel::DecodeStepSampled(int32_t token_id, const kernels::Sample
   const std::vector<float> row = stages_.back()->LastLogitsRow();  // this step's own fp32 row, no second lm_head pass
   return kernels::SampleCanonical(row.data(), vocab, params, u);
 }
-std::vector<int32_t> Qwen4ExpModel::DecodeStepMtpGreedy(int32_t token_id, int64_t k) {
-  if (k <= 0) {
-    return {DecodeStepGreedy(token_id)};
-  }
-  // 1. Try neural MTP drafting first
-  std::vector<int32_t> drafts;
-  if (mtp_ != nullptr) {
-    const uint16_t* h_seed = stages_.back()->LastResidualDev();
-    const uint16_t* embed_table = containers_.front()->EmbedTokensHost();
-    const QuantLinear& lm = containers_.back()->LmHead();
-    drafts = mtp_->Draft(token_id, h_seed, embed_table, lm, k, pos_);
-  }
-
-  // 2. Fall back to n-gram suffix lookup if neural MTP returned nothing
-  if (drafts.empty() && !context_tokens_.empty()) {
-    std::vector<int32_t> search_ctx = context_tokens_;
-    search_ctx.push_back(token_id);
-    for (int gram_len = 3; gram_len >= 1; --gram_len) {
-      if (static_cast<int>(search_ctx.size()) < gram_len) continue;
-      const auto it_end = search_ctx.end();
-      const auto it_start = it_end - gram_len;
-      auto pos = std::find_end(search_ctx.begin(), it_start, it_start, it_end);
-      if (pos != it_start) {
-        auto draft_pos = pos + gram_len;
-        while (draft_pos != it_start && drafts.size() < static_cast<size_t>(k)) {
-          drafts.push_back(*draft_pos++);
-        }
-        if (!drafts.empty()) break;
-      }
-    }
-  }
-
-  if (drafts.empty()) {
-    return {DecodeStepGreedy(token_id)};
-  }
-
-  // Speculative verification of candidate drafts: [token_id, d_1, ..., d_k]
-  const auto t0 = Clock::now();
-  last_ = Timings{};
-  at_prefill_end_ = false;
-
-  std::vector<int32_t> candidates;
-  candidates.reserve(drafts.size() + 1);
-  candidates.push_back(token_id);
-  candidates.insert(candidates.end(), drafts.begin(), drafts.end());
-
-  const int64_t n_candidates = static_cast<int64_t>(candidates.size());
-  HeadOut out;
-  const Qwen4ExpHeadRequest req{Qwen4ExpHeadRequest::Kind::kAllArgmax, 0.0f};
-  RunChunk(candidates.data(), n_candidates, /*is_prefill=*/false, &req, &out);
-  last_.total_ms = MsSince(t0);
-
-  context_tokens_.push_back(token_id);
-
-  std::vector<int32_t> round;
-  int64_t accepted = 0;
-  for (size_t i = 0; i < drafts.size(); ++i) {
-    int32_t true_next = (i < out.tokens.size()) ? out.tokens[i] : out.token;
-    if (true_next == drafts[i]) {
-      round.push_back(drafts[i]);
-      context_tokens_.push_back(drafts[i]);
-      ++accepted;
-    } else {
-      round.push_back(true_next);
-      context_tokens_.push_back(true_next);
-      break;
-    }
-  }
-  if (accepted == static_cast<int64_t>(drafts.size())) {
-    int32_t bonus = (drafts.size() < out.tokens.size()) ? out.tokens[drafts.size()] : out.token;
-    round.push_back(bonus);
-    context_tokens_.push_back(bonus);
-  }
-
-  // Rewind excess positions from pos_
-  const int64_t actually_committed = accepted + 1;
-  const int64_t excess = n_candidates - actually_committed;
-  if (excess > 0) {
-    pos_ -= excess;
-  }
-  return round;
+std::vector<int32_t> Qwen4ExpModel::DecodeStepMtpGreedy(int32_t token_id, int64_t /*k*/) {
+  int32_t next = DecodeStepGreedy(token_id);
+  return {next};
 }
 
-std::vector<int32_t> Qwen4ExpModel::DecodeStepMtpSampled(int32_t token_id, int64_t k,
+std::vector<int32_t> Qwen4ExpModel::DecodeStepMtpSampled(int32_t token_id, int64_t /*k*/,
                                                          const kernels::SampleParams& params,
                                                          std::mt19937_64& rng) {
   if (params.temperature <= 0.0f) {
-    return DecodeStepMtpGreedy(token_id, k);
+    return DecodeStepMtpGreedy(token_id, 0);
   }
   int32_t next = DecodeStepSampled(token_id, params, rng);
   return {next};

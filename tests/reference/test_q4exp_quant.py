@@ -84,6 +84,8 @@ def check(cond, what: str) -> None:
     if not cond:
         FAILS.append(what)
         print(f"FAIL: {what}")
+        if pytest is not None and __name__ != "__main__":
+            raise AssertionError(what)  # collected by pytest: a failed check must fail the test
 
 
 def raises(fn, exc=Exception, text: str = "") -> bool:

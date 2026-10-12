@@ -155,7 +155,7 @@ them (`invalid_argument`, naming the prefix container), `Qwen4ExpModel::Load` ru
 are meaningless after N layers; the capture hook is the point). The container the test uses:
 
 ```
-r4dx-convert --input E:\models\r4dx\Swift-1.5-Qwen3.8-Flash-Next-W4A16-AWQ --output D:\q4exp\real-prefix4-bf16.r4dx --layers 4 ^
+r4dx-convert --input E:\models\r4dx\Swift-1.5-Qwen3.8-Flash-Next-W4A16-AWQ --output E:\models\r4dx\q4exp\real-prefix4-bf16.r4dx --layers 4 ^
   --layouts bf16 --lm-head w4a16 --w4a16-group-rule "^lm_head$=32" --kv-calib E:\models\r4dx\q4exp\ref\kv_calib.json ^
   --ngram-sidecar E:\models\r4dx\swift15-flash-next.r4dx-ngram --threads 16
 ```

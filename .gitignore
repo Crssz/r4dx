@@ -20,3 +20,7 @@ __pycache__/
 # SKIPs (CTest SKIPPED, not FAILED) with a regeneration hint when this file is absent, same
 # convention tests/model's golden-data tests already use.
 tests/kernels/golden/
+
+# scratch probes in the repo root
+/cross_dev_ev.*
+/p2p_check.*

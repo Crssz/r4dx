@@ -185,7 +185,7 @@ def emulate_scan(q, k, v, g, beta, scale, form, clamp=80.0):
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--container", default=r"D:\q4exp\real-prefix4-bf16.r4dx")
+    ap.add_argument("--container", default=r"E:\models\r4dx\q4exp\real-prefix4-bf16.r4dx")
     ap.add_argument("--golden", default=r"E:\models\r4dx\q4exp\ref\layer_goldens\T70.recent.safetensors")
     ap.add_argument("--layers", type=int, nargs="+", default=[0, 1, 2])
     ap.add_argument("--emulate", action="store_true", help="emulate the shipped (split) and the span-safe (stable) chunk scan")

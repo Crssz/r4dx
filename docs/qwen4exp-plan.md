@@ -346,7 +346,7 @@ HF reference work runs on device 1 only (`$env:HIP_VISIBLE_DEVICES = '1'`).
 | M0-7 | done | Real references under `E:\models\r4dx\q4exp\ref\` (canon, 8k/32k probes, layer goldens, `kv_calib.json`, fp32 truth); sizes + sha256 in `tools/reference/qwen4exp/REAL_REF.md`. |
 | M1-1 | done | `Arch::kQwen4Exp`, `qwen4exp_config.h`. |
 | M1-2 | done | `r4dx-convert` qwen4_exp layout + virtual AWQ source (bit-equal to `awq_dequant.py` on 8 real tensors); real checkpoint `--plan-only` consumes all 73,884 packed linears, header 12 MB, plan 2.5 s. |
-| M1-3 | done | `Qwen4ExpContainer` (loader test 453 checks on bf16/w4a16/synthetic trellis), real 4-layer prefix container `D:\q4exp\real-prefix4-bf16.r4dx`. |
+| M1-3 | done | `Qwen4ExpContainer` (loader test 453 checks on bf16/w4a16/synthetic trellis), real 4-layer prefix container `E:\models\r4dx\q4exp\real-prefix4-bf16.r4dx`. |
 | M1-4..9 | done | Kernels with GPU tests vs HF fixtures: hc, MoE (router ties exact), PLE, sigmoid gated GDN norm, QSA core (selected sets equal the `recent` reference on 100% of rows, 0.28 ms decode at 262k ctx), n-gram reader (4096 rows in ~23 ms cold, 16 rows 0.27 ms). |
 | M1-5 | done | KB 3: 48 libr4d instantiations, bit-exact reconstruct and CPU-reference GEMM on the qwen4exp shapes; KB 4/5 device code identical to HEAD (ISA listing diff). |
 | M1-16..18 | done on tiny + real prefix | `Qwen4ExpModel`/`LocalTextModel`; layer-isolated golden tests pass for both GDN prefill modes; prefill/decode/chunk-split/checkpoint bit-identical; two-device split bit-identical to single device (crash found and fixed: stream created before `hipSetDevice`). |

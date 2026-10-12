@@ -41,9 +41,11 @@ param(
     [int]$LoadTimeoutSec = 1500,
     [int]$LockTimeoutMinutes = 240,
     [string]$ServerExe = "",
-    [string]$DryRun = "false",
+    [string]$DryRunArg = "false",
     [string]$Inner = "false"
 )
+# DryRun arrives as a string ("false" is truthy in `$DryRun -or ...`): keep a real boolean for the whole script.
+$DryRun = ($DryRunArg -eq "true")
 $ErrorActionPreference = "Stop"
 $Repo = (Resolve-Path (Join-Path $PSScriptRoot "..\..")).Path
 Set-Location $Repo

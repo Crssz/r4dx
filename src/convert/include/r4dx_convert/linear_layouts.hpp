@@ -36,7 +36,7 @@ struct LayoutSet {
   // The trellis layout (docs/trellis-kernel.md 2; r4dx-convert --trellis-from, trellis_import.hpp):
   // `<base>.trellis.w` / `.suh` / `.svh`, IMPORTED from an oracle directory, never quantized here.
   // Exclusive -- a trellis linear has no other layout (3.4: no `.bf16.w` may defeat the old-binary
-  // guard). `trellis_bits` is KB (4 or 5); `trellis_parts` the N of each fused part in container
+  // guard). `trellis_bits` is KB (3, 4 or 5); `trellis_parts` the N of each fused part in container
   // row order ({17408, 17408} for mlp.gate_up; empty = one part of N). Ignored when `trellis` is
   // false.
   bool trellis = false;
@@ -109,7 +109,7 @@ inline std::vector<std::string> LinearLayoutTensorNames(const std::string& base,
 // (with its own group, always spelled out), joined by '+', or "none". So a
 // --keep-bf16 linear is "bf16", the Q3 sweep recipe's quantized linear "w4a16.g64". Everything a linear's tensors depend on beyond the run-wide flags is in it:
 // its tensor names and sizes, which quantizers run (LDLQ applies iff a 4-bit layout is present), and
-// at which w4a16 group. A trellis linear is "trellis.k4" / "trellis.k5" (its parts follow from its
+// at which w4a16 group. A trellis linear is "trellis.k3" / "trellis.k4" / "trellis.k5" (its parts follow from its
 // HF names, not from a flag, so they are not part of the id).
 inline std::string LayoutSetId(const LayoutSet& ls) {
   std::string s;
@@ -138,7 +138,7 @@ inline bool ParseLayoutSetId(const std::string& id, LayoutSet* out) {
         ls.w4a16 = true;
         ls.w4a16_group = std::stoi(t.substr(7));
         if (ls.w4a16_group != kW4A16Group && !IsW4A16GroupSupported(ls.w4a16_group)) return false;
-      } else if (t == "trellis.k4" || t == "trellis.k5") {
+      } else if (t == "trellis.k3" || t == "trellis.k4" || t == "trellis.k5") {
         ls.trellis = true;
         ls.trellis_bits = t.back() - '0';
       } else {
@@ -197,7 +197,7 @@ struct QuantOptions {
   const LdlqFactor* ldlq = nullptr;
 };
 
-// The trellis layout's shape rules (docs/trellis-kernel.md 2.1, 2.4, 2.5): KB in {4, 5}; K, N and
+// The trellis layout's shape rules (docs/trellis-kernel.md 2.1, 2.4, 2.5): KB in {3, 4, 5}; K, N and
 // every part a multiple of 128 (both Hadamards and the scale vectors work in 128-blocks, and every
 // TP = 2 rank range must be 128-aligned); the parts sum to N; no other layout next to it.
 inline void CheckTrellisLayout(const std::string& base, int64_t N, int64_t K, const LayoutSet& ls) {
@@ -207,8 +207,8 @@ inline void CheckTrellisLayout(const std::string& base, int64_t N, int64_t K, co
   };
   if (ls.bf16 || ls.w4a16)
     fail("a trellis linear is written in the trellis layout only (docs/trellis-kernel.md 3.4)");
-  if (ls.trellis_bits != 4 && ls.trellis_bits != 5)
-    fail("KB=" + std::to_string(ls.trellis_bits) + " is not a rate the kernel instantiates (4, 5)");
+  if (ls.trellis_bits != 3 && ls.trellis_bits != 4 && ls.trellis_bits != 5)
+    fail("KB=" + std::to_string(ls.trellis_bits) + " is not a rate the kernel instantiates (3, 4, 5)");
   if (K % 128 != 0) fail("K is not a multiple of 128");
   if (N % 128 != 0) fail("N is not a multiple of 128");
   int64_t sum = 0;

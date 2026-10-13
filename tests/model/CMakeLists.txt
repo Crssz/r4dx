@@ -495,6 +495,13 @@ add_executable(test_gemma_config test_gemma_config.cpp)
 target_link_libraries(test_gemma_config PRIVATE r4dx_model_arch)
 add_test(NAME test_gemma_config COMMAND test_gemma_config)
 
+# test_qwen4exp_config (docs/qwen4exp-plan.md M1-1): Qwen4ExpConfig::FromJson on the real
+# Swift-1.5-Qwen3.8-Flash-Next config (layer pattern, PLE ids, derived QSA / n-gram helpers, every refusal), and
+# DetectArch / ArchName for all three arches. CPU-only, header + arch.cpp only.
+add_executable(test_qwen4exp_config test_qwen4exp_config.cpp)
+target_link_libraries(test_qwen4exp_config PRIVATE r4dx_model_arch)
+add_test(NAME test_qwen4exp_config COMMAND test_qwen4exp_config)
+
 # test_gemma_container (docs/gemma4-plan.md M1-19): GemmaContainer::Inspect (the CPU half of the Gemma loader --
 # `__metadata__` + the tensor directory, no HIP call) on a tiny 6-layer fixture converted by the real r4dx-convert
 # (when built), the real Huihui bf16.r4dx header (SKIP when absent), and option-A rotation metadata. CPU only:
@@ -662,3 +669,6 @@ endif()
 if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/attention/CMakeLists.txt")
   add_subdirectory(attention)
 endif()
+
+# tests/model/qwen4exp/: glob-registered tests of the qwen4_exp arch (docs/qwen4exp-plan.md).
+add_subdirectory(qwen4exp)

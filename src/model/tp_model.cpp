@@ -1276,9 +1276,21 @@ std::unique_ptr<TextModel> LoadTextModel(const ModelOptions& opts, const TpOptio
   // The pipeline switch (docs/pp-prefill.md Phase 2): ModelOptions::pp, -1 following R4DX_PP; off by default.
   const bool pp_on = ResolvePpSwitch(opts.pp);
   // Arch dispatch (docs/gemma4-plan.md 3.2): the container header alone decides. DetectArch answers
-  // kQwen35 for every container without a `model_arch` / Gemma model_config -- including a file it
-  // cannot read -- so the Qwen branches below see exactly what they saw before.
-  if (DetectArch(opts.container_path) == Arch::kGemma4) {
+  // kQwen35 for every container without a `model_arch` / Gemma or qwen4_exp model_config -- including
+  // a file it cannot read -- so the Qwen branches below see exactly what they saw before.
+  const Arch arch = DetectArch(opts.container_path);
+  if (arch == Arch::kQwen4Exp) {
+    if (pp_on) {
+      throw std::invalid_argument("LoadTextModel: --pp 2 does not support qwen4_exp (it splits its layers over the two "
+                                  "cards itself; R4DX_Q4_DEVICES / R4DX_Q4_SPLIT)");
+    }
+    if (tp.world != 1) {
+      throw std::invalid_argument("LoadTextModel: --tp " + std::to_string(tp.world) +
+                                  " does not support qwen4_exp (it splits its layers over the two cards itself)");
+    }
+    return LoadQwen4ExpTextModel(opts, tp);
+  }
+  if (arch == Arch::kGemma4) {
     if (pp_on) throw std::invalid_argument("LoadTextModel: --pp 2 does not support Gemma 4 (it has its own RunChunk)");
     return LoadGemmaTextModel(opts, tp);
   }

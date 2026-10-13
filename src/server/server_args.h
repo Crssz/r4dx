@@ -27,6 +27,8 @@ inline constexpr int kMaxBatchSlots = 16;
 struct ServerArgs {
   std::string model_path;
   std::string layout = "bf16";
+  // --layout given on the command line (a qwen4_exp trellis container otherwise defaults to trellis, docs/qwen4exp.md).
+  bool layout_given = false;
   // Same default as src/cli/cli_args.h: the Huihui abliterated checkpoint dir, whose four tokenizer /
   // chat-template files are byte-identical to the base Qwen3.8-27B's.
   std::string tokenizer_dir = QwenDefaultTokenizerDir();  // dialect.h
@@ -34,7 +36,7 @@ struct ServerArgs {
   // and the engine resolves the default from the dialect (docs/gemma4-plan.md 5.3): Gemma's assembled
   // tokenizer dir, or the Qwen default above (unchanged).
   bool tokenizer_dir_given = false;
-  // --dialect {auto|qwen35|gemma4} (docs/gemma4-plan.md 5.3, task M1-14): the per-family text surface
+  // --dialect {auto|qwen35|gemma4|qwen4_exp} (docs/gemma4-plan.md 5.3, task M1-14): the per-family text surface
   // (reasoning markers, tool-call syntax, EOS list, BOS on raw prompts). auto reads the tokenizer
   // dir (tokenizer_config.json / vocab), then cross-checks the loaded model's architecture.
   std::string dialect = "auto";
@@ -198,7 +200,7 @@ struct ServerUsageError : std::runtime_error {
 inline std::string ServerUsageText(const char* argv0) {
   return std::string("usage: ") + argv0 +
          " --model <container.r4dx> --layout {w4a16|bf16|trellis} "
-         "[--tokenizer-dir <dir>] [--dialect {auto|qwen35|gemma4}] [--host <addr>] [--port N] "
+         "[--tokenizer-dir <dir>] [--dialect {auto|qwen35|gemma4|qwen4_exp}] [--host <addr>] [--port N] "
          "[--max-ctx N] [--extended-ctx] "
          "[--max-tokens-default N] [--max-queue N] [--think {on|off}] [--layers N] "
          "[--default-temperature F] [--default-top-p F] [--default-top-k N] "
@@ -305,7 +307,7 @@ inline ServerArgs ParseServerArgs(int argc, char** argv) {
   for (int i = 1; i < argc; ++i) {
     const std::string arg = argv[i];
     if (arg == "--model") a.model_path = NextServerArg(argc, argv, i, "--model");
-    else if (arg == "--layout") a.layout = NextServerArg(argc, argv, i, "--layout");
+    else if (arg == "--layout") { a.layout = NextServerArg(argc, argv, i, "--layout"); a.layout_given = true; }
     else if (arg == "--tokenizer-dir") { a.tokenizer_dir = NextServerArg(argc, argv, i, "--tokenizer-dir"); a.tokenizer_dir_given = true; }
     else if (arg == "--dialect") a.dialect = NextServerArg(argc, argv, i, "--dialect");
     else if (arg == "--extended-ctx") a.extended_ctx = true;
@@ -385,8 +387,8 @@ inline ServerArgs ParseServerArgs(int argc, char** argv) {
   if (a.model_path.empty()) throw ServerUsageError("--model is required");
   if (a.port <= 0 || a.port > 65535) throw ServerUsageError("--port must be in 1..65535");
   if (a.max_ctx <= 0) throw ServerUsageError("--max-ctx must be > 0");
-  if (a.dialect != "auto" && a.dialect != "qwen35" && a.dialect != "gemma4") {
-    throw ServerUsageError("--dialect must be 'auto', 'qwen35' or 'gemma4'");
+  if (a.dialect != "auto" && a.dialect != "qwen35" && a.dialect != "gemma4" && a.dialect != "qwen4_exp") {
+    throw ServerUsageError("--dialect must be 'auto', 'qwen35', 'gemma4' or 'qwen4_exp'");
   }
   if (a.request_log_tokens && a.request_log.empty()) {
     throw ServerUsageError("--request-log-tokens needs --request-log <path> (it adds fields to that file)");

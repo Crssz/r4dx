@@ -204,11 +204,11 @@ void FullCoverage(Gemm& g, const Tuning& t, bool two_parts, int n_split, const s
 
 // The whole knob space of docs/trellis-kernel.md 4.4; the host decides what is legal on this shape
 // (a rejected tuning throws before launching), and every tuning it accepts must be bit-exact.
-void TestRawSweep(std::mt19937_64& rng) {
-  const int K = 8192, N = 512, KB = 4;
+void TestRawSweep(std::mt19937_64& rng, int KB = 4) {
+  const int K = 8192, N = 512;
   std::vector<uint32_t> words = RandomWords(rng, static_cast<size_t>(K / 16) * (N / 16) * 8 * KB);
   std::vector<uint32_t> grid = trellis_ref::ToPairGrid(words, K, N, KB);
-  Gemm g(grid, trellis_ref::DecodePairGrid(grid, K, N, KB), K, N);
+  Gemm g(grid, trellis_ref::DecodePairGrid(grid, K, N, KB), K, N, KB);
 
   // Eight one-hot activations per part, uploaded once and cycled: rows spread over the whole K so
   // every K slice of every split sees some.
@@ -281,8 +281,9 @@ void TestRawSweep(std::mt19937_64& rng) {
                                     (two ? " P=2" : " P=1") + ": " + std::to_string(bad) +
                                     " elements wrong");
               }
-  std::printf("  raw sweep K=%d N=%d: %d legal tunings run bit-exact%s, %d rejected by the host\n", K,
-              N, legal, bad_total ? " (NOT all)" : "", illegal);
+  std::printf("  raw sweep K=%d N=%d%s: %d legal tunings run bit-exact%s, %d rejected by the host\n", K,
+              N, KB == 4 ? "" : (" KB=" + std::to_string(KB)).c_str(), legal,
+              bad_total ? " (NOT all)" : "", illegal);
   Check(legal > 1000, "raw sweep: suspiciously few legal tunings (" + std::to_string(legal) + ")");
 }
 
@@ -292,9 +293,9 @@ void TestRawSweep(std::mt19937_64& rng) {
 //   K = 1152 (72 = 8 * 9 k-tiles): SK*SKG*U = 8, 9 steps -- the loop runs 4 iterations and then the
 //     odd tail. Every production K has an odd factor (5120 = 320 k-tiles, 6144 = 384, 17408 = 1088),
 //     so e.g. SK*SKG*U = 64 at K = 5120 gives 5 steps: this path.
-void TestRawFullCoverage(std::mt19937_64& rng) {
+void TestRawFullCoverageKb(std::mt19937_64& rng, int KB) {
   const int N = 512;
-  for (int KB : {4, 5}) {
+  {
     auto weight = [&](int K) {
       std::vector<uint32_t> words = RandomWords(rng, static_cast<size_t>(K / 16) * (N / 16) * 8 * KB);
       std::vector<uint32_t> grid = trellis_ref::ToPairGrid(words, K, N, KB);
@@ -325,10 +326,13 @@ void TestRawFullCoverage(std::mt19937_64& rng) {
                 "instantiations x {unsplit, split}\n", KB, N, kernels);
     // KB = 4: every (NP, U) with NP*U <= 8 up to its MT cap, 25 x 2 NT; KB = 5 gives up one MT at
     // (NP, U) = (2, 4): 24 x 2.
-    const int want = KB == 4 ? 50 : 48;
+    const int want = KB == 4 ? 50 : 48;   // KB 3 takes KB 5's table (4 loads and a 24-register decode)
     Check(kernels == want, "full coverage KB " + std::to_string(KB) + ": expected " + std::to_string(want) +
                                " instantiated kernels, ran " + std::to_string(kernels));
   }
+}
+void TestRawFullCoverage(std::mt19937_64& rng) {
+  for (int KB : {4, 5}) TestRawFullCoverageKb(rng, KB);
 }
 
 // On dense random A at a production shape (K = 5120: 320 k-tiles, so SK*SKG*U = 64 runs 5 steps,
@@ -336,11 +340,11 @@ void TestRawFullCoverage(std::mt19937_64& rng) {
 //   - the M = 1 rows against an fp64 dot product with the CPU decode, within the fp32 summation
 //     bound 2 n 2^-24 sum|a q| (n = K/16 + 16 + SK + SKG additions per element, generous);
 //   - row identity (rows of M = 2..16 calls equal their M = 1 calls) and 20-repeat determinism.
-void TestRawOrder(std::mt19937_64& rng) {
-  const int K = 5120, N = 1024, KB = 4;
+void TestRawOrder(std::mt19937_64& rng, int KB = 4) {
+  const int K = 5120, N = 1024;
   std::vector<uint32_t> words = RandomWords(rng, static_cast<size_t>(K / 16) * (N / 16) * 8 * KB);
   std::vector<uint32_t> grid = trellis_ref::ToPairGrid(words, K, N, KB);
-  Gemm g(grid, trellis_ref::DecodePairGrid(grid, K, N, KB), K, N);
+  Gemm g(grid, trellis_ref::DecodePairGrid(grid, K, N, KB), K, N, KB);
   std::uniform_real_distribution<float> ud(-1.f, 1.f);
   std::vector<uint16_t> a(static_cast<size_t>(64) * K);
   for (auto& x : a) x = FloatToF16(ud(rng));
@@ -414,9 +418,10 @@ void TestRawOrder(std::mt19937_64& rng) {
     }
     Check(differ == 0, "determinism " + t.Str() + ": " + std::to_string(differ) + " of 20 repeats differ");
   }
-  std::printf("  K=%d N=%d dense A, %zu tunings: M=1 rows vs fp64 (worst error %.3f of the bound), row "
+  std::printf("  K=%d N=%d%s dense A, %zu tunings: M=1 rows vs fp64 (worst error %.3f of the bound), row "
               "identity (M 2/5/8/16 vs M=1), 20-repeat determinism\n",
-              K, N, sizeof(tunings) / sizeof(tunings[0]), worst_ratio);
+              K, N, KB == 4 ? "" : (" KB=" + std::to_string(KB)).c_str(),
+              sizeof(tunings) / sizeof(tunings[0]), worst_ratio);
 }
 
 void TestPreconditions() {
@@ -431,9 +436,10 @@ void TestPreconditions() {
   Check(Throws([&] { call(65, K, N, N, 4, 4, 2, 1, 1, 1, 2, 16); }), "M = 65 accepted");
   Check(Throws([&] { call(1, 1000, N, N, 4, 4, 2, 1, 1, 1, 2, 16); }), "K % 128 accepted");
   Check(Throws([&] { call(1, K, 500, 500, 4, 4, 2, 1, 1, 1, 2, 16); }), "N % 128 accepted");
-  Check(Throws([&] { call(1, K, N, N, 3, 4, 2, 1, 1, 1, 2, 16); }), "KB = 3 accepted (not instantiated)");
+  Check(Throws([&] { call(1, K, N, N, 2, 4, 2, 1, 1, 1, 2, 16); }), "KB = 2 accepted (not instantiated)");
   Check(Throws([&] { call(1, K, N, N, 6, 4, 2, 1, 1, 1, 2, 16); }), "KB = 6 accepted (not instantiated)");
   Check(Throws([&] { call(1, K, N, N, 5, 1, 2, 3, 2, 1, 4, 16); }), "(KB 5, NP 2, U 4, MT 3) accepted");
+  Check(Throws([&] { call(1, K, N, N, 3, 1, 2, 3, 2, 1, 4, 16); }), "(KB 3, NP 2, U 4, MT 3) accepted");
   Check(Throws([&] { call(1, K, N, N, 4, 1, 2, 1, 4, 1, 4, 16); }), "NP*U = 16 accepted");
   Check(Throws([&] { call(1, K, N, N, 4, 1, 2, 2, 4, 1, 2, 16); }), "(NP 4, U 2, MT 2) accepted");
   Check(Throws([&] { call(1, K, N, N, 4, 4, 2, 1, 4, 1, 1, 16); }), "Wc = 512 accepted");
@@ -447,17 +453,18 @@ void TestPreconditions() {
   Check(Throws([&] { call(1, K, N, N, 4, 3, 2, 1, 1, 1, 2, 16); }), "WV = 3 accepted");
   Check(Throws([&] { call(1, K, N, N, 4, 4, 2, 1, 1, 3, 2, 16); }), "SKG = 3 accepted");
   Check(Throws([&] { r4d_trellis_reconstruct_f16(16, 16, 1024, 48, 4, 0); }), "reconstruct N % 32 accepted");
-  Check(Throws([&] { r4d_trellis_reconstruct_f16(16, 16, 1024, 64, 3, 0); }), "reconstruct KB = 3 accepted");
-  Check(r4d_gemm_trellis_nt_m64_has_rate(4) == 1 && r4d_gemm_trellis_nt_m64_has_rate(5) == 1 &&
-            r4d_gemm_trellis_nt_m64_has_rate(3) == 0,
-        "has_rate: 4 and 5 yes, 3 no");
+  Check(Throws([&] { r4d_trellis_reconstruct_f16(16, 16, 1024, 64, 2, 0); }), "reconstruct KB = 2 accepted");
+  Check(r4d_gemm_trellis_nt_m64_has_rate(3) == 1 && r4d_gemm_trellis_nt_m64_has_rate(4) == 1 &&
+            r4d_gemm_trellis_nt_m64_has_rate(5) == 1 && r4d_gemm_trellis_nt_m64_has_rate(2) == 0 &&
+            r4d_gemm_trellis_nt_m64_has_rate(6) == 0,
+        "has_rate: 3, 4 and 5 yes, 2 and 6 no");
   Check(r4d_gemm_trellis_nt_m64_max_m() == 64, "max_m 64");
   Check(r4d_gemm_trellis_nt_m64_ws_bytes(16, 5120, 8) == static_cast<size_t>(8) * 16 * 5120 * 4,
         "ws_bytes = SKG*M*N*4");
 }
 
-void TestReconstructRandom(std::mt19937_64& rng) {
-  for (int KB : {4, 5}) {
+void TestReconstructRandomKb(std::mt19937_64& rng, int KB) {
+  {
     const int K = 512, N = 384;
     std::vector<uint32_t> words = RandomWords(rng, static_cast<size_t>(K / 16) * (N / 16) * 8 * KB);
     std::vector<uint32_t> grid = trellis_ref::ToPairGrid(words, K, N, KB);
@@ -470,6 +477,9 @@ void TestReconstructRandom(std::mt19937_64& rng) {
     Check(diff == 0, "reconstruct KB " + std::to_string(KB) + " random: " + std::to_string(diff) +
                          " values differ");
   }
+}
+void TestReconstructRandom(std::mt19937_64& rng) {
+  for (int KB : {4, 5}) TestReconstructRandomKb(rng, KB);
 }
 
 // ---- goldens (trellis_golden.py) -------------------------------------------------------------
@@ -559,6 +569,49 @@ void TestGemmaShapes(std::mt19937_64& rng) {
   std::printf("  gemma shapes: %d (K, N, KB, tuning) cases, every k, bit-exact\n", cases);
 }
 
+// KB = 3 (docs/trellis-kernel.md "KB = 3"; the trellis rate of qwen4_exp's experts): everything the
+// KB = 4 and 5 cases above hold, at the new rate, after them so their random draws are unchanged.
+//   - reconstruct and the CPU decode on random words;
+//   - every instantiated (NP, U, MT) x NT x {unsplit, split}, K = 1024 and K = 1152;
+//   - the whole legal tuning space on a K = 8192 weight, the fp64 / row-identity / determinism test;
+//   - the shapes the arch uses: every k of each, at the decode fallback tuning (the M <= 16 split
+//     rule of linear.cpp's FallbackTuning) and the M > 16 unsplit MT 4 one; gate_up is a 2-part
+//     linear (n_split = 640).
+void TestQwen4ExpShapesKb3(std::mt19937_64& rng) {
+  const struct { int K, N, n_split; const char* name; } shapes[] = {
+      {2560, 1280, 640, "expert gate_up"}, {640, 2560, 0, "expert down"}, {2560, 12288, 0, "attn.qg"},
+      {2560, 10240, 0, "gdn.qkv"},         {2560, 6144, 0, "gdn.z / attn.o in"}, {6144, 2560, 0, "out_proj / o"},
+      {2560, 512, 0, "attn.k / v"}};
+  const int KB = 3;
+  int cases = 0;
+  for (const auto& s : shapes) {
+    std::vector<uint32_t> words = RandomWords(rng, static_cast<size_t>(s.K / 16) * (s.N / 16) * 8 * KB);
+    std::vector<uint32_t> grid = trellis_ref::ToPairGrid(words, s.K, s.N, KB);
+    Gemm g(grid, trellis_ref::DecodePairGrid(grid, s.K, s.N, KB), s.K, s.N, KB);
+    int skg = std::max(1, std::min(4, 128 / (s.N / 128)));
+    int p = 1;
+    while (p * 2 <= skg) p *= 2;
+    skg = p;
+    while (skg > 1 && (s.K / 16) % (2 * skg * 2) != 0) skg /= 2;
+    const Tuning decode{4, 2, 1, 1, skg, 2, 1}, prefill{4, 2, 4, 1, 1, 2, 0};
+    for (const Tuning& t : {decode, prefill}) {
+      FullCoverage(g, t, s.n_split != 0, s.n_split != 0 ? s.n_split : s.N,
+                   std::string("qwen4exp ") + s.name + " K=" + std::to_string(s.K) +
+                       " N=" + std::to_string(s.N) + " KB=3");
+      ++cases;
+    }
+  }
+  std::printf("  qwen4exp shapes KB=3: %d (shape, tuning) cases, every k, bit-exact\n", cases);
+}
+
+void TestKb3(std::mt19937_64& rng) {
+  TestReconstructRandomKb(rng, 3);
+  TestRawFullCoverageKb(rng, 3);
+  TestRawSweep(rng, 3);
+  TestRawOrder(rng, 3);
+  TestQwen4ExpShapesKb3(rng);
+}
+
 }  // namespace
 
 int main() {
@@ -572,6 +625,7 @@ int main() {
   TestRawSweep(rng);
   TestRawOrder(rng);
   TestGemmaShapes(rng);
+  TestKb3(rng);
 
   const bool golden = GoldenAvailable();
   if (golden) {

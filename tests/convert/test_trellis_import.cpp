@@ -205,7 +205,7 @@ void TestCodebookAndRing() {
            RoundToF16Value(std::ldexp(3.0, -26)) == std::ldexp(1.0, -24),
        "RoundToF16Value: ties to even (both signs), subnormal step 2^-24");
   bool ring = true;
-  for (int kb : {4, 5}) {
+  for (int kb : {3, 4, 5}) {
     const RingTables& rt = Ring(kb);
     for (int p = 0; p < kTile; ++p) {
       const int64_t R = 256 * kb, start = (((p + 1) * kb - 16) % R + R) % R;
@@ -215,10 +215,10 @@ void TestCodebookAndRing() {
     }
   }
   // Position 0 wraps: its window starts 16 - KB bits before the ring's end (tail-biting).
-  Gate(ring && Ring(4).i0[0] == 31 && Ring(4).off[0] == 20 && Ring(5).i0[0] == 39 &&
-           Ring(5).off[0] == 21,
-       "Ring(4/5): state(p) = the 16 bits ending at (p + 1) KB mod 256 KB, position 0 tail-biting");
-  ExpectThrow("Ring(3) is refused", "KB=3", [] { (void)Ring(3); });
+  Gate(ring && Ring(3).i0[0] == 23 && Ring(3).off[0] == 19 && Ring(3).i1[0] == 0 && Ring(4).i0[0] == 31 &&
+           Ring(4).off[0] == 20 && Ring(5).i0[0] == 39 && Ring(5).off[0] == 21,
+       "Ring(3/4/5): state(p) = the 16 bits ending at (p + 1) KB mod 256 KB, position 0 tail-biting");
+  ExpectThrow("Ring(2) is refused", "KB=2", [] { (void)Ring(2); });
 }
 
 void TestLayoutSet() {
@@ -228,11 +228,13 @@ void TestLayoutSet() {
            TrellisPartCount(one) == 1 && TrellisPartCount(two) == 2,
        "TrellisLayoutSet: the trellis layout only, no bf16 (the old-binary guard)");
   LayoutSet back;
+  const LayoutSet three = TrellisLayoutSet(3);
   Gate(LayoutSetId(one) == "trellis.k4" && LayoutSetId(two) == "trellis.k5" &&
-           ParseLayoutSetId("trellis.k4", &back) && back.trellis && back.trellis_bits == 4 &&
-           !ParseLayoutSetId("bf16+trellis.k4", &back) && !ParseLayoutSetId("trellis.k3", &back) &&
-           !ParseLayoutSetId("w4a16.g64+trellis.k5", &back),
-       "LayoutSetId/ParseLayoutSetId: trellis.k4 / trellis.k5, exclusive, K in {4, 5}");
+           LayoutSetId(three) == "trellis.k3" && ParseLayoutSetId("trellis.k3", &back) && back.trellis &&
+           back.trellis_bits == 3 && ParseLayoutSetId("trellis.k4", &back) && back.trellis &&
+           back.trellis_bits == 4 && !ParseLayoutSetId("bf16+trellis.k4", &back) &&
+           !ParseLayoutSetId("trellis.k2", &back) && !ParseLayoutSetId("w4a16.g64+trellis.k5", &back),
+       "LayoutSetId/ParseLayoutSetId: trellis.k3 / k4 / k5, exclusive, K in {3, 4, 5}");
   Gate(LinearLayoutTensorNames("x", two) ==
            std::vector<std::string>{"x.trellis.w", "x.trellis.suh", "x.trellis.svh"},
        "LinearLayoutTensorNames: .trellis.w, .trellis.suh, .trellis.svh");
@@ -266,7 +268,8 @@ void TestLayoutSet() {
               [&] { plan(384, 256, TrellisLayoutSet(4, {192, 192})); });
   ExpectThrow("parts not summing to N are refused", "sum to 256",
               [&] { plan(384, 256, TrellisLayoutSet(4, {128, 128})); });
-  ExpectThrow("KB = 3 is refused", "KB=3", [&] { plan(256, 256, TrellisLayoutSet(3)); });
+  ExpectThrow("KB = 2 is refused", "KB=2", [&] { plan(256, 256, TrellisLayoutSet(2)); });
+  plan(256, 256, TrellisLayoutSet(3));   // KB 3 is a rate (qwen4_exp's experts): no throw
   LayoutSet mixed = TrellisLayoutSet(4);
   mixed.bf16 = true;
   ExpectThrow("trellis next to bf16 is refused", "trellis layout only",

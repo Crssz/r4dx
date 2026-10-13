@@ -30,6 +30,8 @@ inline constexpr int64_t kMaxMtpDraftKTp = 7;
 struct CliArgs {
   std::string model_path;
   std::string layout = "bf16";
+  // --layout given on the command line (a qwen4_exp trellis container otherwise defaults to trellis, docs/qwen4exp.md).
+  bool layout_given = false;
   // The Huihui abliterated checkpoint dir: its tokenizer.json / tokenizer_config.json /
   // chat_template.jinja / generation_config.json (the four files r4dx reads) are byte-identical to the
   // base Qwen3.8-27B's, so this default serves every Qwen3.8-27B-family container. The base checkpoint
@@ -38,7 +40,7 @@ struct CliArgs {
   // True iff --tokenizer-dir was given. When it was not, main.cpp resolves the default from the dialect
   // (docs/gemma4-plan.md 5.3, task M1-14): Gemma's assembled tokenizer dir, or the Qwen one above.
   bool tokenizer_dir_given = false;
-  // --dialect {auto|qwen35|gemma4}: same meaning as r4dx-server's (src/server/dialect.h).
+  // --dialect {auto|qwen35|gemma4|qwen4_exp}: same meaning as r4dx-server's (src/server/dialect.h).
   std::string dialect = "auto";
   std::string prompt;
   // --prompt-file <path>: the one-shot prompt read verbatim (UTF-8) from a file instead of the command
@@ -270,7 +272,7 @@ struct CliUsageError : std::runtime_error {
 inline std::string CliUsageText(const char* argv0) {
   return std::string("usage: ") + argv0 +
          " --model <container.r4dx> --layout {w4a16|bf16|trellis} "
-         "(--prompt \"...\" | --prompt-file <path> | --chat) [--tokenizer-dir <dir>] [--dialect {auto|qwen35|gemma4}] [--system \"...\"] "
+         "(--prompt \"...\" | --prompt-file <path> | --chat) [--tokenizer-dir <dir>] [--dialect {auto|qwen35|gemma4|qwen4_exp}] [--system \"...\"] "
          "[--think {on|off}] [--max-tokens N] [--temperature F] [--top-k N] [--top-p F] "
          "[--min-p F] [--seed N] [--max-ctx N] [--extended-ctx] [--stats] [--profile] [--profile-token N] "
          "[--profile-prefill] [--mtp N] [--mtp-head-layout {bf16|layout}] "
@@ -382,7 +384,7 @@ inline CliArgs ParseArgs(int argc, char** argv) {
   for (int i = 1; i < argc; ++i) {
     const std::string arg = argv[i];
     if (arg == "--model") a.model_path = NextCliArg(argc, argv, i, "--model");
-    else if (arg == "--layout") a.layout = NextCliArg(argc, argv, i, "--layout");
+    else if (arg == "--layout") { a.layout = NextCliArg(argc, argv, i, "--layout"); a.layout_given = true; }
     else if (arg == "--tokenizer-dir") { a.tokenizer_dir = NextCliArg(argc, argv, i, "--tokenizer-dir"); a.tokenizer_dir_given = true; }
     else if (arg == "--dialect") a.dialect = NextCliArg(argc, argv, i, "--dialect");
     else if (arg == "--extended-ctx") a.extended_ctx = true;
@@ -474,8 +476,8 @@ inline CliArgs ParseArgs(int argc, char** argv) {
   if (a.top_p < 0.0f || a.top_p > 1.0f) throw CliUsageError("--top-p must be in [0, 1]");
   if (a.min_p < 0.0f || a.min_p > 1.0f) throw CliUsageError("--min-p must be in [0, 1]");
   if (a.max_ctx <= 0) throw CliUsageError("--max-ctx must be > 0");
-  if (a.dialect != "auto" && a.dialect != "qwen35" && a.dialect != "gemma4") {
-    throw CliUsageError("--dialect must be 'auto', 'qwen35' or 'gemma4'");
+  if (a.dialect != "auto" && a.dialect != "qwen35" && a.dialect != "gemma4" && a.dialect != "qwen4_exp") {
+    throw CliUsageError("--dialect must be 'auto', 'qwen35', 'gemma4' or 'qwen4_exp'");
   }
   if (a.layers == 0 || a.layers < -1) throw CliUsageError("--layers must be -1 (every layer) or > 0");
   if (a.top_k < 0) throw CliUsageError("--top-k must be >= 0");

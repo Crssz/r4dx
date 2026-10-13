@@ -246,4 +246,9 @@ std::unique_ptr<TextModel> LoadTextModel(const ModelOptions& opts, const TpOptio
 // TextModel::Config().arch is Arch::kGemma4 for what it returns.
 std::unique_ptr<TextModel> LoadGemmaTextModel(const ModelOptions& opts, const TpOptions& tp);
 
+// The qwen4_exp branch of LoadTextModel (arch.h: DetectArch(opts.container_path) == kQwen4Exp). Defined in
+// qwen4exp_local_text_model.cpp: tp.world must be 1 (the two cards are the model's own layer split, plan 4.11 item 4;
+// R4DX_Q4_DEVICES / R4DX_Q4_SPLIT choose them). TextModel::Config().arch is Arch::kQwen4Exp for what it returns.
+std::unique_ptr<TextModel> LoadQwen4ExpTextModel(const ModelOptions& opts, const TpOptions& tp);
+
 }  // namespace r4dx::model

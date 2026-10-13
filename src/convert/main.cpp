@@ -19,6 +19,9 @@
 //                [--trellis-from <oracle dir or its weights_override.json>
 //                 [--trellis-manifest-sha256 <hex>] [--trellis-verify full|none]
 //                 [--trellis-allow-basis exl3] [--trellis-prescale-log2 <int>]]
+//                [--ngram-sidecar <tools/reference/qwen4exp/ngram_sidecar.py output>]  (qwen4_exp only; required there)
+//                [--plan-only]  (qwen4_exp only: register, audit and plan every tensor, print the container's
+//                 tensor count / data bytes / header size and per-phase seconds, then exit WITHOUT writing --output)
 //
 // --trellis-from (docs/trellis-kernel.md sections 2-3, trellis_import.hpp) IMPORTS the EXL3/QTIP
 // trellis bits tools/reference/trellis_quant.py wrote (a quantize-model directory or a mix
@@ -195,6 +198,25 @@
 // and an unrotated run a rotated one, and the reconstruction check compares against fold(W). Qwen keeps
 // the `--trellis-from needs --rotate none` refusal.
 //
+// qwen4_exp (docs/qwen4exp-plan.md 4.11 item 3; src/convert/qwen4exp_layout.{hpp,cpp}, awq_source.{hpp,cpp}):
+// a checkpoint whose config.json says model_type "qwen4_exp" takes the qwen4_exp branch. Its AWQ source
+// (compressed-tensors pack-quantized int4, group 128: `<b>.weight_packed/_scale/_zero_point/_shape`) is read
+// through a virtual source that presents each quad as one bf16 `<b>.weight` dequantized on demand, bit for
+// bit as tools/reference/qwen4exp/awq_dequant.py does; every body linear then goes through the same
+// --layouts / --keep-bf16 / --ldlq / --w4a16-group-rule / --trellis-from machinery as the other archs (a
+// trellis manifest is keyed by HF names; gate+up of one expert is one two-part linear; every expert of a
+// layer's class must share one KB). Required: --ngram-sidecar <file> (the n-gram table's r4dx sidecar:
+// recorded in __metadata__.ngram_sidecar with the body sha256 from its header, never rehashed). Refused:
+// --rotate, --vision on, --mtp on, --draft-vocab-ids, --record-reuse-guard / --reuse-tensors-from.
+// vision.*, mtp.* and the n-gram tensors are not converted (recorded in r4dx_convert_run.skipped);
+// anything else unconsumed fails the run before the header is written.
+// --layers N (N < the config's num_hidden_layers) writes a PREFIX container: the globals (embedding, final mixer, lm_head) and layers
+// [0, N) only, with `__metadata__.layers_present` = N (written only then, so a full container's header is unchanged); the recorded
+// model_config still says every layer, and Qwen4ExpContainer::Inspect / Load / Qwen4ExpModel serve the N present layers and refuse a
+// range beyond them. Used to validate the runtime on the REAL weights' first layers against real_ref.py's layer goldens
+// (tests/model/qwen4exp/test_model_q4exp_real_prefix.cpp): `--layers 4 --layouts bf16 --lm-head w4a16 --w4a16-group-rule "^lm_head$=32"
+// --kv-calib <kv_calib.json> --ngram-sidecar <sidecar>` is 20.9 GiB of data written in 42 s.
+//
 //   r4dx-convert --selftest --selftest-input <small .safetensors, one 2D bf16 tensor "w">
 //                --selftest-output <container path> [--layouts w4a16] [--threads T]
 //                [--no-bf16] [--w4a16-group-rule "<regex>=<g>"]...
@@ -256,6 +278,8 @@
 #include "r4dx_convert/w4a16_groups.hpp"
 
 #include "gemma_layout.hpp"
+#include "awq_source.hpp"
+#include "qwen4exp_layout.hpp"
 
 namespace {
 
@@ -454,6 +478,10 @@ struct AppArgs {
   // --trellis-from was given (refused without it).
   r4dx_convert::trellis::TrellisOptions trellis;
   bool trellis_options = false;
+
+  // --ngram-sidecar (qwen4_exp only, required there): the n-gram table's sidecar file.
+  std::string ngram_sidecar;
+  bool plan_only = false;
 };
 
 // --rotation-seed: a full u64, decimal or 0x-prefixed hex. std::stoull alone would accept "-1"
@@ -559,6 +587,8 @@ AppArgs ParseArgs(int argc, char** argv) {
     else if (arg == "--reuse-tensors-from") a.reuse_from = next(i);
     else if (arg == "--record-reuse-guard") a.record_reuse_guard = true;
     else if (arg == "--trellis-from") a.trellis.from = next(i);
+    else if (arg == "--ngram-sidecar") a.ngram_sidecar = next(i);
+    else if (arg == "--plan-only") a.plan_only = true;
     else if (arg == "--trellis-manifest-sha256") {
       a.trellis.manifest_sha256 = next(i);
       std::transform(a.trellis.manifest_sha256.begin(), a.trellis.manifest_sha256.end(),
@@ -1697,6 +1727,8 @@ ReusePlan PlanReuse(const r4dx_convert::BaselineContainer& b, const ContainerWri
 int RunRotationOut(const AppArgs& args) {
   const std::string config_text = ReadFile(args.input + "\\config.json");
   const nlohmann::json config = nlohmann::json::parse(config_text);
+  if (config.value("model_type", std::string()) == r4dx_convert::qwen4exp::kModelArch)
+    throw std::runtime_error("--rotation-out: qwen4_exp checkpoints are not rotated (--rotate is refused for them)");
   RotationSource rot(args.rotate, args.rotation_seed, args.rotation_seed_explicit,
                      config.at("text_config"));
   const auto tensors = rot.Tensors();
@@ -1751,6 +1783,38 @@ int RunConvert(const AppArgs& args) {
   // Gemma 4 (gemma_layout.hpp): the Gemma branch below registers its own tensors; the Qwen code that
   // follows is reached only when this is false, so a Qwen run is exactly what it was.
   const bool is_gemma = config.value("model_type", std::string()) == r4dx_convert::gemma::kModelArch;
+  const bool is_qwen4 = config.value("model_type", std::string()) == r4dx_convert::qwen4exp::kModelArch;
+  if (!is_qwen4 && !args.ngram_sidecar.empty())
+    throw std::runtime_error("--ngram-sidecar applies to qwen4_exp checkpoints only (this one is not qwen4_exp)");
+  if (!is_qwen4 && args.plan_only)
+    throw std::runtime_error("--plan-only applies to qwen4_exp checkpoints only (this one is not qwen4_exp)");
+  // qwen4_exp: text only in milestone 1, one scheme, one layout path. Refused before any shard is opened.
+  r4dx_convert::qwen4exp::TextShape qshape;
+  r4dx_convert::qwen4exp::NgramSidecar ngram;
+  if (is_qwen4) {
+    if (args.ngram_sidecar.empty())
+      throw std::runtime_error("qwen4_exp needs --ngram-sidecar <file> (tools/reference/qwen4exp/ngram_sidecar.py "
+                               "repack's output): the n-gram table is not stored in the container");
+    if (args.vision == 1 || args.mtp == 1)
+      throw std::runtime_error("--vision on / --mtp on: the qwen4_exp branch converts the text model only "
+                               "(vision.* and mtp.* are skipped)");
+    if (!args.draft_vocab_ids.empty())
+      throw std::runtime_error("--draft-vocab-ids needs the MTP head, which the qwen4_exp branch does not convert");
+    if (r4dx_convert::ParseRotationKind(args.rotate) != r4dx_convert::RotationKind::kNone)
+      throw std::runtime_error("--rotate " + args.rotate + ": not supported for qwen4_exp (the gated residual's "
+                               "4-stream layout has no rotation fold)");
+    if (args.record_reuse_guard || !args.reuse_from.empty())
+      throw std::runtime_error("--record-reuse-guard / --reuse-tensors-from are not supported for qwen4_exp yet "
+                               "(the guard reads model.safetensors.index.json and hashes every shard)");
+    const auto qc = config.find("quantization_config");
+    if (qc != config.end() && qc->is_object() &&
+        !(qc->contains("format") && qc->at("format") == "pack-quantized"))
+      throw std::runtime_error("qwen4_exp: quantization_config.format is " +
+                               (qc->contains("format") ? qc->at("format").dump() : std::string("missing")) +
+                               "; only a bf16 checkpoint or compressed-tensors \"pack-quantized\" is converted");
+    qshape = r4dx_convert::qwen4exp::ParseTextConfig(config);
+    ngram = r4dx_convert::qwen4exp::ReadNgramSidecar(args.ngram_sidecar, qshape, config);
+  }
   if (!is_gemma && args.audio == 1)
     throw std::runtime_error("--audio applies to Gemma 4 checkpoints only (this one is not gemma4_unified)");
   if (is_gemma && args.mtp == 1)
@@ -1767,8 +1831,8 @@ int RunConvert(const AppArgs& args) {
     throw std::runtime_error("--record-reuse-guard / --reuse-tensors-from are not supported for gemma4_unified "
                              "yet (the guard reads model.safetensors.index.json)");
   const bool do_audio = is_gemma && args.audio == 1;
-  const bool do_vision = is_gemma ? (args.vision == 1) : (args.vision >= 0 ? (args.vision == 1) : full_run);
-  const bool do_mtp = is_gemma ? false : (args.mtp >= 0 ? (args.mtp == 1) : full_run);
+  const bool do_vision = (is_gemma || is_qwen4) ? (args.vision == 1) : (args.vision >= 0 ? (args.vision == 1) : full_run);
+  const bool do_mtp = (is_gemma || is_qwen4) ? false : (args.mtp >= 0 ? (args.mtp == 1) : full_run);
 
   LayoutSet layouts = ParseLayoutList(args.layouts_spec, /*bf16_default_on=*/true);
   LayoutSet lm_head_layouts = ParseLayoutList(args.lm_head_spec, /*bf16_default_on=*/false);
@@ -1790,6 +1854,9 @@ int RunConvert(const AppArgs& args) {
   if (is_gemma)
     std::cout << "[r4dx-convert] arch=" << r4dx_convert::gemma::kModelArch
               << " audio=" << (do_audio ? "on" : "off") << "\n";
+  if (is_qwen4)
+    std::cout << "[r4dx-convert] arch=" << r4dx_convert::qwen4exp::kModelArch << " ngram-sidecar=" << ngram.path
+              << " (" << ngram.rows << " rows x " << ngram.row_bytes << " B, body sha256 " << ngram.sha256 << ")\n";
 
   // The BYTE LAYOUT is identical in both modes (docs/container-format.md "How the quantized values
   // are chosen"); only the (scale, zero) values differ.
@@ -1900,6 +1967,19 @@ int RunConvert(const AppArgs& args) {
   }
 
   ShardedModel model(args.input);
+  // A compressed-tensors pack-quantized checkpoint (qwen4_exp's AWQ) is read through the virtual source:
+  // every `<b>.weight_packed/_scale/_zero_point/_shape` quad appears as one bf16 `<b>.weight`. Any other
+  // checkpoint is untouched (0 linears, nothing installed).
+  const auto t_awq0 = std::chrono::steady_clock::now();
+  const size_t awq_linears = r4dx_convert::awq::InstallAwqSource(model, config);
+  if (awq_linears > 0)
+    std::cout << "[r4dx-convert] awq source: " << awq_linears
+              << " pack-quantized linear(s) (int4, group 128, asymmetric) dequantized to bf16 on demand\n";
+  if (is_qwen4 && config.contains("quantization_config") && config.at("quantization_config").is_object() &&
+      awq_linears == 0)
+    throw std::runtime_error("qwen4_exp: config.json says pack-quantized but the checkpoint has no "
+                             "*.weight_packed tensors");
+  const auto t_reg0 = std::chrono::steady_clock::now();
   ContainerWriter writer;
 
   // Every add_* below pushes exactly ONE plan job and ONE emit job, so job j's emit writes exactly the
@@ -2074,11 +2154,14 @@ int RunConvert(const AppArgs& args) {
     std::vector<float> norm;
   };
   std::map<std::string, VerifyFold> verify_folds;  // HF name -> its fold (rotated trellis imports)
+  // qwen4_exp --trellis-from: container base of every routed-expert linear -> its imported KB (0 = not
+  // imported), for the per-(layer, class) KB rule.
+  std::unordered_map<std::string, int> trellis_kb;
 
   // `fold` is what --rotate does to this linear (RotationSource::In / Out); the default, kNone, is
   // what every call outside the text-layer loop -- and every call without --rotate -- gets.
   auto add_linear = [&](std::vector<std::string> hf_names, std::string container_base,
-                         LayoutSet requested, LinearFold fold = LinearFold{}) {
+                         LayoutSet requested, LinearFold fold = LinearFold{}, bool trellis_eligible = true) {
     // --keep-bf16 and --ldlq decide per container base name, which is known here -- so plan and
     // emit cannot disagree about what this linear is (the two lambdas below capture the SAME
     // resolved `ls` / `use_ldlq`, rather than each re-evaluating a regex). --keep-bf16 wins: a kept
@@ -2094,11 +2177,13 @@ int RunConvert(const AppArgs& args) {
     // wins; a kept linear's "would have been" bytes are then priced at the trellis layout it
     // replaced.
     bool imported = false;
-    if (trellis.Enabled() && r4dx_convert::trellis::IsBodyLinearBase(container_base)) {
+    if (trellis.Enabled() && trellis_eligible && r4dx_convert::trellis::IsBodyLinearBase(container_base)) {
       LayoutSet tls;
       imported = trellis.Resolve(container_base, hf_names, kept, &tls, std::cout);
       if (tls.trellis) requested = tls;
     }
+    if (is_qwen4 && trellis.Enabled() && trellis_eligible && container_base.find(".moe.experts.") != std::string::npos)
+      trellis_kb[container_base] = imported ? requested.trellis_bits : 0;
     // A rotated trellis import (Gemma): the oracle quantized fold(W), so the reconstruction check
     // must compare against the same fold of the checkpoint weight (the fold and its norm, per HF
     // tensor; the norm is read here, single-threaded, for the worker threads of the check).
@@ -2246,7 +2331,46 @@ int RunConvert(const AppArgs& args) {
     }
   }
 
-  for (int i = 0; i < (is_gemma ? 0 : layers); ++i) {
+  // ---- qwen4_exp branch (qwen4exp_layout.cpp): the whole text stack, through the closures above ---------
+  if (is_qwen4) {
+    namespace qw = r4dx_convert::qwen4exp;
+    qw::Kit kit;
+    kit.all_names = [&model]() { return model.AllNames(); };
+    kit.has = [&model](const std::string& n) { return model.Has(n); };
+    kit.shape = [&model](const std::string& n) { return model.Meta(n).shape; };
+    kit.add_bf16 = add_bf16;
+    kit.add_fp32_widen = add_fp32_widen;
+    kit.add_descale = [&](const std::string& container_name, int n_kv, int layer_idx, const char* kind) {
+      add_descale(container_name, n_kv, layer_idx, kind, /*calib_applicable=*/true);
+    };
+    kit.add_linear = [&](const std::vector<std::string>& hf_names, const std::string& base, qw::LinearRole role) {
+      switch (role) {
+        case qw::LinearRole::kHead:
+          add_linear(hf_names, base, lm_head_layouts);
+          break;
+        case qw::LinearRole::kBf16Only:  // shared experts: `.bf16.w` only, never a trellis body linear
+          add_linear(hf_names, base, r4dx_convert::KeptBf16LayoutSet(), LinearFold{}, /*trellis_eligible=*/false);
+          break;
+        default:
+          add_linear(hf_names, base, layouts);
+          break;
+      }
+    };
+    const std::unordered_set<std::string> consumed = qw::AddTextStack(kit, qshape, layers);
+    // The coverage audit: nothing in the checkpoint may be silently left out of the container.
+    const std::vector<std::string> unconsumed = qw::UnconsumedTensors(model.AllNames(), consumed, layers);
+    if (!unconsumed.empty()) {
+      std::string msg = "r4dx-convert (qwen4_exp): " + std::to_string(unconsumed.size()) +
+                        " checkpoint tensor(s) are not converted and not skipped on purpose (a mis-guessed "
+                        "tensor name, or a tensor this converter does not know):";
+      for (size_t k = 0; k < unconsumed.size() && k < 20; ++k) msg += "\n  " + unconsumed[k];
+      if (unconsumed.size() > 20) msg += "\n  ... and " + std::to_string(unconsumed.size() - 20) + " more";
+      throw std::runtime_error(msg);
+    }
+    if (trellis.Enabled()) qw::CheckExpertKbUniform(trellis_kb);
+  }
+
+  for (int i = 0; i < ((is_gemma || is_qwen4) ? 0 : layers); ++i) {
     const std::string hf = "model.language_model.layers." + std::to_string(i) + ".";
     const std::string base = "text.layers." + std::to_string(i) + ".";
     // --rotate folds (all kNone without it): input_layernorm's (1 + w) goes into this layer's token
@@ -2302,7 +2426,7 @@ int RunConvert(const AppArgs& args) {
 
   // Everything from here on is outside the rotated stack and is never folded: the runtime applies
   // x Q after the embedding gather and x Q^T before final_norm (docs/quant2.md section 3).
-  if (!is_gemma) {  // (the Gemma branch above registered these, the head from the tied embedding)
+  if (!is_gemma && !is_qwen4) {  // (the Gemma / qwen4_exp branches above registered these)
     add_bf16("model.language_model.embed_tokens.weight", "text.embed_tokens");
     add_bf16("model.language_model.norm.weight", "text.final_norm");
     add_linear({"lm_head.weight"}, "lm_head", lm_head_layouts);
@@ -2593,6 +2717,36 @@ int RunConvert(const AppArgs& args) {
         " -- the trellis layout only (<base>.trellis.w|suh|svh, __metadata__.quant.trellis); "
         "--keep-bf16 bases (r4dx_convert_run.keep_bf16_linears) bf16 only";
   }
+  // qwen4_exp: the Qwen summary above does not describe this container; model_arch and the sidecar record are
+  // what the loader reads (plan 4.11 item 3). Written ONLY for qwen4_exp.
+  if (is_qwen4) {
+    namespace fs = std::filesystem;
+    fs::path in = fs::u8path(args.input).lexically_normal();
+    if (!in.has_filename()) in = in.parent_path();
+    metadata["model_id"] = in.filename().u8string();
+    metadata["model_arch"] = r4dx_convert::qwen4exp::kModelArch;
+    // --layers N < the config's layer count: a PREFIX container (globals + layers [0, N)). The loader reads this key
+    // (Qwen4ExpContainer::Inspect); a full container carries no key, so its header is unchanged.
+    if (layers < num_layers_total) metadata["layers_present"] = layers;
+    metadata["ngram_sidecar"] = ngram.ToJson();
+    const std::string body = trellis.Enabled()
+                                 ? "trellis (--trellis-from, one KB per layer and expert class; __metadata__.quant.trellis)"
+                                 : "w4a16|bf16 (as requested by --layouts; pick at load time)";
+    metadata["quant_summary"] = {
+        {"text.layers.*.attn.qg|k|v|o, gdn.in_proj_qkv|z|out_proj, moe.experts.*.gate_up|down", body},
+        {"text.layers.*.moe.shared.gate|up|down", "bf16 (<base>.bf16.w; never quantized)"},
+        {"text.layers.*.moe.router|shared_gate, gdn.in_proj_a|b, attn.indexer.qk, ple.key_proj|value_proj, hc.*.down|up|inject",
+         "bf16 (never quantized)"},
+        {"text.layers.*.hc.*.norm, text.hc_final.*, attn.q_norm|k_norm, attn.indexer.q_norm|k_norm, gdn.norm_weight, "
+         "ple.norm_*, gdn.conv1d_weight, ple.conv1d, text.embed_tokens",
+         "bf16 raw weights (norm kernels apply 1 + w)"},
+        {"text.layers.*.gdn.A_log|dt_bias", "fp32 (bf16 checkpoint tensors widened)"},
+        {"text.layers.*.attn.k_descale|v_descale", "fp32 [kv_heads] (--kv-calib or 1.0)"},
+        {"lm_head", "w4a16|bf16 (as requested by --layouts / --lm-head), untied"},
+        {"vision.*, mtp.*", "not converted (milestone 1 is text only)"},
+        {"n-gram table", "not in this container: __metadata__.ngram_sidecar names the sidecar file"},
+    };
+  }
   metadata["quant"] = BuildQuantMetadata(w4a16_groups.GroupsJson());
   if (trellis.Enabled()) metadata["quant"]["trellis"] = trellis.QuantMetadata();
   metadata["model_config"] = config;
@@ -2634,6 +2788,17 @@ int RunConvert(const AppArgs& args) {
   if (is_gemma) {
     metadata["r4dx_convert_run"]["arch"] = r4dx_convert::gemma::kModelArch;
     metadata["r4dx_convert_run"]["audio"] = do_audio;
+  }
+  if (is_qwen4) {
+    metadata["r4dx_convert_run"]["arch"] = r4dx_convert::qwen4exp::kModelArch;
+    metadata["r4dx_convert_run"]["awq_source"] =
+        awq_linears > 0 ? nlohmann::json({{"format", "pack-quantized"}, {"num_bits", 4}, {"group_size", 128},
+                                           {"symmetric", false}, {"linears", awq_linears}})
+                        : nlohmann::json("none (bf16 checkpoint)");
+    metadata["r4dx_convert_run"]["skipped"] = {
+        "vision.* (model.visual.*): milestone 1 is text only",
+        "mtp.*: not converted yet",
+        "n-gram table tensors (layers.*.ple.ple_embedding.*): live in the --ngram-sidecar file"};
   }
   if (rot.Enabled()) {
     metadata["r4dx_convert_run"]["rotate"] = rot.KindName();
@@ -2685,6 +2850,30 @@ int RunConvert(const AppArgs& args) {
         {"bytes_recomputed", reuse_plan.bytes_recomputed},
         {"linears_recomputed", reuse_plan.recomputed_linears},
     };
+  }
+  // --plan-only: everything above ran exactly as in a real run (the audit, the plan jobs, the trellis manifest
+  // and file checks, the metadata); nothing below does. The header is sized with the very construction
+  // ContainerWriter::FinalizeHeader uses, over the planned tensors, so its byte count is the real file's.
+  if (args.plan_only) {
+    const auto th0 = std::chrono::steady_clock::now();
+    nlohmann::json header = nlohmann::json::object();
+    header["__metadata__"] = metadata;
+    uint64_t off = 0;
+    for (size_t i = 0; i < writer.PlannedTensorCount(); ++i) {
+      header[writer.PlannedName(i)] = {
+          {"dtype", "U8"}, {"shape", writer.PlannedShape(i)}, {"data_offsets", {off, off + writer.PlannedBytes(i)}}};
+      off += writer.PlannedBytes(i);
+    }
+    const size_t header_bytes = header.dump().size();
+    const auto th1 = std::chrono::steady_clock::now();
+    std::cout << "[r4dx-convert] plan-only: " << plan_jobs.size() << " job(s) registered, " << writer.PlannedTensorCount()
+              << " tensors planned, " << writer.PlannedDataBytes() << " data bytes, header JSON " << header_bytes
+              << " bytes\n"
+              << "[r4dx-convert] plan-only phases: awq source (opens shards, validates every quad) "
+              << SecondsBetween(t_awq0, t_reg0) << " s, register + audit " << SecondsBetween(t_reg0, t0)
+              << " s, plan jobs " << SecondsBetween(t0, th0) << " s, header build " << SecondsBetween(th0, th1)
+              << " s; no output written\n";
+    return 0;
   }
   // --trellis-from: the container is written as <output>.partial and renamed to <output> only once
   // it is complete and checked (after the emit pass), so <output> never holds an unfinished or

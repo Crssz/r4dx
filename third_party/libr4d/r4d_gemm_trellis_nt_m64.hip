@@ -31,9 +31,9 @@
 // w % SK. A wave owns NP tile PAIRS (32 NP columns: the lane map decodes two adjacent n-tiles at
 // once), so a block covers Wc = 32 WV NP columns, one of 32 / 64 / 128 / 256. SKG blocks split K
 // across the grid (grid.y) and grid.z covers the row tiles, MT per block. Every wave's K range is
-// K / (SK SKG), walked U k-tiles per step. KB = 4 and 5 are two instantiations of the same loop
-// behind different fetches and decodes (3 dwords and 62 VALU per lane per (pair, k-tile) at KB = 4,
-// 5 dwords and 75 VALU at KB = 5).
+// K / (SK SKG), walked U k-tiles per step. KB = 3, 4 and 5 are three instantiations of the same loop
+// behind different fetches and decodes (4 dwords and 74 VALU per lane per (pair, k-tile) at KB = 3,
+// 3 dwords and 62 VALU at KB = 4, 5 dwords and 75 VALU at KB = 5).
 //
 // ADDRESSING.  Everything a lane loads is a loop-invariant 32-bit VGPR offset off a wave-UNIFORM
 // base: the weight base of each pair and the activation base sit in SGPRs and step by a constant
@@ -124,6 +124,11 @@ struct r4d_tq_stage<5, NP, U, MT> {
   unsigned w[NP][U][5];
   v8h af[MT][U];
 };
+template <int NP, int U, int MT>
+struct r4d_tq_stage<3, NP, U, MT> {
+  unsigned w[NP][U][4];
+  v8h af[MT][U];
+};
 
 // Whether a wave double-buffers its loads (the K loop). At MT >= 3 each decoded fragment already
 // feeds 3-4 WMMA per pair, which hides the loads by itself, and a second stage of 4 U MT activation
@@ -132,7 +137,8 @@ struct r4d_tq_stage<5, NP, U, MT> {
 // more than 128 VGPRs -- at KB = 4 (NP, U) = (2, 4) and (4, 1) at MT = 2: with the stages really both
 // live (the K loop's sched_barriers) they compiled to 192 VGPRs and scratch.
 static constexpr bool r4d_tq_prefetch(int KB, int NP, int U, int MT) {
-  return MT <= 2 && 16 * NP * MT + 2 * ((KB == 4 ? 3 : 5) * NP * U + 4 * MT * U) <= 128;
+  return MT <= 2 &&
+         16 * NP * MT + 2 * ((KB == 4 ? 3 : KB == 3 ? 4 : 5) * NP * U + 4 * MT * U) <= 128;
 }
 
 // Makes a wave-uniform pointer opaque to the optimizer (it stays in SGPRs, see the K loop).
@@ -254,11 +260,14 @@ __global__ __launch_bounds__(1024) void r4d_gemm_trellis_nt_m64_kernel(
       wb[p] = (r4d_gbyte)(const unsigned char*)W + ((size_t)(pair0 + p) * kt_total + kt0) * BLK;
     r4d_gbyte abase = (r4d_gbyte)(const unsigned char*)A + (size_t)kt0 * 32;
     // The lane's word offsets inside a block: (A, B) and P at KB = 4, five words at KB = 5.
-    constexpr int NOFF = KB == 4 ? 2 : 5;
+    constexpr int NOFF = KB == 4 ? 2 : KB == 3 ? 4 : 5;
     unsigned woff[NOFF];
     if constexpr (KB == 4) {
       woff[0] = r4d_trellis_k4_off_ab(lane);
       woff[1] = r4d_trellis_k4_off_p(lane);
+    } else if constexpr (KB == 3) {
+#pragma unroll
+      for (int i = 0; i < 4; ++i) woff[i] = r4d_trellis_k3_word(lane, i) * 4u;
     } else {
 #pragma unroll
       for (int i = 0; i < 5; ++i) woff[i] = r4d_trellis_k5_word(lane, i) * 4u;
@@ -284,6 +293,9 @@ __global__ __launch_bounds__(1024) void r4d_gemm_trellis_nt_m64_kernel(
           if constexpr (KB == 4) {
             s.ab[p][u] = r4d_tq_load<unsigned long long, NT>(b, woff[0], u * BLK);
             s.p[p][u] = r4d_tq_load<unsigned, NT>(b, woff[1], u * BLK);
+          } else if constexpr (KB == 3) {
+#pragma unroll
+            for (int i = 0; i < 4; ++i) s.w[p][u][i] = r4d_tq_load<unsigned, NT>(b, woff[i], u * BLK);
           } else {
 #pragma unroll
             for (int i = 0; i < 5; ++i) s.w[p][u][i] = r4d_tq_load<unsigned, NT>(b, woff[i], u * BLK);
@@ -335,6 +347,8 @@ __global__ __launch_bounds__(1024) void r4d_gemm_trellis_nt_m64_kernel(
           if constexpr (KB == 4)
             r4d_trellis_k4_decode(s.p[p][u], (unsigned)s.ab[p][u], (unsigned)(s.ab[p][u] >> 32), f0,
                                   f1);
+          else if constexpr (KB == 3)
+            r4d_trellis_k3_decode(s.w[p][u], k5sh, f0, f1);
           else
             r4d_trellis_k5_decode(s.w[p][u], k5sh, f0, f1);
           if constexpr (WQ) {
@@ -545,6 +559,11 @@ __global__ __launch_bounds__(256) void r4d_trellis_reconstruct_f16_kernel(
   if constexpr (KB == 4) {
     const unsigned ia = r4d_trellis_k4_off_ab(lane) / 4, ip = r4d_trellis_k4_off_p(lane) / 4;
     r4d_trellis_k4_decode(b[ip], b[ia], b[ia + 1], f0, f1);
+  } else if constexpr (KB == 3) {
+    unsigned w4[4];
+#pragma unroll
+    for (int i = 0; i < 4; ++i) w4[i] = b[r4d_trellis_k3_word(lane, i)];
+    r4d_trellis_k3_decode(w4, r4d_trellis_k3_shift(lane), f0, f1);
   } else {
     unsigned w5[5];
 #pragma unroll
@@ -582,7 +601,7 @@ static constexpr int r4d_tq_max_mt(int KB, int NP, int U) {
                   : NP == 2 ? (U == 1 ? 4 : U == 2 || U == 4 ? 3 : 0)
                   : NP == 4 ? (U == 1 ? 2 : U == 2 ? 1 : 0)
                   : 0)
-       : KB == 5 ? (NP == 1 ? (U == 1 || U == 2 || U == 4 ? 4 : 0)
+       : KB == 5 || KB == 3 ? (NP == 1 ? (U == 1 || U == 2 || U == 4 ? 4 : 0)
                   : NP == 2 ? (U == 1 ? 4 : U == 2 ? 3 : U == 4 ? 2 : 0)
                   : NP == 4 ? (U == 1 ? 2 : U == 2 ? 1 : 0)
                   : 0)
@@ -601,7 +620,8 @@ static void r4d_trellis_check(int M, int K, int N, int n_split, int KB, int WV, 
                               int NP, int SKG, int U, int NT, bool have_ws) {
   if (M < 1 || M > R4D_GEMM_TRELLIS_MAX_M) r4d_trellis_fail("M must be 1..64");
   if (K <= 0 || N <= 0 || K % 128 || N % 128) r4d_trellis_fail("K and N must be multiples of 128");
-  if (KB != 4 && KB != 5) r4d_trellis_fail("KB " + std::to_string(KB) + " is not instantiated (4, 5)");
+  if (KB != 3 && KB != 4 && KB != 5)
+    r4d_trellis_fail("KB " + std::to_string(KB) + " is not instantiated (3, 4, 5)");
   if (WV != 1 && WV != 2 && WV != 4) r4d_trellis_fail("WV must be 1, 2 or 4");
   if (SK != 1 && SK != 2 && SK != 4 && SK != 8 && SK != 16)
     r4d_trellis_fail("SK must be 1, 2, 4, 8 or 16");
@@ -726,6 +746,12 @@ static void r4d_tq_run(int64_t a0, int64_t a1, int n_split, int64_t w, int64_t s
   a.clk = (unsigned long long*)clk;
   a.wsc = (const float*)wsc;
   a.wq_gsh = wq_gsh;
+#ifdef R4D_TQ_WQ_UNIT
+  // The _wq measurement entries (r4dx R4DX_FAKEQ_W) exist for KB 4 and 5 only.
+  if (KB == 3) r4d_trellis_fail("KB 3 has no _wq instantiation");
+#else
+  if (KB == 3) { r4d_tq_launch_kb<3>(a, NP, U, MT); return; }
+#endif
   if (KB == 4) r4d_tq_launch_kb<4>(a, NP, U, MT);
   else r4d_tq_launch_kb<5>(a, NP, U, MT);
 }
@@ -790,7 +816,7 @@ void r4d_gemm_trellis_nt_m64_raw(int64_t a0, int64_t a1, int n_split, int64_t w,
              1.f, clk, stream);
 }
 
-int r4d_gemm_trellis_nt_m64_has_rate(int KB) { return KB == 4 || KB == 5; }
+int r4d_gemm_trellis_nt_m64_has_rate(int KB) { return KB == 3 || KB == 4 || KB == 5; }
 int r4d_gemm_trellis_nt_m64_max_m(void) { return R4D_GEMM_TRELLIS_MAX_M; }
 size_t r4d_gemm_trellis_nt_m64_ws_bytes(int M, int N, int SKG) {
   return (size_t)SKG * (size_t)M * (size_t)N * sizeof(float);
@@ -811,14 +837,16 @@ void r4d_trellis_reconstruct_f16(int64_t w, int64_t q, int K, int N, int KB, int
   if (K <= 0 || N <= 0 || K % 16 || N % 32)
     throw std::runtime_error("r4d trellis_reconstruct_f16: K must be a multiple of 16 and N of 32 "
                              "(whole tile pairs)");
-  if (KB != 4 && KB != 5)
-    throw std::runtime_error("r4d trellis_reconstruct_f16: KB must be 4 or 5");
+  if (KB != 3 && KB != 4 && KB != 5)
+    throw std::runtime_error("r4d trellis_reconstruct_f16: KB must be 3, 4 or 5");
   const long long blocks = (long long)(N / 32) * (K / 16);
   dim3 grid((unsigned)((blocks + 7) / 8)), block(8 * WAVE32);
   auto Wp = (const unsigned*)w;
   auto Qp = (unsigned short*)q;
   hipStream_t st = (hipStream_t)stream;
-  if (KB == 4)
+  if (KB == 3)
+    hipLaunchKernelGGL(r4d_trellis_reconstruct_f16_kernel<3>, grid, block, 0, st, Wp, Qp, K, N);
+  else if (KB == 4)
     hipLaunchKernelGGL(r4d_trellis_reconstruct_f16_kernel<4>, grid, block, 0, st, Wp, Qp, K, N);
   else
     hipLaunchKernelGGL(r4d_trellis_reconstruct_f16_kernel<5>, grid, block, 0, st, Wp, Qp, K, N);

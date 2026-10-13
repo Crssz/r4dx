@@ -28,6 +28,18 @@ foreach(t ${R4DX_SERVER_TESTS})
   add_test(NAME ${t} COMMAND ${t})
 endforeach()
 
+# qwen4_exp (docs/qwen4exp.md), CPU only. test_q4exp_dialect: dialect resolution / arch refusal from synthetic
+# container headers (needs the arch library). test_q4exp_template: the Swift chat_template.jinja renders
+# byte-identically to the 27B's through ChatTemplate; exits 77 (SKIPPED) when either checkpoint directory is absent.
+add_executable(test_q4exp_dialect test_q4exp_dialect.cpp)
+target_link_libraries(test_q4exp_dialect PRIVATE r4dx_server_core r4dx_model_arch)
+add_test(NAME test_q4exp_dialect COMMAND test_q4exp_dialect)
+
+add_executable(test_q4exp_template test_q4exp_template.cpp)
+target_link_libraries(test_q4exp_template PRIVATE r4dx_server_core r4dx_tokenizer)
+add_test(NAME test_q4exp_template COMMAND test_q4exp_template)
+set_tests_properties(test_q4exp_template PROPERTIES SKIP_RETURN_CODE 77)
+
 # test_batch_executor: src/server/batch_executor.h (docs/batch-decode.md 7), the thread that owns the model in `--batch N` serving, against a
 # fake decode function with real threads. Header-only and HIP-free (batch_row.h / sampler.hpp are too), so it links nothing.
 add_executable(test_batch_executor test_batch_executor.cpp)

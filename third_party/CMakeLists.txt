@@ -46,15 +46,17 @@ if(EXISTS "${R4D_DEVICE_LIB_PATH}")
   list(APPEND R4D_BASE_FLAGS --rocm-device-lib-path=${R4D_DEVICE_LIB_PATH})
 endif()
 
-# unit -> extra per-unit flags, for the 17 units r4dx links (the two `_wq` units are R4DX_FAKEQ_W's,
+# unit -> extra per-unit flags, for the 18 units r4dx links (the two `_wq` units are R4DX_FAKEQ_W's,
 # docs/int8-prefill.md: the trellis GEMMs with the decoded weights rounded to int8, a unit of their own so
 # the shipped trellis units compile exactly as before; r4d_gemm_trellis_nt_i8 is R4DX_PREFILL_INT8's int8 x int8
-# GEMM, a unit of its own for the same reason).
+# GEMM, a unit of its own for the same reason; r4d_gdn_chunk_scan_stable_* is the span-safe GDN chunk scan, the
+# shipped scan's source compiled with R4D_GDN_SCAN_STABLE = 1, a unit of its own for the same reason).
 set(R4D_UNITS
   r4d_attn_paged_h256_gqa6
   r4d_attn_paged_h256_gqa2
   r4d_attn_vit_h72_bf16
   r4d_gdn_chunk_scan_k128_v128_c64_bf16
+  r4d_gdn_chunk_scan_stable_k128_v128_c64_bf16
   r4d_gdn_conv_w4_h128_bf16
   r4d_gdn_kkt_solve_k128_c64_bf16
   r4d_gdn_recurrent_update_k128_v128_bf16_fp32state
@@ -70,6 +72,7 @@ set(R4D_UNITS
   r4d_registry
 )
 set(R4D_EXTRA_r4d_gdn_chunk_scan_k128_v128_c64_bf16 -mcumode)
+set(R4D_EXTRA_r4d_gdn_chunk_scan_stable_k128_v128_c64_bf16 -mcumode)
 # w4a16's default group is 64 (R4D_GEMM_W4_GROUP in the unit's own source). The SAME number is
 # r4dx_convert's kW4A16Group (quant_int4.hpp); the converter asserts this kernel's _group() export
 # against it at startup, and Container::Load asserts it against every container's own
@@ -87,6 +90,8 @@ set(R4D_DEPS_r4d_gemm_trellis_nt_m64_wq "${LIBR4D_DIR}/r4d_gemm_trellis_nt_m64.h
 set(R4D_DEPS_r4d_gemm_trellis_nt_m256_wq "${LIBR4D_DIR}/r4d_gemm_trellis_nt_m256.hip")
 # The sliding-window unit instantiates the same two kernel files (WIN = 1).
 set(R4D_DEPS_r4d_attn_paged_h256_gqa2 ${R4D_DEPS_r4d_attn_paged_h256_gqa6})
+# The span-safe chunk scan #includes the shipped scan's source with R4D_GDN_SCAN_STABLE defined (a unit of its own, like the `_wq`s).
+set(R4D_DEPS_r4d_gdn_chunk_scan_stable_k128_v128_c64_bf16 "${LIBR4D_DIR}/r4d_gdn_chunk_scan_k128_v128_c64_bf16.hip")
 
 set(R4D_OBJ_DIR "${CMAKE_CURRENT_BINARY_DIR}/r4d_objs")
 file(MAKE_DIRECTORY "${R4D_OBJ_DIR}")

@@ -31,6 +31,16 @@ ModelDialect MakeQwen35() {
   return d;
 }
 
+ModelDialect MakeQwen4Exp() {
+  // The 27B's text surface, byte for byte: Swift-1.5-Qwen3.8-Flash-Next's chat_template.jinja has the same
+  // SHA-256 as Huihui-Qwen3.8-27B-abliterated's (tests/server/test_q4exp_template.cpp pins it when both exist),
+  // and so does its generation_config.json (eos [248046, 248044]), which the tokenizer directory supplies.
+  ModelDialect d = MakeQwen35();
+  d.kind = DialectKind::kQwen4Exp;
+  d.name = "qwen4_exp";
+  return d;
+}
+
 ModelDialect MakeGemma4() {
   ModelDialect d;
   d.kind = DialectKind::kGemma4;
@@ -63,8 +73,21 @@ const ModelDialect& Gemma4Dialect() {
   return d;
 }
 
+const ModelDialect& Qwen4ExpDialect() {
+  static const ModelDialect d = MakeQwen4Exp();
+  return d;
+}
+
 const ModelDialect& DialectFor(DialectKind kind) {
-  return kind == DialectKind::kGemma4 ? Gemma4Dialect() : Qwen35Dialect();
+  switch (kind) {
+    case DialectKind::kGemma4:
+      return Gemma4Dialect();
+    case DialectKind::kQwen4Exp:
+      return Qwen4ExpDialect();
+    case DialectKind::kQwen35:
+      break;
+  }
+  return Qwen35Dialect();
 }
 
 bool ParseDialectName(std::string_view s, DialectKind* out) {
@@ -74,6 +97,10 @@ bool ParseDialectName(std::string_view s, DialectKind* out) {
   }
   if (s == "gemma4") {
     if (out) *out = DialectKind::kGemma4;
+    return true;
+  }
+  if (s == "qwen4_exp") {
+    if (out) *out = DialectKind::kQwen4Exp;
     return true;
   }
   return false;
@@ -108,19 +135,61 @@ std::string JoinPath(const std::string& dir, const char* name) {
 
 DialectKind ResolveDialectKind(std::optional<DialectKind> requested, const std::string& tokenizer_dir,
                                bool container_is_gemma) {
+  return ResolveDialectKindForArch(requested, tokenizer_dir, container_is_gemma ? "gemma4_unified" : "");
+}
+
+DialectKind ResolveDialectKindForArch(std::optional<DialectKind> requested, const std::string& tokenizer_dir,
+                                      std::string_view container_arch) {
   if (requested) return *requested;
-  if (tokenizer_dir.empty()) return container_is_gemma ? DialectKind::kGemma4 : DialectKind::kQwen35;
+  const bool container_is_gemma = container_arch.substr(0, 5) == "gemma";
+  const DialectKind qwen_kind = container_arch == "qwen4_exp" ? DialectKind::kQwen4Exp : DialectKind::kQwen35;
+  if (tokenizer_dir.empty()) return container_is_gemma ? DialectKind::kGemma4 : qwen_kind;
   const std::string config = ReadFileIfPresent(JoinPath(tokenizer_dir, "tokenizer_config.json"));
   // The (tens of MB) vocab is only scanned when the config alone did not say Gemma.
   if (DetectDialect(config, /*has_turn_token=*/false) == DialectKind::kGemma4) return DialectKind::kGemma4;
   const bool has_turn_token =
       ReadFileIfPresent(JoinPath(tokenizer_dir, "tokenizer.json")).find("\"<|turn>\"") != std::string::npos;
-  return DetectDialect(config, has_turn_token);
+  return DetectDialect(config, has_turn_token) == DialectKind::kGemma4 ? DialectKind::kGemma4 : qwen_kind;
 }
 
 std::string ResolveTokenizerDir(const ModelDialect& d, const std::string& requested) {
   if (!requested.empty()) return requested;
   return d.default_tokenizer_dir.empty() ? QwenDefaultTokenizerDir() : d.default_tokenizer_dir;
+}
+
+std::string CheckDefaultTokenizerDir(const ModelDialect& d, const std::string& resolved_dir, bool user_given) {
+  if (d.kind != DialectKind::kQwen4Exp || user_given) return "";
+  if (std::ifstream(JoinPath(resolved_dir, "tokenizer.json"), std::ios::binary)) return "";
+  return "qwen4_exp has no tokenizer of its own to default to: it uses the Qwen3.5 tokenizer, whose default directory '" +
+         resolved_dir + "' has no tokenizer.json (set R4DX_MODELS_ROOT or pass --tokenizer-dir <dir> with the "
+         "Huihui-Qwen3.8-27B-abliterated or base Qwen3.8-27B tokenizer files; the Swift checkpoint's own "
+         "tokenizer.json is not loadable by r4dx)";
+}
+
+Qwen4ExpFlags MakeQwen4ExpFlags(int64_t tp, int64_t pp, int64_t mtp, bool dflash_given, bool vision_on, bool images) {
+  Qwen4ExpFlags f;
+  f.tp = tp;
+  f.pp = pp;
+  f.mtp = mtp;
+  f.dflash = dflash_given;
+  f.vision_on = vision_on;
+  f.images = images;
+  return f;
+}
+
+std::string CheckQwen4ExpFlags(const Qwen4ExpFlags& f) {
+  std::string refused;
+  const auto add = [&](const std::string& what) { refused += (refused.empty() ? "" : "; ") + what; };
+  if (f.tp != 1) {
+    add("--tp " + std::to_string(f.tp) + " (qwen4_exp splits its own layers over the two cards; there is no tensor parallelism)");
+  }
+  if (f.pp == 2) add("--pp 2 (qwen4_exp already runs as a two-stage pipeline of its own; there is no --pp)");
+  if (f.mtp > 0) add("--mtp " + std::to_string(f.mtp) + " (qwen4_exp has no MTP head)");
+  if (f.dflash) add("--dflash (there is no DFlash drafter for qwen4_exp)");
+  if (f.vision_on) add("--vision on (qwen4_exp is text only)");
+  if (f.images) add("--image (qwen4_exp is text only)");
+  if (refused.empty()) return "";
+  return "qwen4_exp does not support: " + refused + " (docs/qwen4exp.md, \"Known limits\")";
 }
 
 std::string CheckDialectAgainstArch(const ModelDialect& d, std::string_view model_arch) {
@@ -129,8 +198,10 @@ std::string CheckDialectAgainstArch(const ModelDialect& d, std::string_view mode
   if (d.kind == DialectKind::kGemma4 && !arch_is_gemma) {
     return std::string("dialect gemma4 does not match model architecture '") + std::string(model_arch) + "'";
   }
-  if (d.kind == DialectKind::kQwen35 && arch_is_gemma) {
-    return std::string("dialect qwen35 does not match model architecture '") + std::string(model_arch) +
+  // The two Qwen dialects share one text surface, so either serves any non-Gemma architecture; only a
+  // Gemma container is refused (and told which dialect it needs).
+  if (d.kind != DialectKind::kGemma4 && arch_is_gemma) {
+    return std::string("dialect ") + d.name + " does not match model architecture '" + std::string(model_arch) +
            "' (pass --dialect gemma4)";
   }
   return "";

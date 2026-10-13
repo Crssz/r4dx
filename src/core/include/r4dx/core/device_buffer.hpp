@@ -59,10 +59,12 @@ class DeviceBuffer {
   DeviceBuffer(const DeviceBuffer&) = delete;
   DeviceBuffer& operator=(const DeviceBuffer&) = delete;
 
-  DeviceBuffer(DeviceBuffer&& other) noexcept : ptr_(other.ptr_), count_(other.count_), device_(other.device_) {
+  DeviceBuffer(DeviceBuffer&& other) noexcept
+      : ptr_(other.ptr_), count_(other.count_), device_(other.device_), owned_(other.owned_) {
     other.ptr_ = nullptr;
     other.count_ = 0;
     other.device_ = -1;
+    other.owned_ = true;
   }
   DeviceBuffer& operator=(DeviceBuffer&& other) noexcept {
     if (this != &other) {
@@ -70,12 +72,29 @@ class DeviceBuffer {
       ptr_ = other.ptr_;
       count_ = other.count_;
       device_ = other.device_;
+      owned_ = other.owned_;
       other.ptr_ = nullptr;
       other.count_ = 0;
       other.device_ = -1;
+      other.owned_ = true;
     }
     return *this;
   }
+
+  // A NON-OWNING window onto `count` elements at `ptr` inside someone else's allocation (one big buffer
+  // sliced into many per-tensor views, e.g. Qwen4ExpContainer's 512 experts per layer). The view never
+  // hipFrees and is not counted in g_device_buffer_bytes (the owner's allocation already is); the owner
+  // MUST outlive every view of it. Everything else (data/size/Zero/Copy*) behaves as on an owning buffer;
+  // Resize() on a view drops the window and then allocates an owning buffer as usual. Default-constructed
+  // and sized buffers are owning, exactly as before.
+  static DeviceBuffer View(T* ptr, size_t count) noexcept {
+    DeviceBuffer b;
+    b.ptr_ = ptr;
+    b.count_ = ptr != nullptr ? count : 0;
+    b.owned_ = false;
+    return b;
+  }
+  bool owned() const noexcept { return owned_; }
 
   T* data() noexcept { return ptr_; }
   const T* data() const noexcept { return ptr_; }
@@ -136,7 +155,7 @@ class DeviceBuffer {
 
  private:
   void Free() noexcept {
-    if (ptr_ != nullptr) {
+    if (ptr_ != nullptr && owned_) {
       static std::atomic<bool> logged{false};
       TpNoteDeviceAlloc("free (DeviceBuffer)", logged);
       static_cast<void>(hipFree(ptr_));
@@ -145,6 +164,7 @@ class DeviceBuffer {
     ptr_ = nullptr;
     count_ = 0;
     device_ = -1;
+    owned_ = true;
   }
 
   // g_device_buffer_bytes: the allocation lands on the calling thread's current device, and the
@@ -159,6 +179,7 @@ class DeviceBuffer {
   T* ptr_ = nullptr;
   size_t count_ = 0;
   int device_ = -1;  // the ordinal ptr_ was allocated on (g_device_buffer_bytes), -1 = none
+  bool owned_ = true;  // false: a View() window onto another buffer's allocation (never freed, never counted)
 };
 
 }  // namespace r4dx::core

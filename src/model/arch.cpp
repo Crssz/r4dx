@@ -17,6 +17,12 @@ bool IsGemma4Name(const nlohmann::json& v) {
   return s == "gemma4_unified" || s == "Gemma4UnifiedForConditionalGeneration";
 }
 
+bool IsQwen4ExpName(const nlohmann::json& v) {
+  if (!v.is_string()) return false;
+  const std::string s = v.get<std::string>();
+  return s == "qwen4_exp" || s == "Qwen4ExpForConditionalGeneration";
+}
+
 }  // namespace
 
 Arch DetectArchFromMetadata(const nlohmann::json& metadata) {
@@ -25,16 +31,20 @@ Arch DetectArchFromMetadata(const nlohmann::json& metadata) {
     const nlohmann::json& a = metadata.at("model_arch");
     const std::string s = a.is_string() ? a.get<std::string>() : std::string();
     if (s == ArchName(Arch::kGemma4)) return Arch::kGemma4;
+    if (s == ArchName(Arch::kQwen4Exp)) return Arch::kQwen4Exp;
     if (s == ArchName(Arch::kQwen35)) return Arch::kQwen35;
     throw std::runtime_error("r4dx::model::DetectArch: unknown __metadata__.model_arch " + a.dump() +
-                             " (this build knows 'gemma4_unified' and 'qwen3_5')");
+                             " (this build knows 'gemma4_unified', 'qwen4_exp' and 'qwen3_5')");
   }
   if (metadata.contains("model_config") && metadata.at("model_config").is_object()) {
     const nlohmann::json& mc = metadata.at("model_config");
     if (mc.contains("model_type") && IsGemma4Name(mc.at("model_type"))) return Arch::kGemma4;
+    if (mc.contains("model_type") && IsQwen4ExpName(mc.at("model_type"))) return Arch::kQwen4Exp;
     if (mc.contains("architectures") && mc.at("architectures").is_array()) {
       for (const auto& a : mc.at("architectures"))
         if (IsGemma4Name(a)) return Arch::kGemma4;
+      for (const auto& a : mc.at("architectures"))
+        if (IsQwen4ExpName(a)) return Arch::kQwen4Exp;
     }
   }
   return Arch::kQwen35;
@@ -62,8 +72,16 @@ Arch DetectArch(const std::string& container_path) {
   return DetectArchFromMetadata(meta);
 }
 
+bool Qwen4ExpDefaultsToTrellis(const std::string& container_path) {
+  const nlohmann::json meta = ReadContainerMetadata(container_path);
+  if (meta.is_null() || DetectArchFromMetadata(meta) != Arch::kQwen4Exp) return false;
+  return meta.is_object() && meta.contains("quant") && meta.at("quant").is_object() &&
+         meta.at("quant").contains("trellis");
+}
+
 int64_t ResolveContainerMaxCtx(const std::string& container_path, Arch arch, bool requested_given,
                                int64_t requested, bool extended_ctx) {
+  // kQwen35 and kQwen4Exp keep the caller's value (arch.h); only Gemma derives a default.
   if (arch != Arch::kGemma4) return requested;
   const nlohmann::json meta = ReadContainerMetadata(container_path);
   if (!meta.is_object() || !meta.contains("model_config"))

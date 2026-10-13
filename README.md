@@ -38,6 +38,15 @@ OpenAI-compatible server. No PyTorch, vLLM or ggml at runtime.
 - **Hybrid two-GPU mode (`--tp 2 --pp 2`, off by default):** the prompt goes through the `--pp 2` pipeline,
   its state is resharded once into the TP layout, and decode runs as `--tp 2`: `--pp 2`'s prefill speed with
   `--tp 2`'s decode speed (docs/pp-tp2-hybrid.md).
+- **Qwen3.8-Flash-Next (`qwen4_exp`, experimental, text only):** a third architecture (GDN + sparse attention,
+  512-expert MoE, hyper-connections, per-layer n-gram embeddings) served on two cards by splitting the layers.
+  Quantized to ~3.3 bits/weight (mixed KB 3 and 4 trellis). Decode with the on-GPU grouped MoE kernel measured
+  **50.3 tok/s at a 243-token prompt and 57.5 tok/s at a 2k-token prompt**; a re-run on 2026-10-11 gave 44.1 tok/s at
+  243 tokens and 48.8 tok/s at 8210 tokens (the old 8k/32k rows of 16.9 and 17.9 tok/s predate that kernel; 32k is
+  not re-measured, and run-to-run spread is about 10%). Prefill
+  is 231 tok/s at 243 tokens, 370 at 2k and about 440-450 at 8k-32k (docs/qwen4exp.md; speeds are recorded, not
+  gated). Needs a 95.4 GiB n-gram sidecar on NVMe; no `--tp`, `--pp`, MTP, DFlash or images. The KL gate
+  (mean KL 0.0578, top-1 89.4% on the canon corpus) is not met and awaits a decision (docs/qwen4exp-plan.md).
 - **Server:** `GET /health`, `GET /v1/models`, `POST /v1/chat/completions` (streaming, tools,
   images) and `POST /v1/completions`. One request at a time, with prefix reuse across turns.
 - **Batched decode (`--batch N`, off by default, unvalidated on a GPU):** up to N requests decoded in one forward
@@ -187,6 +196,7 @@ docs/           design notes and measurements
 | Speculative decoding | [docs/mtp.md](docs/mtp.md), [docs/dflash2.md](docs/dflash2.md), [docs/sampling.md](docs/sampling.md) |
 | Server and vision | [docs/server.md](docs/server.md), [docs/vision.md](docs/vision.md) |
 | Tensor parallelism | [docs/tp.md](docs/tp.md) |
+| Qwen3.8-Flash-Next (`qwen4_exp`, experimental) | [docs/qwen4exp.md](docs/qwen4exp.md), [docs/qwen4exp-plan.md](docs/qwen4exp-plan.md) |
 | Performance and validation | [docs/perf.md](docs/perf.md), [docs/prefill.md](docs/prefill.md), [docs/validation.md](docs/validation.md) |
 | Pipeline-parallel 2-GPU prefill (`--pp 2`, validated) | [docs/pp-prefill.md](docs/pp-prefill.md) |
 | Hybrid 2-GPU mode (`--tp 2 --pp 2`: PP prefill + TP decode) | [docs/pp-tp2-hybrid.md](docs/pp-tp2-hybrid.md) |

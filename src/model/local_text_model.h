@@ -77,6 +77,12 @@ class LocalTextModel final : public TextModel {
     return m_.DecodeStepDflashSampled(token_id, k, p_min, n_min, params, rng, walk_len_out);
   }
 
+  int BatchSlots() const override { return m_.BatchSlots(); }
+  int64_t BatchSlotCtx() const override { return m_.BatchSlotCtx(); }
+  void BatchImport(int slot) override { m_.BatchImport(slot); }
+  void BatchRelease(int slot) override { m_.BatchRelease(slot); }
+  std::vector<int32_t> DecodeBatch(const std::vector<BatchDecodeRow>& rows) override { return m_.DecodeBatch(rows); }
+
   StepProfile DecodeStepProfiled(int32_t token_id) override { return m_.DecodeStepProfiled(token_id); }
   StepProfile PrefillProfiled(const std::vector<int32_t>& token_ids) override {
     return m_.PrefillProfiled(token_ids);

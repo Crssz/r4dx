@@ -49,6 +49,9 @@ OpenAI-compatible server. No PyTorch, vLLM or ggml at runtime.
   (mean KL 0.0578, top-1 89.4% on the canon corpus) is not met and awaits a decision (docs/qwen4exp-plan.md).
 - **Server:** `GET /health`, `GET /v1/models`, `POST /v1/chat/completions` (streaming, tools,
   images) and `POST /v1/completions`. One request at a time, with prefix reuse across turns.
+- **Batched decode (`--batch N`, off by default, unvalidated on a GPU):** up to N requests decoded in one forward
+  pass per token, with `--tp 2` and the hybrid mode; serialized prefill, no speculation. Written without a GPU:
+  only its host-side parts have been run (docs/batch-decode.md).
 
 ## Performance
 
@@ -197,6 +200,7 @@ docs/           design notes and measurements
 | Performance and validation | [docs/perf.md](docs/perf.md), [docs/prefill.md](docs/prefill.md), [docs/validation.md](docs/validation.md) |
 | Pipeline-parallel 2-GPU prefill (`--pp 2`, validated) | [docs/pp-prefill.md](docs/pp-prefill.md) |
 | Hybrid 2-GPU mode (`--tp 2 --pp 2`: PP prefill + TP decode) | [docs/pp-tp2-hybrid.md](docs/pp-tp2-hybrid.md) |
+| Batched decode (`--batch N`, with `--tp 2` and the hybrid mode; not yet run on a GPU) | [docs/batch-decode.md](docs/batch-decode.md) |
 | Hardware notes | [docs/r9700.md](docs/r9700.md) |
 | Detailed usage and history | [docs/usage.md](docs/usage.md), [docs/status.md](docs/status.md) |
 

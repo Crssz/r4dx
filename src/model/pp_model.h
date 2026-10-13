@@ -110,6 +110,15 @@ class PpModel final : public TextModel {
                                                const kernels::SampleParams& params, std::mt19937_64& rng,
                                                int64_t* walk_len_out = nullptr) override;
 
+  // Batched decode (docs/batch-decode.md): stage B's, the decode Model's. A pipelined prefill leaves the single-sequence state in B
+  // (that is the hand-off), BatchImport copies it into a batch slot there, and DecodeBatch never touches stage A -- the mirror
+  // tracker does not see a batch step, because the single-sequence state it mirrors does not move.
+  int BatchSlots() const override { return b_->BatchSlots(); }
+  int64_t BatchSlotCtx() const override { return b_->BatchSlotCtx(); }
+  void BatchImport(int slot) override;
+  void BatchRelease(int slot) override;
+  std::vector<int32_t> DecodeBatch(const std::vector<BatchDecodeRow>& rows) override;
+
   StepProfile DecodeStepProfiled(int32_t token_id) override;
   StepProfile PrefillProfiled(const std::vector<int32_t>& token_ids) override;
 

@@ -129,6 +129,13 @@ set(R4DX_MODEL_TESTS
   # skipped DFlash tail). Options: --phase all|ref|hybrid|verify --dir D --max-ctx N --hybrid-ctx N --keep. HIP_VISIBLE_DEVICES=0,1. Links the
   # R4DX_TP_TESTING variant. Written, NOT run by its author (CPU-only session).
   test_hybrid_real_identity
+  # Batched decode (docs/batch-decode.md): Model::BatchImport / DecodeBatch against the same sequences decoded alone -- lockstep, an irregular
+  # schedule over subsets of the slots, a greedy row batched with sampled ones (one draw per token), slot reuse, the single-sequence state
+  # untouched, the refusals. 4-layer container, bf16 and w4a16. Device 1, SKIP 77 without it. Written, NOT run by its author (CPU-only session).
+  test_batch_decode
+  # The same through TextModel under tensor parallelism (--rig emulate: TpModel, both ranks on one device) and in the hybrid mode (--rig hybrid:
+  # every prefill runs the PP-2 pipeline, is resharded into the ranks, imported into a slot and decoded as TP=2; two cards). Written, NOT run.
+  test_batch_decode_tp
 )
 
 foreach(t ${R4DX_MODEL_TESTS})
@@ -159,6 +166,10 @@ set_tests_properties(test_hybrid_emulate_identity PROPERTIES TIMEOUT 5400)
 set_tests_properties(test_tp_hybrid_identity PROPERTIES ENVIRONMENT "HIP_VISIBLE_DEVICES=0,1" TIMEOUT 5400)
 # The full-depth gate: both cards visible ("0,1" is the natural order, the same as unset), three model loads of ~1-3 minutes each plus ~40 scenarios
 set_tests_properties(test_hybrid_real_identity PROPERTIES ENVIRONMENT "HIP_VISIBLE_DEVICES=0,1" TIMEOUT 7200)
+# test_batch_decode_tp: the loop above registered it as `test_batch_decode_tp` (the emulate rig, the default); add the hybrid rig, both cards visible.
+set_tests_properties(test_batch_decode_tp PROPERTIES TIMEOUT 1800)
+add_test(NAME test_batch_decode_tp_hybrid COMMAND test_batch_decode_tp --rig hybrid)
+set_tests_properties(test_batch_decode_tp_hybrid PROPERTIES ENVIRONMENT "HIP_VISIBLE_DEVICES=0,1" SKIP_RETURN_CODE 77 TIMEOUT 3600)
 
 # The 64-row == 256-row chunk identity again with the DEFAULT prompt-prefill attention (split-KV from 2048 tokens of
 # context, exact-wide below): the 4-layer part, whose 8145-token scenario crosses the engage depth. The split law is a
@@ -368,6 +379,11 @@ add_test(NAME test_hybrid_sync_cpu COMMAND test_hybrid_sync_cpu)
 add_executable(test_hybrid_budget_cpu test_hybrid_budget_cpu.cpp)
 target_include_directories(test_hybrid_budget_cpu PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../../src/model)
 add_test(NAME test_hybrid_budget_cpu COMMAND test_hybrid_budget_cpu)
+# test_batch_plan_cpu: src/model/batch_plan.h (docs/batch-decode.md): the batch slot table, one DecodeBatch step's metadata layout
+# (KV slot mapping, GDN cu / cache_idx / sidx, mrope columns), the step validation and the memory figures. No HIP call; always runs.
+add_executable(test_batch_plan_cpu test_batch_plan_cpu.cpp)
+target_include_directories(test_batch_plan_cpu PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../../src/model)
+add_test(NAME test_batch_plan_cpu COMMAND test_batch_plan_cpu)
 add_executable(test_reshard_plan_cpu test_reshard_plan_cpu.cpp)
 target_link_libraries(test_reshard_plan_cpu PRIVATE r4dx_tp_shard)
 add_test(NAME test_reshard_plan_cpu COMMAND test_reshard_plan_cpu)

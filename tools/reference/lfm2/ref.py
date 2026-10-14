@@ -74,6 +74,23 @@ def causal_mask(T: int, dtype, device=None):
     return m.view(1, 1, T, T)
 
 
+def manual_router(x, weight, bias, top_k: int, norm_topk_prob: bool = True, scale: float = 1.0):
+    """The router CONTRACT (docs/lfm2-plan.md 3.5), independent of HF, all fp32 from the (bf16) operands:
+    s = sigmoid(x @ W^T); selection by top-k of s + bias (ties -> LOWER expert index, stable sort); weights = the
+    UNBIASED s of the selected experts, / (sum + 1e-6), * scale.  Returns (logits, s, ids [N,k] in descending
+    score order, weights [N,k] in the same slot order)."""
+    import torch
+
+    logits = x.float() @ weight.float().T
+    s = torch.sigmoid(logits)
+    score = s + bias.float()
+    ids = torch.sort(score, dim=-1, descending=True, stable=True).indices[..., :top_k]
+    w = s.gather(-1, ids)
+    if norm_topk_prob:
+        w = w / (w.sum(-1, keepdim=True) + 1e-6)
+    return logits, s, ids, w * scale
+
+
 def moe_forward(block, x2d):
     """Lfm2MoeSparseMoeBlock.forward on `[N, H]` tokens, also returning the routing (HF body, unrolled)."""
     bias = block.expert_bias if block.use_expert_bias else None

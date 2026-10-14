@@ -1,6 +1,7 @@
 #include "arch.h"
 
 #include "gemma_config.h"
+#include "lfm2_config.h"
 
 #include <cstdint>
 #include <fstream>
@@ -17,6 +18,12 @@ bool IsGemma4Name(const nlohmann::json& v) {
   return s == "gemma4_unified" || s == "Gemma4UnifiedForConditionalGeneration";
 }
 
+bool IsLfm2Name(const nlohmann::json& v) {
+  if (!v.is_string()) return false;
+  const std::string s = v.get<std::string>();
+  return s == "lfm2_moe" || s == "Lfm2MoeForCausalLM";
+}
+
 }  // namespace
 
 Arch DetectArchFromMetadata(const nlohmann::json& metadata) {
@@ -25,16 +32,20 @@ Arch DetectArchFromMetadata(const nlohmann::json& metadata) {
     const nlohmann::json& a = metadata.at("model_arch");
     const std::string s = a.is_string() ? a.get<std::string>() : std::string();
     if (s == ArchName(Arch::kGemma4)) return Arch::kGemma4;
+    if (s == ArchName(Arch::kLfm2Moe)) return Arch::kLfm2Moe;
     if (s == ArchName(Arch::kQwen35)) return Arch::kQwen35;
     throw std::runtime_error("r4dx::model::DetectArch: unknown __metadata__.model_arch " + a.dump() +
-                             " (this build knows 'gemma4_unified' and 'qwen3_5')");
+                             " (this build knows 'gemma4_unified', 'lfm2_moe' and 'qwen3_5')");
   }
   if (metadata.contains("model_config") && metadata.at("model_config").is_object()) {
     const nlohmann::json& mc = metadata.at("model_config");
     if (mc.contains("model_type") && IsGemma4Name(mc.at("model_type"))) return Arch::kGemma4;
+    if (mc.contains("model_type") && IsLfm2Name(mc.at("model_type"))) return Arch::kLfm2Moe;
     if (mc.contains("architectures") && mc.at("architectures").is_array()) {
-      for (const auto& a : mc.at("architectures"))
+      for (const auto& a : mc.at("architectures")) {
         if (IsGemma4Name(a)) return Arch::kGemma4;
+        if (IsLfm2Name(a)) return Arch::kLfm2Moe;
+      }
     }
   }
   return Arch::kQwen35;
@@ -64,6 +75,13 @@ Arch DetectArch(const std::string& container_path) {
 
 int64_t ResolveContainerMaxCtx(const std::string& container_path, Arch arch, bool requested_given,
                                int64_t requested, bool extended_ctx) {
+  if (arch == Arch::kLfm2Moe) {
+    const nlohmann::json meta = ReadContainerMetadata(container_path);
+    if (!meta.is_object() || !meta.contains("model_config"))
+      throw std::runtime_error("ResolveContainerMaxCtx: " + container_path +
+                               " has no __metadata__.model_config (needed for the LFM2 context default)");
+    return Lfm2Config::FromModelConfig(meta.at("model_config")).ResolveMaxCtx(requested_given ? requested : 0);
+  }
   if (arch != Arch::kGemma4) return requested;
   const nlohmann::json meta = ReadContainerMetadata(container_path);
   if (!meta.is_object() || !meta.contains("model_config"))

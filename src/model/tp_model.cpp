@@ -1219,9 +1219,14 @@ std::unique_ptr<TextModel> LoadTextModel(const ModelOptions& opts, const TpOptio
   // Arch dispatch (docs/gemma4-plan.md 3.2): the container header alone decides. DetectArch answers
   // kQwen35 for every container without a `model_arch` / Gemma model_config -- including a file it
   // cannot read -- so the Qwen branches below see exactly what they saw before.
-  if (DetectArch(opts.container_path) == Arch::kGemma4) {
+  const Arch arch = DetectArch(opts.container_path);
+  if (arch == Arch::kGemma4) {
     if (pp_on) throw std::invalid_argument("LoadTextModel: --pp 2 does not support Gemma 4 (it has its own RunChunk)");
     return LoadGemmaTextModel(opts, tp);
+  }
+  if (arch == Arch::kLfm2Moe) {
+    if (pp_on) throw std::invalid_argument("LoadTextModel: --pp 2 does not support LFM2 (it has its own RunChunk)");
+    return LoadLfm2TextModel(opts, tp);
   }
   if (pp_on) {
     // `--tp 2 --pp 2` is the hybrid serving mode (docs/pp-tp2-hybrid.md): the TP=2 group with the PP-2 prefill stages next to its ranks.

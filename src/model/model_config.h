@@ -40,6 +40,12 @@ struct ModelConfig {
   bool attn_output_gate = true;
 
   int64_t intermediate_size = 0;
+  // LFM2 only (Lfm2Config::ToModelConfig; 0 for Qwen / Gemma): `intermediate_size` is then the DENSE FFN of the first
+  // `num_dense_layers` layers, `moe_intermediate_size` one expert's, `num_experts` the routed experts per MoE layer.
+  // tp::RuleFor reads them to classify text.layers.{i}.mlp.* / moe.experts.{e}.*.
+  int64_t moe_intermediate_size = 0;
+  int64_t num_experts = 0;
+  int64_t num_dense_layers = 0;
 
   double partial_rotary_factor = 0.25;
   double rope_theta = 1.0e7;

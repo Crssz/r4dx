@@ -551,6 +551,26 @@ add_executable(test_tp_shard test_tp_shard.cpp)
 target_link_libraries(test_tp_shard PRIVATE r4dx_tp_shard r4dx_convert)
 add_test(NAME test_tp_shard COMMAND test_tp_shard)
 
+# LFM2 (docs/lfm2-plan.md L1-1 / L1-3 / L1-4), all CPU, no HIP call, no weights:
+#   test_lfm2_config     Lfm2Config::FromJson on the real LFM2.5-24B-A2B config (pattern, every refusal), Lfm2Config::Shard at TP=2,
+#                        DetectArch / ResolveContainerMaxCtx for lfm2_moe and the Qwen / Gemma answers unchanged
+#   test_lfm2_tp_shard   tp::RuleFor's lfm2_moe table over all 40 layers x 64 experts vs Lfm2Config::Shard, the byte plans, the TP=2 algebra
+#   test_lfm2_container  the CPU half of the Lfm2Container loader (lfm2_container_info.h) on a tiny container converted by r4dx-convert
+#                        (when built), header edits, and the real lfm2-l6.r4dx header (SKIP when absent)
+add_executable(test_lfm2_config test_lfm2_config.cpp)
+target_link_libraries(test_lfm2_config PRIVATE r4dx_model_arch)
+add_test(NAME test_lfm2_config COMMAND test_lfm2_config)
+add_executable(test_lfm2_tp_shard test_lfm2_tp_shard.cpp)
+target_link_libraries(test_lfm2_tp_shard PRIVATE r4dx_tp_shard)
+add_test(NAME test_lfm2_tp_shard COMMAND test_lfm2_tp_shard)
+add_executable(test_lfm2_container test_lfm2_container.cpp)
+target_link_libraries(test_lfm2_container PRIVATE r4dx_tp_shard r4dx_convert r4dx_core)
+if(TARGET r4dx-convert)
+  target_compile_definitions(test_lfm2_container PRIVATE R4DX_CONVERT_EXE="$<TARGET_FILE:r4dx-convert>")
+  add_dependencies(test_lfm2_container r4dx-convert)
+endif()
+add_test(NAME test_lfm2_container COMMAND test_lfm2_container)
+
 # test_gemma_tp_shard (docs/gemma4-plan.md M1b-1): the Gemma 4 TP=2 sharding contract on the real 12B config -- tp::RuleFor's
 # Gemma table vs GemmaConfig::Shard, the byte plans (bf16 / w4a16 / trellis) partition every linear, and a tiny-model
 # algebra check that the sharded forward equals the unsharded one. CPU only, no HIP, no container.

@@ -1,4 +1,4 @@
-﻿"""tools/reference/lfm2/full_logits_lfm2_cpu.py  (docs/lfm2-plan.md L0-8 / 6.2: the fp32-truth KL gate)
+"""tools/reference/lfm2/full_logits_lfm2_cpu.py  (docs/lfm2-plan.md L0-8 / 6.2: the fp32-truth KL gate)
 
 CPU-only teacher-forced log-prob dumps for the LFM2.5-24B-A2B gate, in kl_report.py's shared format
 (`<seg>.logprobs.f16` rows 0..T-2 [T-1, V=128000] fp16 + `<seg>.meta.json`), for any mix of tokens files
@@ -69,6 +69,7 @@ from lfm2.common_lfm2 import (  # noqa: E402
     DEFAULT_MODEL_DIR,
     LOGPROB_CLAMP,
     REAL_VOCAB,
+    peak_rss_gb,
     sha256_file,
     token_ids_sha256,
 )
@@ -219,7 +220,7 @@ def main(argv=None) -> int:
     out_dir = args.out_dir
     truth = args.variant == "truth"
     work_dtype = torch.float32 if truth else torch.bfloat16
-    attn = "eager" if truth else "sdpa"
+    attn = "chunked" if truth else "sdpa"   # chunked = exact fp32 eager attention over query chunks (RAM)
     out_dir.mkdir(parents=True, exist_ok=True)
 
     t_start = time.perf_counter()
@@ -250,7 +251,7 @@ def main(argv=None) -> int:
                 states[n] = ref.embed(ids).to(work_dtype).unsqueeze(0)          # no scale; bf16 table widened
             pos[n] = ref.positions(T)
             pe[n] = ref.rope(states[n], pos[n])
-            masks[n] = causal_mask(T, work_dtype) if attn == "eager" else None
+            masks[n] = None   # chunked / sdpa attention build their own causal mask
         for i in range(start_layer, n_layers):
             t0 = time.perf_counter()
             layer = ref.build_layer(i)
@@ -267,7 +268,7 @@ def main(argv=None) -> int:
             kind = "attn" if ref.arch.is_attn(i) else "conv"
             ffn = "dense" if ref.arch.is_dense(i) else "moe"
             print(f"[cpu-ref] L{i:02d} {kind}+{ffn} load {t_load:.1f}s total {time.perf_counter() - t0:.1f}s "
-                  f"max|h|={hmax:.1f} elapsed={(time.perf_counter() - t_start) / 60:.1f}min", flush=True)
+                  f"max|h|={hmax:.1f} elapsed={(time.perf_counter() - t_start) / 60:.1f}min peakRSS={peak_rss_gb() or 0:.2f}GiB", flush=True)
             if not args.tiny:
                 ckpt.parent.mkdir(parents=True, exist_ok=True)
                 torch.save({"names": names, "variant": args.variant, "debug": args.debug_max_layers,

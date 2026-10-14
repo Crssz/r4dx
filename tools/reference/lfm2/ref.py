@@ -31,7 +31,38 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from lfm2.arch import EMBED_NAME, FINAL_NORM_NAME, Lfm2Arch  # noqa: E402
 from lfm2.common_lfm2 import LOGPROB_CLAMP, REAL_VOCAB, ShardIndex  # noqa: E402
 
-ATTN_IMPLS = ("eager", "sdpa")
+ATTN_IMPLS = ("eager", "sdpa", "chunked")
+CHUNKED_ATTN_NAME = "lfm2_chunked_eager"
+ATTN_QUERY_CHUNK = 512
+
+
+def chunked_eager_attention(module, query, key, value, attention_mask, scaling, dropout=0.0, **kwargs):
+    """HF `eager_attention_forward` (repeat_kv, fp32 softmax) over query chunks with an internal causal mask: the
+    same math row by row (a softmax row does not depend on the other rows), but the score tensor is
+    [B, heads, chunk, T] instead of [B, heads, T, T] (6144 tokens: 0.4 GB instead of 4.8 GB). Mask argument ignored
+    (causal, no padding, positions from 0)."""
+    import torch
+
+    from transformers.models.lfm2_moe.modeling_lfm2_moe import repeat_kv
+
+    k = repeat_kv(key, module.num_key_value_groups)
+    v = repeat_kv(value, module.num_key_value_groups)
+    B, H, T, D = query.shape
+    out = torch.empty(B, H, T, D, dtype=query.dtype)
+    for s in range(0, T, ATTN_QUERY_CHUNK):
+        e = min(s + ATTN_QUERY_CHUNK, T)
+        sc = torch.matmul(query[:, :, s:e], k[:, :, :e].transpose(2, 3)) * scaling
+        keep = torch.arange(e).unsqueeze(0) <= torch.arange(s, e).unsqueeze(1)
+        sc = sc + torch.zeros(e - s, e, dtype=sc.dtype).masked_fill(~keep, torch.finfo(sc.dtype).min)
+        w = torch.softmax(sc, dim=-1, dtype=torch.float32).to(query.dtype)
+        out[:, :, s:e] = torch.matmul(w, v[:, :, :e])
+    return out.transpose(1, 2).contiguous(), None
+
+
+def _register_chunked_attention() -> None:
+    from transformers import AttentionInterface
+
+    AttentionInterface.register(CHUNKED_ATTN_NAME, chunked_eager_attention)
 
 
 def causal_mask(T: int, dtype, device=None):
@@ -68,19 +99,22 @@ class Lfm2Reference:
         self.attn = attn
         self.arch = Lfm2Arch.from_model_dir(self.model_dir)
         self.index = ShardIndex.load(self.model_dir)
+        self._hdr_cache = {}
         if not self.index.weight_map:
             raise RuntimeError(f"no safetensors found under {self.model_dir}")
         self.config = config or Lfm2MoeConfig.from_pretrained(str(self.model_dir))
-        self.config._attn_implementation = attn
+        if attn == "chunked":
+            _register_chunked_attention()
+        self.config._attn_implementation = CHUNKED_ATTN_NAME if attn == "chunked" else attn
         self.config._experts_implementation = "eager"
         self.n_layers = self.arch.n_layers if max_layers is None else max_layers
         self.max_layers = max_layers
         self.vocab_size = self.arch.vocab
         self.rotary = modeling.Lfm2MoeRotaryEmbedding(self.config)
-        self.final_norm_w = self.index.get_tensor(FINAL_NORM_NAME).to(self.device, self.dtype)
+        self.final_norm_w = self.raw(FINAL_NORM_NAME).to(self.device, self.dtype)
         self.table = None
         if load_table:
-            table = self.index.get_tensor(EMBED_NAME).to(torch.bfloat16)
+            table = self.raw(EMBED_NAME).to(torch.bfloat16)
             if tuple(table.shape) != (self.arch.vocab, self.arch.hidden):
                 raise RuntimeError(f"{EMBED_NAME} shape {tuple(table.shape)} != config")
             self.table = table.to(self.device)
@@ -88,22 +122,22 @@ class Lfm2Reference:
 
     # -- weights ----------------------------------------------------------------------------------
 
-    def read_tensors(self, names: list[str], dtype) -> dict:
-        """Tensors `names` converted to `dtype` (a private copy each), opening every shard once."""
-        import torch
-        from safetensors import safe_open
+    def raw(self, name: str):
+        """One tensor as stored (fresh buffer): plain seek+readinto, NEVER a safetensors mmap. safe_open maps the
+        whole 5 GB shard copy-on-write, which Windows charges to the commit limit in full on every open and which
+        inflates the working set (g4-load-crash; common.raw_safetensors_read)."""
+        from common import raw_safetensors_header, raw_safetensors_read
 
-        out = {}
         if self.index.single_file is not None:
-            return {n: self.index.get_tensor(n).to(dtype, copy=True) for n in names}
-        by_shard: dict[str, list[str]] = {}
-        for n in names:
-            by_shard.setdefault(self.index.weight_map[n], []).append(n)
-        for shard, ns in by_shard.items():
-            with safe_open(str(self.model_dir / shard), framework="pt", device="cpu") as f:
-                for n in ns:
-                    out[n] = f.get_tensor(n).to(dtype, copy=True)   # copy inside the `with` (mmap lifetime)
-        return out
+            return self.index.get_tensor(name)
+        shard = self.index.weight_map[name]
+        if shard not in self._hdr_cache:
+            self._hdr_cache[shard] = raw_safetensors_header(self.model_dir / shard)
+        return raw_safetensors_read(self.model_dir / shard, name, self._hdr_cache[shard])
+
+    def read_tensors(self, names: list[str], dtype) -> dict:
+        """Tensors `names` converted to `dtype`."""
+        return {n: self.raw(n).to(dtype) for n in names}
 
     def layer_state(self, i: int, dtype=None) -> dict:
         """HF state_dict of decoder layer i (experts stacked), params in `dtype`, expert_bias always F32."""
@@ -117,34 +151,18 @@ class Lfm2Reference:
         state = {}
         for k in shapes:
             t = raw.pop(p + k)
-            if k.endswith("expert_bias"):
-                t = t.to(torch.float32)
-            elif k == "conv.conv.weight":
-                pass  # [H, 1, K] as nn.Conv1d expects
-            state[k] = t
+            state[k] = t.to(torch.float32) if k.endswith("expert_bias") else t   # conv.conv.weight stays [H, 1, K]
         if not a.is_dense(i):
             E, I, H = a.n_experts, a.moe_intermediate, a.hidden
             gu = torch.empty(E, 2 * I, H, dtype=dtype)
             dn = torch.empty(E, H, I, dtype=dtype)
-            names = [f"{p}feed_forward.experts.{e}.{w}.weight" for e in range(E) for w in ("w1", "w3", "w2")]
-            from safetensors import safe_open
-
-            if self.index.single_file is not None:
-                it = ((n, self.index.get_tensor(n)) for n in names)
-                for n, t in it:
-                    self._place(gu, dn, n, t, I)
-            else:
-                by_shard: dict[str, list[str]] = {}
-                for n in names:
-                    by_shard.setdefault(self.index.weight_map[n], []).append(n)
-                for shard, ns in by_shard.items():
-                    with safe_open(str(self.model_dir / shard), framework="pt", device="cpu") as f:
-                        for n in ns:
-                            self._place(gu, dn, n, f.get_tensor(n), I)
+            for e in range(E):
+                for w in ("w1", "w3", "w2"):
+                    n = f"{p}feed_forward.experts.{e}.{w}.weight"
+                    self._place(gu, dn, n, self.raw(n), I)
             state["feed_forward.experts.gate_up_proj"] = gu
             state["feed_forward.experts.down_proj"] = dn
         return state
-
     @staticmethod
     def _place(gu, dn, name: str, t, I: int) -> None:
         parts = name.split(".")
@@ -403,6 +421,15 @@ def selftest_tiny(tmp_dir: Path | str, seed: int = 0) -> dict:
             ht = truth.forward_hidden(ids)
             lt = truth.logits_rows(ht, "fp32")
             res["fp32_vs_hfbf16_logits_max_abs"] = float((lt - got).abs().max())
+            global ATTN_QUERY_CHUNK
+            old, ATTN_QUERY_CHUNK = ATTN_QUERY_CHUNK, 5          # several chunks inside the 14-token sequence
+            try:
+                ch = Lfm2Reference(d, torch.device("cpu"), dtype=torch.float32, attn="chunked")
+                lc = ch.logits_rows(ch.forward_hidden(ids), "fp32")
+            finally:
+                ATTN_QUERY_CHUNK = old
+            res["chunked_vs_eager_fp32_logits_max_abs"] = float((lc - lt).abs().max())
+            assert res["chunked_vs_eager_fp32_logits_max_abs"] < 1e-4, res
             res["fp32_router_ids_equal_bf16_frac"] = float(sum(
                 (truth.last_router_ids[i][0] .sort(-1).values == ref.last_router_ids[i][0].sort(-1).values).all(-1).float().mean()
                 for i in truth.last_router_ids) / max(1, len(truth.last_router_ids)))

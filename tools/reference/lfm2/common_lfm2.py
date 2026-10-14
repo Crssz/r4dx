@@ -47,6 +47,36 @@ def token_ids_sha256(token_ids) -> str:
     return sha256_bytes(payload)
 
 
+def peak_rss_gb() -> float | None:
+    """Peak working set of this process in GiB (Windows PROCESS_MEMORY_COUNTERS; resource.getrusage elsewhere)."""
+    try:
+        if os.name == "nt":
+            import ctypes
+            from ctypes import wintypes
+
+            class PMC(ctypes.Structure):
+                _fields_ = [("cb", wintypes.DWORD), ("PageFaultCount", wintypes.DWORD),
+                            ("PeakWorkingSetSize", ctypes.c_size_t), ("WorkingSetSize", ctypes.c_size_t),
+                            ("QuotaPeakPagedPoolUsage", ctypes.c_size_t), ("QuotaPagedPoolUsage", ctypes.c_size_t),
+                            ("QuotaPeakNonPagedPoolUsage", ctypes.c_size_t), ("QuotaNonPagedPoolUsage", ctypes.c_size_t),
+                            ("PagefileUsage", ctypes.c_size_t), ("PeakPagefileUsage", ctypes.c_size_t)]
+
+            pmc = PMC()
+            pmc.cb = ctypes.sizeof(PMC)
+            k32 = ctypes.windll.kernel32
+            k32.GetCurrentProcess.restype = wintypes.HANDLE
+            gpmi = ctypes.WinDLL("psapi").GetProcessMemoryInfo
+            gpmi.argtypes = [wintypes.HANDLE, ctypes.POINTER(PMC), wintypes.DWORD]
+            gpmi.restype = wintypes.BOOL
+            ok = gpmi(k32.GetCurrentProcess(), ctypes.byref(pmc), pmc.cb)
+            return pmc.PeakWorkingSetSize / 2**30 if ok else None
+        import resource
+
+        return resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 2**20
+    except Exception:
+        return None
+
+
 def allowed_devices() -> set[str]:
     raw = os.environ.get("R4DX_REF_ALLOWED_DEVICES", "1")
     return {t.strip() for t in raw.split(",") if t.strip()}

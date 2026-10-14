@@ -376,3 +376,21 @@ set_source_files_properties(test_tp_allreduce_cpu_peer.cpp test_tp_allreduce_2gp
 # against) and src/model/kernels/model_kernels.h's declaration.
 target_include_directories(test_fused_quant PRIVATE "${CMAKE_SOURCE_DIR}/src/model")
 target_link_libraries(test_fused_quant PRIVATE r4dx_model_kernels)
+
+# ---- LFM2 kernels (docs/lfm2-plan.md 3.3 / 3.5, tasks L1-6 / L1-7) ------------------------------------
+# GPU step (ctest runs the CPU reference test too, which is harmless):
+#   $env:HIP_VISIBLE_DEVICES='1'; ctest --test-dir build\win-hip -R lfm2_ --output-on-failure
+# test_lfm2_shortconv / _router / _moe test src/kernels' lfm2_kernels.hip against lfm2_ref.hpp;
+# test_lfm2_rope_norm64 pins the EXISTING rope / rmsnorm kernels at head_dim 64. All four are GPU tests
+# (WRITTEN, NOT YET RUN), built with /EHc- because they check precondition throws out of extern "C" entry points.
+foreach(t test_lfm2_shortconv test_lfm2_router test_lfm2_moe test_lfm2_rope_norm64)
+  add_executable(${t} ${t}.cpp)
+  target_link_libraries(${t} PRIVATE r4dx_core r4dx_kernels r4d_core)
+  set_source_files_properties(${t}.cpp PROPERTIES COMPILE_OPTIONS "/EHc-")
+  add_test(NAME ${t} COMMAND ${t})
+  set_tests_properties(${t} PROPERTIES ENVIRONMENT "HIP_VISIBLE_DEVICES=1")
+endforeach()
+# test_lfm2_ref_cpu: pure CPU (no HIP call, no kernel library) -- lfm2_ref.hpp against hand cases and naive
+# implementations (whole-sequence causal conv1d, stable sort, HF rope / rmsnorm). Always runs.
+add_executable(test_lfm2_ref_cpu test_lfm2_ref_cpu.cpp)
+add_test(NAME test_lfm2_ref_cpu COMMAND test_lfm2_ref_cpu)

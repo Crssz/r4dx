@@ -302,6 +302,13 @@ void TestRealGeometry() {
               r2.Find("text.layers.2.moe.experts.63.down") != nullptr,
           "--layers 3: layers 3+ allow-listed, layers 0-2 + embed/head converted");
     Check(lf::UnconsumedTensors(all, c2, 40).size() > 7000, "audit with all layers expected but 3 converted names the rest");
+    // lfm2-l6.r4dx = `--layers 6` (layers 0-5: conv, conv, attention + 4 MoE layers): 10 conv + 4 attn + 4 dense + 512 expert + head.
+    Recorder r6;
+    r6.shapes = rec.shapes;
+    lf::Kit k6 = r6.MakeKit();
+    const std::set<std::string> c6 = lf::AddTextStack(k6, shape, 6);
+    Check(lf::UnconsumedTensors(all, c6, 6).empty() && r6.linear.size() == 10 + 4 + 4 + 4 * 64 * 2 + 1 && r6.shaped.size() == 5 && r6.widen.size() == 4,
+          "--layers 6 (the lfm2-l6 test container): 531 linears, 5 conv weights, 4 expert_bias, nothing left over");
   }
   // The audit.
   {
@@ -415,6 +422,12 @@ void TestRealCheckpointHeader() {
   lf::Kit kit = rec.MakeKit();
   const std::set<std::string> consumed = lf::AddTextStack(kit, lf::ParseConfig(json::parse(ReadWhole(dir / "config.json"))), 40);
   Check(lf::UnconsumedTensors(kit.all_names(), consumed, 40).empty(), "real header + real config.json: every tensor consumed");
+  Recorder rec6;
+  rec6.shapes = rec.shapes;
+  lf::Kit kit6 = rec6.MakeKit();
+  const std::set<std::string> consumed6 = lf::AddTextStack(kit6, lf::ParseConfig(json::parse(ReadWhole(dir / "config.json"))), 6);
+  Check(lf::UnconsumedTensors(kit6.all_names(), consumed6, 6).empty() && rec6.linear.size() == 531,
+        "real header + real config.json, --layers 6 (lfm2-l6): 531 linears, every other layer allow-listed");
 }
 
 // ---- (b) the exe on a tiny synthetic checkpoint -------------------------------------------------------------------

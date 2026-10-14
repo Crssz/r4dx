@@ -107,6 +107,44 @@ def test_selftest_and_dumps():
         print("router agreement", round(ra["overall_same_expert_set_frac"], 3))
 
 
+def test_greedy_matches_hf_nocache():
+    """greedy_ref_lfm2.py (cache-less, layer-streamed, lockstep) == a plain HF no-cache greedy loop, prompt by
+    prompt (ids exactly, the recorded top-2 gaps positive); and --compare accepts / rejects as specified."""
+    import greedy_ref_lfm2 as G
+    from transformers.models.lfm2_moe.modeling_lfm2_moe import Lfm2MoeForCausalLM
+
+    with tempfile.TemporaryDirectory() as t:
+        out = Path(t) / "g.json"
+        assert G.main(["--tiny", "--max-new-tokens", "10", "--out", str(out), "--threads", "2"]) == 0
+        doc = json.loads(out.read_text())
+        model_dir = R.build_tiny_checkpoint(Path(t) / "m", 0)
+        hf = Lfm2MoeForCausalLM.from_pretrained(str(model_dir), dtype=torch.bfloat16, attn_implementation="sdpa").eval()
+        for p in doc["prompts"]:
+            ids = list(p["prompt_ids"])
+            want = []
+            for _ in range(len(p["gen_ids"])):
+                with torch.no_grad():
+                    lg = hf(input_ids=torch.tensor([ids + want]), use_cache=False).logits[0, -1].float()[:150]
+                want.append(int(lg.argmax()))
+            assert want == p["gen_ids"], (p["name"], want, p["gen_ids"])
+            assert all(s["gap"] >= 0 for s in p["steps"]) and len(p["steps"]) == len(p["gen_ids"])
+        # --compare: identical passes; a divergence at step 0 with a large gap fails; at a tiny gap passes
+        test = {p["name"]: list(p["gen_ids"]) for p in doc["prompts"]}
+        tp = Path(t) / "test.json"
+        tp.write_text(json.dumps(test))
+        assert G.compare(out, tp, 16) == 0
+        bad = {k: ([(v[0] + 1) % 150] + v[1:]) for k, v in test.items()}
+        tp.write_text(json.dumps(bad))
+        for p in doc["prompts"]:
+            p["steps"][0]["gap"] = 5.0
+        out.write_text(json.dumps(doc))
+        assert G.compare(out, tp, 16) == 1
+        for p in doc["prompts"]:
+            p["steps"][0]["gap"] = 0.01
+        out.write_text(json.dumps(doc))
+        assert G.compare(out, tp, 16) == 0
+
+
 def test_tiny_flag_runs():
     import full_logits_lfm2_cpu as F
 

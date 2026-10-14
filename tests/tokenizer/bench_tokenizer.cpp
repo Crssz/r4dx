@@ -129,7 +129,7 @@ int main(int argc, char** argv) {
             // so decode(encode(text)) == text only up to that replacement.
             std::string expect_text;
             for (size_t k = 0; k < d.text.size();) {
-                if (d.text.compare(k, 3, "\xE2\x96\x81") == 0) { expect_text += ' '; k += 3; }
+                if (tok.kind() == Tokenizer::Kind::kSpmByteFallback && d.text.compare(k, 3, "\xE2\x96\x81") == 0) { expect_text += ' '; k += 3; }
                 else expect_text += d.text[k++];
             }
             if (tok.decode(d.ids, true) != expect_text) {

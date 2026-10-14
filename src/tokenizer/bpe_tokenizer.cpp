@@ -94,6 +94,15 @@ const std::string kQwen35SplitExpected =
     "(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\\r\\n\\p{L}\\p{N}]?[\\p{L}\\p{M}]+|\\p{N}| ?[^\\s\\p{L}\\p{M}\\p{N}]+"
     "[\\r\\n]*|\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+";
 
+// Llama-3 split regex (LFM2.5, docs/lfm2-tokenizer-notes.md): digits grouped in runs of up to 3
+// (`\p{N}{1,3}`), `\p{L}+` letter runs (marks NOT absorbed). unicode.cpp's dispatcher recognizes
+// this exact spelling (`(?i:...)` form) for unicode_regex_split_custom_llama3(), so the trigger
+// string IS the expected tokenizer.json string.
+const std::string kLlama3SplitExpected =
+    "(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\\r\\n\\p{L}\\p{N}]?\\p{L}+|\\p{N}{1,3}| ?[^\\s\\p{L}\\p{N}]+[\\r\\n]*|\\s*"
+    "[\\r\\n]+|\\s+(?!\\S)|\\s+";
+const std::string& kLlama3SplitTrigger = kLlama3SplitExpected;
+
 std::string read_file_or_throw(const std::string& path) {
     std::ifstream f(path, std::ios::binary);
     if (!f) {
@@ -663,8 +672,11 @@ void validate_pretokenizer(const json& root, const Tokenizer::Options& options) 
     if (model.value("byte_fallback", false)) {
         throw std::runtime_error("Tokenizer: model.byte_fallback=true is not supported");
     }
-    if (!model.value("continuing_subword_prefix", std::string()).empty() ||
-        !model.value("end_of_word_suffix", std::string()).empty()) {
+    // (both keys are present but null in LFM2's tokenizer.json; json::value() throws on null)
+    auto nonempty_string = [&](const char* key) {
+        return model.contains(key) && model[key].is_string() && !model[key].get<std::string>().empty();
+    };
+    if (nonempty_string("continuing_subword_prefix") || nonempty_string("end_of_word_suffix")) {
         throw std::runtime_error("Tokenizer: non-empty continuing_subword_prefix/end_of_word_suffix "
                                   "is not supported");
     }
@@ -699,11 +711,29 @@ void validate_pretokenizer(const json& root, const Tokenizer::Options& options) 
         throw std::runtime_error("Tokenizer: pre_tokenizer.pretokenizers[0] is not a Regex Split");
     }
     const std::string regex = split["pattern"]["Regex"].get<std::string>();
-    if (regex != kQwen2SplitExpected && regex != kQwen35SplitExpected) {
+    if (regex != kQwen2SplitExpected && regex != kQwen35SplitExpected && regex != kLlama3SplitExpected) {
         throw std::runtime_error(
-            "Tokenizer: pre_tokenizer regex does not match either pattern this tokenizer "
-            "implements (Qwen2 or Qwen3.5; got: " +
+            "Tokenizer: pre_tokenizer regex does not match any pattern this tokenizer "
+            "implements (Qwen2, Qwen3.5 or Llama-3; got: " +
             regex + ")");
+    }
+    // Split.behavior must be Isolated (every regex match its own piece; the regexes tile the text,
+    // so the unmatched-gap handling of Isolated never fires) and not inverted.
+    if (split.value("behavior", std::string("Isolated")) != "Isolated" || split.value("invert", false)) {
+        throw std::runtime_error("Tokenizer: pre_tokenizer.pretokenizers[0] must be behavior=Isolated, "
+                                  "invert=false");
+    }
+    // post_processor: a TemplateProcessing/RobertaProcessing/BertProcessing stage would add a
+    // BOS/EOS the encoder here never emits. ByteLevel (a no-op for ids), Sequence-of-ByteLevel
+    // and absent/null are fine. (LFM2.5: ByteLevel, no automatic BOS; its chat template emits
+    // <|startoftext|> as text.)
+    if (root.contains("post_processor") && !root["post_processor"].is_null()) {
+        const std::string pp = root["post_processor"].value("type", "");
+        if (pp != "ByteLevel") {
+            throw std::runtime_error("Tokenizer: post_processor.type=\"" + pp +
+                                      "\" is not supported (only null/ByteLevel; it would add special tokens "
+                                      "encode() does not)");
+        }
     }
     const json& byte_level = pretoks[1];
     if (byte_level.value("type", "") != "ByteLevel") {
@@ -722,10 +752,10 @@ void validate_pretokenizer(const json& root, const Tokenizer::Options& options) 
     if (!root.contains("decoder") || root["decoder"].value("type", "") != "ByteLevel") {
         throw std::runtime_error("Tokenizer: expected decoder.type == \"ByteLevel\"");
     }
-    const json& decoder = root["decoder"];
-    if (decoder.value("add_prefix_space", false)) {
-        throw std::runtime_error("Tokenizer: decoder.add_prefix_space=true is not supported");
-    }
+    // decoder.add_prefix_space / trim_offsets / use_regex are inert for the ByteLevel *decoder* (the
+    // tokenizers crate's ByteLevel::decode only maps byte-chars back to bytes; the flags matter to the
+    // pre-tokenizer and to offsets). LFM2's tokenizer.json sets add_prefix_space=true here, so they
+    // are deliberately not checked; the pre-tokenizer's own flag is checked above.
 }
 
 // Throws unless tokenizer.json is exactly the Gemma-style shape documented above spm_encode_chunk.
@@ -899,6 +929,16 @@ void verify_split_dispatch(const std::string& trigger) {
                 "std::regex path). Check that kQwen35SplitTrigger still matches "
                 "vendor/llamacpp_unicode/unicode.cpp's dispatcher literal after any re-vendor.");
         }
+    } else if (trigger == kLlama3SplitTrigger) {
+        // \p{N}{1,3}: five digits split 3 + 2 (the Qwen patterns split every digit), and the Thai
+        // probe must split like Qwen2 (marks not absorbed).
+        const std::vector<std::string> digits = unicode_regex_split("12345", {trigger}, /*byte_encode=*/false);
+        if (digits.size() != 2 || digits[0] != "123" || digits[1] != "45" || parts.size() < 2) {
+            throw std::runtime_error(
+                "Tokenizer: split-dispatch self-check failed for the Llama-3 trigger -- "
+                "unicode_regex_split_custom_llama3() likely did not fire. Check that kLlama3SplitTrigger "
+                "still matches vendor/llamacpp_unicode/unicode.cpp's dispatcher literal after any re-vendor.");
+        }
     } else if (trigger == kQwen2SplitTrigger) {
         if (parts.size() < 2) {
             throw std::runtime_error(
@@ -946,7 +986,9 @@ Tokenizer::Impl load_impl(const std::string& tokenizer_json_path, const std::str
     if (!spm) {
         const std::string regex =
             root["pre_tokenizer"]["pretokenizers"][0]["pattern"]["Regex"].get<std::string>();
-        impl.split_trigger = (regex == kQwen2SplitExpected) ? kQwen2SplitTrigger : kQwen35SplitTrigger;
+        impl.split_trigger = (regex == kQwen2SplitExpected)   ? kQwen2SplitTrigger
+                             : (regex == kLlama3SplitExpected) ? kLlama3SplitTrigger
+                                                               : kQwen35SplitTrigger;
     }
 
     // Merge vocab: model.vocab is {token_text: id}; size the id_to_token table to the max id + 1

@@ -63,6 +63,7 @@ import importlib.util
 import json
 import math
 import os
+import re
 import struct
 import subprocess
 import sys
@@ -127,18 +128,26 @@ def module_list(layer_type: str, arch: ArchSpec = QWEN) -> list[str]:
     return arch.module_list(layer_type)
 
 
-def hf_name(layer: int, module: str) -> str:
-    return f"{LAYER_PREFIX}{layer}.{module}.weight"
+def hf_name(layer: int, module: str, arch: ArchSpec = QWEN) -> str:
+    return arch.hf_name(layer, module)   # LFM2: model.layers.N.<module>.weight (per-expert module names included)
 
 
 def parse_hf_name(name: str) -> tuple[int, str] | None:
-    """`model.language_model.layers.7.mlp.down_proj.weight` -> (7, 'mlp.down_proj')."""
-    if not (name.startswith(LAYER_PREFIX) and name.endswith(".weight")):
+    """`model.language_model.layers.7.mlp.down_proj.weight` -> (7, 'mlp.down_proj'); LFM2's
+    `model.layers.7.feed_forward.experts.12.w2.weight` -> (7, 'feed_forward.experts.*.w2') (the class collapses
+    the expert index, so the per-class summaries stay readable)."""
+    from arch_table import LFM2_PREFIX
+
+    prefix = next((p for p in (LAYER_PREFIX, LFM2_PREFIX) if name.startswith(p)), None)
+    if prefix is None or not name.endswith(".weight"):
         return None
-    head, _, rest = name[len(LAYER_PREFIX):].partition(".")
+    head, _, rest = name[len(prefix):].partition(".")
     if not head.isdigit():
         return None
-    return int(head), rest[: -len(".weight")]
+    rest = rest[: -len(".weight")]
+    if prefix == LFM2_PREFIX:
+        rest = re.sub(r"\bexperts\.\d+\.", "experts.*.", rest)
+    return int(head), rest
 
 
 def sha256_path(path: Path) -> str:
@@ -1319,6 +1328,15 @@ def allocate_ranked(tensors: list[dict], bpw: float, arch: ArchSpec, gaps: dict 
     for any arch, prior = gemma_mix without the oracle data (docs/gemma4-plan.md 11)."""
     if ranking not in ("auto", "exl3", "prior", "gemma"):
         raise ValueError(f"unknown ranking {ranking!r}")
+    if arch.is_lfm2 and ranking in ("auto", "prior", "lfm2"):
+        # docs/lfm2-plan.md 7.1: groups per layer role, K5 floor for the non-expert linears
+        import lfm2_mix
+
+        use_gaps = None if ranking == "prior" else gaps
+        rates, report = lfm2_mix.allocate(tensors, bpw, rate_floor, rate_next, use_gaps)
+        return rates, report, "lfm2-proxy" if use_gaps is not None else "lfm2-prior"
+    if ranking == "lfm2":
+        raise ValueError(f"--ranking lfm2 is the lfm2_moe ranking; arch is {arch.name}")
     use_gemma = ranking in ("prior", "gemma") or (ranking == "auto" and arch.is_gemma)
     if not use_gemma:
         return allocate(tensors, bpw), None, "exl3"
@@ -1338,31 +1356,27 @@ def model_linears(model_dir: Path, arch: ArchSpec | None = None) -> list[dict]:
     cfg = json.loads((Path(model_dir) / "config.json").read_text(encoding="utf-8"))
     tc = cfg.get("text_config", cfg)
     arch = resolve_arch(None, model_dir) if arch is None else arch
-    from common import ShardIndex
+    from common import ShardIndex, raw_safetensors_header
 
     sidx = ShardIndex.load(Path(model_dir))
     wm = sidx.weight_map
     if not wm:
         raise FileNotFoundError(f"{model_dir}: no model.safetensors.index.json / model.safetensors")
-    from safetensors import safe_open
 
     shapes: dict[str, list[int]] = {}
     by_shard: dict[str, list[str]] = {}
     out = []
-    for layer, lt in enumerate(tc["layer_types"]):
+    for layer, lt in enumerate(arch.layer_kinds(tc)):    # LFM2: conv_dense / conv_moe / full_attention_*
         for idx, mod in enumerate(module_list(lt, arch)):
-            name = hf_name(layer, mod)
+            name = hf_name(layer, mod, arch)
             by_shard.setdefault(wm[name], []).append(name)
             out.append({"name": name, "layer": layer, "idx": idx, "module": mod, "layer_type": lt,
                         "qgroup": arch.qgroups[mod]})
     for shard, names in by_shard.items():
-        if sidx.single_file is not None:  # header only, no whole-file mmap (g4-load-crash)
-            for nm in names:
-                shapes[nm] = list(sidx._hdr[0][nm]["shape"])
-            continue
-        with safe_open(str(Path(model_dir) / shard), framework="pt", device="cpu") as f:
-            for nm in names:
-                shapes[nm] = list(f.get_slice(nm).get_shape())
+        # header only: plain reads, no whole-file mmap of a multi-GB shard (g4-load-crash)
+        hdr = sidx._hdr if sidx.single_file is not None else raw_safetensors_header(Path(model_dir) / shard)
+        for nm in names:
+            shapes[nm] = list(hdr[0][nm]["shape"])
     for t in out:
         n, k = shapes[t["name"]]
         t.update({"n": n, "k": k, "numel": n * k})
@@ -1513,9 +1527,18 @@ def cmd_quantize_model(args) -> int:
     from common import ShardIndex, resolve_device, sha256_file  # noqa: E402
 
     out_dir = Path(args.out_dir)
-    model_dir = Path(args.model_dir)
-    hdir = Path(args.hessian_dir)
+    from arch_table import LFM2_MODEL_DIR
+
+    from common import DEFAULT_MODEL_DIR, MODELS_ROOT
+
+    model_dir = Path(args.model_dir or (LFM2_MODEL_DIR if args.arch == "lfm2_moe" else DEFAULT_MODEL_DIR))
     arch = resolve_arch(args.arch, model_dir)
+    if args.hessian_dir is None:
+        if arch.is_lfm2:
+            raise SystemExit("[trellis] --arch lfm2_moe needs --hessian-dir (hessian_capture.py --arch lfm2_moe "
+                             "--out-dir, docs/lfm2-plan.md 7.3: D:\\r4dx-scratch\\lfm2\\hessian-v1)")
+        args.hessian_dir = MODELS_ROOT / "r4dx" / "huihui" / "hessian-v2"
+    hdir = Path(args.hessian_dir)
     rot = None
     if args.rotation is not None:
         if not arch.is_gemma:
@@ -1548,7 +1571,7 @@ def cmd_quantize_model(args) -> int:
     job = {"model_dir": str(model_dir), "config_sha256": config_sha, "hessian_dir": str(hdir),
            "hessian_manifest_sha256": hman_sha, "hessian_basis": args.hessian_basis,
            "codebook": "mul1", "recipe": RECIPE, "code_sha256": code_sha256()}
-    if arch.is_gemma:  # a Qwen job keeps exactly its old fields: existing Qwen oracle directories stay resumable
+    if arch.is_gemma or arch.is_lfm2:  # a Qwen job keeps exactly its old fields: existing Qwen oracle dirs stay resumable
         job["arch"] = arch.name
     if rot is not None:
         job["rotation"] = rot.fingerprint()  # kind, seed, tensors_sha256: r4dx-convert checks it (CheckRotation)
@@ -1567,7 +1590,7 @@ def cmd_quantize_model(args) -> int:
         lt = next(t["layer_type"] for t in linears if t["layer"] == layer)
         rec_path = out_dir / f"L{layer:02d}.json"
         st_path = out_dir / f"L{layer:02d}.safetensors"
-        want_k = {hf_name(layer, m): rates[hf_name(layer, m)] for m in module_list(lt, arch)}
+        want_k = {hf_name(layer, m, arch): rates[hf_name(layer, m, arch)] for m in module_list(lt, arch)}
         if rec_path.exists() and st_path.exists():
             old = json.loads(rec_path.read_text(encoding="utf-8"))
             if (layer_record_usable(old, job, rates)
@@ -1577,7 +1600,7 @@ def cmd_quantize_model(args) -> int:
             print(f"[trellis] L{layer:02d}: existing output is for another job, code or rate; redoing",
                   flush=True)
         t_layer = time.perf_counter()
-        names = [hf_name(layer, m) for m in module_list(lt, arch)]
+        names = [hf_name(layer, m, arch) for m in module_list(lt, arch)]
         raw = get_tensors_grouped(index, names)
         tensors_out: dict[str, torch.Tensor] = {}
         records: dict[str, dict] = {}
@@ -1585,10 +1608,12 @@ def cmd_quantize_model(args) -> int:
             ckey = f"text.layers.{layer}.{arch.linears[mods[0]][0]}"
             hfile = hdir / keys[ckey]
             t0 = time.perf_counter()
-            names_g = [hf_name(layer, m) for m in mods]
+            names_g = [hf_name(layer, m, arch) for m in mods]
             weights = {n: raw[n] for n in names_g}
             H, rows = read_hess(hfile, device)
             hrec = {"file": hfile.name, "rows": rows, "key": ckey}
+            if arch.is_lfm2 and hfile.name in (hman.get("shrunk") or {}):   # a rare expert's shrunk Hessian
+                hrec["shrunk"] = hman["shrunk"][hfile.name]
             if rot is not None:
                 H, weights, hrec = rotate_group(rot, arch, index, layer, lt, mods, weights, H, hrec,
                                                 hdir, rms_keys, ckey, device)
@@ -1661,8 +1686,12 @@ def dry_run_quantize(args, arch: ArchSpec, rot, linears, rates, layers, keys, rm
     problems = []
     n_groups = 0
     kinds_seen = set()
+    k_of = {t["name"]: t["k"] for t in linears}
+    lt_of = {t["layer"]: t["layer_type"] for t in linears}
+    hman_shrunk = json.loads((hdir / "hessian.json").read_text(encoding="utf-8")).get("shrunk") or {}  # LFM2
     for layer in layers:
-        lt = next(t["layer_type"] for t in linears if t["layer"] == layer)
+        lt = lt_of[layer]
+        ex = {"groups": 0, "rows": [], "shrunk": 0, "ks": set()}   # LFM2: one summary line for the experts
         for tap, mods in _layer_groups(layer, lt, arch):
             ckey = f"text.layers.{layer}.{arch.linears[mods[0]][0]}"
             n_groups += 1
@@ -1670,7 +1699,7 @@ def dry_run_quantize(args, arch: ArchSpec, rot, linears, rates, layers, keys, rm
                 problems.append(f"hessian.json has no key {ckey}")
                 continue
             hfile = hdir / keys[ckey]
-            line = f"    L{layer:02d} {lt[:7]:<7} {tap:<7} {','.join(m.split('.')[-1][:-5] for m in mods):<10}"
+            line = f"    L{layer:02d} {lt[:7]:<7} {tap:<7} {','.join(re.sub(r'_proj$', '', m.split('.')[-1]) for m in mods):<10}"
             try:
                 with open(hfile, "rb") as f:
                     hdr = f.read(HESS_HEADER.size)
@@ -1679,9 +1708,14 @@ def dry_run_quantize(args, arch: ArchSpec, rot, linears, rates, layers, keys, rm
                 line += f" <- {hfile.name} K={k} rows={rows}{'' if ok else ' BAD MAGIC'}"
                 if not ok:
                     problems.append(f"{hfile}: bad magic")
-                want_k = next(t["k"] for t in linears if t["name"] == hf_name(layer, mods[0]))
+                want_k = k_of[hf_name(layer, mods[0], arch)]
                 if k != want_k:
-                    problems.append(f"{hfile}: K={k} but {hf_name(layer, mods[0])} has in_features {want_k}")
+                    problems.append(f"{hfile}: K={k} but {hf_name(layer, mods[0], arch)} has in_features {want_k}")
+                if arch.is_lfm2 and tap.startswith("E"):
+                    ex["groups"] += 1
+                    ex["rows"].append(rows)
+                    ex["ks"].add(k)
+                    ex["shrunk"] += hfile.name in hman_shrunk
             except OSError as e:
                 line += f" <- {hfile.name} MISSING ({e.strerror})"
                 problems.append(f"{hfile}: not readable")
@@ -1691,7 +1725,12 @@ def dry_run_quantize(args, arch: ArchSpec, rot, linears, rates, layers, keys, rm
                 kinds_seen.add("rms" if rk else "divide")
             elif rot is not None and rot.had_site(lt, mods[0]):
                 line += f"  H' = Hb^T H Hb ({rot.had_site(lt, mods[0])})"
-            print(line)
+            if not (arch.is_lfm2 and tap.startswith("E")):
+                print(line)
+        if ex["groups"]:
+            print(f"    L{layer:02d} {lt[:7]:<7} experts: {ex['groups']} Hessian group(s) (gate_up + down per "
+                  f"expert), K {sorted(ex['ks'])}, rows min {min(ex['rows'])} max {max(ex['rows'])}, "
+                  f"{ex['shrunk']} shrunk")
     print(f"[trellis] {n_groups} Hessian group(s); job key {json.dumps({k: job[k] for k in job if k not in ('recipe',)}, default=str)[:300]}")
     if problems:
         for p in problems[:20]:
@@ -1782,11 +1821,13 @@ def cmd_mix(args) -> int:
         print(f"[trellis] WARNING: the source directories were written by different trellis_quant.py / "
               f"trellis_viterbi.hip versions (recorded in the manifest): {code}", flush=True)
     arch = get_arch(base.get("arch"))
+    if arch.is_lfm2:   # the per-expert tables follow the checkpoint's expert count
+        arch = resolve_arch(arch.name, base["model_dir"])
     linears = model_linears(Path(base["model_dir"]), arch)
     gaps = None
     lo = min(srcs)
     hi = rate_next(lo)
-    if arch.is_gemma and args.ranking != "prior" and hi in srcs:
+    if (arch.is_gemma or arch.is_lfm2) and args.ranking != "prior" and hi in srcs:
         # the data term: the Hessian proxy the promotion lo -> hi removes, per tensor (docs/gemma4-plan.md 11)
         try:
             gaps = {t["name"]: srcs[lo]["tensors"][t["name"]]["proxy"] - srcs[hi]["tensors"][t["name"]]["proxy"]
@@ -1794,8 +1835,9 @@ def cmd_mix(args) -> int:
         except KeyError as e:
             raise SystemExit(f"[trellis] --ranking {args.ranking}: a source manifest lacks the proxy of {e}; "
                              f"use --ranking prior")
-    elif args.ranking == "gemma":
-        raise SystemExit(f"[trellis] --ranking gemma needs the K{lo:g} and K{hi:g} sources (arch gemma4_unified)")
+    elif args.ranking in ("gemma", "lfm2"):
+        raise SystemExit(f"[trellis] --ranking {args.ranking} needs the K{lo:g} and K{hi:g} sources "
+                         f"(arch {arch.name})")
     rates, report, ranking_used = allocate_ranked(linears, args.bpw, arch, gaps, args.ranking)
     need = sorted(set(rates.values()))
     lacking = [r for r in need if r not in srcs]
@@ -1819,6 +1861,10 @@ def cmd_mix(args) -> int:
            "allocation": {"rule": ("docs/trellis.md 9 (AL::create_q_strategy) with EXL3's qgroups (q/k/v, "
                                    "in_proj_qkv + in_proj_z, gate + up promoted as units; o/out/down "
                                    "alone), every priority 0") if ranking_used == "exl3" else
+                                  ("tools/reference/lfm2_mix.py: attention / ShortConv / dense linears at the K5 "
+                                   "floor, the experts' gate_up and down promoted per layer GROUP (all experts of a "
+                                   "layer together) by descending prior x oracle-proxy-gap score "
+                                   "(docs/lfm2-plan.md 7.1)") if ranking_used.startswith("lfm2") else
                                   ("tools/reference/gemma_mix.py: EXL3's budget and whole-group rule, groups "
                                    "promoted by descending prior x oracle-proxy-gap score (docs/gemma4-plan.md 11)"),
                           **({"ranking": ranking_used} if ranking_used != "exl3" else {}),
@@ -2055,10 +2101,16 @@ def main() -> int:
 
     p = sub.add_parser("quantize-model", help="quantize every decoder linear into an override dir")
     enc_args(p)
-    p.add_argument("--model-dir", type=Path, default=DEFAULT_MODEL_DIR)
-    p.add_argument("--arch", default="auto", choices=["auto", "qwen3_5", "gemma4_unified"],
+    p.add_argument("--model-dir", type=Path, default=None,
+                   help="the bf16 checkpoint (default: the Huihui-Qwen one of common.py; LFM2.5-24B-A2B with "
+                        "--arch lfm2_moe)")
+    p.add_argument("--arch", default="auto", choices=["auto", "qwen3_5", "gemma4_unified", "lfm2_moe"],
                    help="which family's linears / taps / container keys (tools/reference/arch_table.py); "
-                        "auto reads --model-dir's config.json model_type. gemma4_unified: q/k/v/o (no v on "
+                        "auto reads --model-dir's config.json model_type. lfm2_moe: attn q/k/v/o, ShortConv "
+                        "in_proj/out_proj, dense w1+w3 / w2 (layers 0-1), and PER EXPERT w1+w3 / w2 of the MoE "
+                        "layers (checkpoint keys experts.{e}.w{1,3,2}.weight; container keys "
+                        "text.layers.L.moe.experts.E.gate_up / .down, Hessians L{i}.E{e}.mlp_in / mlp_mid); "
+                        "unrotated; lm_head and the embedding stay bf16 here. gemma4_unified: q/k/v/o (no v on "
                         "the 8 full layers) + gate/up/down, hessian keys attn.q / attn.k / attn.v / attn.o / "
                         "mlp.gate_up / mlp.down; lm_head and the embedding stay bf16 (the converter's w4a16 "
                         "path takes lm_head)")
@@ -2072,7 +2124,8 @@ def main() -> int:
     p.add_argument("--dry-run", action="store_true",
                    help="CPU only, no encoder, no device: list the tap groups, the Hessian files they would "
                         "read (header check), the rates and the rotation fold, and exit")
-    p.add_argument("--hessian-dir", type=Path, default=MODELS_ROOT / "r4dx" / "huihui" / "hessian-v2")
+    p.add_argument("--hessian-dir", type=Path, default=None,
+                   help="hessian_capture.py's --out-dir (default: the Huihui hessian-v2; required for lfm2_moe)")
     p.add_argument("--out-dir", type=Path, required=True)
     g = p.add_mutually_exclusive_group(required=True)
     g.add_argument("--K", type=float, help="one rate for every linear (3.5, 4, 5, ...)")
@@ -2088,8 +2141,11 @@ def main() -> int:
     p.add_argument("--bpw", type=float, required=True)
     p.add_argument("--src", action="append", required=True, help="a finished --K directory (repeat)")
     p.add_argument("--out-dir", type=Path, required=True)
-    p.add_argument("--ranking", default="auto", choices=["auto", "exl3", "prior", "gemma"],
-                   help="which promotion order: auto = the arch's own (qwen3_5: EXL3's, unchanged; "
+    p.add_argument("--ranking", default="auto", choices=["auto", "exl3", "prior", "gemma", "lfm2"],
+                   help="which promotion order: auto = the arch's own (qwen3_5: EXL3's, unchanged; lfm2_moe: "
+                        "tools/reference/lfm2_mix.py, the expert groups scored by the K4-vs-K5 proxy gap times "
+                        "the layer priors, non-expert linears at K5 -- 'prior' drops the data term, 'lfm2' "
+                        "refuses to run without it; "
                         "gemma4_unified: tools/reference/gemma_mix.py, scored by the K4-vs-K5 oracle proxy gap "
                         "times position/kind priors); exl3 = EXL3's for any arch; prior = Gemma's priors only, "
                         "no oracle data; gemma = Gemma's, refuses to run without the proxy data")

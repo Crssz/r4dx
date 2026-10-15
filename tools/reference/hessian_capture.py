@@ -177,6 +177,7 @@ import struct
 import subprocess
 import sys
 import time
+import types
 import unicodedata
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -194,7 +195,7 @@ if str(TOOLS_REF) not in sys.path:
 # The architecture table (docs/gemma4-plan.md M1-25): which modules are tapped, which norm feeds them, how
 # the container names them. The module-level constants below are the Qwen3.5 entry (unchanged values);
 # every function takes `arch=` (default QWEN) so a Gemma 4 run uses arch_table.GEMMA.
-from arch_table import GEMMA, QWEN, ArchSpec  # noqa: E402
+from arch_table import GEMMA, LFM2, QWEN, ArchSpec, lfm2_expert_of  # noqa: E402,F401
 DEFAULT_CORPUS_DIR = TOOLS_REF / "kv_calib_corpus"
 DEFAULT_CALIB_TXT = TOOLS_REF / "calib.txt"
 from common import MODELS_ROOT  # noqa: E402  (stdlib-only module; no torch)
@@ -1449,6 +1450,10 @@ class CaptureState:
     seconds_per_file: dict[str, float] = field(default_factory=dict)
     layer_seconds: list[float] = field(default_factory=list)
     shared_gate: SharedInputGate = field(default_factory=SharedInputGate)
+    #: LFM2 routed experts (docs/lfm2-plan.md 7.3): layer -> the raw routed row count of every expert (a list of
+    #: n_experts ints), and file -> the shrinkage record of every expert file written as a shrunk Hessian.
+    expert_rows: dict[int, list] = field(default_factory=dict)
+    shrunk: dict[str, dict] = field(default_factory=dict)
     #: The weightless rms taps (RmsTapPlan): stats, the norm's eps, and the fp32 (1 + w) the norm
     #: module multiplies by (from the materialized layer), for evaluate_rms_gates.
     rms_written: dict[str, dict] = field(default_factory=dict)
@@ -1523,9 +1528,15 @@ def _write_accum(out_dir: Path, plan, acc: HessianAccum, st: CaptureState,
                  rms: bool = False) -> None:
     import torch
 
-    t0 = time.perf_counter()
     rows = acc.rows
-    h = acc.finalize_fp32()
+    _write_matrix(out_dir, plan, acc.finalize_fp32(), rows, st, rms)
+
+
+def _write_matrix(out_dir: Path, plan, h, rows: int, st: CaptureState, rms: bool = False) -> None:
+    """Write the finished fp32 mean Hessian `h` (a torch tensor, rows = what the header records)."""
+    import torch
+
+    t0 = time.perf_counter()
     on_device = h.is_cuda
     host = h.cpu().numpy()
     del h
@@ -1540,6 +1551,68 @@ def _write_accum(out_dir: Path, plan, acc: HessianAccum, st: CaptureState,
           f"trace={stats['trace']:.6g} min_diag={stats['min_diag']:.3e} "
           f"{stats['bytes'] / 2**20:8.1f} MiB {st.seconds_per_file[plan.file]:5.1f}s{warn}",
           flush=True)
+
+
+#: LFM2 pooled taps (docs/lfm2-plan.md 7.3): the layer's Hessian of ALL tokens entering the experts (mlp_in: every
+#: token once, N rows) and of every routed pair's expert activation (mlp_mid: N x top_k rows). Files
+#: L{i:02d}.pool.mlp_in.hess / L{i:02d}.pool.mlp_mid.hess, no container key: they exist for the shrinkage of rare
+#: experts (and are kept as the fallback prior).
+POOL_MODULES = {"in": "feed_forward.experts:pool_in", "mid": "feed_forward.experts:pool_mid"}
+
+
+def expert_plan_kind(p: "TapPlan"):
+    """('in' | 'mid', expert) for a routed-expert tap plan, ('pool_in' | 'pool_mid', None) for a pool, else None."""
+    for kind, mod in POOL_MODULES.items():
+        if p.module == mod:
+            return f"pool_{kind}", None
+    ex = lfm2_expert_of(p.module)
+    if ex is None:
+        return None
+    e, w = ex
+    return ("mid" if w == "w2" else "in"), e
+
+
+def _write_expert_layer(out_dir: Path, layer: int, layer_plans: list, accs: dict, taps, st: CaptureState,
+                        ref=None) -> None:
+    """End of an LFM2 MoE layer: record the raw routed rows of every expert, then write each expert file -- the
+    plain mean Hessian when it has >= 4 K routed rows, else the SHRUNK one (expert_shrink, toward the layer's
+    pooled Hessian; the header's `rows` is then the effective rows n_e + n_0 and st.shrunk records the raw count).
+    Written experts leave `accs`; the pools stay for the caller."""
+    from lfm2.capture import expert_row_gate, expert_shrink
+
+    st.expert_rows[layer] = list(taps.rows)
+    pool_h = {}
+    for p in layer_plans:
+        ek = expert_plan_kind(p)
+        if ek is not None and ek[0] in ("pool_in", "pool_mid") and p.file in accs:
+            a = accs[p.file]
+            if a.rows > 0:
+                pool_h[ek[0]] = a.acc / float(a.rows)
+    for p in layer_plans:
+        ek = expert_plan_kind(p)
+        if ek is None or ek[0].startswith("pool") or p.file not in accs:
+            continue
+        kind, e = ek
+        acc = accs.pop(p.file)
+        rows_e = acc.rows
+        gate = expert_row_gate(p.k)
+        if rows_e >= gate:
+            _write_accum(out_dir, p, acc, st)
+            continue
+        hp = pool_h.get(f"pool_{kind}")
+        if hp is None:
+            if rows_e == 0:
+                raise SystemExit(f"[hessian] {p.file}: expert {e} of layer {layer} got NO routed row and there is no "
+                                 f"pooled Hessian to fall back on (--keys excluded the pool?)")
+            _write_accum(out_dir, p, acc, st)   # no pool selected: the raw (short) Hessian, the rows gate reports it
+            continue
+        h, eff = expert_shrink(acc.acc, rows_e, hp, p.k)
+        st.shrunk[p.file] = {"rows_raw": rows_e, "n0": gate, "rows_effective": eff, "layer": layer, "expert": e,
+                             "kind": kind}
+        print(f"[hessian]   {p.file}: expert {e} has {rows_e} routed rows < {gate}: SHRUNK toward the layer's pooled "
+              f"Hessian (n0={gate}, effective rows {eff})", flush=True)
+        _write_matrix(out_dir, p, h, eff, st)
+        acc.acc = None
 
 
 def run_capture(ref, seqs: list[Seq], plans: list[TapPlan], specs, n_run: int, out_dir: Path,
@@ -1563,7 +1636,7 @@ def run_capture(ref, seqs: list[Seq], plans: list[TapPlan], specs, n_run: int, o
     gate_layers = {}
     if shared_gate:
         for t in arch.shared_gate:
-            if t in layer_types[:n_run]:
+            if t in layer_types[:n_run] and arch.shared_gate[t]:   # LFM2's conv_moe has nothing to compare
                 gate_layers[layer_types.index(t)] = t
     by_layer: dict[int, list[TapPlan]] = {}
     for p in plans:
@@ -1607,14 +1680,36 @@ def run_capture(ref, seqs: list[Seq], plans: list[TapPlan], specs, n_run: int, o
             layer = ref.build_layer(i)
             accs: dict[str, HessianAccum] = {}
             handles = []
+            ex_in: dict[int, HessianAccum] = {}     # LFM2 routed experts (not nn.Modules): see lfm2/capture.py
+            ex_mid: dict[int, HessianAccum] = {}
+            pools: dict[str, HessianAccum] = {}
             for p in by_layer.get(i, []):
                 acc = HessianAccum(p.k, dev)
                 accs[p.file] = acc
+                ek = expert_plan_kind(p) if arch.is_lfm2 else None
+                if ek is not None:
+                    kind, e = ek
+                    if kind == "in":
+                        ex_in[e] = acc
+                    elif kind == "mid":
+                        ex_mid[e] = acc
+                    else:
+                        pools[kind] = acc
+                    continue
                 mod = layer
                 for part in p.module.split("."):
                     mod = getattr(mod, part)
                 handles.append(mod.register_forward_pre_hook(
                     lambda _m, inputs, _acc=acc: _acc.update(inputs[0])))
+            taps = None
+            if ex_in or ex_mid or pools:
+                from lfm2.capture import ExpertTaps
+
+                taps = ExpertTaps(layer.feed_forward.experts, ex_in, ex_mid, pools.get("pool_in"),
+                                  pools.get("pool_mid"),
+                                  guard=lambda x, w, out, where: guard_linear(x, w, None, out, st, where),
+                                  where=f"L{i:02d}.experts").install()
+                handles.append(types.SimpleNamespace(remove=taps.remove))
             # The weightless rms taps: the norm's INPUT is the residual x; accumulate rms(x) with the
             # module's own eps, no weight (the scale it would apply is recorded for the gates).
             rms_accs: dict[str, HessianAccum] = {}
@@ -1650,8 +1745,11 @@ def run_capture(ref, seqs: list[Seq], plans: list[TapPlan], specs, n_run: int, o
             t_fwd = time.perf_counter() - t_layer
             print(f"[hessian] layer {i:>2}/{n_run} ({layer_types[i]}): forward+accumulate "
                   f"{t_fwd:.1f}s, writing {len(accs) + len(rms_accs)} tap(s)", flush=True)
+            if taps is not None:
+                _write_expert_layer(out_dir, i, by_layer.get(i, []), accs, taps, st, ref)
             for p in by_layer.get(i, []):
-                _write_accum(out_dir, p, accs.pop(p.file), st)
+                if p.file in accs:
+                    _write_accum(out_dir, p, accs.pop(p.file), st)
             for rp in rms_by_layer.get(i, []):
                 _write_accum(out_dir, rp, rms_accs.pop(rp.file), st, rms=True)
             st.layer_seconds.append(time.perf_counter() - t_layer)
@@ -1748,14 +1846,14 @@ def norm_weight_name(scope: str, layer: int | None, module: str, arch: ArchSpec 
     """HF name of the norm whose output a tap's representative module reads, or None for taps not fed
     by a norm (out_proj / o_proj / down_proj inputs)."""
     if scope == "lm_head":
-        return "model.language_model.norm.weight"
+        return "model.embedding_norm.weight" if arch.is_lfm2 else "model.language_model.norm.weight"
     if scope == "mtp":
         if module == "mtp:norm_out":
             return "mtp.norm.weight"
         n = arch.norm_before.get(module.split(":", 1)[1])
         return f"mtp.layers.0.{n}.weight" if n else None
     n = arch.norm_before.get(module)
-    return f"model.language_model.layers.{layer}.{n}.weight" if n else None
+    return f"{arch.layer_prefix}{layer}.{n}.weight" if n else None
 
 
 def structural_zero_channels(model_dir: Path, taps: dict[str, tuple],
@@ -1768,12 +1866,15 @@ def structural_zero_channels(model_dir: Path, taps: dict[str, tuple],
 
     index = ShardIndex.load(model_dir)
     out: dict[str, list[int]] = {}
+    zero_cache: dict[str, list[int]] = {}   # LFM2: ~130 expert taps per layer read the same ffn_norm vector
     for f, (scope, layer, module) in taps.items():
         name = norm_weight_name(scope, layer, module, arch)
         if name is None:
             continue
-        w = index.get_tensor(name).to(torch.float32)
-        out[f] = torch.nonzero(arch.norm_offset + w == 0.0).flatten().tolist()
+        if name not in zero_cache:
+            w = index.get_tensor(name).to(torch.float32)
+            zero_cache[name] = torch.nonzero(arch.norm_offset + w == 0.0).flatten().tolist()
+        out[f] = zero_cache[name]
     return out
 
 
@@ -1897,6 +1998,49 @@ def evaluate_gates(audit: dict, all_keys: list[str], plans: list[TapPlan], st: C
     gates["ok"] = all(gates[g] for g in ("converter_audit_ok", "keys_selected_ok", "k_ok",
                                          "finite_ok", "min_diag_ok", "rows_ok", "shared_input_ok"))
     return gates
+
+
+#: LFM2: the largest fraction of (layer, expert, linear) Hessians allowed to fall below the 4 x K routed-rows gate
+#: (they are shrunk toward the pooled Hessian, docs/lfm2-plan.md 7.3; above this the calibration set is too thin and
+#: the stage fails -- generate targeted text for the weakest experts instead).
+MAX_SHORT_EXPERT_FRAC = 0.02
+
+
+def evaluate_expert_rows(st: CaptureState, plans: list, max_short_frac: float = MAX_SHORT_EXPERT_FRAC) -> dict:
+    """LFM2 routed-experts row-count gate (CPU; over what the capture recorded): every written expert file's RAW
+    routed rows against 4 x K. `expert_rows_ok` is the fraction of short files <= max_short_frac."""
+    short, total = [], 0
+    per_layer: dict[int, dict] = {}
+    for p in plans:
+        ek = expert_plan_kind(p)
+        if ek is None or ek[0].startswith("pool") or p.file not in st.written:
+            continue
+        total += 1
+        rows = st.expert_rows[p.layer][ek[1]]
+        gate = ROWS_PER_K_MIN * p.k
+        if rows < gate:
+            short.append((p.file, rows, gate))
+    for layer, rows in sorted(st.expert_rows.items()):
+        per_layer[layer] = {"min": min(rows), "max": max(rows), "mean": sum(rows) / len(rows),
+                            "zero": sum(1 for r in rows if r == 0)}
+    frac = len(short) / total if total else 0.0
+    return {"expert_rows_ok": frac <= max_short_frac, "expert_rows": {
+        "max_short_frac": max_short_frac, "short_frac": frac, "n_short": len(short), "n_total": total,
+        "short": short[:64], "per_layer": per_layer,
+        "rule": "raw routed rows per expert linear >= 4 K (gate_up K = hidden, down K = moe_intermediate); shorter "
+                "ones are shrunk toward the layer's pooled Hessian (n0 = 4 K)"}}
+
+
+def print_expert_rows(g: dict) -> None:
+    er = g["expert_rows"]
+    print(f"[gate] LFM2 expert rows: {'PASS' if g['expert_rows_ok'] else 'FAIL'} -- {er['n_short']} of "
+          f"{er['n_total']} expert Hessians below 4 K routed rows ({100 * er['short_frac']:.2f} %, allowed "
+          f"{100 * er['max_short_frac']:.2f} %); shrunk toward the pooled Hessian")
+    for layer, v in er["per_layer"].items():
+        print(f"[gate]   L{layer:02d} routed rows/expert: min {v['min']} mean {v['mean']:.0f} max {v['max']} "
+              f"({v['zero']} with none)")
+    for f, r, need in er["short"][:12]:
+        print(f"[gate]   short: {f}: rows={r} < {need}")
 
 
 def print_gates(g: dict) -> None:
@@ -2086,7 +2230,7 @@ def regate(out_dir: Path, model_dir: Path | None) -> int:
 
     arch = get_arch(doc.get("arch"))  # a Qwen manifest records no "arch"; Gemma's says gemma4_unified
     if model_dir is None:
-        model_dir = Path(doc["model_dir"]) if arch.is_gemma else DEFAULT_MODEL_DIR
+        model_dir = Path(doc["model_dir"]) if (arch.is_gemma or arch.is_lfm2) else DEFAULT_MODEL_DIR
     structural = structural_zero_channels(model_dir, taps, arch)
     act_dead = activation_dead_channels(out_dir, [f for f in doc["files"] if f in taps], arch)
     structural = merge_exempt(structural, act_dead)
@@ -2094,7 +2238,8 @@ def regate(out_dir: Path, model_dir: Path | None) -> int:
     gates.pop("nonpositive_diag_files", None)
     gates.update(diag_gate(nonpos, structural))
     gates["ok"] = all(gates[g] for g in ("converter_audit_ok", "keys_selected_ok", "k_ok",
-                                         "finite_ok", "min_diag_ok", "rows_ok", "shared_input_ok"))
+                                         "finite_ok", "min_diag_ok", "rows_ok", "shared_input_ok")
+                      + (("expert_rows_ok",) if "expert_rows_ok" in gates else ()))
     print_gates(gates)
     if not gates["ok"]:
         print("[hessian] --regate: still failing; hessian.failed.json left as is")
@@ -2264,13 +2409,14 @@ def build_corpus_for(args, arch: ArchSpec, tokenizer) -> tuple[list[Seq], list[d
     """The calibration corpus of `arch`: Qwen's is build_corpus (text sources tokenized with the
     RefTokenizer); Gemma's is the token-id JSONL of tools/reference/gemma/gen_samples.py (--gen-file,
     docs/gemma4-plan.md 4.6 / M0-9), one sequence per non-rejected sample."""
-    if not arch.is_gemma:
+    if not (arch.is_gemma or arch.is_lfm2):
         return build_corpus(args, tokenizer)
     from gemma.capture import build_tokens_corpus
 
     if getattr(args, "gen_file", None) is None or str(args.gen_file).lower() == "none":
-        raise SystemExit("[hessian] --arch gemma4_unified: the corpus is gen_samples.py's token-id JSONL "
-                         "(tools/reference/gemma/gen_samples.py --out samples.jsonl): pass it as --gen-file")
+        gen = ("tools/reference/lfm2/gen_samples.py" if arch.is_lfm2 else "tools/reference/gemma/gen_samples.py")
+        raise SystemExit(f"[hessian] --arch {arch.name}: the corpus is gen_samples.py's token-id JSONL "
+                         f"({gen} --out samples.jsonl): pass it as --gen-file")
     return build_tokens_corpus(Path(args.gen_file), args.seq_len, getattr(args, "gen_max_seqs", None))
 
 
@@ -2279,6 +2425,10 @@ def make_reference(arch: ArchSpec, model_dir: Path, device):
     GemmaCaptureRef adapter (over gemma.ref.GemmaReference) for Gemma 4."""
     import torch
 
+    if arch.is_lfm2:
+        from lfm2.capture import Lfm2CaptureRef
+
+        return Lfm2CaptureRef(model_dir, device, dtype=torch.bfloat16)
     if arch.is_gemma:
         from gemma.capture import GemmaCaptureRef
 
@@ -2294,6 +2444,77 @@ def _pick_hidden_device(args, device, hidden_bytes: int):
     if args.hidden_device == "auto":
         return device if hidden_bytes <= 6 * 2**30 else torch.device("cpu")
     return device if args.hidden_device == "cuda" else torch.device("cpu")
+
+
+def print_lfm2_plan(plans: list, predicted_rows: dict, estimate: int) -> None:
+    """--dry-run of --arch lfm2_moe: the tap groups (one line per layer for the routed experts and their pools,
+    one per file for the rest), the files and their size in GiB, grouped by what they are."""
+    cat_bytes: dict[str, int] = {}
+    cat_files: dict[str, int] = {}
+
+    def add(cat: str, p) -> None:
+        cat_bytes[cat] = cat_bytes.get(cat, 0) + hess_file_bytes(p.k)
+        cat_files[cat] = cat_files.get(cat, 0) + 1
+
+    by_layer: dict[int, dict] = {}
+    for p in plans:
+        ek = expert_plan_kind(p) if p.scope == "layer" else None
+        if ek is None:
+            add("lm_head" if p.scope == "lm_head" else "dense/mixer taps", p)
+            print(f"    {p.file:<22} K={p.k:>5} rows~{predicted_rows[p.file]:>8} "
+                  f"{hess_file_bytes(p.k) / 2**20:8.1f} MiB  {','.join(p.keys)}")
+            continue
+        kind = ek[0]
+        add("pooled" if kind.startswith("pool") else f"experts ({kind})", p)
+        g = by_layer.setdefault(p.layer, {"in": [], "mid": [], "pool_in": [], "pool_mid": []})
+        g[kind].append(p)
+    for layer, g in sorted(by_layer.items()):
+        for kind in ("in", "mid"):
+            ps = g[kind]
+            if ps:
+                e_lo, e_hi = expert_plan_kind(ps[0])[1], expert_plan_kind(ps[-1])[1]
+                print(f"    L{layer:02d}.E{e_lo:02d}..E{e_hi:02d}.mlp_{kind}.hess  x{len(ps)} K={ps[0].k:>5} "
+                      f"rows~{predicted_rows[ps[0].file]:>7} (average expert) "
+                      f"{hess_file_bytes(ps[0].k) / 2**20:7.1f} MiB each, {len(ps) * hess_file_bytes(ps[0].k) / 2**30:.2f} GiB; "
+                      f"keys text.layers.{layer}.moe.experts.<e>.{'gate_up' if kind == 'in' else 'down'}")
+        for kind in ("pool_in", "pool_mid"):
+            for p in g[kind]:
+                print(f"    {p.file:<22} K={p.k:>5} rows~{predicted_rows[p.file]:>8} "
+                      f"{hess_file_bytes(p.k) / 2**20:8.1f} MiB  (pooled, no container key)")
+    print("[hessian] LFM2 tap groups and sizes (packed upper triangle, fp32):")
+    for cat in sorted(cat_bytes):
+        print(f"    {cat:<20} {cat_files[cat]:>6} file(s)  {cat_bytes[cat] / 2**30:8.2f} GiB")
+    print(f"    {'TOTAL':<20} {sum(cat_files.values()):>6} file(s)  {sum(cat_bytes.values()) / 2**30:8.2f} GiB "
+          f"(estimate incl. manifest {estimate / 2**30:.2f} GiB)")
+
+
+def rows_report(out_dir: Path, max_short_frac: float | None) -> int:
+    """--rows-report (CPU): the routed rows per expert recorded by an LFM2 capture, per layer, and the experts under
+    the 4 x K gate -- run before ANY oracle stage (docs/lfm2-plan.md 7.3)."""
+    path = out_dir / MANIFEST_NAME
+    if not path.is_file():
+        path = out_dir / FAILED_MANIFEST_NAME
+    if not path.is_file():
+        raise SystemExit(f"[hessian] --rows-report: no {MANIFEST_NAME} / {FAILED_MANIFEST_NAME} in {out_dir}")
+    doc = json.loads(path.read_text(encoding="utf-8"))
+    if "expert_rows" not in doc:
+        raise SystemExit(f"[hessian] --rows-report: {path} records no expert_rows (not an lfm2_moe capture)")
+    ks = doc["expert_row_gate_k"]
+    short = 0
+    total = 0
+    for layer, rows in sorted(doc["expert_rows"].items(), key=lambda kv: int(kv[0])):
+        n_short = sum(1 for r in rows if r < 4 * ks["in"] or r < 4 * ks["mid"])
+        short += sum((r < 4 * ks["in"]) + (r < 4 * ks["mid"]) for r in rows)
+        total += 2 * len(rows)
+        order = sorted(range(len(rows)), key=lambda e: rows[e])[:4]
+        print(f"[rows] L{int(layer):02d}: min {min(rows)} mean {sum(rows) / len(rows):.0f} max {max(rows)}; "
+              f"{n_short}/{len(rows)} expert(s) under the gate (in < {4 * ks['in']} / mid < {4 * ks['mid']}); "
+              f"rarest: {[(e, rows[e]) for e in order]}")
+    frac = short / total if total else 0.0
+    limit = MAX_SHORT_EXPERT_FRAC if max_short_frac is None else max_short_frac
+    print(f"[rows] {short} of {total} expert Hessians are under their gate ({100 * frac:.2f} %, limit "
+          f"{100 * limit:.2f} %): {'PASS' if frac <= limit else 'FAIL'}; shrunk files: {len(doc.get('shrunk', {}))}")
+    return 0 if frac <= limit else 1
 
 
 def run_rms_only(args) -> int:
@@ -2507,8 +2728,15 @@ def main() -> int:
     ap.add_argument("--model-dir", type=Path, default=None,
                     help="checkpoint (default: common.DEFAULT_MODEL_DIR; the Huihui Gemma directory "
                          "with --arch gemma4_unified)")
-    ap.add_argument("--arch", default="auto", choices=["auto", "qwen3_5", "gemma4_unified"],
-                    help="which family's taps and corpus (tools/reference/arch_table.py). auto: read "
+    ap.add_argument("--arch", default="auto", choices=["auto", "qwen3_5", "gemma4_unified", "lfm2_moe"],
+                    help="which family's taps and corpus (tools/reference/arch_table.py). lfm2_moe: taps "
+                         "in (operator_norm output: q/k/v or conv.in_proj) / out / mlp_in (ffn_norm output) / mlp_mid "
+                         "for the dense layers 0-1; on MoE layers one pair PER EXPERT "
+                         "L{i}.E{e}.mlp_in / mlp_mid over the tokens routed to expert e, a pooled pair "
+                         "L{i}.pool.mlp_in / mlp_mid over all tokens entering the experts, per-expert row "
+                         "counts in hessian.json, shrinkage of experts under 4 K rows; lm_head = the "
+                         "post-embedding_norm hidden (tied head); the corpus is --gen-file's token-id JSONL "
+                         "(tools/reference/lfm2/gen_samples.py). auto: read "
                          "--model-dir's config.json model_type (--rms-only / --regate: the set's own "
                          "manifest). gemma4_unified: taps q/k/v (+ no v on the 8 full layers) / o / "
                          "mlp_in = pre_feedforward_layernorm / down / lm_head (post-final-norm, before "
@@ -2554,6 +2782,18 @@ def main() -> int:
                     help="where the inter-layer hidden states live (auto: device if <= 6 GiB)")
     ap.add_argument("--dry-run", action="store_true",
                     help="print corpus sizes, the file list and the disk estimate; no GPU")
+    ap.add_argument("--device", choices=["cuda", "cpu"], default="cuda",
+                    help="cuda (default; HIP_VISIBLE_DEVICES must be '1') or cpu (tests on a tiny checkpoint; "
+                         "far too slow for a real capture)")
+    ap.add_argument("--assume-tokens", type=int, default=1_500_000, metavar="N",
+                    help="lfm2_moe --dry-run without --gen-file: the corpus size the row predictions assume")
+    ap.add_argument("--max-short-expert-frac", type=float, default=None, metavar="F",
+                    help="lfm2_moe: the largest fraction of expert Hessians allowed under 4 K routed rows before "
+                         f"the gate fails (default {MAX_SHORT_EXPERT_FRAC}; docs/lfm2-plan.md 7.3)")
+    ap.add_argument("--rows-report", action="store_true",
+                    help="lfm2_moe, CPU only: print the per-layer routed-row counts recorded in --out-dir's "
+                         "hessian.json (or hessian.failed.json) and the experts under the gate; run it BEFORE any "
+                         "oracle stage")
     ap.add_argument("--rms-taps", action="store_true",
                     help="also capture the weightless rms taps L{i}.in.rms.hess / L{i}.mlp_in.rms.hess "
                          "(rms(x) of each text layer's input_layernorm / post_attention_layernorm "
@@ -2582,8 +2822,10 @@ def main() -> int:
 
     # The GPU rule, before anything expensive (common.resolve_device re-checks it). --dry-run never
     # touches the GPU, so it is exempt.
+    if args.rows_report:
+        return rows_report(args.out_dir, args.max_short_expert_frac)
     visible = os.environ.get("HIP_VISIBLE_DEVICES")
-    if not args.dry_run and visible != "1":
+    if not args.dry_run and visible != "1" and args.device != "cpu":
         raise SystemExit(
             "[hessian] refusing to run: $env:HIP_VISIBLE_DEVICES must be exactly '1' (only HIP "
             f"device 1, the headless R9700, may be used). Got {visible!r}. (--dry-run needs no GPU.)"
@@ -2601,17 +2843,26 @@ def main() -> int:
         from gemma.common_gemma import DEFAULT_MODEL_DIR as GEMMA_MODEL_DIR
 
         args.model_dir = GEMMA_MODEL_DIR
+    if args.model_dir is None and args.arch == "lfm2_moe":
+        from arch_table import LFM2_MODEL_DIR
+
+        args.model_dir = LFM2_MODEL_DIR
     model_dir = args.model_dir or DEFAULT_MODEL_DIR
     arch = resolve_arch(args.arch, model_dir)
-    if arch.is_gemma and args.tokenizer is not None:
-        raise SystemExit("[hessian] --tokenizer does not apply to --arch gemma4_unified (the corpus is "
+    token_corpus = arch.is_gemma or arch.is_lfm2   # the corpus is gen_samples.py's token ids, no tokenizer
+    if token_corpus and args.tokenizer is not None:
+        raise SystemExit(f"[hessian] --tokenizer does not apply to --arch {arch.name} (the corpus is "
                          "token ids from gen_samples.py)")
+    if arch.is_lfm2 and (args.rms_taps or args.rms_only):
+        raise SystemExit("[hessian] --rms-taps / --rms-only: not for lfm2_moe (unrotated trellis, plan 7.1)")
 
-    audit = audit_converter_source(arch.converter_source() if arch.is_gemma else CONVERTER_MAIN,
+    audit = audit_converter_source(arch.converter_source() if token_corpus else CONVERTER_MAIN,
                                    arch=arch.converter_arch)
     print(f"[hessian] arch {arch.name}: converter audit ({audit['path']}): "
           f"text={len(audit['found']['text'])} mtp={len(audit['found']['mtp'])} add_linear shapes, "
-          f"direct PlanLinearLayouts={audit['direct_plan_linear_layouts']}")
+          f"direct PlanLinearLayouts={audit['direct_plan_linear_layouts']}"
+          f"{' SKIPPED: ' + audit['skipped'] if audit.get('skipped') else ''}"
+          f"{' WARNING missing container stems ' + str(audit['warnings']) if audit.get('warnings') else ''}")
     for kind in ("missing", "unexpected", "mismatched"):
         if audit[kind]:
             print(f"[hessian] converter audit {kind.upper()}: {audit[kind]}")
@@ -2619,7 +2870,7 @@ def main() -> int:
         raise SystemExit(f"[hessian] {audit['path']}'s add_linear set no longer matches "
                          "imatrix_capture.enumerate_quantized_linears() -- update it first")
 
-    if arch.is_gemma:
+    if token_corpus:
         tokenizer = _tokens_corpus_tokenizer()
         print(f"[hessian] corpus tokenizer: {tokenizer.describe()}")
     else:
@@ -2628,11 +2879,17 @@ def main() -> int:
         tokenizer = load_ref_tokenizer(model_dir, args.tokenizer or DEFAULT_TOKENIZER_MODE)
         print(f"[hessian] tokenizer: {tokenizer.mode} ({tokenizer.describe()})")
     t0 = time.perf_counter()
-    seqs, sources = build_corpus_for(args, arch, tokenizer)
-    total_tokens = sum(len(s.token_ids) for s in seqs)
-    print(f"[hessian] corpus: {len(seqs)} sequences, {total_tokens} tokens "
-          f"({time.perf_counter() - t0:.1f}s to {'load' if arch.is_gemma else 'tokenize'})")
-    print_corpus_sources(sources)
+    if arch.is_lfm2 and args.dry_run and args.gen_file is None:
+        # The plan's dry-run of the REAL config needs no samples: predicted routed rows use --assume-tokens.
+        seqs, sources, total_tokens = [], [], int(args.assume_tokens)
+        print(f"[hessian] --dry-run without --gen-file: no corpus loaded, row predictions assume "
+              f"{total_tokens} tokens (--assume-tokens; the plan's target is 1.5 M)")
+    else:
+        seqs, sources = build_corpus_for(args, arch, tokenizer)
+        total_tokens = sum(len(s.token_ids) for s in seqs)
+        print(f"[hessian] corpus: {len(seqs)} sequences, {total_tokens} tokens "
+              f"({time.perf_counter() - t0:.1f}s to {'load' if token_corpus else 'tokenize'})")
+        print_corpus_sources(sources)
 
     text_config = text_config_view(arch, model_dir)
     n_layers = int(text_config.num_hidden_layers)
@@ -2664,6 +2921,26 @@ def main() -> int:
                          "L{i}.mlp_in)")
     # MTP taps carry T-1 rows per sequence (MtpTaps pairs row i with token i+1), all others T.
     predicted_rows = {p.file: total_tokens - (len(seqs) if p.scope == "mtp" else 0) for p in plans}
+    if arch.is_lfm2:
+        # routed experts: an AVERAGE expert sees N x top_k / n_experts rows (real routing is skewed: the capture
+        # records the real counts); the pools see every token (mlp_in) / every routed pair (mlp_mid)
+        top_k, n_exp = int(text_config.num_experts_per_tok), int(text_config.num_experts)
+        for p in plans:
+            if expert_plan_kind(p) is not None:
+                predicted_rows[p.file] = total_tokens * top_k // n_exp
+        pool_plans = []
+        k_of: dict[tuple, int] = {}      # (layer, 'in' | 'mid') -> K of that layer's expert taps
+        for p in plans:
+            ek = expert_plan_kind(p)
+            if ek is not None:
+                k_of[(p.layer, ek[0])] = p.k
+        for (layer, kind), k in sorted(k_of.items()):
+            pf = f"L{layer:02d}.pool.mlp_{kind}.hess"
+            pool_plans.append(TapPlan(pf, "layer", layer, POOL_MODULES[kind], k, [],
+                                      "pooled: every token entering the experts (mlp_in) / every routed pair's "
+                                      "expert activation (mlp_mid)"))
+            predicted_rows[pf] = total_tokens * (1 if kind == "in" else top_k)
+        plans = plans + pool_plans
     estimate = (sum(hess_file_bytes(p.k) for p in plans) +
                 sum(hess_file_bytes(rp.k) for rp in rms_plans) + (1 << 20))
 
@@ -2673,7 +2950,9 @@ def main() -> int:
           f"{f'; + {len(rms_plans)} weightless rms tap(s)' if rms_plans else ''}")
     short = [(p.file, predicted_rows[p.file], ROWS_PER_K_MIN * p.k) for p in plans
              if predicted_rows[p.file] < ROWS_PER_K_MIN * p.k]
-    if args.dry_run:
+    if args.dry_run and arch.is_lfm2:
+        print_lfm2_plan(plans, predicted_rows, estimate)
+    elif args.dry_run:
         for p in plans:
             print(f"    {p.file:<22} K={p.k:>5} rows~{predicted_rows[p.file]:>7} "
                   f"{hess_file_bytes(p.k) / 2**20:8.1f} MiB  {','.join(p.keys)}")
@@ -2724,7 +3003,8 @@ def main() -> int:
     import transformers
     from common import resolve_device
 
-    device = resolve_device("cuda")
+    device = resolve_device(args.device)
+    on_cuda = device.type == "cuda"
     torch.backends.cuda.matmul.allow_tf32 = False
     torch.set_float32_matmul_precision("highest")
     hidden_bytes = total_tokens * int(text_config.hidden_size) * 2
@@ -2739,26 +3019,34 @@ def main() -> int:
         print(f"[hessian] WARNING --layers {n_run}: SMOKE RUN -- lm_head/MTP taps see layer "
               f"{n_run - 1}'s output, not the stack's; this set is NOT a valid Hessian set")
 
-    torch.cuda.reset_peak_memory_stats()
+    if on_cuda:
+        torch.cuda.reset_peak_memory_stats()
     t_start = time.perf_counter()
     st = run_capture(ref, seqs, plans, specs, n_run, args.out_dir, hidden_device,
                      args.draft_head, rms_plans=rms_plans, arch=arch)
     seconds = time.perf_counter() - t_start
-    peak = torch.cuda.max_memory_allocated() / 2**30
-    reserved = torch.cuda.max_memory_reserved() / 2**30
+    peak = torch.cuda.max_memory_allocated() / 2**30 if on_cuda else 0.0
+    reserved = torch.cuda.max_memory_reserved() / 2**30 if on_cuda else 0.0
     print(f"[hessian] capture done: {seconds:.1f}s, peak VRAM {peak:.3f} GiB allocated / "
           f"{reserved:.3f} GiB reserved")
 
     # The first layer of each type, over the WHOLE stack: a --layers smoke that stops before the
     # first attention layer reports the shared-input check as incomplete.
-    shared_expected = [ref.layer_types.index(t) for t in arch.shared_gate if t in ref.layer_types]
+    shared_expected = [ref.layer_types.index(t) for t in arch.shared_gate
+                       if t in ref.layer_types and arch.shared_gate[t]]
     structural = structural_zero_channels(model_dir, {p.file: (p.scope, p.layer, p.module)
                                                       for p in plans if p.file in st.written}, arch)
     act_dead = activation_dead_channels(args.out_dir, [p.file for p in plans if p.file in st.written], arch)
     structural = merge_exempt(structural, act_dead)
     gates = evaluate_gates(audit, all_keys, plans, st, selected_keys, shared_expected, structural)
     gates["activation_dead_channels"] = act_dead
+    if arch.is_lfm2:
+        gates.update(evaluate_expert_rows(st, plans, MAX_SHORT_EXPERT_FRAC if args.max_short_expert_frac is None
+                                          else args.max_short_expert_frac))
+        gates["ok"] = bool(gates["ok"] and gates["expert_rows_ok"])
     print_gates(gates)
+    if arch.is_lfm2:
+        print_expert_rows(gates)
 
     files = {f: w for f, w in st.written.items()}
     # A --layers smoke run still captures lm_head/MTP (the code path is exercised), but from layer
@@ -2818,6 +3106,22 @@ def main() -> int:
                                "pre_feedforward_layernorm's output (up_proj shares it), mlp_mid = down_proj "
                                "input, lm_head = the post-final-norm hidden before the softcap (tied head). "
                                "Norm scale is w (plain), not 1 + w.")
+    if arch.is_lfm2:
+        extra["arch"] = arch.name
+        extra["arch_notes"] = ("lfm2_moe taps (tools/reference/arch_table.py): in = operator_norm's output (q/k/v or "
+                               "conv.in_proj), out = out_proj / conv.out_proj input, mlp_in = ffn_norm's output "
+                               "(dense w1/w3; on MoE layers PER EXPERT e: L{i}.E{e}.mlp_in over the tokens ROUTED to "
+                               "e, serving moe.experts.{e}.gate_up), mlp_mid = silu(w1 x) * w3 x (dense w2 input; "
+                               "L{i}.E{e}.mlp_mid over the routed tokens, serving moe.experts.{e}.down), "
+                               "L{i}.pool.mlp_in / pool.mlp_mid = every token entering the experts / every routed "
+                               "pair's activation (no container key), lm_head = post-embedding_norm hidden (tied "
+                               "head). Norm scale is w (plain). An expert under 4 x K routed rows has a SHRUNK "
+                               "Hessian (n_e H_e + n0 H_pool) / (n_e + n0), n0 = 4 K, header rows = n_e + n0; "
+                               "`shrunk` has the raw counts, `expert_rows` the raw routed rows per layer and expert.")
+        extra["expert_rows"] = {str(layer): rows for layer, rows in sorted(st.expert_rows.items())}
+        extra["expert_row_gate_k"] = {"in": int(text_config.hidden_size), "mid": int(text_config.moe_intermediate_size)}
+        extra["shrunk"] = dict(sorted(st.shrunk.items()))
+        extra["rows_per_k_min_experts"] = ROWS_PER_K_MIN
     # --rms-taps: the rms files enter the manifest ("files", "rms_keys", "rms_capture") only if their
     # own gates pass -- whichever manifest name the post-norm gates choose, so --regate keeps them.
     # Otherwise the post-norm set is written without them and the rms report goes to

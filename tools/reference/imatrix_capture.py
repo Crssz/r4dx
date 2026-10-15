@@ -163,6 +163,42 @@ def enumerate_gemma_linears(text_config, do_mtp: bool = False, do_draft_head: bo
     return specs
 
 
+def enumerate_lfm2_linears(text_config, do_mtp: bool = False, do_draft_head: bool = False) -> list[LinearSpec]:
+    """The LFM2 (lfm2_moe) counterpart, in converter order (docs/lfm2-plan.md 4, 7.1; the container names of
+    arch_table.LFM2): attention layers attn.q / attn.k / attn.v / attn.o (HF q/k/v/out_proj), ShortConv layers
+    conv.in_proj / conv.out_proj, the dense FFN (layers < num_dense_layers) mlp.gate_up = [w1; w3] / mlp.down = w2,
+    the MoE FFN one `moe.experts.{e}.gate_up` = [experts.e.w1; experts.e.w3] and `.down` = experts.e.w2 PER EXPERT,
+    then the tied `lm_head` (the embedding table, fed by the post-embedding_norm hidden). The router, expert_bias,
+    conv.conv.weight and every norm are never quantized. The taps keep the HF module names, so
+    hessian_capture's table (arch_table.LFM2) maps them: the expert taps are the ROUTED tokens' inputs."""
+    if do_mtp or do_draft_head:
+        raise SystemExit("[imatrix] lfm2_moe has no MTP head (pass --no-mtp; no --draft-head)")
+    from arch_table import LFM2_PREFIX, lfm2_arch
+
+    arch = lfm2_arch(int(text_config.num_experts))
+    specs: list[LinearSpec] = []
+    for i, kind in enumerate(text_config.layer_kinds):
+        hf = f"{LFM2_PREFIX}{i}."
+        base = f"text.layers.{i}."
+        for module in arch.module_list(kind):
+            if module.startswith("feed_forward."):
+                continue                      # the FFN is enumerated below (fused gate_up, per-expert)
+            specs.append(LinearSpec(base + arch.linears[module][0], [hf + module + ".weight"],
+                                    f"layer{i}:{module}"))
+        if kind.endswith("_dense"):
+            specs.append(LinearSpec(base + "mlp.gate_up", [hf + "feed_forward.w1.weight", hf + "feed_forward.w3.weight"],
+                                    f"layer{i}:feed_forward.w1"))
+            specs.append(LinearSpec(base + "mlp.down", [hf + "feed_forward.w2.weight"], f"layer{i}:feed_forward.w2"))
+        else:
+            for e in range(arch.n_experts):
+                ex = f"feed_forward.experts.{e}."
+                specs.append(LinearSpec(base + f"moe.experts.{e}.gate_up", [hf + ex + "w1.weight", hf + ex + "w3.weight"],
+                                        f"layer{i}:{ex}w1"))
+                specs.append(LinearSpec(base + f"moe.experts.{e}.down", [hf + ex + "w2.weight"], f"layer{i}:{ex}w2"))
+    specs.append(LinearSpec("lm_head", [arch.lm_head_name], "final_norm_out"))
+    return specs
+
+
 def enumerate_quantized_linears(text_config, do_mtp: bool, do_draft_head: bool,
                                 arch=None) -> list[LinearSpec]:
     """Every linear `src/convert/main.cpp` routes through `add_linear` (i.e. every linear that gets
@@ -178,6 +214,8 @@ def enumerate_quantized_linears(text_config, do_mtp: bool, do_draft_head: bool,
     """
     if arch is not None and arch.is_gemma:
         return enumerate_gemma_linears(text_config, do_mtp, do_draft_head)
+    if arch is not None and arch.is_lfm2:
+        return enumerate_lfm2_linears(text_config, do_mtp, do_draft_head)
     specs: list[LinearSpec] = []
     for i, kind in enumerate(text_config.layer_types):
         hf = f"{TEXT_LAYER_PREFIX}{i}."
@@ -320,6 +358,27 @@ def audit_gemma_layout_source(path: Path) -> dict:
             "mismatched": mismatched, "ok": ok}
 
 
+#: The container name stems the LFM2 branch of the converter (src/convert/lfm2_layout.cpp, lane C) must produce;
+#: audit_lfm2_layout_source only WARNS about one it cannot find (the file's exact form is the converter lane's).
+LFM2_CONTAINER_STEMS = ("attn.q", "attn.k", "attn.v", "attn.o", "conv.in_proj", "conv.out_proj", "mlp.gate_up",
+                        "mlp.down", "moe.experts", "gate_up", "down")
+
+
+def audit_lfm2_layout_source(path: Path) -> dict:
+    """The LFM2 scope of `audit_converter_source`. The converter's LFM branch is written by another lane and may
+    not exist in this tree: then the audit is SKIPPED (ok, `skipped` says why); when it exists, every expected
+    container stem (LFM2_CONTAINER_STEMS) must occur as a quoted string, else a WARNING is recorded (`warnings`),
+    not a failure -- the structure of that file is not this lane's to dictate."""
+    base = {"path": repo_relative(path), "sha256": None, "found": {"text": {}, "mtp": {}},
+            "direct_plan_linear_layouts": [], "missing": [], "unexpected": [], "mismatched": [], "ok": True}
+    if not Path(path).is_file():
+        return {**base, "skipped": f"{base['path']} does not exist in this tree (converter lane not merged)"}
+    src = Path(path).read_text(encoding="utf-8")
+    quoted = set(_QUOTED.findall(src))
+    warnings = [s for s in LFM2_CONTAINER_STEMS if not any(s in q for q in quoted)]
+    return {**base, "sha256": sha256_file(path), "warnings": warnings}
+
+
 def audit_converter_source(path: Path, arch: str = "qwen35") -> dict:
     """Re-derive main.cpp's `add_linear` call set from its text and diff it against
     `EXPECTED_ADD_LINEAR`. Only calls whose FIRST argument is a `{...}` initializer list are the
@@ -331,8 +390,10 @@ def audit_converter_source(path: Path, arch: str = "qwen35") -> dict:
     (src/convert/gemma_layout.cpp) and `EXPECTED_ADD_LINEAR_GEMMA` is the reference."""
     if arch == "gemma4_unified":
         return audit_gemma_layout_source(path)
+    if arch == "lfm2_moe":
+        return audit_lfm2_layout_source(path)
     if arch != "qwen35":
-        raise SystemExit(f"[imatrix] unknown converter arch {arch!r} (qwen35 | gemma4_unified)")
+        raise SystemExit(f"[imatrix] unknown converter arch {arch!r} (qwen35 | gemma4_unified | lfm2_moe)")
     src = path.read_text(encoding="utf-8")
     mtp_at = src.find("if (do_mtp)")
     if mtp_at < 0:
@@ -622,8 +683,9 @@ class FinalNormInputTap:
 
 
 def tensor_shapes(index: ShardIndex, names: list[str]) -> dict[str, list[int]]:
-    """Shapes straight from the safetensors headers -- no tensor data is read."""
-    from safetensors import safe_open
+    """Shapes straight from the safetensors headers -- no tensor data is read (plain file reads of the
+    header: no mmap of a multi-GB shard, common.raw_safetensors_header)."""
+    from common import raw_safetensors_header
 
     by_shard: dict[str, list[str]] = {}
     for n in names:
@@ -632,9 +694,9 @@ def tensor_shapes(index: ShardIndex, names: list[str]) -> dict[str, list[int]]:
         by_shard.setdefault(index.weight_map[n], []).append(n)
     out: dict[str, list[int]] = {}
     for shard, shard_names in by_shard.items():
-        with safe_open(str(index.model_dir / shard), framework="pt", device="cpu") as f:
-            for n in shard_names:
-                out[n] = [int(v) for v in f.get_slice(n).get_shape()]
+        hdr = index._hdr if index.single_file is not None else raw_safetensors_header(index.model_dir / shard)
+        for n in shard_names:
+            out[n] = [int(v) for v in hdr[0][n]["shape"]]
     return out
 
 
@@ -813,7 +875,9 @@ def dry_run_arch(args, arch) -> int:
 
     audit = audit_converter_source(arch.converter_source(), arch=arch.converter_arch)
     print(f"[imatrix] --dry-run, arch {arch.name}: converter audit ({audit['path']}): "
-          f"text={len(audit['found']['text'])} mtp={len(audit['found']['mtp'])} add_linear shapes")
+          f"text={len(audit['found']['text'])} mtp={len(audit['found']['mtp'])} add_linear shapes"
+          f"{' SKIPPED: ' + audit['skipped'] if audit.get('skipped') else ''}"
+          f"{' WARNINGS (missing container stems): ' + str(audit['warnings']) if audit.get('warnings') else ''}")
     for kind in ("missing", "unexpected", "mismatched"):
         if audit[kind]:
             print(f"[imatrix] converter audit {kind.upper()}: {audit[kind]}")
@@ -832,8 +896,12 @@ def dry_run_arch(args, arch) -> int:
           f"{text_config.num_hidden_layers} layers; K checked against the headers, no K-concat; "
           f"{len(plans)} Hessian tap(s)")
     by_type: dict[str, list[str]] = {}
-    for i, kind in enumerate(text_config.layer_types):
+    for i, kind in enumerate(getattr(text_config, "layer_kinds", None) or text_config.layer_types):
         mods = [s.key.split(f"text.layers.{i}.", 1)[1] for s in specs if s.key.startswith(f"text.layers.{i}.")]
+        if arch.is_lfm2:  # 64 experts x 2 linears: show the first expert and the count
+            exp = [m for m in mods if m.startswith("moe.experts.")]
+            mods = [m for m in mods if not m.startswith("moe.experts.")] + (
+                [f"{exp[0]} ... ({len(exp)} expert linears)"] if exp else [])
         by_type.setdefault(kind, mods)
     for kind, mods in by_type.items():
         print(f"    {kind:<18} {', '.join(mods)}")
@@ -847,7 +915,7 @@ def main() -> int:
     ap.add_argument("--model-dir", type=Path, default=None,
                     help="checkpoint (default: the Qwen3.5 default of common.py, or the Huihui Gemma "
                          "directory with --arch gemma4_unified)")
-    ap.add_argument("--arch", default="auto", choices=["auto", "qwen3_5", "gemma4_unified"],
+    ap.add_argument("--arch", default="auto", choices=["auto", "qwen3_5", "gemma4_unified", "lfm2_moe"],
                     help="which family's linears / taps (tools/reference/arch_table.py); auto reads "
                          "--model-dir's config.json model_type. gemma4_unified supports --dry-run only "
                          "here: the Gemma Hessians (hessian_capture.py --arch gemma4_unified) are what "
@@ -892,9 +960,16 @@ def main() -> int:
             from gemma.common_gemma import DEFAULT_MODEL_DIR as GEMMA_MODEL_DIR
 
             args.model_dir = GEMMA_MODEL_DIR
+        elif args.arch == "lfm2_moe":
+            from arch_table import LFM2_MODEL_DIR
+
+            args.model_dir = LFM2_MODEL_DIR
         else:
             args.model_dir = DEFAULT_MODEL_DIR
     arch = resolve_arch(args.arch, args.model_dir)
+    if arch.is_lfm2 and not args.dry_run:
+        raise SystemExit("[imatrix] --arch lfm2_moe: no activation-importance capture (the trellis path takes "
+                         "Hessians: hessian_capture.py --arch lfm2_moe). --dry-run works.")
     if arch.is_gemma:
         return dry_run_arch(args, arch) if args.dry_run else _gemma_unsupported()
     if args.dry_run:

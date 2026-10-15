@@ -256,6 +256,7 @@
 #include "r4dx_convert/w4a16_groups.hpp"
 
 #include "gemma_layout.hpp"
+#include "lfm2_layout.hpp"
 
 namespace {
 
@@ -1739,7 +1740,9 @@ int RunConvert(const AppArgs& args) {
   const int threads = ResolveThreads(args.threads);
   const std::string config_text = ReadFile(args.input + "\\config.json");
   const nlohmann::json config = nlohmann::json::parse(config_text);
-  const nlohmann::json& text_cfg = config.at("text_config");
+  // LFM2 (lfm2_layout.hpp): config.json is FLAT (no text_config) and the LFM branch below registers its own tensors.
+  const bool is_lfm2 = config.value("model_type", std::string()) == r4dx_convert::lfm2::kModelArch;
+  const nlohmann::json& text_cfg = is_lfm2 ? config : config.at("text_config");
 
   const int hidden = text_cfg.at("hidden_size").get<int>();
   const int num_layers_total = text_cfg.at("num_hidden_layers").get<int>();
@@ -1766,9 +1769,24 @@ int RunConvert(const AppArgs& args) {
   if (is_gemma && (args.record_reuse_guard || !args.reuse_from.empty()))
     throw std::runtime_error("--record-reuse-guard / --reuse-tensors-from are not supported for gemma4_unified "
                              "yet (the guard reads model.safetensors.index.json)");
+  if (is_lfm2) {
+    // The LFM2 layout is the plain bf16 / w4a16 body (docs/lfm2-plan.md 4); everything below is for another family or
+    // a later task (L3: trellis import of the per-expert linears), refused rather than half-applied.
+    const char* refused = args.vision == 1       ? "--vision on (lfm2_moe has no vision tower)"
+                          : args.mtp == 1        ? "--mtp on (lfm2_moe has no MTP head)"
+                          : !args.kv_calib.empty() ? "--kv-calib (the LFM2 KV cache is bf16: no descale tensors)"
+                          : !args.trellis.from.empty() ? "--trellis-from (not wired for lfm2_moe yet; docs/lfm2-plan.md L3)"
+                          : r4dx_convert::ParseRotationKind(args.rotate) != r4dx_convert::RotationKind::kNone
+                              ? "--rotate (the LFM2 trellis is unrotated)"
+                          : (args.record_reuse_guard || !args.reuse_from.empty())
+                              ? "--record-reuse-guard / --reuse-tensors-from (the guard reads the Qwen checkpoint layout)"
+                          : !args.draft_vocab_ids.empty() ? "--draft-vocab-ids (the reduced-vocab head is an MTP feature)"
+                                                          : nullptr;
+    if (refused != nullptr) throw std::runtime_error(std::string("r4dx-convert (lfm2_moe): ") + refused + " is not supported");
+  }
   const bool do_audio = is_gemma && args.audio == 1;
-  const bool do_vision = is_gemma ? (args.vision == 1) : (args.vision >= 0 ? (args.vision == 1) : full_run);
-  const bool do_mtp = is_gemma ? false : (args.mtp >= 0 ? (args.mtp == 1) : full_run);
+  const bool do_vision = is_lfm2 ? false : is_gemma ? (args.vision == 1) : (args.vision >= 0 ? (args.vision == 1) : full_run);
+  const bool do_mtp = (is_gemma || is_lfm2) ? false : (args.mtp >= 0 ? (args.mtp == 1) : full_run);
 
   LayoutSet layouts = ParseLayoutList(args.layouts_spec, /*bf16_default_on=*/true);
   LayoutSet lm_head_layouts = ParseLayoutList(args.lm_head_spec, /*bf16_default_on=*/false);
@@ -1790,6 +1808,7 @@ int RunConvert(const AppArgs& args) {
   if (is_gemma)
     std::cout << "[r4dx-convert] arch=" << r4dx_convert::gemma::kModelArch
               << " audio=" << (do_audio ? "on" : "off") << "\n";
+  if (is_lfm2) std::cout << "[r4dx-convert] arch=" << r4dx_convert::lfm2::kModelArch << "\n";
 
   // The BYTE LAYOUT is identical in both modes (docs/container-format.md "How the quantized values
   // are chosen"); only the (scale, zero) values differ.
@@ -2246,7 +2265,53 @@ int RunConvert(const AppArgs& args) {
     }
   }
 
-  for (int i = 0; i < (is_gemma ? 0 : layers); ++i) {
+  // ---- LFM2 branch (lfm2_layout.cpp): the whole text stack incl. the per-expert linears, the embedding, the final
+  // norm and the tied head, through the same closures ------------------------------------------------------------
+  if (is_lfm2) {
+    namespace lf = r4dx_convert::lfm2;
+    const lf::TextShape lshape = lf::ParseConfig(config);
+    lf::Kit kit;
+    kit.all_names = [&model]() { return model.AllNames(); };
+    kit.has = [&model](const std::string& n) { return model.Has(n); };
+    kit.shape = [&model](const std::string& n) { return model.Meta(n).shape; };
+    kit.add_bf16 = add_bf16;
+    // A relabelled bf16 passthrough (conv.conv.weight [H,1,L] -> [H,L]): the bytes are copied unchanged.
+    kit.add_bf16_shaped = [&](const std::string& hf_name, const std::string& container_name,
+                              const std::vector<int64_t>& shape_no_width) {
+      plan_jobs.push_back([&writer, &model, hf_name, container_name, shape_no_width]() {
+        const auto& meta = model.Meta(hf_name);
+        int64_t n = 1;
+        for (int64_t d : shape_no_width) n *= d;
+        if (n != meta.ElemCount())
+          throw std::runtime_error("r4dx-convert (lfm2_moe): '" + hf_name + "' cannot be relabelled to " +
+                                   container_name + ": element count differs");
+        std::vector<int64_t> shape = shape_no_width;
+        shape.push_back(2);
+        writer.Plan(container_name, shape, static_cast<uint64_t>(meta.ElemCount()) * 2);
+      });
+      emit_jobs.push_back([&writer, &model, hf_name, container_name]() {
+        auto bytes = r4dx_convert::CopyRawBf16(model, hf_name);
+        writer.WriteTensor(container_name, bytes.data(), bytes.size());
+      });
+    };
+    kit.add_fp32_widen = add_fp32_widen;
+    kit.add_linear = [&](const std::vector<std::string>& hf_names, const std::string& base, bool head) {
+      add_linear(hf_names, base, head ? lm_head_layouts : layouts);
+    };
+    const std::set<std::string> consumed = lf::AddTextStack(kit, lshape, layers);
+    // The coverage audit: nothing in the checkpoint may be silently left out of the container.
+    const std::vector<std::string> unconsumed = lf::UnconsumedTensors(model.AllNames(), consumed, layers);
+    if (!unconsumed.empty()) {
+      std::string msg = "r4dx-convert (lfm2_moe): " + std::to_string(unconsumed.size()) +
+                        " checkpoint tensor(s) are not converted and not allow-listed (a mis-guessed tensor "
+                        "name, or a tensor this converter does not know):";
+      for (size_t k = 0; k < unconsumed.size() && k < 20; ++k) msg += "\n  " + unconsumed[k];
+      if (unconsumed.size() > 20) msg += "\n  ... and " + std::to_string(unconsumed.size() - 20) + " more";
+      throw std::runtime_error(msg);
+    }
+  }
+
+  for (int i = 0; i < ((is_gemma || is_lfm2) ? 0 : layers); ++i) {
     const std::string hf = "model.language_model.layers." + std::to_string(i) + ".";
     const std::string base = "text.layers." + std::to_string(i) + ".";
     // --rotate folds (all kNone without it): input_layernorm's (1 + w) goes into this layer's token
@@ -2302,7 +2367,7 @@ int RunConvert(const AppArgs& args) {
 
   // Everything from here on is outside the rotated stack and is never folded: the runtime applies
   // x Q after the embedding gather and x Q^T before final_norm (docs/quant2.md section 3).
-  if (!is_gemma) {  // (the Gemma branch above registered these, the head from the tied embedding)
+  if (!is_gemma && !is_lfm2) {  // (the Gemma / LFM2 branches above registered these, the head from the tied embedding)
     add_bf16("model.language_model.embed_tokens.weight", "text.embed_tokens");
     add_bf16("model.language_model.norm.weight", "text.final_norm");
     add_linear({"lm_head.weight"}, "lm_head", lm_head_layouts);
@@ -2579,6 +2644,28 @@ int RunConvert(const AppArgs& args) {
           "fp32 (signs, mix; q2ab also had_down/o/o_full_signs) -- see __metadata__.rotation";
     }
   }
+  // LFM2: model_arch / norm_kind are what model::DetectArch and the loader read (docs/lfm2-plan.md 4); written ONLY
+  // for lfm2_moe, so every other container keeps its header byte for byte.
+  if (is_lfm2) {
+    namespace fs = std::filesystem;
+    fs::path in = fs::u8path(args.input).lexically_normal();
+    if (!in.has_filename()) in = in.parent_path();
+    metadata["model_id"] = in.filename().u8string();  // e.g. LFM2.5-24B-A2B
+    metadata["model_arch"] = r4dx_convert::lfm2::kModelArch;
+    metadata["norm_kind"] = "plain";
+    metadata["quant_summary"] = {
+        {"text.layers.*.attn.q|k|v|o", "w4a16|bf16 (as requested by --layouts; pick at load time)"},
+        {"text.layers.*.conv.in_proj|out_proj", "w4a16|bf16 (as requested by --layouts)"},
+        {"text.layers.*.mlp.gate_up|down", "w4a16|bf16 (dense layers only; gate rows first)"},
+        {"text.layers.*.moe.experts.*.gate_up|down", "w4a16|bf16 (per-expert linears; gate_up = w1 rows then w3 rows)"},
+        {"text.layers.*.conv.weight", "bf16 [hidden, 3] (conv.conv.weight [hidden,1,3] squeezed; never quantized)"},
+        {"text.layers.*.moe.router", "bf16 [experts, hidden] passthrough (never quantized)"},
+        {"text.layers.*.moe.expert_bias", "fp32 [experts, 4] (the F32 buffer; selection bias only)"},
+        {"text.layers.*.operator_norm|ffn_norm, attn.q_norm|k_norm, text.final_norm", "bf16 raw plain weights (x * w, not 1 + w)"},
+        {"text.embed_tokens", "bf16 [vocab, hidden], no scale"},
+        {"lm_head", "w4a16|bf16 (as requested by --layouts / --lm-head), the tied embedding written untied"},
+    };
+  }
   // --trellis-from: the body's summary lines say what the body now is (the four entries above
   // describe the multi-layout body, which a trellis container does not have), and
   // __metadata__.quant.trellis is what the loader parses (docs/trellis-kernel.md 2.3, 2.5). Only
@@ -2635,6 +2722,7 @@ int RunConvert(const AppArgs& args) {
     metadata["r4dx_convert_run"]["arch"] = r4dx_convert::gemma::kModelArch;
     metadata["r4dx_convert_run"]["audio"] = do_audio;
   }
+  if (is_lfm2) metadata["r4dx_convert_run"]["arch"] = r4dx_convert::lfm2::kModelArch;
   if (rot.Enabled()) {
     metadata["r4dx_convert_run"]["rotate"] = rot.KindName();
     metadata["r4dx_convert_run"]["rotation_seed"] = rot.Seed();

@@ -17,7 +17,13 @@ add_library(r4dx_convert_gemma STATIC gemma_layout.cpp)
 target_include_directories(r4dx_convert_gemma PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(r4dx_convert_gemma PUBLIC r4dx_convert)
 
+# r4dx_convert_lfm2: the LFM2 (lfm2_moe) branch's tensor layout (lfm2_layout.hpp -- names, shape checks, per-expert
+# linears, coverage audit). Same shape as r4dx_convert_gemma; tests/convert/test_lfm2_layout.cpp drives it.
+add_library(r4dx_convert_lfm2 STATIC lfm2_layout.cpp)
+target_include_directories(r4dx_convert_lfm2 PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
+target_link_libraries(r4dx_convert_lfm2 PUBLIC r4dx_convert)
+
 if(R4DX_BUILD_CONVERT)
   add_executable(r4dx-convert main.cpp)
-  target_link_libraries(r4dx-convert PRIVATE r4dx_convert r4dx_convert_gemma)
+  target_link_libraries(r4dx-convert PRIVATE r4dx_convert r4dx_convert_gemma r4dx_convert_lfm2)
 endif()

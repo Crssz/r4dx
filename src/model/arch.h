@@ -20,11 +20,19 @@ namespace r4dx::model {
 enum class Arch {
   kQwen35,  // Qwen3.5/3.8 hybrid GDN + full attention (every container before Gemma support)
   kGemma4,  // gemma4_unified: sliding + full attention, sandwich norms, GeGLU, tied head
+  kLfm2Moe,  // lfm2_moe (LFM2.5-24B-A2B): ShortConv + attention, dense then 64-expert MoE FFN, tied head
 };
 
-// Stable on-disk / log spelling: `__metadata__.model_arch` for Gemma, "qwen3_5" for Qwen (which
+// Stable on-disk / log spelling: `__metadata__.model_arch` for Gemma / LFM2, "qwen3_5" for Qwen (which
 // carries no such key). server/dialect.cpp's CheckDialectAgainstArch keys off the "gemma" prefix.
-inline const char* ArchName(Arch a) { return a == Arch::kGemma4 ? "gemma4_unified" : "qwen3_5"; }
+inline const char* ArchName(Arch a) {
+  switch (a) {
+    case Arch::kGemma4: return "gemma4_unified";
+    case Arch::kLfm2Moe: return "lfm2_moe";
+    case Arch::kQwen35: break;
+  }
+  return "qwen3_5";
+}
 
 // The arch a `__metadata__` object describes:
 //   1. `model_arch` present: "gemma4_unified" -> kGemma4, "qwen3_5" -> kQwen35, anything else throws
@@ -48,6 +56,9 @@ nlohmann::json ReadContainerMetadata(const std::string& container_path);
 // r4dx-cli and r4dx-server so the two cannot drift:
 //   * kQwen35: `requested` unchanged -- the callers' own default (262144) and every explicit value
 //     behave exactly as before this function existed;
+//   * kLfm2Moe: Lfm2Config::ResolveMaxCtx on the container's (flat) model_config: the default is the config's
+//     max_position_embeddings (131072), an explicit larger value throws std::invalid_argument (no rope
+//     scaling exists beyond it, so there is no extended-context opt-in; `extended_ctx` does not change that);
 //   * kGemma4: GemmaConfig::ResolveMaxCtx on the container's text_config. `requested_given` false means
 //     the user passed no --max-ctx: the default is the checkpoint's max_position_embeddings (131072
 //     for Huihui), or kExtendedMaxCtx (262144) when `extended_ctx` (the opt-in flag) is set. An explicit

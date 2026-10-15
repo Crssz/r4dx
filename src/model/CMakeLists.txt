@@ -122,6 +122,9 @@ set(R4DX_MODEL_SOURCES
   gemma_local_text_model.cpp
   # M1b-1: the tensor-parallel (--tp 2) Gemma TextModel (rank threads + TpComm, docs/tp.md 2.1-2.9 specialised to GemmaModel).
   gemma_tp_model.cpp
+  # LFM2 (docs/lfm2-plan.md L1-1 / L1-3): the LoadLfm2TextModel dispatch target (placeholder until L1-8) and the container loader.
+  lfm2_local_text_model.cpp
+  lfm2_container.cpp
   gdn_layer.cpp
   mlp.cpp
   final_lm_head.cpp

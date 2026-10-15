@@ -423,9 +423,10 @@ def pool_stats(segs: list[dict]) -> dict:
             "nll_ref": float(nll_ref.mean()), "nll_test": float(nll_test.mean())}
 
 
-def gate_thresholds(noise: dict) -> dict:
-    """The thresholds r4dx must meet, from the noise term (pool_stats of KL(truth||HF-bf16-sdpa))."""
-    return {"kl_max": GATE_KL_FACTOR * noise["mean_kl"] + GATE_KL_SLACK,
+def gate_thresholds(noise: dict, slack: float = GATE_KL_SLACK) -> dict:
+    """The thresholds r4dx must meet, from the noise term (pool_stats of KL(truth||HF-bf16-sdpa)).
+    `slack` is the epsilon of the rule (Gemma: 0.005; LFM2 passes its own, never this default)."""
+    return {"kl_max": GATE_KL_FACTOR * noise["mean_kl"] + slack,
             "top1_min_pct": noise["top1_pct"] - GATE_TOP1_SLACK_PTS}
 
 
@@ -441,9 +442,10 @@ def worst_rows(segs: list[dict], n: int = 5) -> list[dict]:
     return rows[:n]
 
 
-def evaluate_group(test: list[dict], noise: list[dict], base: list[dict] | None, gated: bool) -> dict:
+def evaluate_group(test: list[dict], noise: list[dict], base: list[dict] | None, gated: bool,
+                   slack: float = GATE_KL_SLACK) -> dict:
     t, nz = pool_stats(test), pool_stats(noise)
-    thr = gate_thresholds(nz)
+    thr = gate_thresholds(nz, slack)
     out = {"rows": t["rows"], "test": t, "noise": nz, "thresholds": thr, "worst_rows": worst_rows(test),
            "kl_ok": t["mean_kl"] <= thr["kl_max"], "top1_ok": t["top1_pct"] >= thr["top1_min_pct"]}
     if base is not None:
@@ -475,11 +477,13 @@ def build_gate_groups(chat_items: list[dict], raw_items: list[dict]) -> list[tup
 
 def gate_gemma_fp32_markdown(res: dict) -> str:
     quant = res["mode"] == "quantized-increment"
-    L = [f"# Gemma fp32-truth gate -- test `{res['test_dir']}`",
+    slack = res["rule"]["kl_slack"]
+    title = {"gemma-fp32": "Gemma", "lfm2-fp32": "LFM2"}.get(res["gate"], res["gate"])
+    L = [f"# {title} fp32-truth gate -- test `{res['test_dir']}`",
          f"- truth `{res['truth_dir']}`; noise (HF bf16 sdpa) `{res['noise_dir']}`"
          + (f"; base (r4dx bf16) `{res['base_dir']}`" if quant else ""),
          "- rule: " + ("KL(truth||quant) - KL(truth||r4dx-bf16) <= 0.01 per group (quantized: increment)" if quant else
-                      f"mean KL <= {GATE_KL_FACTOR} x noise KL + {GATE_KL_SLACK}; top-1 >= noise top-1 - "
+                      f"mean KL <= {GATE_KL_FACTOR} x noise KL + {slack}; top-1 >= noise top-1 - "
                       f"{GATE_TOP1_SLACK_PTS:g} pt"),
          "- chat groups are scored on model-turn tokens only; raw groups are REPORTED, no pass/fail", ""]
     head = ("| group | rows | test mean KL | median | p99 | noise mean KL | noise median | noise p99 | KL max (gate) | "
@@ -504,7 +508,8 @@ def gate_gemma_fp32_markdown(res: dict) -> str:
 
 def gate_gemma_fp32(truth_dir: Path, noise_dir: Path, test_dir: Path, chat_tokens: Path,
                     raw_tokens: Path | None = None, raw_max_tokens: int = 512, raw_names: list[str] | None = None,
-                    base_dir: Path | None = None, row_chunk: int = 32, strict: bool = True) -> dict:
+                    base_dir: Path | None = None, row_chunk: int = 32, strict: bool = True,
+                    slack: float = GATE_KL_SLACK, gate_name: str = "gemma-fp32") -> dict:
     chat_doc = json.loads(Path(chat_tokens).read_text(encoding="utf-8"))
     chat_items, raw_items = [], []
 
@@ -538,15 +543,15 @@ def gate_gemma_fp32(truth_dir: Path, noise_dir: Path, test_dir: Path, chat_token
     groups = []
     for gname, gated, items in build_gate_groups(chat_items, raw_items):
         g = evaluate_group([i["test"] for i in items], [i["noise"] for i in items],
-                           [i["base"] for i in items] if base_dir is not None else None, gated)
+                           [i["base"] for i in items] if base_dir is not None else None, gated, slack)
         g["name"], g["gated"], g["segments"] = gname, gated, [i["name"] for i in items]
         groups.append(g)
     primary = [g["pass"] for g in groups if g["gated"]]
-    return {"gate": "gemma-fp32", "mode": "quantized-increment" if base_dir is not None else "bf16",
+    return {"gate": gate_name, "mode": "quantized-increment" if base_dir is not None else "bf16",
             "truth_dir": str(truth_dir), "noise_dir": str(noise_dir), "test_dir": str(test_dir),
             "base_dir": None if base_dir is None else str(base_dir), "chat_tokens": str(chat_tokens),
             "raw_tokens": None if raw_tokens is None else str(raw_tokens), "raw_max_tokens": raw_max_tokens,
-            "rule": {"kl_factor": GATE_KL_FACTOR, "kl_slack": GATE_KL_SLACK, "top1_slack_pts": GATE_TOP1_SLACK_PTS,
+            "rule": {"kl_factor": GATE_KL_FACTOR, "kl_slack": slack, "top1_slack_pts": GATE_TOP1_SLACK_PTS,
                      "quant_increment": GATE_QUANT_INCREMENT},
             "groups": groups, "pass": bool(primary) and all(primary),
             "per_segment": [{"name": i["name"], "group": i["group"],
@@ -554,6 +559,72 @@ def gate_gemma_fp32(truth_dir: Path, noise_dir: Path, test_dir: Path, chat_token
                              "test_top1_pct": i["test"]["top1_agreement_pct"],
                              "noise_top1_pct": i["noise"]["top1_agreement_pct"], "rows": i["test"]["rows"]}
                             for i in chat_items + raw_items]}
+
+
+# --------------------------------------------------------------------------------------------
+# LFM2: noise term and the parameterized epsilon (docs/lfm2-plan.md 6.4)
+# --------------------------------------------------------------------------------------------
+#
+# `--gate lfm2-fp32` is the gemma-fp32 rule with ONE difference: the epsilon is NOT a constant. LFM's epsilon is
+# set from LFM's own measured noise term (KL(truth||HF-bf16-sdpa)), so it must be passed explicitly (`--epsilon`).
+# Without `--test-dir` the command only reports the noise term per group and the thresholds that several
+# candidate epsilons would imply (`--epsilon-candidates`, a menu, not a default for gating).
+
+LFM2_EPS_CANDIDATES = (0.0025, 0.005, 0.01)
+
+
+def lfm2_noise_term(truth_dir: Path, noise_dir: Path, chat_tokens: Path, raw_tokens: Path | None = None,
+                    raw_max_tokens: int = 512, raw_names: list[str] | None = None, row_chunk: int = 32,
+                    strict: bool = True, candidates=LFM2_EPS_CANDIDATES) -> dict:
+    """Per gate group: pooled KL(truth||noise-side) and top-1, and for each candidate epsilon the thresholds the
+    gate would impose (`kl_max = 1.5 * noise_mean_kl + eps`, `top1_min = noise_top1 - 1 pt`)."""
+    chat_doc = json.loads(Path(chat_tokens).read_text(encoding="utf-8"))
+    items = []
+    for s in chat_doc["segments"]:
+        if "score_mask" not in s:
+            raise SystemExit(f"{chat_tokens}: segment {s['name']} has no score_mask (not a chat corpus)")
+        r = compare_segment(s["name"], s["token_ids"], truth_dir, noise_dir, row_chunk, strict,
+                            row_mask=row_mask_from_score_mask(s["score_mask"]))
+        items.append({"name": s["name"], "group": s.get("group", "chat"), "noise": r})
+    raw_items = []
+    if raw_tokens is not None:
+        for s in json.loads(Path(raw_tokens).read_text(encoding="utf-8"))["segments"]:
+            if raw_names is not None and s["name"] not in raw_names:
+                continue
+            if not (Path(truth_dir) / f"{s['name']}.meta.json").exists() or \
+                    not (Path(noise_dir) / f"{s['name']}.meta.json").exists():
+                continue
+            ids = s["token_ids"][:raw_max_tokens] if raw_max_tokens else s["token_ids"]
+            raw_items.append({"name": s["name"], "group": "raw",
+                              "noise": compare_segment(s["name"], ids, truth_dir, noise_dir, row_chunk, strict)})
+    groups = []
+    for gname, gated, its in build_gate_groups(items, raw_items):
+        nz = pool_stats([i["noise"] for i in its])
+        groups.append({"name": gname, "gated": gated, "segments": [i["name"] for i in its], "noise": nz,
+                       "implied": {f"{e:g}": gate_thresholds(nz, e) for e in candidates}})
+    return {"kind": "lfm2-noise-term", "truth_dir": str(truth_dir), "noise_dir": str(noise_dir),
+            "chat_tokens": str(chat_tokens), "kl_factor": GATE_KL_FACTOR, "top1_slack_pts": GATE_TOP1_SLACK_PTS,
+            "epsilon_candidates": list(candidates), "groups": groups,
+            "per_segment": [{"name": i["name"], "group": i["group"], "rows": i["noise"]["rows"],
+                             "noise_mean_kl": i["noise"]["mean_kl"], "noise_top1_pct": i["noise"]["top1_agreement_pct"]}
+                            for i in items + raw_items]}
+
+
+def lfm2_noise_markdown(res: dict) -> str:
+    cands = [f"{e:g}" for e in res["epsilon_candidates"]]
+    L = [f"# LFM2 noise term KL(truth||HF-bf16-sdpa) -- noise `{res['noise_dir']}`", f"- truth `{res['truth_dir']}`",
+         f"- gate rule (epsilon to be chosen from this): mean KL <= {res['kl_factor']} x noise KL + epsilon; "
+         f"top-1 >= noise top-1 - {res['top1_slack_pts']:g} pt", "",
+         "| group | rows | noise mean KL | median | p99 | noise top-1 | top-1 min | "
+         + " | ".join(f"KL max @ eps {c}" for c in cands) + " |",
+         "|" + "---|" * (7 + len(cands))]
+    for g in res["groups"]:
+        n = g["noise"]
+        t1 = g["implied"][cands[0]]["top1_min_pct"]
+        L.append(f"| {g['name']} | {n['rows']} | {n['mean_kl']:.5f} | {n['median_kl']:.5f} | {n['p99_kl']:.5f} | "
+                 f"{n['top1_pct']:.2f}% | {t1:.2f}% | " + " | ".join(f"{g['implied'][c]['kl_max']:.5f}" for c in cands) + " |")
+    L += ["", "No verdict: pass `--epsilon <value> --test-dir <dump>` to gate an engine dump."]
+    return "\n".join(L)
 
 
 # --------------------------------------------------------------------------------------------
@@ -688,9 +759,16 @@ def main() -> int:
     ap.add_argument("--use-score-mask", action="store_true",
                     help="score-mask aware mode for the plain report: segments of --tokens that carry a "
                          "`score_mask` are aggregated over the model-turn rows only")
-    ap.add_argument("--gate", choices=["gemma-fp32"], default=None,
+    ap.add_argument("--gate", choices=["gemma-fp32", "lfm2-fp32"], default=None,
                     help="gemma-fp32: the M1 gate against the fp32 truth (see the section comment above "
-                         "gate_gemma_fp32); needs --truth-dir --noise-dir --test-dir and --tokens=chat_gemma.json")
+                         "gate_gemma_fp32); needs --truth-dir --noise-dir --test-dir and --tokens=chat_gemma.json. "
+                         "lfm2-fp32: the same rule with an EXPLICIT --epsilon (no default); without --test-dir it "
+                         "prints the measured noise term and the thresholds implied by --epsilon-candidates")
+    ap.add_argument("--epsilon", type=float, default=None,
+                    help="lfm2-fp32: the KL slack of the rule (set from the measured noise term; required with "
+                         "--test-dir unless --base-dir judges a quantized increment)")
+    ap.add_argument("--epsilon-candidates", default=",".join(f"{e:g}" for e in LFM2_EPS_CANDIDATES),
+                    help="lfm2-fp32 noise report: comma list of epsilons to show thresholds for")
     ap.add_argument("--truth-dir", type=Path, help="gate: fp32-truth dump dir")
     ap.add_argument("--noise-dir", type=Path, help="gate: HF bf16 sdpa dump dir (the noise term)")
     ap.add_argument("--base-dir", type=Path, default=None,
@@ -711,6 +789,36 @@ def main() -> int:
         res = gate_gemma_fp32(args.truth_dir, args.noise_dir, args.test_dir, args.tokens, args.raw_tokens,
                               args.raw_max_tokens, None if args.raw_segment is None else args.raw_segment.split(","),
                               args.base_dir, args.row_chunk, strict=not args.allow_mismatch)
+        print(gate_gemma_fp32_markdown(res))
+        if args.out:
+            args.out.parent.mkdir(parents=True, exist_ok=True)
+            args.out.write_text(json.dumps({"generated_at": dt.datetime.now(dt.timezone.utc).isoformat(), **res},
+                                           indent=2), encoding="utf-8")
+            print(f"\n[kl_report] wrote {args.out}")
+        return 0 if res["pass"] else 1
+    if args.gate == "lfm2-fp32":
+        need = [("--truth-dir", args.truth_dir), ("--noise-dir", args.noise_dir), ("--tokens", args.tokens)]
+        missing = [n for n, v in need if v is None]
+        if missing:
+            raise SystemExit(f"[kl_report] --gate lfm2-fp32 needs {', '.join(missing)}")
+        raw_names = None if args.raw_segment is None else args.raw_segment.split(",")
+        strict = not args.allow_mismatch
+        if args.test_dir is None:
+            cands = tuple(float(x) for x in args.epsilon_candidates.split(",") if x.strip())
+            res = lfm2_noise_term(args.truth_dir, args.noise_dir, args.tokens, args.raw_tokens, args.raw_max_tokens,
+                                  raw_names, args.row_chunk, strict, cands)
+            print(lfm2_noise_markdown(res))
+            if args.out:
+                args.out.parent.mkdir(parents=True, exist_ok=True)
+                args.out.write_text(json.dumps({"generated_at": dt.datetime.now(dt.timezone.utc).isoformat(), **res},
+                                               indent=2), encoding="utf-8")
+            return 0
+        if args.epsilon is None and args.base_dir is None:
+            raise SystemExit("[kl_report] --gate lfm2-fp32 --test-dir needs an explicit --epsilon (LFM2 has no "
+                             "default: set it from the measured noise term; run without --test-dir to print it)")
+        res = gate_gemma_fp32(args.truth_dir, args.noise_dir, args.test_dir, args.tokens, args.raw_tokens,
+                              args.raw_max_tokens, raw_names, args.base_dir, args.row_chunk, strict=strict,
+                              slack=0.0 if args.epsilon is None else args.epsilon, gate_name="lfm2-fp32")
         print(gate_gemma_fp32_markdown(res))
         if args.out:
             args.out.parent.mkdir(parents=True, exist_ok=True)

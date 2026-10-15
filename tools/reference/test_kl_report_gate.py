@@ -150,6 +150,66 @@ def test_quantized_increment_mode():
         assert b["increment_kl"] > K.GATE_QUANT_INCREMENT and not bad["pass"]
 
 
+def test_lfm2_gate_epsilon_is_a_parameter():
+    """--gate lfm2-fp32: no default epsilon; the noise report lists the implied thresholds; the verdict moves with
+    the explicit epsilon; Gemma's constant is untouched."""
+    import contextlib
+    import io
+
+    with tempfile.TemporaryDirectory() as t:
+        tmp = Path(t)
+        w = World(tmp)
+        w.dump("noise", 0.1, 31)
+        w.dump("mid", 0.2, 32)
+        pc, pr = w.tokens()
+        nr = K.lfm2_noise_term(tmp / "truth", tmp / "noise", pc, pr, raw_max_tokens=0, candidates=(0.001, 0.02))
+        names = [g["name"] for g in nr["groups"]]
+        assert names == ["chat-code", "chat-english", "chat-thai", "chat-ALL", "raw:r1", "raw-ALL"], names
+        a = next(g for g in nr["groups"] if g["name"] == "chat-ALL")
+        for e in ("0.001", "0.02"):
+            assert abs(a["implied"][e]["kl_max"] - (1.5 * a["noise"]["mean_kl"] + float(e))) < 1e-12
+        assert "No verdict" in K.lfm2_noise_markdown(nr)
+        # the same dump gives a different verdict for different explicit epsilons
+        base = K.gate_gemma_fp32(tmp / "truth", tmp / "noise", tmp / "mid", pc, slack=0.0, gate_name="lfm2-fp32")
+        g0 = next(g for g in base["groups"] if g["name"] == "chat-ALL")
+        excess = g0["test"]["mean_kl"] - 1.5 * g0["noise"]["mean_kl"]
+        assert excess > 0, "test dump must be noisier than 1.5 x noise for this check"
+        tight = K.gate_gemma_fp32(tmp / "truth", tmp / "noise", tmp / "mid", pc, slack=excess * 0.5, gate_name="lfm2-fp32")
+        loose = K.gate_gemma_fp32(tmp / "truth", tmp / "noise", tmp / "mid", pc, slack=excess * 1.5, gate_name="lfm2-fp32")
+        gt = next(g for g in tight["groups"] if g["name"] == "chat-ALL")
+        gl = next(g for g in loose["groups"] if g["name"] == "chat-ALL")
+        assert not gt["kl_ok"] and gl["kl_ok"]
+        assert loose["rule"]["kl_slack"] == excess * 1.5 and loose["gate"] == "lfm2-fp32"
+        assert "# LFM2 fp32-truth gate" in K.gate_gemma_fp32_markdown(loose)
+        # Gemma default slack unchanged
+        gem = K.gate_gemma_fp32(tmp / "truth", tmp / "noise", tmp / "mid", pc)
+        assert gem["rule"]["kl_slack"] == K.GATE_KL_SLACK == 0.005 and gem["gate"] == "gemma-fp32"
+        # CLI: --test-dir without --epsilon is refused; without --test-dir it prints the noise report
+        argv0 = sys.argv
+        try:
+            sys.argv = ["kl_report.py", "--gate", "lfm2-fp32", "--truth-dir", str(tmp / "truth"), "--noise-dir",
+                        str(tmp / "noise"), "--test-dir", str(tmp / "mid"), "--tokens", str(pc)]
+            try:
+                K.main()
+                raise AssertionError("expected SystemExit for the missing --epsilon")
+            except SystemExit as e:
+                assert "--epsilon" in str(e)
+            sys.argv = ["kl_report.py", "--gate", "lfm2-fp32", "--truth-dir", str(tmp / "truth"), "--noise-dir",
+                        str(tmp / "noise"), "--tokens", str(pc)]
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                assert K.main() == 0
+            assert "noise term" in buf.getvalue() and "chat-ALL" in buf.getvalue()
+            sys.argv = ["kl_report.py", "--gate", "lfm2-fp32", "--truth-dir", str(tmp / "truth"), "--noise-dir",
+                        str(tmp / "noise"), "--test-dir", str(tmp / "mid"), "--tokens", str(pc), "--epsilon", "1.0"]
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                K.main()                 # the verdict also depends on top-1 (not on epsilon); the rule text must show it
+            assert "noise KL + 1.0;" in buf.getvalue() and "# LFM2 fp32-truth gate" in buf.getvalue()
+        finally:
+            sys.argv = argv0
+
+
 def test_existing_behaviour_unchanged_without_mask():
     with tempfile.TemporaryDirectory() as t:
         w = World(Path(t))

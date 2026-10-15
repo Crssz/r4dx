@@ -105,10 +105,14 @@ struct ToolCallParseResult {
 ToolCallParseResult ParseToolCalls(const std::string& text);
 
 // Dialect-aware entry point: Qwen35 forwards to ParseToolCalls(text) unchanged; Gemma4 parses
-// `<|tool_call>call:NAME{k:v,...}<tool_call|>` spans (gemma_tool_call_parser.cpp). Same contract
+// `<|tool_call>call:NAME{k:v,...}<tool_call|>` spans (gemma_tool_call_parser.cpp); Lfm2 parses the Pythonic
+// list above (lfm2_tool_call_parser.cpp). Same contract
 // (never throws, malformed spans degrade to content with had_malformed_call).
 ToolCallParseResult ParseToolCalls(const std::string& text, const ModelDialect& dialect);
 ToolCallParseResult ParseGemmaToolCalls(const std::string& text, const ModelDialect& dialect);
+// LFM2.5: `<|tool_call_start|>[name(arg=value, ...), ...]<|tool_call_end|>` spans, Python-literal values
+// (lfm2_tool_call_parser.cpp; the file comment there has the grammar and the malformed-span rules).
+ToolCallParseResult ParseLfm2ToolCalls(const std::string& text, const ModelDialect& dialect);
 
 // Drops any parsed tool call whose name is not in `known_names` (case-sensitive, matching OpenAI
 // function-name semantics). tool_choice: "none" already removes every tool definition from the

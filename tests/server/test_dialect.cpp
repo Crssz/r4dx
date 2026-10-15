@@ -133,9 +133,103 @@ void TestResolve() {
   fs::remove_all(root);
 }
 
+// ---- LFM2.5 (docs/lfm2-plan.md 5.3, L2-3) ------------------------------------------------------------
+void TestLfm2Table() {
+  const auto& l = Lfm2Dialect();
+  CHECK(l.kind == DialectKind::kLfm2 && std::string(l.name) == "lfm2");
+  CHECK(&DialectFor(DialectKind::kLfm2) == &l);
+  CHECK(l.reasoning.open.empty() && l.reasoning.close == "</think>");
+  CHECK(l.prompt_reasoning_open == "<think>" && l.prompt_reasoning_closed.empty());
+  CHECK(l.tool_open == "<|tool_call_start|>" && l.tool_close == "<|tool_call_end|>");
+  CHECK(l.tool_open.size() == 19 && l.tool_open.size() - 1 == 18);  // gate holdback 18
+  CHECK(!l.chat_template_polyfills && l.bos_on_raw_prompt && !l.has_reasoning_effort && l.forces_thinking);
+  CHECK(l.keep_special_on_decode.empty());  // both tool markers and <think> are NON-special added tokens
+  CHECK((l.eos_ids == std::vector<int32_t>{124900}));
+  CHECK(!l.default_tokenizer_dir.empty());
+  // generation_config.json defaults, LFM2 only
+  CHECK(l.sampling.temperature && *l.sampling.temperature == 0.1f);
+  CHECK(l.sampling.top_k && *l.sampling.top_k == 50);
+  CHECK(l.sampling.repetition_penalty && *l.sampling.repetition_penalty == 1.05f);
+  CHECK(!l.sampling.top_p && !l.sampling.min_p);
+  // Qwen and Gemma carry no defaults and never force thinking: their requests are unchanged.
+  for (const ModelDialect* d : {&Qwen35Dialect(), &Gemma4Dialect()}) {
+    CHECK(!d->forces_thinking);
+    CHECK(!d->sampling.temperature && !d->sampling.top_k && !d->sampling.top_p && !d->sampling.min_p &&
+          !d->sampling.repetition_penalty);
+  }
+  DialectKind k;
+  CHECK(ParseDialectName("lfm2", &k) && k == DialectKind::kLfm2);
+  CHECK(!ParseDialectName("LFM2", &k));
+}
+
+void TestLfm2PromptState() {
+  const auto& l = Lfm2Dialect();
+  // The template ends the generation prompt with an open "<think>" (no newline). The model always thinks.
+  const std::string prompt = "<|startoftext|><|im_start|>user\nhi<|im_end|>\n<|im_start|>assistant\n<think>";
+  CHECK(l.ReasoningStart(true, prompt) == Start::kInReasoning);
+  CHECK(l.ReasoningOpenInPrompt(true, prompt));
+  CHECK(l.CheckpointSuffix(true, prompt) == "<think>");
+  // After a tool turn the prompt still ends with the same opener.
+  CHECK(l.CheckpointSuffix(true, "...<|im_start|>tool\nr<|im_end|>\n<|im_start|>assistant\n<think>") == "<think>");
+  CHECK(l.CheckpointSuffix(true, "no opener at the end").empty());
+}
+
+void TestLfm2Detect() {
+  const std::string lfm_cfg = "{\"bos_token\":\"<|startoftext|>\",\"tokenizer_class\":\"TokenizersBackend\"}";
+  CHECK(DetectDialect(lfm_cfg, false, true) == DialectKind::kLfm2);
+  CHECK(DetectDialect(lfm_cfg, false, false) == DialectKind::kQwen35);  // bos alone is not enough
+  CHECK(DetectDialect("{\"bos_token\":null}", false, true) == DialectKind::kQwen35);
+  CHECK(DetectDialect("{\"bos_token\":\"<bos>\"}", false, true) == DialectKind::kQwen35);
+  CHECK(DetectDialect("{\"tokenizer_class\":\"GemmaTokenizer\",\"bos_token\":\"<|startoftext|>\"}", false, true) ==
+        DialectKind::kGemma4);  // Gemma outranks
+  CHECK(DetectDialect(lfm_cfg, true, true) == DialectKind::kGemma4);
+  CHECK(DetectDialect("not json", false, true) == DialectKind::kQwen35);
+  // The two-argument form every existing caller uses is unchanged.
+  CHECK(DetectDialect(lfm_cfg, false) == DialectKind::kQwen35);
+
+  namespace fs = std::filesystem;
+  const fs::path root = fs::temp_directory_path() / "r4dx_test_dialect_lfm2";
+  fs::remove_all(root);
+  fs::create_directories(root / "lfm");
+  fs::create_directories(root / "noconfig_tool");
+  std::ofstream(root / "lfm" / "tokenizer_config.json") << lfm_cfg;
+  std::ofstream(root / "lfm" / "tokenizer.json")
+      << "{\"added_tokens\":[{\"id\":124905,\"content\":\"<|tool_call_start|>\"}]}";
+  std::ofstream(root / "noconfig_tool" / "tokenizer.json")
+      << "{\"added_tokens\":[{\"id\":124905,\"content\":\"<|tool_call_start|>\"}]}";
+  const std::string lfm = (root / "lfm").string();
+  CHECK(ResolveDialectKind(std::nullopt, lfm, false) == DialectKind::kLfm2);
+  CHECK(ResolveDialectKind(std::nullopt, (root / "noconfig_tool").string(), false) == DialectKind::kQwen35);
+  CHECK(ResolveDialectKind(DialectKind::kQwen35, lfm, false) == DialectKind::kQwen35);  // explicit wins
+  CHECK(ResolveDialectKind(DialectKind::kLfm2, "", false) == DialectKind::kLfm2);
+  // no tokenizer dir: the container architecture decides
+  CHECK(ResolveDialectKind(std::nullopt, "", false, true) == DialectKind::kLfm2);
+  CHECK(ResolveDialectKind(std::nullopt, "", true, false) == DialectKind::kGemma4);
+  CHECK(ResolveDialectKind(std::nullopt, "", false, false) == DialectKind::kQwen35);
+  fs::remove_all(root);
+
+  CHECK(ResolveTokenizerDir(Lfm2Dialect(), "") == Lfm2Dialect().default_tokenizer_dir);
+  CHECK(ResolveTokenizerDir(Lfm2Dialect(), "X:\\lfm") == "X:\\lfm");
+}
+
+void TestLfm2ArchCheck() {
+  CHECK(ArchNameIsLfm2("lfm2_moe") && ArchNameIsLfm2("lfm2") && !ArchNameIsLfm2("qwen3_5") && !ArchNameIsLfm2(""));
+  CHECK(CheckDialectAgainstArch(Lfm2Dialect(), "lfm2_moe").empty());
+  CHECK(CheckDialectAgainstArch(Lfm2Dialect(), "").empty());
+  CHECK(!CheckDialectAgainstArch(Lfm2Dialect(), "qwen3_5").empty());
+  CHECK(!CheckDialectAgainstArch(Lfm2Dialect(), "gemma4_unified").empty());
+  CHECK(!CheckDialectAgainstArch(Qwen35Dialect(), "lfm2_moe").empty());
+  CHECK(!CheckDialectAgainstArch(Gemma4Dialect(), "lfm2_moe").empty());
+  CHECK(CheckDialectAgainstArch(Qwen35Dialect(), "qwen3_5").empty());  // unchanged
+}
+
 }  // namespace
 
 int main() {
+  TestLfm2Table();
+  TestLfm2PromptState();
+  TestLfm2Detect();
+  TestLfm2ArchCheck();
   TestResolve();
   TestTables();
   TestParseName();

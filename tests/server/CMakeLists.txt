@@ -20,6 +20,7 @@ set(R4DX_SERVER_TESTS
   test_gemma_reasoning_splitter
   test_gemma_tool_call_parser
   test_gemma_tool_stream_gate
+  test_lfm2_tool_call_parser
 )
 
 foreach(t ${R4DX_SERVER_TESTS})
@@ -27,6 +28,11 @@ foreach(t ${R4DX_SERVER_TESTS})
   target_link_libraries(${t} PRIVATE r4dx_server_core)
   add_test(NAME ${t} COMMAND ${t})
 endforeach()
+
+# test_lfm2_tool_call_parser also round-trips every tool call of the HF-rendered chat goldens (the file is in
+# the repo; the test skips that part when it is missing).
+target_compile_definitions(test_lfm2_tool_call_parser PRIVATE
+  R4DX_LFM2_GOLDEN="${CMAKE_SOURCE_DIR}/tests/tokenizer/golden_lfm2.json")
 
 # test_engine_recovery: Engine::RunRequest's error path (docs/tp.md 2.4, 8.4), through engine.cpp
 # itself, against CPU fakes of TpModel's state machine and of the TP=1 model
@@ -45,7 +51,14 @@ if(R4DX_BUILD_SERVER)
   target_compile_definitions(test_engine_recovery PRIVATE
     R4DX_TOKENIZER_MODEL_DIR="${R4DX_TOKENIZER_MODEL_DIR}"
     R4DX_GEMMA_TOKENIZER_DIR="${R4DX_GEMMA_TOKENIZER_DIR}"
+    R4DX_LFM2_TOKENIZER_DIR="${R4DX_LFM2_TOKENIZER_DIR}"
   )
+  # The LFM2 scenario needs r4dx::model::Arch::kLfm2Moe (lane C, src/model/arch.h): compiled only once the enum
+  # exists, so this file builds on a branch that has not merged it yet.
+  file(STRINGS "${CMAKE_SOURCE_DIR}/src/model/arch.h" _r4dx_arch_has_lfm2 REGEX "kLfm2Moe")
+  if(_r4dx_arch_has_lfm2)
+    target_compile_definitions(test_engine_recovery PRIVATE R4DX_TEST_LFM2_ARCH=1)
+  endif()
   target_link_libraries(test_engine_recovery PRIVATE
     r4dx_server_core
     r4dx_model

@@ -1,5 +1,22 @@
 # Status
 
+## LFM2.5-24B-A2B: bf16 TP=2 works, trellis in progress, 2026-10-15
+
+Second-family side model (`lfm2_moe`: 30 short-conv + 10 attention layers, 64-expert top-4 MoE, 2.45 B active of 24 B),
+merged to main from branch `lfm2`. Full page: [lfm2.md](lfm2.md); design [lfm2-plan.md](lfm2-plan.md); facts
+[lfm2-semantics.md](lfm2-semantics.md).
+
+| | bf16, `--tp 2` | trellis (one card) |
+|---|---|---|
+| container | `E:\models\r4dx\lfm2\lfm2-24b-a2b-bf16.r4dx`, 48.5 GB, about 25.8 GiB VRAM per rank | **in progress** (tooling ported, no container yet) |
+| KL gate (epsilon 0.005) | **PASS**: ALL 0.00993 vs HF-bf16 noise 0.01248; Thai 0.0165 / 0.0216; code 0.0076 / 0.0086; english 0.0077 / 0.0100; tool 0.0028 / 0.0026; top-1 96.83 % vs 96.53 % | not measured |
+| speed | teacher-forced 25 ms/row, server decode about 60 tok/s | not measured |
+| server | manual smoke passed (reasoning split, Thai, Pythonic tool call); `tools\server\smoke.ps1 -Dialect lfm2` written, not yet run | -- |
+
+Not optimized yet: the MoE path is the staged one (a host readback of the routed expert ids per MoE layer at decode, one
+GEMM triple per expert at prefill); no drafter, no vision. `/v1/models` reports `n_ctx_train` 131072 for LFM2 (it was the Qwen
+constant 262144).
+
 ## Default container: the Huihui abliterated trellis mix4.5m; base files retired, 2026-09-29
 
 `E:\models\r4dx\huihui-qwen38-27b-abl-trellis-mix45m.r4dx` with `--layout trellis` (details, frozen

@@ -227,4 +227,9 @@ std::unique_ptr<TextModel> LoadTextModel(const ModelOptions& opts, const TpOptio
 // TextModel::Config().arch is Arch::kGemma4 for what it returns.
 std::unique_ptr<TextModel> LoadGemmaTextModel(const ModelOptions& opts, const TpOptions& tp);
 
+// The LFM2 branch of LoadTextModel (arch.h: DetectArch(opts.container_path) == kLfm2Moe). Defined in
+// lfm2_local_text_model.cpp (docs/lfm2-plan.md 3.1): tp.world == 1 -> Lfm2LocalTextModel, tp.world == 2 ->
+// Lfm2TpModel. L1-1 ships a placeholder that throws std::runtime_error until L1-8 / L1-10 replace it.
+std::unique_ptr<TextModel> LoadLfm2TextModel(const ModelOptions& opts, const TpOptions& tp);
+
 }  // namespace r4dx::model

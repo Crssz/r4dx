@@ -76,6 +76,30 @@ add_test(NAME convert_gemma_trellis COMMAND convert_gemma_trellis)
 set_tests_properties(convert_gemma_trellis PROPERTIES SKIP_RETURN_CODE 77 FIXTURES_SETUP gemma_trellis_containers
   ENVIRONMENT "R4DX_GEMMA_TRELLIS_KEEP=${CMAKE_BINARY_DIR}/gemma_trellis_keep")
 
+# LFM2 converter branch (src/convert/lfm2_layout.{hpp,cpp}, docs/lfm2-plan.md L1-2): the layout over the real-geometry
+# 7610-tensor header (and the real checkpoint's header bytes when present) through a recording kit, and -- when
+# r4dx-convert is built -- the exe on a tiny synthetic lfm2_moe checkpoint (per-expert tensors, F32 expert_bias, flat
+# config, single-file and sharded): exact tensor set / shapes / bytes, w4a16, --layers, every refusal. CPU-only;
+# writes a few MB under %TEMP% and removes them.
+add_executable(convert_lfm2_layout test_lfm2_layout.cpp)
+target_link_libraries(convert_lfm2_layout PRIVATE r4dx_convert_lfm2)
+if(TARGET r4dx-convert)
+  target_compile_definitions(convert_lfm2_layout PRIVATE R4DX_CONVERT_EXE="$<TARGET_FILE:r4dx-convert>")
+  add_dependencies(convert_lfm2_layout r4dx-convert)
+endif()
+add_test(NAME convert_lfm2_layout COMMAND convert_lfm2_layout)
+
+# --trellis-from on lfm2_moe (docs/lfm2-plan.md L3-2): tiny per-expert checkpoint + synthetic oracle directories, all in C++
+# (no Python, no GPU). SKIPs (77) without r4dx-convert.
+add_executable(convert_lfm2_trellis test_lfm2_trellis.cpp)
+target_link_libraries(convert_lfm2_trellis PRIVATE r4dx_convert)
+if(TARGET r4dx-convert)
+  target_compile_definitions(convert_lfm2_trellis PRIVATE R4DX_CONVERT_EXE="$<TARGET_FILE:r4dx-convert>")
+  add_dependencies(convert_lfm2_trellis r4dx-convert)
+endif()
+add_test(NAME convert_lfm2_trellis COMMAND convert_lfm2_trellis)
+set_tests_properties(convert_lfm2_trellis PROPERTIES SKIP_RETURN_CODE 77)
+
 add_executable(convert_rotation test_rotation.cpp)
 target_link_libraries(convert_rotation PRIVATE r4dx_convert)
 target_compile_definitions(convert_rotation PRIVATE

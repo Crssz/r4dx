@@ -45,6 +45,22 @@ add_test(NAME tokenizer_golden_gemma
                                   --model-dir ${R4DX_GEMMA_TOKENIZER_DIR})
 set_tests_properties(tokenizer_golden_gemma PROPERTIES SKIP_RETURN_CODE 77)
 
+# LFM2.5-24B-A2B (byte-level BPE with the Llama-3 split regex, no normalizer, no automatic BOS, chat
+# template with Pythonic tool calls): golden_lfm2.json from tools/tok_ref/gen_golden_lfm2.py. The model dir
+# is the checkpoint dir itself (tokenizer.json, tokenizer_config.json, chat_template.jinja,
+# generation_config.json). Override with the R4DX_LFM2_TOKENIZER_DIR environment variable or cache entry.
+if(DEFINED ENV{R4DX_LFM2_TOKENIZER_DIR})
+  set(_r4dx_lfm2_tok_default "$ENV{R4DX_LFM2_TOKENIZER_DIR}")
+else()
+  set(_r4dx_lfm2_tok_default "${R4DX_MODELS_ROOT}/LiquidAI/LFM2.5-24B-A2B")
+endif()
+set(R4DX_LFM2_TOKENIZER_DIR "${_r4dx_lfm2_tok_default}" CACHE PATH
+    "Directory containing the LFM2.5-24B-A2B tokenizer.json/tokenizer_config.json/chat_template.jinja/generation_config.json")
+add_test(NAME tokenizer_golden_lfm2
+         COMMAND tokenizer_golden --golden ${CMAKE_CURRENT_SOURCE_DIR}/golden_lfm2.json
+                                  --model-dir ${R4DX_LFM2_TOKENIZER_DIR})
+set_tests_properties(tokenizer_golden_lfm2 PROPERTIES SKIP_RETURN_CODE 77)
+
 if(NOT EXISTS "${R4DX_TOKENIZER_MODEL_DIR}/tokenizer.json")
   message(WARNING "tests/tokenizer: ${R4DX_TOKENIZER_MODEL_DIR}/tokenizer.json not found; "
                    "'tokenizer_golden' is registered but will report SKIPPED at run time. Set "

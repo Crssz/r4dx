@@ -133,6 +133,24 @@ add_custom_command(
 )
 set_source_files_properties("${R4DX_GEMMA_OBJ}" PROPERTIES EXTERNAL_OBJECT TRUE GENERATED TRUE)
 
+# ---- LFM2 device pieces (docs/lfm2-plan.md 3.3 / 3.5, task L1-6) ---------------------------------------
+# lfm2_kernels.hip: fused ShortConv + state update, the fp32 sigmoid router, the MoE counting sort /
+# gather and the fixed-order fp32 combine (include/r4dx/kernels/lfm2_kernels.h). Same flags as
+# r4dx_kernels.hip. Attached to r4dx_kernels with target_sources() below the add_library.
+set(R4DX_LFM2_SRC "${CMAKE_CURRENT_SOURCE_DIR}/src/lfm2_kernels.hip")
+set(R4DX_LFM2_OBJ "${R4DX_KERNELS_OBJ_DIR}/lfm2_kernels.obj")
+add_custom_command(
+  OUTPUT "${R4DX_LFM2_OBJ}"
+  COMMAND "${CMAKE_COMMAND}" -E env "PATH=${R4DX_KERNELS_HIPCC_PATH}"
+          "${R4DX_HIPCC}" ${R4DX_KERNELS_FLAGS} -c "${R4DX_LFM2_SRC}" -o "${R4DX_LFM2_OBJ}"
+  DEPENDS "${R4DX_LFM2_SRC}"
+          "${CMAKE_CURRENT_SOURCE_DIR}/include/r4dx/kernels/lfm2_kernels.h"
+          "${CMAKE_CURRENT_SOURCE_DIR}/include/r4dx/kernels/kernels.h"
+          "${CMAKE_CURRENT_SOURCE_DIR}/../core/include/r4dx/core/error.hpp"
+  COMMENT "hipcc (${R4D_GFX_ARCH}) lfm2_kernels.obj"
+  VERBATIM
+)
+set_source_files_properties("${R4DX_LFM2_OBJ}" PROPERTIES EXTERNAL_OBJECT TRUE GENERATED TRUE)
 # ---- second hipcc object: the tensor-parallel all-reduce (docs/tp.md 6.3.1) ----------------------
 # r4dx_tp_kernels.hip is a port of tools/tp_bench's flag(drain 3, acq 0) kernel. It is built with
 # EXACTLY r4dx_kernels.hip's flags -- WGP mode, never -mcumode: the drain-3 correctness argument
@@ -187,9 +205,29 @@ add_custom_target(r4dx_tp_kernels_isa ALL DEPENDS "${R4DX_TP_KERNELS_ISA_STAMP}"
 
 add_library(r4dx_kernels STATIC "${R4DX_KERNELS_OBJ}" "${R4DX_TP_KERNELS_OBJ}" "${R4DX_ROTATE_OBJ}"
             "${R4DX_TRELLIS_OBJ}" "${R4DX_GEMMA_OBJ}")
+target_sources(r4dx_kernels PRIVATE "${R4DX_LFM2_OBJ}")
 set_target_properties(r4dx_kernels PROPERTIES LINKER_LANGUAGE CXX)
 add_dependencies(r4dx_kernels r4dx_tp_kernels_isa)
 target_include_directories(r4dx_kernels PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/include")
 # r4d_core: r4dx_dflash_conv_bf16 calls r4d_dflash_conv_t2_g16_bf16 (see the -I above). PUBLIC so
 # every consumer of r4dx_kernels resolves it without having to know about that dependency edge.
 target_link_libraries(r4dx_kernels PUBLIC r4dx_hip_runtime r4d_core)
+
+# ---- repetition penalty on device logits (docs/lfm2-plan.md 5.4) ---------------------------------------
+# rep_penalty.hip: r4dx_apply_repetition_penalty_f32 (include/r4dx/kernels/rep_penalty.h). Own hipcc object,
+# r4dx_kernels.hip's flags, attached with target_sources so this block does not touch the add_library line.
+set(R4DX_REP_SRC "${CMAKE_CURRENT_SOURCE_DIR}/src/rep_penalty.hip")
+set(R4DX_REP_OBJ "${R4DX_KERNELS_OBJ_DIR}/rep_penalty.obj")
+add_custom_command(
+  OUTPUT "${R4DX_REP_OBJ}"
+  COMMAND "${CMAKE_COMMAND}" -E env "PATH=${R4DX_KERNELS_HIPCC_PATH}"
+          "${R4DX_HIPCC}" ${R4DX_KERNELS_FLAGS} -c "${R4DX_REP_SRC}" -o "${R4DX_REP_OBJ}"
+  DEPENDS "${R4DX_REP_SRC}"
+          "${CMAKE_CURRENT_SOURCE_DIR}/include/r4dx/kernels/rep_penalty.h"
+          "${CMAKE_CURRENT_SOURCE_DIR}/include/r4dx/kernels/kernels.h"
+          "${CMAKE_CURRENT_SOURCE_DIR}/../core/include/r4dx/core/error.hpp"
+  COMMENT "hipcc (${R4D_GFX_ARCH}) rep_penalty.obj"
+  VERBATIM
+)
+set_source_files_properties("${R4DX_REP_OBJ}" PROPERTIES EXTERNAL_OBJECT TRUE GENERATED TRUE)
+target_sources(r4dx_kernels PRIVATE "${R4DX_REP_OBJ}")

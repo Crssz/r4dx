@@ -51,3 +51,18 @@ re-run the build + tests.
   Related, not a minja patch: Gemma's template needs `ChatTemplateOptions{.apply_polyfills = false}`
   (src/tokenizer/chat_template.h). minja's caps probe reports `supports_tool_calls=false` for it and
   the default polyfills would rewrite assistant `tool_calls` into JSON content.
+
+- **minja.hpp, LFM2.5 patches (2 local changes, both needed by LiquidAI/LFM2.5-24B-A2B's
+  `chat_template.jinja`; covered by the `tokenizer_golden_lfm2` chat cases):**
+  1. *`replace` filter* (`Context::builtins`): `x | replace(old, new[, count])`. Upstream only had the
+     `str.replace` method, so `(arg | replace("\\", "\\\\") | replace("'", "\\'") | ...)` threw
+     "Value is not callable: null". Left to right, non-overlapping (Python semantics); an empty `old`
+     leaves the text unchanged.
+  2. *Python float repr* (`Value::to_str`, helper `py_float_repr`): `{{ 1.5 | string }}` printed
+     `1.500000` (printf `%f`); HF/Python prints `1.5` (shortest round-trip digits, scientific below
+     1e-4 and from 1e16: `1e-07`, `1e+16`, `3.0`, `inf`, `nan`). Affects a float tool-call argument in
+     the Pythonic tool-call rendering. Qwen goldens unchanged; the Gemma goldens could not be re-run
+     in the lane-B worktree (the Gemma tokenizer directory is absent on this machine), so re-run
+     `tokenizer_golden_gemma` after merging.
+  Related: LFM2 needs `ChatTemplateOptions{.apply_polyfills = false}` (minja's caps probe misreads the
+  template exactly as it does for Gemma's; the polyfills would turn `tool_calls` into JSON content).

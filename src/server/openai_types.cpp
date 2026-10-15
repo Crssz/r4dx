@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <cmath>
 #include <cstdio>
 #include <cstring>
 #include <mutex>
@@ -479,6 +480,17 @@ SamplingParams ParseSampling(const nlohmann::json& body, const SamplingParams& d
     sp.min_p = body.at("min_p").get<float>();
     if (sp.min_p < 0.0f || sp.min_p > 1.0f) {
       throw ApiError{400, "invalid_request_error", "'min_p' must be in [0, 1]"};
+    }
+  }
+  if (body.contains("repetition_penalty") && !body.at("repetition_penalty").is_null()) {
+    if (!body.at("repetition_penalty").is_number()) {
+      throw ApiError{400, "invalid_request_error", "'repetition_penalty' must be a number"};
+    }
+    sp.repetition_penalty = body.at("repetition_penalty").get<float>();
+    // HF requires a strictly positive value; 0 would divide the positive logits by zero. A huge value is
+    // just a very strong penalty, but inf/nan (not representable in JSON anyway) are refused too.
+    if (!(sp.repetition_penalty > 0.0f) || !std::isfinite(sp.repetition_penalty)) {
+      throw ApiError{400, "invalid_request_error", "'repetition_penalty' must be a finite number > 0"};
     }
   }
   if (body.contains("seed") && !body.at("seed").is_null()) {
@@ -971,7 +983,7 @@ nlohmann::json BuildModelEntryJson(const std::string& model_id, int64_t created_
           // probe instead of (or in addition to) `architecture.input_modalities` (docs/vision.md).
           {"modalities", ModelInputModalities(has_vision, has_audio)},
           {"supported_parameters",
-           nlohmann::json::array({"temperature", "top_p", "top_k", "min_p", "seed", "max_tokens",
+           nlohmann::json::array({"temperature", "top_p", "top_k", "min_p", "repetition_penalty", "seed", "max_tokens",
                                   "max_completion_tokens", "stop", "stream", "stream_options",
                                   "tools", "tool_choice", "chat_template_kwargs", "reasoning",
                                   "reasoning_effort", "include_reasoning", "enable_thinking",

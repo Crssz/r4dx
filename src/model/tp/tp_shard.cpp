@@ -141,6 +141,90 @@ bool LookupGemmaLayerRule(const std::string& s, const ModelConfig& g, int64_t la
   return true;
 }
 
+// LFM2 (docs/lfm2-plan.md 3.6, 4, task L1-4): the per-layer table, keyed by the suffix after `text.layers.{i}.`. `g` is
+// Lfm2Config::ToModelConfig() of the UNSHARDED config. Everything splits INSIDE a layer; the residual, the norms,
+// the router and expert_bias replicate:
+//   attention      q / k / v column-parallel (heads, kv heads), out_proj row-parallel (K = heads * head_dim), q/k layernorm replicated;
+//   ShortConv      conv.in_proj column-parallel in THREE segments (B, C, x: rank r takes channels [r*H/w, (r+1)*H/w) of each),
+//                  conv.weight (the squeezed [H, 3] taps) rows split the same channels, conv.out_proj row-parallel (K = H);
+//   dense FFN      mlp.gate_up (gate | up, two segments), mlp.down row-parallel (K = intermediate);
+//   MoE            EVERY expert is TP-split (gate | up halves, down K = moe_intermediate); router + expert_bias replicated.
+// Returns false for a name the table does not know; throws for a tensor on the wrong kind of layer (a conv tensor on an
+// attention layer, a dense mlp on a MoE layer, an expert index out of range).
+bool LookupLfm2LayerRule(const std::string& s, const ModelConfig& g, int64_t layer, ShardRule* rule) {
+  const bool attn = g.layer_types.at(static_cast<size_t>(layer)) == "full_attention";
+  const bool dense = layer < g.num_dense_layers;
+  const int64_t H = g.hidden_size;
+  const auto need_attn = [&](bool want) {
+    if (attn != want) {
+      Fail("RuleFor: '" + s + "' is a " + (want ? "attention" : "ShortConv") + " tensor on " +
+           (attn ? "an attention" : "a ShortConv") + " layer (" + std::to_string(layer) + ")");
+    }
+  };
+  const auto need_dense = [&](bool want) {
+    if (dense != want) {
+      Fail("RuleFor: '" + s + "' is a " + (want ? "dense-FFN" : "MoE") + " tensor on " + (dense ? "a dense" : "an MoE") +
+           " layer (" + std::to_string(layer) + ")");
+    }
+  };
+  if (s == "operator_norm" || s == "ffn_norm") {
+    *rule = Replicate();
+  } else if (s == "attn.q") {
+    need_attn(true);
+    *rule = Rows({g.num_attention_heads * g.head_dim});
+  } else if (s == "attn.k" || s == "attn.v") {
+    need_attn(true);
+    *rule = Rows({g.num_key_value_heads * g.head_dim});
+  } else if (s == "attn.o") {
+    need_attn(true);
+    *rule = Cols(g.num_attention_heads * g.head_dim);
+  } else if (s == "attn.q_norm" || s == "attn.k_norm") {
+    need_attn(true);
+    *rule = Replicate();
+  } else if (s == "conv.in_proj") {
+    need_attn(false);
+    *rule = Rows({H, H, H});
+  } else if (s == "conv.weight") {
+    need_attn(false);
+    *rule = Rows({H});
+  } else if (s == "conv.out_proj") {
+    need_attn(false);
+    *rule = Cols(H);
+  } else if (s == "mlp.gate_up") {
+    need_dense(true);
+    *rule = Rows({g.intermediate_size, g.intermediate_size});
+  } else if (s == "mlp.down") {
+    need_dense(true);
+    *rule = Cols(g.intermediate_size);
+  } else if (s == "moe.router" || s == "moe.expert_bias") {
+    need_dense(false);
+    *rule = Replicate();
+  } else if (StartsWith(s, "moe.experts.")) {
+    need_dense(false);
+    // moe.experts.{e}.gate_up | moe.experts.{e}.down
+    const size_t p = sizeof("moe.experts.") - 1;
+    size_t q = p;
+    while (q < s.size() && q - p < 6 && s[q] >= '0' && s[q] <= '9') ++q;
+    if (q == p || q >= s.size() || s[q] != '.') return false;
+    const int64_t e = std::stoll(s.substr(p, q - p));
+    if (e >= g.num_experts) {
+      Fail("RuleFor: '" + s + "' names expert " + std::to_string(e) + " of a " + std::to_string(g.num_experts) +
+           "-expert layer");
+    }
+    const std::string tail = s.substr(q + 1);
+    if (tail == "gate_up") {
+      *rule = Rows({g.moe_intermediate_size, g.moe_intermediate_size});
+    } else if (tail == "down") {
+      *rule = Cols(g.moe_intermediate_size);
+    } else {
+      return false;
+    }
+  } else {
+    return false;
+  }
+  return true;
+}
+
 void CheckWorldRank(const char* fn, int world, int rank) {
   if (world < 1 || rank < 0 || rank >= world) {
     Fail(std::string(fn) + ": need world >= 1 and 0 <= rank < world, got world " +
@@ -254,6 +338,10 @@ ShardRule RuleFor(const std::string& base, const ModelConfig& global) {
       if (!LookupGemmaLayerRule(base.substr(q + 1), global, layer, &rule)) unknown();
       return rule;
     }
+    if (global.arch == Arch::kLfm2Moe) {
+      if (!LookupLfm2LayerRule(base.substr(q + 1), global, layer, &rule)) unknown();
+      return rule;
+    }
     LayerKind kind;
     if (!LookupLayerRule(base.substr(q + 1), global, &rule, &kind)) unknown();
     const bool gdn_layer = global.IsGdnLayer(layer);
@@ -263,6 +351,10 @@ ShardRule RuleFor(const std::string& base, const ModelConfig& global) {
     }
     return rule;
   }
+
+  // LFM2 has no MTP head and no quant2 rotation (docs/lfm2-plan.md 4): those names must never be classified by the
+  // Qwen / Gemma tables below.
+  if (global.arch == Arch::kLfm2Moe && (StartsWith(base, "mtp.") || StartsWith(base, "rotation."))) unknown();
 
   if (StartsWith(base, "mtp.")) {
     // The MTP head is one full-attention decoder layer (sharded exactly like a body attention

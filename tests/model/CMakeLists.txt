@@ -551,6 +551,43 @@ add_executable(test_tp_shard test_tp_shard.cpp)
 target_link_libraries(test_tp_shard PRIVATE r4dx_tp_shard r4dx_convert)
 add_test(NAME test_tp_shard COMMAND test_tp_shard)
 
+# LFM2 (docs/lfm2-plan.md L1-1 / L1-3 / L1-4), all CPU, no HIP call, no weights:
+#   test_lfm2_config     Lfm2Config::FromJson on the real LFM2.5-24B-A2B config (pattern, every refusal), Lfm2Config::Shard at TP=2,
+#                        DetectArch / ResolveContainerMaxCtx for lfm2_moe and the Qwen / Gemma answers unchanged
+#   test_lfm2_tp_shard   tp::RuleFor's lfm2_moe table over all 40 layers x 64 experts vs Lfm2Config::Shard, the byte plans, the TP=2 algebra
+#   test_lfm2_container  the CPU half of the Lfm2Container loader (lfm2_container_info.h) on a tiny container converted by r4dx-convert
+#                        (when built), header edits, and the real lfm2-l6.r4dx header (SKIP when absent)
+add_executable(test_lfm2_config test_lfm2_config.cpp)
+target_link_libraries(test_lfm2_config PRIVATE r4dx_model_arch)
+add_test(NAME test_lfm2_config COMMAND test_lfm2_config)
+add_executable(test_lfm2_tp_shard test_lfm2_tp_shard.cpp)
+target_link_libraries(test_lfm2_tp_shard PRIVATE r4dx_tp_shard)
+add_test(NAME test_lfm2_tp_shard COMMAND test_lfm2_tp_shard)
+add_executable(test_lfm2_container test_lfm2_container.cpp)
+target_link_libraries(test_lfm2_container PRIVATE r4dx_tp_shard r4dx_convert r4dx_core)
+if(TARGET r4dx-convert)
+  target_compile_definitions(test_lfm2_container PRIVATE R4DX_CONVERT_EXE="$<TARGET_FILE:r4dx-convert>")
+  add_dependencies(test_lfm2_container r4dx-convert)
+endif()
+add_test(NAME test_lfm2_container COMMAND test_lfm2_container)
+
+# LFM2 model GPU tests (docs/lfm2-plan.md L1-8 / L1-9 / L1-10), ONE device, SKIP 77 without their data. NOT run by their author.
+#   lfm2_layer_golden   test_lfm2_layers.cpp: Lfm2Model's layers 0 / 2 / 3, the FFN alone, the ShortConv state carry, q/k norm +
+#                       rope, embed / final norm / tied head on the real lfm2-l6.r4dx vs layer_golden_lfm2.py's goldens
+#                       (R4DX_LFM2_GOLDEN_DIR, R4DX_LFM2_L6_CONTAINER)
+#   lfm2_tiny_e2e       test_lfm2_tiny_e2e.cpp: the whole stack on the tiny fixture (R4DX_LFM2_TINY_DIR) vs Lfm2Reference logits at
+#                       TP=1 and TP=2 (--tp-mode emulate), determinism, checkpoint / restore, greedy / sampled
+# ctest -R "lfm2_layer|lfm2_tiny"
+add_executable(test_lfm2_layers test_lfm2_layers.cpp)
+target_link_libraries(test_lfm2_layers PRIVATE r4dx_model r4dx_convert r4dx_core r4d_core)
+target_compile_definitions(test_lfm2_layers PRIVATE R4DX_LFM2_GOLDEN_DIR="${CMAKE_SOURCE_DIR}/tools/reference/golden_out/lfm2")
+add_test(NAME lfm2_layer_golden COMMAND test_lfm2_layers)
+set_tests_properties(lfm2_layer_golden PROPERTIES ENVIRONMENT "HIP_VISIBLE_DEVICES=1" SKIP_RETURN_CODE 77)
+add_executable(test_lfm2_tiny_e2e test_lfm2_tiny_e2e.cpp)
+target_link_libraries(test_lfm2_tiny_e2e PRIVATE r4dx_model r4dx_convert r4dx_core r4d_core)
+add_test(NAME lfm2_tiny_e2e COMMAND test_lfm2_tiny_e2e)
+set_tests_properties(lfm2_tiny_e2e PROPERTIES ENVIRONMENT "HIP_VISIBLE_DEVICES=1" SKIP_RETURN_CODE 77)
+
 # test_gemma_tp_shard (docs/gemma4-plan.md M1b-1): the Gemma 4 TP=2 sharding contract on the real 12B config -- tp::RuleFor's
 # Gemma table vs GemmaConfig::Shard, the byte plans (bf16 / w4a16 / trellis) partition every linear, and a tiny-model
 # algebra check that the sharded forward equals the unsharded one. CPU only, no HIP, no container.

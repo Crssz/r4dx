@@ -139,10 +139,43 @@ void TestDialectAndContextFlags() {
     CHECK(a.dialect == "gemma4" && a.tokenizer_dir_given && a.tokenizer_dir == "C:\\gtok");
     CHECK(a.max_ctx_given && a.max_ctx == 65536 && a.extended_ctx);
   }
-  for (const char* d : {"auto", "qwen35", "gemma4"}) {
+  for (const char* d : {"auto", "qwen35", "gemma4", "lfm2"}) {
     std::vector<std::string> storage = {"r4dx-server", "--model", "m.r4dx", "--dialect", d};
     auto argv = ToArgv(storage);
     CHECK(r4dx::server::ParseServerArgs(static_cast<int>(argv.size()), argv.data()).dialect == d);
+  }
+}
+
+// --default-repetition-penalty and the "was given" markers a dialect's own sampling defaults (LFM2) consult.
+void TestSamplingDefaultGivenMarkers() {
+  {
+    std::vector<std::string> storage = {"r4dx-server", "--model", "m.r4dx"};
+    auto argv = ToArgv(storage);
+    const auto a = r4dx::server::ParseServerArgs(static_cast<int>(argv.size()), argv.data());
+    CHECK(a.default_repetition_penalty == 1.0f);
+    CHECK(!a.default_temperature_given && !a.default_top_p_given && !a.default_top_k_given &&
+          !a.default_min_p_given && !a.default_repetition_penalty_given);
+  }
+  {
+    std::vector<std::string> storage = {"r4dx-server", "--model", "m.r4dx", "--default-temperature", "0.3",
+                                        "--default-top-k", "20", "--default-repetition-penalty", "1.2"};
+    auto argv = ToArgv(storage);
+    const auto a = r4dx::server::ParseServerArgs(static_cast<int>(argv.size()), argv.data());
+    CHECK(a.default_temperature_given && a.default_temperature == 0.3f);
+    CHECK(a.default_top_k_given && a.default_top_k == 20);
+    CHECK(a.default_repetition_penalty_given && a.default_repetition_penalty == 1.2f);
+    CHECK(!a.default_top_p_given && !a.default_min_p_given);
+  }
+  for (const char* bad : {"0", "-1"}) {
+    std::vector<std::string> storage = {"r4dx-server", "--model", "m.r4dx", "--default-repetition-penalty", bad};
+    auto argv = ToArgv(storage);
+    bool threw = false;
+    try {
+      r4dx::server::ParseServerArgs(static_cast<int>(argv.size()), argv.data());
+    } catch (const r4dx::server::ServerUsageError&) {
+      threw = true;
+    }
+    CHECK(threw);
   }
 }
 
@@ -615,6 +648,7 @@ int main() {
   TestNonsensicalValuesThrow();
   TestUnparseableNumberThrowsServerUsageError();
   TestDialectAndContextFlags();
+  TestSamplingDefaultGivenMarkers();
   TestMtpHeadLayoutFlag();
   TestMtpDraftHeadFlag();
   TestEmbedDeviceResidentFlag();

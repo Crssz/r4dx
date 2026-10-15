@@ -12,6 +12,8 @@
 #include <cctype>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
 #include <cmath>
 #include <exception>
 #include <functional>
@@ -52,6 +54,46 @@ inline std::string normalize_newlines(const std::string & s) {
 #else
   return s;
 #endif
+}
+
+// r4dx patch (LFM2): Python's str(float) / repr(float) (shortest round-trip digits; scientific when the
+// decimal exponent is < -4 or >= 16; "1.5", "3.0", "1e-07", "1e+16", "inf", "nan"). Upstream minja used
+// std::to_string (printf "%f": "1.500000"), which is what `{{ arg_value | string }}` printed for a float
+// tool-call argument; HF renders the Python repr.
+inline std::string py_float_repr(double x) {
+  if (std::isnan(x)) return "nan";
+  if (std::isinf(x)) return x < 0 ? "-inf" : "inf";
+  if (x == 0) return std::signbit(x) ? "-0.0" : "0.0";
+  char buf[64];
+  int prec = 1;
+  for (; prec <= 17; ++prec) {  // shortest digit count that round-trips
+    std::snprintf(buf, sizeof(buf), "%.*e", prec - 1, x);
+    if (std::strtod(buf, nullptr) == x) break;
+  }
+  std::string s(buf);  // d.ddde[+-]XX
+  const bool neg = s[0] == '-';
+  if (neg) s.erase(0, 1);
+  const size_t epos = s.find('e');
+  const int exp10 = std::atoi(s.c_str() + epos + 1);
+  std::string digits;
+  for (size_t i = 0; i < epos; ++i) if (s[i] != '.') digits += s[i];
+  std::string out;
+  if (exp10 >= -4 && exp10 < 16) {
+    if (exp10 < 0) {
+      out = "0." + std::string(static_cast<size_t>(-exp10 - 1), '0') + digits;
+    } else if (static_cast<size_t>(exp10) + 1 >= digits.size()) {
+      out = digits + std::string(static_cast<size_t>(exp10) + 1 - digits.size(), '0') + ".0";
+    } else {
+      out = digits.substr(0, static_cast<size_t>(exp10) + 1) + "." + digits.substr(static_cast<size_t>(exp10) + 1);
+    }
+  } else {
+    out = digits.substr(0, 1);
+    if (digits.size() > 1) out += "." + digits.substr(1);
+    char eb[16];
+    std::snprintf(eb, sizeof(eb), "e%c%02d", exp10 < 0 ? '-' : '+', exp10 < 0 ? -exp10 : exp10);
+    out += eb;
+  }
+  return neg ? "-" + out : out;
 }
 
 /* Values that behave roughly like in Python. */
@@ -463,7 +505,7 @@ public:
   std::string to_str() const {
     if (is_string()) return get<std::string>();
     if (is_number_integer()) return std::to_string(get<int64_t>());
-    if (is_number_float()) return std::to_string(get<double>());
+    if (is_number_float()) return py_float_repr(get<double>());
     if (is_boolean()) return get<bool>() ? "True" : "False";
     if (is_null()) return "None";
     return dump();
@@ -2772,6 +2814,32 @@ inline std::shared_ptr<Context> Context::builtins() {
   globals.set("trim", simple_function("trim", { "text" }, [](const std::shared_ptr<Context> &, Value & args) {
     auto & text = args.at("text");
     return text.is_null() ? text : Value(strip(text.get<std::string>()));
+  }));
+  // r4dx patch (LFM2): Jinja's `replace` FILTER (`x | replace(old, new[, count])`). Upstream minja only
+  // had the str.replace METHOD, so `(arg | replace("\\", "\\\\") | ...)` in LFM2's chat template hit
+  // "Value is not callable: null". Left-to-right non-overlapping, like Python str.replace; an empty
+  // `old` leaves the text unchanged (Python would interleave `new`; the LFM2 template never does it).
+  globals.set("replace", Value::callable([=](const std::shared_ptr<Context> &, ArgumentsValue & args) {
+    args.expectArgs("replace", {3, 4}, {0, 0});
+    auto & text = args.args[0];
+    if (text.is_null()) return text;
+    std::string str = text.get<std::string>();
+    const std::string before = args.args[1].get<std::string>();
+    const std::string after = args.args[2].get<std::string>();
+    int64_t count = args.args.size() == 4 ? args.args[3].get<int64_t>() : -1;
+    if (before.empty()) return Value(str);
+    std::string out;
+    size_t pos = 0;
+    while (count != 0) {
+      const size_t hit = str.find(before, pos);
+      if (hit == std::string::npos) break;
+      out.append(str, pos, hit - pos);
+      out += after;
+      pos = hit + before.size();
+      if (count > 0) --count;
+    }
+    out.append(str, pos, std::string::npos);
+    return Value(out);
   }));
   auto char_transform_function = [](const std::string & name, const std::function<char(char)> & fn) {
     return simple_function(name, { "text" }, [=](const std::shared_ptr<Context> &, Value & args) {

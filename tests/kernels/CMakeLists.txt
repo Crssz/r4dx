@@ -102,6 +102,10 @@ set(R4DX_KERNEL_TESTS
   test_argmax_multi
   test_gdn_ab_merge
   test_attn_precore
+  # LFM2 repetition penalty (docs/lfm2-plan.md 5.4): r4dx_apply_repetition_penalty_f32 bit for bit against the
+  # host rule (rep_penalty.hpp); GPU test written, NOT run by its author: `ctest -R rep_penalty` (runs the pure-CPU
+  # twin test_rep_penalty_cpu too).
+  test_rep_penalty
 )
 
 foreach(t ${R4DX_KERNEL_TESTS})
@@ -161,6 +165,7 @@ set_source_files_properties(test_dflash_attn.cpp test_dflash_conv.cpp test_topk_
                             test_trellis_input.cpp test_trellis_gemm.cpp test_fused_quant.cpp
                             test_trellis_m256.cpp test_trellis_i8_gemm.cpp test_trellis_input_i8.cpp test_fake_quant_act.cpp test_fake_quant_w.cpp test_rope_proportional.cpp
                             test_gemma_postnorm.cpp test_gemma_resid_f32.cpp test_rotate_residual_f32.cpp
+                            test_rep_penalty.cpp
                             PROPERTIES COMPILE_OPTIONS "/EHc-")
 
 # test_attn_gate_mul_hadamard's kernel lives in r4dx_model_attention (src/model/attention), not
@@ -376,3 +381,26 @@ set_source_files_properties(test_tp_allreduce_cpu_peer.cpp test_tp_allreduce_2gp
 # against) and src/model/kernels/model_kernels.h's declaration.
 target_include_directories(test_fused_quant PRIVATE "${CMAKE_SOURCE_DIR}/src/model")
 target_link_libraries(test_fused_quant PRIVATE r4dx_model_kernels)
+
+# ---- LFM2 kernels (docs/lfm2-plan.md 3.3 / 3.5, tasks L1-6 / L1-7) ------------------------------------
+# GPU step (ctest runs the CPU reference test too, which is harmless):
+#   $env:HIP_VISIBLE_DEVICES='1'; ctest --test-dir build\win-hip -R lfm2_ --output-on-failure
+# test_lfm2_shortconv / _router / _moe test src/kernels' lfm2_kernels.hip against lfm2_ref.hpp;
+# test_lfm2_rope_norm64 pins the EXISTING rope / rmsnorm kernels at head_dim 64. All four are GPU tests
+# (WRITTEN, NOT YET RUN), built with /EHc- because they check precondition throws out of extern "C" entry points.
+foreach(t test_lfm2_shortconv test_lfm2_router test_lfm2_moe test_lfm2_rope_norm64)
+  add_executable(${t} ${t}.cpp)
+  target_link_libraries(${t} PRIVATE r4dx_core r4dx_kernels r4d_core)
+  set_source_files_properties(${t}.cpp PROPERTIES COMPILE_OPTIONS "/EHc-")
+  add_test(NAME ${t} COMMAND ${t})
+  set_tests_properties(${t} PROPERTIES ENVIRONMENT "HIP_VISIBLE_DEVICES=1")
+endforeach()
+# test_lfm2_ref_cpu: pure CPU (no HIP call, no kernel library) -- lfm2_ref.hpp against hand cases and naive
+# implementations (whole-sequence causal conv1d, stable sort, HF rope / rmsnorm). Always runs.
+add_executable(test_lfm2_ref_cpu test_lfm2_ref_cpu.cpp)
+add_test(NAME test_lfm2_ref_cpu COMMAND test_lfm2_ref_cpu)
+
+# test_rep_penalty_cpu: pure CPU (header-only rep_penalty.hpp + sampler.hpp, no HIP call). Always runs.
+add_executable(test_rep_penalty_cpu test_rep_penalty_cpu.cpp)
+target_include_directories(test_rep_penalty_cpu PRIVATE "${CMAKE_SOURCE_DIR}/src/kernels/include")
+add_test(NAME test_rep_penalty_cpu COMMAND test_rep_penalty_cpu)

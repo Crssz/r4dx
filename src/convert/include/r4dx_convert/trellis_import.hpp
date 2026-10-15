@@ -284,9 +284,13 @@ inline std::string PadTo(std::string s, size_t width) {
   return s;
 }
 
-// "model.language_model.layers.7.mlp.down_proj.weight" -> 7, or -1.
+// "model.language_model.layers.7.mlp.down_proj.weight" -> 7, or -1. LFM2 (lfm2_moe) names its layers
+// "model.layers.7.feed_forward.experts.12.w1.weight": every expert of a layer is a manifest key of its own (the
+// per-expert checkpoint names ARE the manifest keys, so no expert suffix is needed), and the layer index is the same.
 inline int HfLayerIndex(const std::string& hf) {
-  static const std::string prefix = "model.language_model.layers.";
+  static const std::string prefix_vl = "model.language_model.layers.";
+  static const std::string prefix_lfm = "model.layers.";
+  const std::string& prefix = hf.compare(0, prefix_vl.size(), prefix_vl) == 0 ? prefix_vl : prefix_lfm;
   if (hf.compare(0, prefix.size(), prefix) != 0) return -1;
   size_t i = prefix.size();
   int v = 0;

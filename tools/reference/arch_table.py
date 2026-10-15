@@ -27,7 +27,9 @@ attn.qg, no gdn.*, no mtp.*).
 
 from __future__ import annotations
 
+import functools
 import json
+import os
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -64,6 +66,11 @@ class ArchSpec:
     rms_norms: tuple = ()                      #: (norm module whose INPUT is hooked, tap id)
     rms_key_suffixes: dict = field(default_factory=dict, hash=False)
     attention_layer_types: tuple = (FULL,)
+    #: HF name prefix of a decoder layer (LFM2: `model.layers.`; everything else `model.language_model.layers.`)
+    layer_prefix: str = LAYER_PREFIX
+    #: LFM2 only: routed-expert count of the checkpoint this spec was built for (its per-expert module tables
+    #: are sized by it); 0 for every other arch
+    n_experts: int = 0
 
     # -- derived -----------------------------------------------------------------------------------
 
@@ -75,7 +82,7 @@ class ArchSpec:
                              f"(have {sorted(self.modules_by_layer_type)})") from None
 
     def hf_name(self, layer: int, module: str) -> str:
-        return f"{LAYER_PREFIX}{layer}.{module}.weight"
+        return f"{self.layer_prefix}{layer}.{module}.weight"
 
     def container_key(self, layer: int, module: str) -> str:
         return f"text.layers.{layer}.{self.linears[module][0]}"
@@ -87,6 +94,19 @@ class ArchSpec:
     @property
     def is_gemma(self) -> bool:
         return self.name == "gemma4_unified"
+
+    @property
+    def is_lfm2(self) -> bool:
+        return self.name == "lfm2_moe"
+
+    def layer_kinds(self, cfg: dict) -> list:
+        """The per-layer type strings the tables below are keyed by. Qwen / Gemma: config's `layer_types`
+        verbatim. LFM2: `<conv|full_attention>_<dense|moe>` (the FFN kind follows `num_dense_layers`)."""
+        types = list(cfg["layer_types"])
+        if not self.is_lfm2:
+            return types
+        nd = int(cfg.get("num_dense_layers", 2))
+        return [f"{t}_{'dense' if i < nd else 'moe'}" for i, t in enumerate(types)]
 
     def converter_source(self) -> Path:
         return REPO_ROOT / self.converter_path
@@ -229,12 +249,106 @@ GEMMA = ArchSpec(
     attention_layer_types=(SLIDING, FULL),
 )
 
-ARCHES = {QWEN.name: QWEN, GEMMA.name: GEMMA}
+# ---------------------------------------------------------------------------------------------------
+# LFM2 (lfm2_moe; LiquidAI/LFM2.5-24B-A2B, docs/lfm2-plan.md 7.1)
+# ---------------------------------------------------------------------------------------------------
+#
+# Layer kinds are `<conv|full_attention>_<dense|moe>` (ArchSpec.layer_kinds). HF names (the REAL checkpoint's,
+# PER-EXPERT: experts.{e}.{w1 = gate, w3 = up, w2 = down}):
+#   attention  self_attn.{q,k,v,out}_proj        container attn.{q,k,v,o}        taps in (q,k,v) / out
+#   ShortConv  conv.in_proj / conv.out_proj      container conv.{in_proj,out_proj} taps in / out
+#   dense FFN  feed_forward.{w1,w3} / w2         container mlp.gate_up / mlp.down taps mlp_in / mlp_mid
+#   MoE FFN    feed_forward.experts.{e}.{w1,w3} / w2   container moe.experts.{e}.gate_up / .down
+#              taps `E{e:02d}.mlp_in` / `E{e:02d}.mlp_mid`  (files L{i:02d}.E{e:02d}.mlp_in.hess ...):
+#              each is the Hessian of the tokens ROUTED to expert e (gate/up share one input, as dense).
+# `conv.conv.weight`, the router `feed_forward.gate.weight`, `expert_bias`, every norm and q/k layernorm stay
+# bf16/fp32 passthrough (never quantized, never captured). Taps `in` / `mlp_in` are the outputs of
+# `operator_norm` / `ffn_norm` (plain scale w, norm_offset 0).
+# Quantization groups (the allocator's promotion units, plan 7.1): mixer in (q,k,v | conv.in_proj), mixer out,
+# FFN gate_up of ALL experts of a layer (`moe.gu`), FFN down of ALL experts (`moe.d`).
+
+LFM2_PREFIX = "model.layers."
+#: The bf16 checkpoint (plan 6.2: R4DX_MODEL_DIR overrides, as common_lfm2.py will document)
+LFM2_MODEL_DIR = Path(os.environ.get("R4DX_MODEL_DIR")
+                      or Path(os.environ.get("R4DX_MODELS_ROOT", r"E:\models")) / "LiquidAI" / "LFM2.5-24B-A2B")
+LFM2_CONV = "conv"
+LFM2_KINDS = ("conv_dense", "conv_moe", "full_attention_dense", "full_attention_moe")
+_LFM2_ATTN = ["self_attn.q_proj", "self_attn.k_proj", "self_attn.v_proj", "self_attn.out_proj"]
+_LFM2_CONV = ["conv.in_proj", "conv.out_proj"]
+_LFM2_DENSE = ["feed_forward.w1", "feed_forward.w3", "feed_forward.w2"]
+LFM2_EXPERT_RE = re.compile(r"feed_forward\.experts\.(\d+)\.(w1|w3|w2)")
+
+
+def lfm2_expert_modules(e: int) -> list:
+    return [f"feed_forward.experts.{e}.w1", f"feed_forward.experts.{e}.w3", f"feed_forward.experts.{e}.w2"]
+
+
+def lfm2_expert_of(module: str):
+    """`feed_forward.experts.5.w3` -> (5, 'w3'); None for any other module."""
+    m = LFM2_EXPERT_RE.fullmatch(module)
+    return (int(m.group(1)), m.group(2)) if m else None
+
+
+@functools.lru_cache(maxsize=None)
+def lfm2_arch(n_experts: int = 64) -> ArchSpec:
+    """The lfm2_moe spec for a checkpoint with `n_experts` routed experts (the real one has 64)."""
+    experts = [m for e in range(n_experts) for m in lfm2_expert_modules(e)]
+    linears = {
+        "self_attn.q_proj": ("attn.q", "in"), "self_attn.k_proj": ("attn.k", "in"),
+        "self_attn.v_proj": ("attn.v", "in"), "self_attn.out_proj": ("attn.o", "out"),
+        "conv.in_proj": ("conv.in_proj", "in"), "conv.out_proj": ("conv.out_proj", "out"),
+        "feed_forward.w1": ("mlp.gate_up", "mlp_in"), "feed_forward.w3": ("mlp.gate_up", "mlp_in"),
+        "feed_forward.w2": ("mlp.down", "mlp_mid"),
+    }
+    qgroups = {
+        "self_attn.q_proj": "self_attn.qkv", "self_attn.k_proj": "self_attn.qkv",
+        "self_attn.v_proj": "self_attn.qkv", "self_attn.out_proj": "self_attn.o",
+        "conv.in_proj": "conv.in", "conv.out_proj": "conv.o",
+        "feed_forward.w1": "mlp.gu", "feed_forward.w3": "mlp.gu", "feed_forward.w2": "mlp.d",
+    }
+    norm_before = {"self_attn.q_proj": "operator_norm", "conv.in_proj": "operator_norm",
+                   "feed_forward.w1": "ffn_norm"}
+    shared_with = {"self_attn.k_proj": "self_attn.q_proj", "self_attn.v_proj": "self_attn.q_proj",
+                   "feed_forward.w3": "feed_forward.w1"}
+    tap_of = {"self_attn.q_proj": "in", "conv.in_proj": "in", "self_attn.out_proj": "out",
+              "conv.out_proj": "out", "feed_forward.w1": "mlp_in", "feed_forward.w2": "mlp_mid"}
+    for e in range(n_experts):
+        w1, w3, w2 = lfm2_expert_modules(e)
+        tag = f"E{e:02d}"
+        linears[w1] = linears[w3] = (f"moe.experts.{e}.gate_up", f"{tag}.mlp_in")
+        linears[w2] = (f"moe.experts.{e}.down", f"{tag}.mlp_mid")
+        qgroups[w1] = qgroups[w3] = "moe.gu"
+        qgroups[w2] = "moe.d"
+        norm_before[w1] = "ffn_norm"
+        shared_with[w3] = w1
+        tap_of[w1], tap_of[w2] = f"{tag}.mlp_in", f"{tag}.mlp_mid"
+    dense_gate = ("feed_forward.w1", ["feed_forward.w3"])
+    qkv_gate = ("self_attn.q_proj", ["self_attn.k_proj", "self_attn.v_proj"])
+    return ArchSpec(
+        name="lfm2_moe", model_types=("lfm2_moe",), converter_arch="lfm2_moe",
+        converter_path="src/convert/lfm2_layout.cpp", norm_offset=0.0,
+        lm_head_name="model.embed_tokens.weight",   # tied: the head is the embedding table
+        has_mtp=False, linears=linears, qgroups=qgroups,
+        modules_by_layer_type={
+            "conv_dense": _LFM2_CONV + _LFM2_DENSE, "conv_moe": _LFM2_CONV + experts,
+            "full_attention_dense": _LFM2_ATTN + _LFM2_DENSE, "full_attention_moe": _LFM2_ATTN + experts},
+        norm_before=norm_before, shared_with=shared_with, tap_of=tap_of, mtp_tap_of={},
+        shared_gate={"conv_dense": [dense_gate], "conv_moe": [],
+                     "full_attention_dense": [qkv_gate, dense_gate], "full_attention_moe": [qkv_gate]},
+        rms_norms=(), rms_key_suffixes={},
+        attention_layer_types=("full_attention_dense", "full_attention_moe"),
+        layer_prefix=LFM2_PREFIX, n_experts=n_experts)
+
+
+LFM2 = lfm2_arch(64)
+
+ARCHES = {QWEN.name: QWEN, GEMMA.name: GEMMA, LFM2.name: LFM2}
 ARCH_NAMES = tuple(ARCHES)
 
 
 def get_arch(name: str | None) -> ArchSpec:
-    """The spec of `name` (None = qwen3_5, the historical default)."""
+    """The spec of `name` (None = qwen3_5, the historical default). lfm2_moe: the 64-expert spec (resolve_arch
+    with a model dir sizes it by the checkpoint's config)."""
     if name is None:
         return QWEN
     for spec in ARCHES.values():
@@ -250,25 +364,47 @@ def read_config(model_dir: Path | str) -> dict:
 
 def detect_arch(model_dir: Path | str) -> ArchSpec:
     """The arch of a checkpoint directory, from config.json's model_type (top level, then
-    text_config's); anything that is not Gemma 4 is the Qwen3.5 default, as before this table existed."""
+    text_config's); LFM2 (sized by the config's num_experts); anything else that is not Gemma 4 is the Qwen3.5
+    default, as before this table existed."""
     cfg = read_config(model_dir)
     for mt in (cfg.get("model_type"), (cfg.get("text_config") or {}).get("model_type")):
         if mt in GEMMA.model_types:
             return GEMMA
+        if mt in LFM2.model_types:
+            return lfm2_arch(int(cfg.get("num_experts", 64)))
     return QWEN
 
 
 def resolve_arch(requested: str | None, model_dir: Path | str | None) -> ArchSpec:
     """`--arch` of the tools: 'auto'/None = detect from model_dir (Qwen when there is none)."""
+    has_cfg = model_dir is not None and (Path(model_dir) / "config.json").is_file()
     if requested in (None, "auto"):
-        return detect_arch(model_dir) if model_dir is not None and (Path(model_dir) / "config.json").is_file() else QWEN
-    return get_arch(requested)
+        return detect_arch(model_dir) if has_cfg else QWEN
+    spec = get_arch(requested)
+    if spec.is_lfm2 and has_cfg:   # the per-expert tables follow the checkpoint's expert count
+        return lfm2_arch(int(read_config(model_dir).get("num_experts", 64)))
+    return spec
 
 
 def text_config_view(arch: ArchSpec, model_dir: Path | str):
     """What enumerate_quantized_linears needs of a text config (`layer_types`, `num_hidden_layers`,
     `hidden_size`): the transformers config for Qwen (common.load_text_config), a plain namespace read
-    from config.json for Gemma (no transformers, so the CPU dry-run needs only numpy)."""
+    from config.json for Gemma and LFM2 (no transformers, so the CPU dry-run needs only numpy).
+    LFM2: `layer_types` are the HF ones (conv / full_attention); `layer_kinds` the table keys."""
+    if arch.is_lfm2:
+        t = read_config(model_dir)
+        n = int(t["num_hidden_layers"])
+        if len(t["layer_types"]) != n:
+            raise ValueError(f"layer_types has {len(t['layer_types'])} entries for {n} layers")
+        return SimpleNamespace(
+            layer_types=list(t["layer_types"]), layer_kinds=arch.layer_kinds(t), num_hidden_layers=n,
+            hidden_size=int(t["hidden_size"]), intermediate_size=int(t["intermediate_size"]),
+            moe_intermediate_size=int(t["moe_intermediate_size"]), vocab_size=int(t["vocab_size"]),
+            num_attention_heads=int(t["num_attention_heads"]), num_key_value_heads=int(t["num_key_value_heads"]),
+            head_dim=int(t.get("head_dim") or t["hidden_size"] // t["num_attention_heads"]),
+            num_dense_layers=int(t.get("num_dense_layers", 2)), num_experts=int(t["num_experts"]),
+            num_experts_per_tok=int(t["num_experts_per_tok"]), norm_eps=float(t.get("norm_eps", 1e-5)),
+            conv_L_cache=int(t.get("conv_L_cache", 3)))
     if not arch.is_gemma:
         from common import load_text_config
 
@@ -287,7 +423,7 @@ def text_config_view(arch: ArchSpec, model_dir: Path | str):
 
 
 def norm_scale_name(arch: ArchSpec, layer: int, norm: str) -> str:
-    return f"{LAYER_PREFIX}{layer}.{norm}.weight"
+    return f"{arch.layer_prefix}{layer}.{norm}.weight"
 
 
 RMS_POST_FILE_RE = re.compile(r"L(\d{2,})\.(in|mlp_in)\.hess")

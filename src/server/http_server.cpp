@@ -197,7 +197,7 @@ HttpServer::HttpServer(Engine& engine) : impl_(std::make_unique<Impl>(engine)) {
       // byte identical to before this feature existed). `emit_reasoning` is the separate
       // "think, but do not return the thought" question (reasoning.exclude / include_reasoning,
       // docs/server.md's "Thinking controls").
-      const bool enable_thinking = ResolveEnableThinking(req.thinking, engine_ref.DefaultThinking());
+      const bool enable_thinking = engine_ref.ResolveThinking(req.thinking);
       // Gemma 4 (task M1-14): the model opens a thought span by itself, thinking requested or not, and
       // the sink always splits it off; with thinking off a stray span is still returned as
       // reasoning_content unless the client excluded it (an empty one is not put on the wire below).

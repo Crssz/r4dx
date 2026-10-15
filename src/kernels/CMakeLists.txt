@@ -193,3 +193,22 @@ target_include_directories(r4dx_kernels PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/incl
 # r4d_core: r4dx_dflash_conv_bf16 calls r4d_dflash_conv_t2_g16_bf16 (see the -I above). PUBLIC so
 # every consumer of r4dx_kernels resolves it without having to know about that dependency edge.
 target_link_libraries(r4dx_kernels PUBLIC r4dx_hip_runtime r4d_core)
+
+# ---- repetition penalty on device logits (docs/lfm2-plan.md 5.4) ---------------------------------------
+# rep_penalty.hip: r4dx_apply_repetition_penalty_f32 (include/r4dx/kernels/rep_penalty.h). Own hipcc object,
+# r4dx_kernels.hip's flags, attached with target_sources so this block does not touch the add_library line.
+set(R4DX_REP_SRC "${CMAKE_CURRENT_SOURCE_DIR}/src/rep_penalty.hip")
+set(R4DX_REP_OBJ "${R4DX_KERNELS_OBJ_DIR}/rep_penalty.obj")
+add_custom_command(
+  OUTPUT "${R4DX_REP_OBJ}"
+  COMMAND "${CMAKE_COMMAND}" -E env "PATH=${R4DX_KERNELS_HIPCC_PATH}"
+          "${R4DX_HIPCC}" ${R4DX_KERNELS_FLAGS} -c "${R4DX_REP_SRC}" -o "${R4DX_REP_OBJ}"
+  DEPENDS "${R4DX_REP_SRC}"
+          "${CMAKE_CURRENT_SOURCE_DIR}/include/r4dx/kernels/rep_penalty.h"
+          "${CMAKE_CURRENT_SOURCE_DIR}/include/r4dx/kernels/kernels.h"
+          "${CMAKE_CURRENT_SOURCE_DIR}/../core/include/r4dx/core/error.hpp"
+  COMMENT "hipcc (${R4D_GFX_ARCH}) rep_penalty.obj"
+  VERBATIM
+)
+set_source_files_properties("${R4DX_REP_OBJ}" PROPERTIES EXTERNAL_OBJECT TRUE GENERATED TRUE)
+target_sources(r4dx_kernels PRIVATE "${R4DX_REP_OBJ}")

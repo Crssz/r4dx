@@ -265,6 +265,15 @@ ROWS_PER_K_MIN = 4
 #: many fails the diagonal gate outright: that is a broken capture, not a handful of dead channels.
 MAX_REPORTED_CHANNELS = 64
 
+
+def widen_report_cap(arch) -> None:
+    """LFM2 experts: a down_proj input (K = 1536) can have hundreds of numerically dead channels in a rarely
+    routed expert (L02: up to ~20 %, first capture). The cap only protects against a broken capture, which the
+    strict dead-row rule (activation_dead_channels) already catches per channel, so lift it to > K."""
+    global MAX_REPORTED_CHANNELS
+    if getattr(arch, "is_lfm2", False):
+        MAX_REPORTED_CHANNELS = 4096
+
 #: The zero-centred norm that feeds each representative module. A channel whose (1 + w) is exactly
 #: 0 is identically zero after the norm, so its Hessian row/column is exactly zero: a property of
 #: the checkpoint (e.g. layer 7 post_attention_layernorm channel 3994), not a capture bug. LDLQ is
@@ -1885,6 +1894,9 @@ def structural_zero_channels(model_dir: Path, taps: dict[str, tuple],
 #: column sees a constant-zero input) -- but only exempt when the WHOLE Hessian row is exactly zero, which a hook
 #: that captured garbage could not produce.
 ACTIVATION_DEAD_SUFFIX = ".mlp_mid.hess"
+#: LFM2 only: a zero-diagonal channel whose whole row stays below this is numerically dead (1e-20 is 15 orders
+#: under any live diagonal, and far above the 2e-27 observed).
+LFM2_DEAD_ROW_MAX = 1e-20
 ACTIVATION_DEAD_RULE = ("Gemma mlp_mid only: channels whose Hessian diagonal AND whole row are exactly 0 "
                         "(gelu_tanh saturated to 0 on every calibration token)")
 
@@ -1892,7 +1904,8 @@ ACTIVATION_DEAD_RULE = ("Gemma mlp_mid only: channels whose Hessian diagonal AND
 def activation_dead_channels(out_dir: Path, files: list[str], arch: ArchSpec = QWEN) -> dict[str, list[int]]:
     """{file: channels with an exactly-zero Hessian row} for Gemma's mlp_mid files (ACTIVATION_DEAD_SUFFIX).
     Reads only the needed entries of the packed upper triangle (memory-mapped). Empty for Qwen."""
-    if not getattr(arch, "is_gemma", False):
+    is_lfm2 = bool(getattr(arch, "is_lfm2", False))
+    if not getattr(arch, "is_gemma", False) and not is_lfm2:
         return {}
     out: dict[str, list[int]] = {}
     for f in files:
@@ -1913,6 +1926,12 @@ def activation_dead_channels(out_dir: Path, files: list[str], arch: ArchSpec = Q
             j = np.arange(i, dtype=np.int64)
             left = np.asarray(tri[start(j) + (i - j)]) if i else np.zeros(0, np.float32)  # H[0..i, i]
             if not right.any() and not left.any():
+                dead.append(i)
+            elif is_lfm2 and max(float(np.abs(right).max()), float(np.abs(left).max()) if left.size else 0.0) \
+                    <= LFM2_DEAD_ROW_MAX:
+                # LFM2 SwiGLU mid channel with activations so small that x_i^2 underflows fp32 (the stored
+                # diagonal is 0) while x_i x_j survives as a denormal: numerically dead, row <= 2e-27 against
+                # typical diagonals of 3e-5 (L02 experts, 127 channels in the first capture).
                 dead.append(i)
         if dead:
             out[f] = dead
@@ -2229,6 +2248,7 @@ def regate(out_dir: Path, model_dir: Path | None) -> int:
     from common import DEFAULT_MODEL_DIR
 
     arch = get_arch(doc.get("arch"))  # a Qwen manifest records no "arch"; Gemma's says gemma4_unified
+    widen_report_cap(arch)
     if model_dir is None:
         model_dir = Path(doc["model_dir"]) if (arch.is_gemma or arch.is_lfm2) else DEFAULT_MODEL_DIR
     structural = structural_zero_channels(model_dir, taps, arch)
@@ -2849,7 +2869,8 @@ def main() -> int:
         args.model_dir = LFM2_MODEL_DIR
     model_dir = args.model_dir or DEFAULT_MODEL_DIR
     arch = resolve_arch(args.arch, model_dir)
-    token_corpus = arch.is_gemma or arch.is_lfm2   # the corpus is gen_samples.py's token ids, no tokenizer
+    widen_report_cap(arch)
+    token_corpus = arch.is_gemma or arch.is_lfm2  # the corpus is gen_samples.py's token ids, no tokenizer
     if token_corpus and args.tokenizer is not None:
         raise SystemExit(f"[hessian] --tokenizer does not apply to --arch {arch.name} (the corpus is "
                          "token ids from gen_samples.py)")

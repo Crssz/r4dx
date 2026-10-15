@@ -108,6 +108,7 @@ class Lfm2Container {
 
  private:
   Lfm2Container() = default;
+  friend class Lfm2Model;  // default-constructs it, then assigns Lfm2Container::Load's result (as GemmaModel)
   template <class Fn>
   void ForEachLinear(Fn&& fn);
   void AssignTrellisTickets();

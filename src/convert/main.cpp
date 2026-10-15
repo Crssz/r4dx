@@ -1771,11 +1771,10 @@ int RunConvert(const AppArgs& args) {
                              "yet (the guard reads model.safetensors.index.json)");
   if (is_lfm2) {
     // The LFM2 layout is the plain bf16 / w4a16 body (docs/lfm2-plan.md 4); everything below is for another family or
-    // a later task (L3: trellis import of the per-expert linears), refused rather than half-applied.
+    // a later task, refused rather than half-applied.
     const char* refused = args.vision == 1       ? "--vision on (lfm2_moe has no vision tower)"
                           : args.mtp == 1        ? "--mtp on (lfm2_moe has no MTP head)"
                           : !args.kv_calib.empty() ? "--kv-calib (the LFM2 KV cache is bf16: no descale tensors)"
-                          : !args.trellis.from.empty() ? "--trellis-from (not wired for lfm2_moe yet; docs/lfm2-plan.md L3)"
                           : r4dx_convert::ParseRotationKind(args.rotate) != r4dx_convert::RotationKind::kNone
                               ? "--rotate (the LFM2 trellis is unrotated)"
                           : (args.record_reuse_guard || !args.reuse_from.empty())

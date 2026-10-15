@@ -270,7 +270,7 @@ HttpServer::HttpServer(Engine& engine) : impl_(std::make_unique<Impl>(engine)) {
         res.set_content(BuildChatCompletionResponse(id, model_id, created, content, sink->tool_calls,
                                                      sink->finish_reason, usage, sink->timings,
                                                      reasoning_content)
-                             .dump(),
+                             .dump(-1, ' ', false, nlohmann::json::error_handler_t::replace),
                          kJsonContentType);
       }
     } catch (const ApiError& err) {
@@ -331,7 +331,7 @@ HttpServer::HttpServer(Engine& engine) : impl_(std::make_unique<Impl>(engine)) {
         res.set_content(
             BuildCompletionResponse(id, model_id, created, sink->text, sink->finish_reason, usage,
                                     sink->timings)
-                .dump(),
+                .dump(-1, ' ', false, nlohmann::json::error_handler_t::replace),
             kJsonContentType);
       }
     } catch (const ApiError& err) {

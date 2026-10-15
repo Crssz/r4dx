@@ -55,6 +55,9 @@
 #endif
 // The assembled Gemma 4 tokenizer directory (tests/tokenizer's cache variable of the same name); the
 // Gemma scenario below is skipped (not failed) without it.
+#ifndef R4DX_LFM2_TOKENIZER_DIR
+#define R4DX_LFM2_TOKENIZER_DIR (r4dx::ModelsPath("LiquidAI/LFM2.5-24B-A2B"))
+#endif
 #ifndef R4DX_GEMMA_TOKENIZER_DIR
 #define R4DX_GEMMA_TOKENIZER_DIR (r4dx::ModelsPath("Huihui-gemma-4-12B-it-abliterated-tok"))
 #endif
@@ -99,6 +102,10 @@ class FakeTextModel final : public r4dx::model::TextModel {
 
   // The n-th forward command from now fails, after it has fed its tokens (a real mid-forward failure
   // leaves the KV/GDN state dirty too).
+  // The logits row is `floor` everywhere and 1.0 at the scripted token (default floor 0: exactly the row every
+  // other scenario has always seen). A floor above 0 makes a repetition penalty on the scripted token visible:
+  // 1.0 / p drops below the floor, so greedy decoding moves to the lowest-index token that was not seen.
+  void SetRowFloor(float floor) { row_floor_ = floor; }
   void ArmFault(int64_t nth_forward) { fault_in_ = nth_forward; }
   State GetState() const { return state_; }
   bool Dirty() const { return dirty_; }  // a fault's tokens are in the state, no Reset() since
@@ -242,7 +249,7 @@ class FakeTextModel final : public r4dx::model::TextModel {
     return static_cast<int32_t>(1000 + h % 20000);
   }
   std::vector<float> Row() const {
-    std::vector<float> row(static_cast<size_t>(kVocab), 0.0f);
+    std::vector<float> row(static_cast<size_t>(kVocab), row_floor_);
     row[static_cast<size_t>(Next())] = 1.0f;
     return row;
   }
@@ -254,6 +261,7 @@ class FakeTextModel final : public r4dx::model::TextModel {
   State state_ = State::kReady;
   bool dirty_ = false;
   int64_t fault_in_ = 0;
+  float row_floor_ = 0.0f;
   std::vector<int32_t> fed_;
   std::optional<std::vector<int32_t>> ckpt_;
   std::vector<int32_t> pending_reply_, script_prompt_, script_reply_;
@@ -267,7 +275,8 @@ struct Harness {
 Harness MakeEngine(const std::string& tokenizer_dir, bool dflash, bool tp, bool checkpoint = false,
                    bool thinking = false, const std::string& request_log_path = "",
                    r4dx::model::Arch arch = r4dx::model::Arch::kQwen35,
-                   std::optional<r4dx::server::DialectKind> dialect = std::nullopt) {
+                   std::optional<r4dx::server::DialectKind> dialect = std::nullopt,
+                   const std::function<void(r4dx::server::EngineOptions&)>& opts_hook = nullptr) {
   Harness e;
   r4dx::server::EngineOptions opts;
   if (!request_log_path.empty()) {  // --request-log
@@ -292,6 +301,7 @@ Harness MakeEngine(const std::string& tokenizer_dir, bool dflash, bool tp, bool 
     *slot = m.get();
     return std::unique_ptr<r4dx::model::TextModel>(std::move(m));
   };
+  if (opts_hook) opts_hook(opts);
   e.engine = std::make_unique<r4dx::server::Engine>(std::move(opts));
   e.engine->LoadAndStart();
   return e;
@@ -315,8 +325,8 @@ std::shared_ptr<r4dx::server::BufferingSink> Run(Harness& e, const std::vector<r
   req->messages = messages;
   req->raw_prompt = raw_prompt;
   req->tools = tools;
+  req->sampling.temperature = 0.0f;  // greedy unless the tweak asks otherwise
   if (tweak) tweak(*req);
-  req->sampling.temperature = 0.0f;
   req->max_tokens = max_tokens;
   // `thinking`: split the reply into `text` (the answer) and `reasoning_text`, as http_server.cpp
   // builds the sink for a thinking request. The engine's dialect goes to the sink the way http_server.cpp
@@ -714,6 +724,254 @@ void GemmaScenario(const std::string& dir) {
   }
 }
 
+// HF repetition penalty through RunRequest itself (docs/lfm2-plan.md 5.4), on the Qwen tokenizer: the penalty is
+// not dialect-specific. The fake's logits row is `floor` (0.5) everywhere and 1.0 at the scripted token, so a
+// penalty p on a SEEN scripted token (1.0 / 3 < 0.5) moves greedy decoding to the lowest-index unseen token
+// (id 0, "!"). Checked: a generated token is penalized from its second occurrence; a PROMPT token is seen from
+// the first step; the sampled path (temperature > 0, top_k 1) penalizes the row too; penalty 1 changes nothing
+// (and is what every request without the field carries); a speculative engine refuses penalty != 1 with a 400.
+void RepetitionPenaltyScenario(const std::string& dir) {
+  const int failures_before = g_failures;
+  r4dx::Tokenizer::Options topt;
+  topt.allow_unimplemented_normalizer = true;
+  const r4dx::Tokenizer tok = r4dx::Tokenizer::from_directory(dir, topt);
+  const int32_t eos = static_cast<int32_t>(tok.eos_ids().front());
+  const int32_t X = static_cast<int32_t>(tok.encode("x", /*parse_special=*/false).front());
+  const std::string xs = tok.decode({X}, true);
+  const std::vector<r4dx::server::ChatMessage> user = {Msg("user", "Say hi.")};
+  const nlohmann::json no_tools = nlohmann::json::array();
+  auto pen = [](float p, float temperature = 0.0f) {
+    return [p, temperature](r4dx::server::PendingRequest& r) {
+      r.sampling.repetition_penalty = p;
+      r.sampling.temperature = temperature;
+      r.sampling.top_k = temperature > 0.0f ? 1 : 0;  // a sampled request that is still deterministic
+      r.sampling.has_seed = true;
+      r.sampling.seed = 5;
+    };
+  };
+  auto script = [&](Harness& e, std::vector<int32_t> reply) {
+    reply.push_back(eos);
+    e.fake->ScriptReplyToNextPrompt(std::move(reply));
+  };
+  auto fresh = [&](bool dflash = false) {
+    Harness e = MakeEngine(dir, dflash, /*tp=*/false);
+    e.fake->SetRowFloor(0.5f);
+    return e;
+  };
+
+  for (float temperature : {0.0f, 0.7f}) {
+    const char* tag = temperature > 0.0f ? "sampled" : "greedy";
+    // (penalty 1 on the sampled path runs the device summary step, which the fake does not model: greedy only)
+    if (temperature == 0.0f) {  // penalty 1: the scripted reply, untouched
+      Harness e = fresh();
+      script(e, {X, X, X});
+      const auto a = Run(e, user, 8, false, no_tools, false, "", pen(1.0f, temperature));
+      CHECK(!a->errored && a->text == xs + xs + xs && a->finish_reason == "stop",
+            "[reppen %s] penalty 1: errored=%d text '%s'", tag, static_cast<int>(a->errored), a->text.c_str());
+      e.engine->Shutdown();
+    }
+    {  // penalty 3: x is fine once, then 1/3 < 0.5 and the lowest unseen id takes over
+      Harness e = fresh();
+      script(e, {X, X, X});
+      const auto b = Run(e, user, 8, false, no_tools, false, "", pen(3.0f, temperature));
+      CHECK(!b->errored && b->text.rfind(xs, 0) == 0 && b->text != xs + xs + xs && b->completion_tokens >= 2,
+            "[reppen %s] penalty 3: errored=%d text '%s' n=%lld", tag, static_cast<int>(b->errored), b->text.c_str(),
+            static_cast<long long>(b->completion_tokens));
+      e.engine->Shutdown();
+    }
+    {  // a prompt token is in the seen set from the very first step
+      int32_t prompt_tok = -1;
+      {
+        Harness probe = fresh();
+        script(probe, {X});
+        Run(probe, user, 4, false, no_tools, false, "", pen(1.0f, temperature));
+        CHECK(probe.fake->first_prefill.size() > 2, "[reppen %s] probe prefill too short", tag);
+        if (probe.fake->first_prefill.size() > 2) prompt_tok = probe.fake->first_prefill[1];
+        probe.engine->Shutdown();
+      }
+      const std::string piece = tok.decode({prompt_tok}, /*skip_special_tokens=*/false);
+      if (temperature == 0.0f) {
+        Harness e1 = fresh();
+        script(e1, {prompt_tok});
+        const auto a = Run(e1, user, 4, false, no_tools, false, "", pen(1.0f, temperature));
+        CHECK(!a->errored && a->text == piece, "[reppen %s] prompt token, penalty 1: '%s' want '%s'", tag,
+              a->text.c_str(), piece.c_str());
+        e1.engine->Shutdown();
+      }
+      Harness e2 = fresh();
+      script(e2, {prompt_tok});
+      const auto b = Run(e2, user, 4, false, no_tools, false, "", pen(3.0f, temperature));
+      CHECK(!b->errored && b->text != piece && b->text.rfind("!", 0) == 0,
+            "[reppen %s] prompt token, penalty 3 must move to id 0: '%s'", tag, b->text.c_str());
+      e2.engine->Shutdown();
+    }
+  }
+  {  // a speculative engine cannot hook the penalty: 400, before anything runs
+    Harness e = fresh(/*dflash=*/true);
+    script(e, {X, X});
+    const auto a = Run(e, user, 4, false, no_tools, false, "", pen(1.2f));
+    CHECK(a->errored && a->error_status == 400, "[reppen dflash] penalty != 1: errored=%d status=%d",
+          static_cast<int>(a->errored), a->error_status);
+    const auto b = Run(e, user, 4, false, no_tools, false, "", pen(1.0f));
+    CHECK(!b->errored, "[reppen dflash] penalty 1 still runs: %s", b->error_message.c_str());
+    e.engine->Shutdown();
+  }
+  if (g_failures == failures_before) {
+    std::printf("[reppen] generated and prompt tokens penalized (greedy and sampled); penalty 1 untouched; "
+                "dflash + penalty -> 400\n");
+  }
+}
+
+#ifdef R4DX_TEST_LFM2_ARCH
+// The LFM2 dialect through RunRequest itself (docs/lfm2-plan.md 5.3, L2-5), against a CPU fake whose Config().arch
+// is kLfm2Moe and the real LFM2.5 tokenizer directory (this scenario needs Arch::kLfm2Moe from lane C: it is
+// compiled only when src/model/arch.h has it). Every reply is scripted, so what is checked is the engine wiring:
+//   * dialect auto-detected from the tokenizer dir, a contradicting forced dialect fails the load, and the
+//     dialect's own generation_config defaults (temperature 0.1, top_k 50, repetition_penalty 1.05) fill only
+//     the --default-* fields the operator left alone;
+//   * the model always thinks: the request's enable_thinking is ignored, `reasoning</think>answer` splits into
+//     reasoning_content / content with reasoning_tokens reported, thinking requested off included;
+//   * generation stops on <|im_end|> (124900); a Pythonic call stops it with finish_reason "tool_calls";
+//   * a chat prompt carries the template's one <|startoftext|>, a raw prompt exactly one, prepended;
+//   * --prompt-checkpoint holds back the one `<think>` token;
+//   * a template error (a tool call whose arguments are a non-empty JSON string) is a 400.
+void Lfm2Scenario(const std::string& dir) {
+  using r4dx::model::Arch;
+  using r4dx::server::DialectKind;
+  const int failures_before = g_failures;
+  const r4dx::Tokenizer tok = r4dx::Tokenizer::from_directory(dir);
+  auto ids = [&](const std::string& s) {
+    const std::vector<r4dx::TokenId> v = tok.encode(s, /*parse_special=*/true);
+    return std::vector<int32_t>(v.begin(), v.end());
+  };
+  auto with = [](std::vector<int32_t> v, int32_t last) {
+    v.push_back(last);
+    return v;
+  };
+  constexpr int32_t kImEnd = 124900, kBos = 124894, kThink = 124901;
+  const std::vector<r4dx::server::ChatMessage> user = {Msg("user", "Say hi.")};
+  const nlohmann::json no_tools = nlohmann::json::array();
+
+  {
+    Harness e = MakeEngine(dir, false, false, false, false, "", Arch::kLfm2Moe);
+    CHECK(e.engine->Dialect().kind == DialectKind::kLfm2, "[lfm2] dialect not auto-detected as lfm2");
+    CHECK(e.engine->DefaultThinking(), "[lfm2] /v1/models must report thinking on by default");
+    const r4dx::server::SamplingParams& sd = e.engine->SamplingDefaults();
+    CHECK(sd.temperature == 0.1f && sd.top_k == 50 && sd.repetition_penalty == 1.05f && sd.top_p == 1.0f &&
+              sd.min_p == 0.0f,
+          "[lfm2] dialect sampling defaults: t=%g k=%d p=%g rp=%g", sd.temperature, sd.top_k, sd.top_p,
+          sd.repetition_penalty);
+    CHECK(e.engine->ResolveThinking(r4dx::server::ThinkingControls{}) &&
+              e.engine->ResolveThinking([] { r4dx::server::ThinkingControls t; t.enabled = false; return t; }()),
+          "[lfm2] thinking must be forced on, whatever the request says");
+
+    // a direct reply with reasoning, stop on <|im_end|>
+    e.fake->ScriptReplyToNextPrompt(with(ids("Plan it.</think>Hi there."), kImEnd));
+    const auto a = Run(e, user, 32, true, no_tools, false, "", [](r4dx::server::PendingRequest& r) {
+      r.thinking.enabled = false;  // ignored
+    });
+    CHECK(!a->errored && a->text == "Hi there." && a->reasoning_text == "Plan it." && a->finish_reason == "stop" &&
+              a->reasoning_tokens > 0,
+          "[lfm2] reply: errored=%d text '%s' reasoning '%s' finish '%s' reasoning_tokens %lld",
+          static_cast<int>(a->errored), a->text.c_str(), a->reasoning_text.c_str(), a->finish_reason.c_str(),
+          static_cast<long long>(a->reasoning_tokens));
+    CHECK(e.fake->first_prefill.size() > 2 && e.fake->first_prefill[0] == kBos && e.fake->first_prefill[1] != kBos &&
+              e.fake->first_prefill.back() == kThink,
+          "[lfm2] chat prompt: one <|startoftext|> first, an open <think> last (first %d, last %d)",
+          e.fake->first_prefill.empty() ? -1 : e.fake->first_prefill.front(),
+          e.fake->first_prefill.empty() ? -1 : e.fake->first_prefill.back());
+
+    // a Pythonic call
+    const nlohmann::json tools = nlohmann::json::parse(
+        R"([{"type":"function","function":{"name":"get_weather","description":"Current weather",
+            "parameters":{"type":"object","properties":{"city":{"type":"string"}},"required":["city"]}}}])");
+    e.fake->ScriptReplyToNextPrompt(with(
+        ids("need it</think><|tool_call_start|>[get_weather(city='Paris', days=3)]<|tool_call_end|>"), kImEnd));
+    const auto c = Run(e, {Msg("user", "Weather in Paris?")}, 64, true, tools);
+    CHECK(!c->errored && c->tool_calls.size() == 1 && c->tool_calls[0].name == "get_weather" &&
+              c->tool_calls[0].arguments_json == "{\"city\":\"Paris\",\"days\":3}" && c->finish_reason == "tool_calls" &&
+              c->reasoning_text == "need it",
+          "[lfm2] tool call: errored=%d calls=%zu finish '%s' text '%s'", static_cast<int>(c->errored),
+          c->tool_calls.size(), c->finish_reason.c_str(), c->text.c_str());
+
+    // a tool round trip: the assistant turn's call (arguments decoded to a mapping) and the tool result render
+    r4dx::server::ChatMessage asst = Msg("assistant", "");
+    asst.content = std::nullopt;
+    r4dx::server::ToolCallOut tc;
+    tc.id = "call_1";
+    tc.name = "get_weather";
+    tc.arguments_json = "{\"city\":\"Paris\"}";
+    asst.tool_calls.push_back(tc);
+    r4dx::server::ChatMessage tool_msg = Msg("tool", "{\"temp\": 20}");
+    tool_msg.tool_call_id = "call_1";
+    e.fake->ScriptReplyToNextPrompt(with(ids("done</think>It is 20."), kImEnd));
+    const auto d = Run(e, {Msg("user", "Weather in Paris?"), asst, tool_msg}, 32, true, tools);
+    CHECK(!d->errored && d->text == "It is 20.", "[lfm2] tool round trip: errored=%d '%s' (%s)",
+          static_cast<int>(d->errored), d->text.c_str(), d->error_message.c_str());
+
+    // a template error is a 400, not a 500
+    r4dx::server::ChatMessage bad = asst;
+    bad.tool_calls[0].arguments_json = "\"not an object\"";
+    const auto f = Run(e, {Msg("user", "x"), bad}, 8, true, no_tools);
+    CHECK(f->errored && f->error_status == 400, "[lfm2] template error: errored=%d status=%d",
+          static_cast<int>(f->errored), f->error_status);
+
+    // a raw prompt: exactly one BOS in front of the plain tokens
+    const auto g = Run(e, {}, 4, false, no_tools, /*raw_completion=*/true, "Hello world");
+    const std::vector<r4dx::TokenId> plain = tok.encode("Hello world", /*parse_special=*/false);
+    CHECK(!g->errored && e.fake->first_prefill.size() == plain.size() + 1 && e.fake->first_prefill[0] == kBos &&
+              std::equal(plain.begin(), plain.end(), e.fake->first_prefill.begin() + 1),
+          "[lfm2] raw prompt: %zu prefill ids, want BOS + %zu", e.fake->first_prefill.size(), plain.size());
+    e.engine->Shutdown();
+  }
+
+  // the dialect's sampling defaults yield to the operator's explicit --default-* flags
+  {
+    Harness e = MakeEngine(dir, false, false, false, false, "", Arch::kLfm2Moe, std::nullopt,
+                           [](r4dx::server::EngineOptions& o) {
+                             o.sampling_defaults.temperature = 0.6f;
+                             o.sampling_given.temperature = true;
+                             o.sampling_defaults.repetition_penalty = 1.0f;
+                             o.sampling_given.repetition_penalty = true;
+                           });
+    const r4dx::server::SamplingParams& sd = e.engine->SamplingDefaults();
+    CHECK(sd.temperature == 0.6f && sd.repetition_penalty == 1.0f && sd.top_k == 50,
+          "[lfm2] explicit flags must win: t=%g rp=%g k=%d", sd.temperature, sd.repetition_penalty, sd.top_k);
+    e.engine->Shutdown();
+  }
+
+  // --prompt-checkpoint: only the single <think> token is held back
+  {
+    Harness e = MakeEngine(dir, false, false, /*checkpoint=*/true, false, "", Arch::kLfm2Moe);
+    e.fake->ScriptReplyToNextPrompt(with(ids("Hm.</think>Ok."), kImEnd));
+    const auto a = Run(e, user, 16, true, no_tools);
+    CHECK(!a->errored && e.fake->prefill_sizes.size() == 2 && e.fake->prefill_sizes[1] == 1 && e.fake->saves == 1,
+          "[lfm2] checkpoint: %zu prefill calls (last %zu), saves %d; want 2 calls ending in 1 token, 1 save",
+          e.fake->prefill_sizes.size(), e.fake->prefill_sizes.empty() ? size_t{0} : e.fake->prefill_sizes.back(),
+          e.fake->saves);
+    e.engine->Shutdown();
+  }
+
+  // a forced dialect that contradicts the model's architecture fails the load, in both directions
+  for (int dir_of_mismatch = 0; dir_of_mismatch < 2; ++dir_of_mismatch) {
+    bool threw = false;
+    try {
+      Harness e = dir_of_mismatch == 0
+                      ? MakeEngine(dir, false, false, false, false, "", Arch::kLfm2Moe, DialectKind::kQwen35)
+                      : MakeEngine(dir, false, false, false, false, "", Arch::kQwen35, DialectKind::kLfm2);
+      e.engine->Shutdown();
+    } catch (const std::exception&) {
+      threw = true;
+    }
+    CHECK(threw, "[lfm2] a dialect/arch mismatch (%s) must fail LoadAndStart", dir_of_mismatch == 0 ? "qwen35 on lfm2" : "lfm2 on qwen");
+  }
+  if (g_failures == failures_before) {
+    std::printf("[lfm2] dialect auto-detected and arch-checked; thinking forced; reasoning split; Pythonic call -> "
+                "tool_calls; BOS once; checkpoint holds back <think>; template error 400; sampling defaults honoured\n");
+  }
+}
+#endif  // R4DX_TEST_LFM2_ARCH
+
 }  // namespace
 
 int main() {
@@ -731,6 +989,17 @@ int main() {
       CheckpointThinkingScenario(tokenizer_dir, tp);
     }
     RequestLogFaultScenario(tokenizer_dir);
+    RepetitionPenaltyScenario(tokenizer_dir);
+#ifdef R4DX_TEST_LFM2_ARCH
+    const std::string lfm2_dir = R4DX_LFM2_TOKENIZER_DIR;
+    if (std::filesystem::exists(std::filesystem::path(lfm2_dir) / "tokenizer.json")) {
+      Lfm2Scenario(lfm2_dir);
+    } else {
+      std::fprintf(stderr, "NOTE: %s/tokenizer.json not found; the LFM2 scenario was skipped\n", lfm2_dir.c_str());
+    }
+#else
+    std::fprintf(stderr, "NOTE: src/model/arch.h has no Arch::kLfm2Moe yet (lane C); the LFM2 scenario is not compiled\n");
+#endif
     const std::string gemma_dir = R4DX_GEMMA_TOKENIZER_DIR;
     if (std::filesystem::exists(std::filesystem::path(gemma_dir) / "tokenizer.json")) {
       GemmaScenario(gemma_dir);

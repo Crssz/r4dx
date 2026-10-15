@@ -467,18 +467,26 @@ int RunMain(int argc, char** argv) {
     r4dx::server::DialectKind k;
     if (r4dx::server::ParseDialectName(args.dialect, &k)) requested_dialect = k;
   }
+  // The container's arch spelling when its header carries `model_arch` (Gemma and LFM2 do): the dialect is
+  // cross-checked by name, as r4dx-server does (src/server/engine.cpp), so no Arch enum value is needed for LFM2.
+  const nlohmann::json container_meta = r4dx::model::ReadContainerMetadata(args.model_path);
+  std::string container_arch_name;
+  if (container_meta.is_object()) {
+    container_arch_name =
+        container_meta.contains("model_arch") && container_meta.at("model_arch").is_string()
+            ? container_meta.at("model_arch").get<std::string>()
+            : std::string(r4dx::model::ArchName(r4dx::model::DetectArchFromMetadata(container_meta)));
+  }
+  const bool container_is_lfm2 = r4dx::server::ArchNameIsLfm2(container_arch_name);
   const r4dx::server::ModelDialect& dialect = r4dx::server::DialectFor(r4dx::server::ResolveDialectKind(
       requested_dialect, args.tokenizer_dir_given ? args.tokenizer_dir : std::string(),
-      r4dx::model::DetectArch(args.model_path) == r4dx::model::Arch::kGemma4));
-  {
-    const nlohmann::json meta = r4dx::model::ReadContainerMetadata(args.model_path);
-    if (meta.is_object()) {
-      const std::string err = r4dx::server::CheckDialectAgainstArch(
-          dialect, r4dx::model::ArchName(r4dx::model::DetectArchFromMetadata(meta)));
-      if (!err.empty()) {
-        std::fprintf(stderr, "error: %s\n", err.c_str());
-        return 2;
-      }
+      !container_is_lfm2 && r4dx::model::DetectArch(args.model_path) == r4dx::model::Arch::kGemma4,
+      container_is_lfm2));
+  if (container_meta.is_object()) {
+    const std::string err = r4dx::server::CheckDialectAgainstArch(dialect, container_arch_name);
+    if (!err.empty()) {
+      std::fprintf(stderr, "error: %s\n", err.c_str());
+      return 2;
     }
   }
   const std::string tokenizer_dir =

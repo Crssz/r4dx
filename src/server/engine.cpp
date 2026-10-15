@@ -13,6 +13,7 @@
 #include "audio_frames.h"  // src/audio: ExpandAudioPlaceholders (docs/gemma4-audio.md)
 #include "image_prompt.h"  // src/vision: ExpandImagePlaceholders (docs/vision.md)
 #include "mtp_round.hpp"
+#include "r4dx/kernels/rep_penalty.hpp"
 #include "r4dx/kernels/sampler.hpp"
 #include "reasoning_splitter.h"
 #include "tool_call_parser.h"
@@ -128,20 +129,44 @@ void Engine::LoadAndStart() {
   // Dialect (docs/gemma4-plan.md 5.3, task M1-14), resolved once, BEFORE the tokenizer/template load
   // because it decides their options and the default directory: an explicit --dialect wins; auto looks
   // at the tokenizer directory when one was given, else at the container's architecture.
+  // The container header's arch spelling when it carries `model_arch` (LFM2 containers do, as Gemma's do): the
+  // dialect is cross-checked against the NAME, so server code needs no r4dx::model::Arch value for LFM2.
+  // A container without the key (every Qwen one) goes through DetectArch* exactly as before.
+  const nlohmann::json container_meta = r4dx::model::ReadContainerMetadata(opts_.model_opts.container_path);
+  std::string container_arch_name;  // "" = header unreadable (a test's fake model path)
+  if (container_meta.is_object()) {
+    if (container_meta.contains("model_arch") && container_meta.at("model_arch").is_string()) {
+      container_arch_name = container_meta.at("model_arch").get<std::string>();
+    } else {
+      container_arch_name = r4dx::model::ArchName(r4dx::model::DetectArchFromMetadata(container_meta));
+    }
+  }
+  const bool container_is_lfm2 = ArchNameIsLfm2(container_arch_name);
   const DialectKind kind = ResolveDialectKind(
       opts_.dialect, opts_.tokenizer_dir,
-      r4dx::model::DetectArch(opts_.model_opts.container_path) == r4dx::model::Arch::kGemma4);
+      !container_is_lfm2 &&
+          r4dx::model::DetectArch(opts_.model_opts.container_path) == r4dx::model::Arch::kGemma4,
+      container_is_lfm2);
   dialect_ = &DialectFor(kind);
+  // The dialect's own generation_config sampling defaults (LFM2 only; Qwen/Gemma carry none): they replace
+  // a --default-* value only where the operator did not pass that flag. A request's own fields still win
+  // over both (ParseSampling seeds from this struct, then reads the body).
+  {
+    const ModelDialect::SamplingDefaults& sd = dialect_->sampling;
+    const EngineOptions::SamplingGiven& given = opts_.sampling_given;
+    SamplingParams& s = opts_.sampling_defaults;
+    if (sd.temperature && !given.temperature) s.temperature = *sd.temperature;
+    if (sd.top_p && !given.top_p) s.top_p = *sd.top_p;
+    if (sd.top_k && !given.top_k) s.top_k = *sd.top_k;
+    if (sd.min_p && !given.min_p) s.min_p = *sd.min_p;
+    if (sd.repetition_penalty && !given.repetition_penalty) s.repetition_penalty = *sd.repetition_penalty;
+  }
   // Fail fast, before a multi-GB model load, when the container's header already says the dialect is
   // wrong. A container that cannot be read (a test's fake model path) says nothing here; the check
   // against the loaded model's own Config().arch below covers it.
-  {
-    const nlohmann::json meta = r4dx::model::ReadContainerMetadata(opts_.model_opts.container_path);
-    if (meta.is_object()) {
-      const std::string err = CheckDialectAgainstArch(
-          *dialect_, r4dx::model::ArchName(r4dx::model::DetectArchFromMetadata(meta)));
-      if (!err.empty()) throw std::runtime_error(err);
-    }
+  if (container_meta.is_object()) {
+    const std::string err = CheckDialectAgainstArch(*dialect_, container_arch_name);
+    if (!err.empty()) throw std::runtime_error(err);
   }
   tokenizer_dir_ = ResolveTokenizerDir(*dialect_, opts_.tokenizer_dir);
   // Both stay at their defaults for Qwen (empty keep-list, polyfills on): byte-identical loading.
@@ -289,7 +314,7 @@ void Engine::RunRequest(PendingRequest& req) {
     // split) and the same ResolveEnableThinking formula http_server.cpp already used to decide the
     // sink's own splitting behavior, so the two independently-made calls can never drift apart.
     const bool enable_thinking = req.kind == RequestKind::kChat
-                                      ? ResolveEnableThinking(req.thinking, opts_.default_thinking)
+                                      ? ResolveThinking(req.thinking)
                                       : false;
     if (rec != nullptr) rec->thinking = enable_thinking;
     const ModelDialect& dialect = *dialect_;
@@ -611,6 +636,15 @@ void Engine::RunRequest(PendingRequest& req) {
     if (!opts_.model_opts.dflash_container.empty()) {
       model_->SetDflashInjectionEnabled(use_dflash);
     }
+    // Repetition penalty (docs/lfm2-plan.md 5.4) runs on the host over a full-logits step (below); the
+    // speculative paths verify draft rows on the device and have no such hook. 1.0 (the default and what every
+    // Qwen/Gemma request carries) never gets here.
+    if (req.sampling.repetition_penalty != 1.0f && (use_dflash || model_->MtpEnabled())) {
+      note_error(400);
+      req.sink->OnError(400, "repetition_penalty != 1 is not supported together with speculative decode "
+                              "(--mtp / --dflash)");
+      return;
+    }
 
     // Prefix reuse (task point 2): continue from the existing KV/GDN state if `full_tokens_i32`
     // extends what's already fed; otherwise Model::Reset() (re-zero GDN/KV/MTP state in place,
@@ -791,6 +825,7 @@ void Engine::RunRequest(PendingRequest& req) {
     sp.top_k = req.sampling.top_k;
     sp.top_p = req.sampling.top_p;
     sp.min_p = req.sampling.min_p;
+    sp.repetition_penalty = req.sampling.repetition_penalty;
     const uint64_t seed_used =
         req.sampling.has_seed ? req.sampling.seed : std::random_device{}();
     std::mt19937_64 rng = r4dx::kernels::MakeRng(seed_used);
@@ -1094,6 +1129,43 @@ void Engine::RunRequest(PendingRequest& req) {
           } else if (outcome.hit_max_tokens) {
             stopped = true;
           }
+        }
+      }
+    } else if (sp.repetition_penalty != 1.0f) {
+      // HF repetition penalty (docs/lfm2-plan.md 5.4): every distinct token of the prompt AND of this
+      // generation has its logit scaled (negative: x p, else: / p) BEFORE temperature/top-k/top-p, and
+      // greedy decoding is penalized too (HF applies the processor in every mode). The device
+      // fast paths (argmax / row summary) never see the raw row, so this branch takes the full-logits step
+      // (TextModel::DecodeStep: one [vocab] row per token; ~0.5 MB for LFM2) and penalizes on the host
+      // with the same rule r4dx_apply_repetition_penalty_f32 implements. One draw per sampled token, none
+      // when greedy -- as the loops below. Only reached with a penalty != 1, so Qwen/Gemma are untouched.
+      const int64_t vocab = static_cast<int64_t>(logits.size());
+      r4dx::kernels::SeenTokens seen(vocab);
+      seen.AddAll(full_tokens_i32);
+      seen.Apply(logits.data(), vocab, sp.repetition_penalty);
+      int32_t next = r4dx::kernels::Sample(logits.data(), vocab, sp, rng);
+      for (int64_t step = 0; step < max_tokens; ++step) {
+        if (req.sink->IsCancelled()) {
+          finish_reason = "cancelled";
+          break;
+        }
+        const int32_t tok = next;
+        if (is_eos(tok)) {
+          finish_reason = "stop";
+          break;
+        }
+        generated_tokens.push_back(tok);
+        seen.Add(tok);
+        const bool stop_hit = EmitToken(req, decoder, accumulated, tok, forward, &stop_match_pos, stop_search_floor);
+        NoteReasoningProgress();
+        // Feed `tok` regardless of stop_hit (committed_tokens must match the KV/GDN state).
+        logits = model_->DecodeStep(tok);
+        committed_tokens.push_back(tok);
+        seen.Apply(logits.data(), static_cast<int64_t>(logits.size()), sp.repetition_penalty);
+        next = r4dx::kernels::Sample(logits.data(), static_cast<int64_t>(logits.size()), sp, rng);
+        if (stop_hit) {
+          finish_reason = "stop";
+          break;
         }
       }
     } else if (greedy) {

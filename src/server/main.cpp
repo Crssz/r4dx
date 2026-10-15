@@ -106,6 +106,9 @@ int main(int argc, char** argv) {
   opts.sampling_defaults.top_p = args.default_top_p;
   opts.sampling_defaults.top_k = args.default_top_k;
   opts.sampling_defaults.min_p = args.default_min_p;
+  opts.sampling_defaults.repetition_penalty = args.default_repetition_penalty;
+  opts.sampling_given = {args.default_temperature_given, args.default_top_p_given, args.default_top_k_given,
+                         args.default_min_p_given, args.default_repetition_penalty_given};
   // Tensor parallel (docs/tp.md 9.1): filled exactly as src/cli/main.cpp fills its own TpOptions;
   // server_args.h already refused every --tp-* flag at --tp 1.
   opts.tp.world = args.tp;

@@ -61,6 +61,9 @@ struct SamplingParams {
   float top_p = 1.0f;
   int top_k = 0;
   float min_p = 0.0f;
+  // HF-style repetition penalty (an extension field, as vLLM's): 1.0 = off, the exact identity (Qwen/Gemma
+  // never leave it). > 1 discourages repeats of any prompt or generated token (docs/lfm2-plan.md 5.4).
+  float repetition_penalty = 1.0f;
   bool has_seed = false;
   uint64_t seed = 0;
 };

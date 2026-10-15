@@ -307,7 +307,8 @@ def main(argv=None) -> int:
             res = K.lfm2_noise_term(args.truth_dir, out_dir, chat[0], None, args.max_tokens, None, 32, True, cands)
             res["raw_noise"] = []
             for rp in raws:
-                rr = K.lfm2_noise_term(args.truth_dir, out_dir, chat[0], rp, args.max_tokens, None, 32, True, cands)
+                rmax = args.long_max_tokens if "long" in rp.name else args.max_tokens
+                rr = K.lfm2_noise_term(args.truth_dir, out_dir, chat[0], rp, rmax, None, 32, True, cands)
                 res["raw_noise"] += [g for g in rr["groups"] if g["name"].startswith("raw")]
             if (args.truth_dir / "router_ids.npz").exists():
                 res["router_id_agreement_truth_vs_bf16sdpa"] = router_agreement(args.truth_dir / "router_ids.npz",

@@ -128,6 +128,7 @@ set(R4DX_MODEL_SOURCES
   lfm2_container.cpp
   lfm2_layers.cpp
   lfm2_model.cpp
+  lfm2_tp_model.cpp
   gdn_layer.cpp
   mlp.cpp
   final_lm_head.cpp

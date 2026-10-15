@@ -8,6 +8,7 @@
 #include <stdexcept>
 #include <string>
 
+#include "lfm2_tp_model.h"
 #include "model.h"  // ModelOptions
 #include "r4dx/core/device_buffer.hpp"
 #include "r4dx/core/error.hpp"
@@ -78,9 +79,7 @@ Lfm2ModelOptions MakeLfm2ModelOptions(const ModelOptions& opts) {
 }
 
 std::unique_ptr<TextModel> LoadLfm2TextModel(const ModelOptions& opts, const TpOptions& tp) {
-  if (tp.world == 2) {
-    throw std::runtime_error("LoadTextModel: LFM2 --tp 2 is not wired yet (Lfm2TpModel, docs/lfm2-plan.md L1-10)");
-  }
+  if (tp.world == 2) return Lfm2TpModel::Load(opts, tp);
   if (tp.world != 1) {
     throw std::invalid_argument("LoadTextModel: TpOptions::world must be 1 or 2, got " + std::to_string(tp.world));
   }

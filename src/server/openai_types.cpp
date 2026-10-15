@@ -965,7 +965,7 @@ nlohmann::json ModelSupportedReasoningEfforts() {
 
 nlohmann::json BuildModelEntryJson(const std::string& model_id, int64_t created_unix,
                                     int64_t max_ctx, bool default_thinking, bool has_vision,
-                                    bool has_audio) {
+                                    bool has_audio, int64_t n_ctx_train) {
   nlohmann::json capabilities =
       nlohmann::json::array({"completion", "chat", "tool_use", "reasoning"});
   if (has_vision) capabilities.push_back("image");
@@ -977,7 +977,7 @@ nlohmann::json BuildModelEntryJson(const std::string& model_id, int64_t created_
           {"context_length", max_ctx},
           {"max_model_len", max_ctx},
           {"max_completion_tokens", max_ctx},
-          {"meta", {{"n_ctx", max_ctx}, {"n_ctx_train", kModelNativeContextLength}}},
+          {"meta", {{"n_ctx", max_ctx}, {"n_ctx_train", n_ctx_train}}},
           {"capabilities", capabilities},
           // `modalities` -- a second, plainer spelling of the same "image" answer several clients
           // probe instead of (or in addition to) `architecture.input_modalities` (docs/vision.md).
@@ -1000,10 +1000,11 @@ nlohmann::json BuildModelEntryJson(const std::string& model_id, int64_t created_
 }
 
 nlohmann::json BuildModelsResponse(const std::string& model_id, int64_t created_unix, int64_t max_ctx,
-                                    bool default_thinking, bool has_vision, bool has_audio) {
+                                    bool default_thinking, bool has_vision, bool has_audio,
+                                    int64_t n_ctx_train) {
   return {{"object", "list"},
-          {"data", nlohmann::json::array({BuildModelEntryJson(model_id, created_unix, max_ctx,
-                                                               default_thinking, has_vision, has_audio)})}};
+          {"data", nlohmann::json::array({BuildModelEntryJson(model_id, created_unix, max_ctx, default_thinking,
+                                                               has_vision, has_audio, n_ctx_train)})}};
 }
 
 nlohmann::json BuildTimingsJson(const TimingStats& timings) {

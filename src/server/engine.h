@@ -154,6 +154,9 @@ class Engine {
   // http_server.cpp hands its sinks stays valid for the process.
   const ModelDialect& Dialect() const { return *dialect_; }
   int64_t MaxCtx() const { return opts_.model_opts.max_ctx; }
+  // `/v1/models` meta.n_ctx_train: the checkpoint's max_position_embeddings for an LFM2 container (131072; read
+  // from the container's verbatim config.json at load), else the Qwen constant kModelNativeContextLength.
+  int64_t NativeCtx() const { return native_ctx_ > 0 ? native_ctx_ : kModelNativeContextLength; }
   int64_t MaxTokensDefault() const { return opts_.max_tokens_default; }
   const SamplingParams& SamplingDefaults() const { return opts_.sampling_defaults; }
   // The server's thinking default as /v1/models reports it: always on for a dialect that forces thinking.
@@ -233,6 +236,7 @@ class Engine {
 
   EngineOptions opts_;
   std::string model_id_;
+  int64_t native_ctx_ = 0;  // 0 = unknown (NativeCtx() falls back to kModelNativeContextLength)
   const ModelDialect* dialect_ = &Qwen35Dialect();
   std::string tokenizer_dir_;  // opts_.tokenizer_dir after the default was resolved
 

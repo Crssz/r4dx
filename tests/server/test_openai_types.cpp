@@ -895,6 +895,15 @@ void TestBuildModelEntryJsonSupportedParametersOnlyListsParsedFields() {
   CHECK(!has("n"));
 }
 
+void TestBuildModelsResponseNativeContextOverride() {
+  // LFM2.5 reports its own max_position_embeddings (131072), not the Qwen constant.
+  const json resp = BuildModelsResponse("lfm", 1000, 65536, true, false, false, 131072);
+  CHECK(resp.at("data")[0].at("meta").at("n_ctx_train") == 131072);
+  CHECK(resp.at("data")[0].at("meta").at("n_ctx") == 65536);
+  const json one = BuildModelEntryJson("lfm", 1000, 65536, true, false, false, 131072);
+  CHECK(one.at("meta").at("n_ctx_train") == 131072);
+}
+
 void TestBuildModelsResponseWrapsSingleEntry() {
   const json resp = BuildModelsResponse("my-model", 1000, 65536);
   CHECK(resp.at("data")[0].at("context_length") == 65536);
@@ -1330,6 +1339,7 @@ int main() {
   TestBuildModelEntryJsonReasoningBlockFollowsThinkFlag();
   TestBuildModelsResponsePassesDefaultThinkingThrough();
   TestBuildModelsResponseWrapsSingleEntry();
+  TestBuildModelsResponseNativeContextOverride();
   TestBuildChatCompletionResponse();
   TestBuildToolCallsJson();
   TestBuildChatCompletionResponseWithToolCalls();

@@ -105,6 +105,13 @@ Which mode to use:
   - [docs/perf.md](docs/perf.md) and [docs/prefill.md](docs/prefill.md) (methodology)
   - [docs/huihui.md](docs/huihui.md) (accuracy)
 
+### Other models
+
+| Model | Container | Modes | State |
+|---|---|---|---|
+| Qwen3.8-27B (Huihui) | trellis mix4.5m, about 17 GiB | one GPU, `--pp 2`, `--tp 2`, hybrid, MTP / DFlash2 | default, tables above |
+| LFM2.5-24B-A2B (`lfm2_moe`, 2.45 B active) | bf16, 48.5 GB | `--tp 2` only (about 25.8 GiB per card), about 60 tok/s decode; KL gate PASS vs HF-bf16 (ALL 0.00993 vs 0.01248, top-1 96.83 %) | bf16 works; **trellis (one card) in progress**; MoE path not optimized yet; always thinks, Pythonic tool calls ([docs/lfm2.md](docs/lfm2.md)) |
+
 ## Requirements
 
 - Windows 11, the AMD HIP SDK (default location `C:\opt\rocm`) and an RDNA4 GPU (gfx1201). It is
@@ -181,6 +188,7 @@ docs/           design notes and measurements
 | Building on Windows | [docs/build-windows.md](docs/build-windows.md) |
 | Trellis quantization and kernel | [docs/quant2.md](docs/quant2.md), [docs/trellis-kernel.md](docs/trellis-kernel.md) |
 | Default model and baselines | [docs/huihui.md](docs/huihui.md) |
+| LFM2.5-24B-A2B (MoE, bf16 TP=2) | [docs/lfm2.md](docs/lfm2.md), [docs/lfm2-plan.md](docs/lfm2-plan.md), [docs/lfm2-semantics.md](docs/lfm2-semantics.md) |
 | Speculative decoding | [docs/mtp.md](docs/mtp.md), [docs/dflash2.md](docs/dflash2.md), [docs/sampling.md](docs/sampling.md) |
 | Server and vision | [docs/server.md](docs/server.md), [docs/vision.md](docs/vision.md) |
 | Tensor parallelism | [docs/tp.md](docs/tp.md) |

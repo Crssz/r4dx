@@ -338,13 +338,15 @@ inline constexpr int64_t kModelNativeContextLength = 262144;
 // and adds `"image"` to `capabilities` (a client checking either shape sees the same answer).
 nlohmann::json BuildModelEntryJson(const std::string& model_id, int64_t created_unix,
                                     int64_t max_ctx, bool default_thinking = false,
-                                    bool has_vision = false, bool has_audio = false);
+                                    bool has_vision = false, bool has_audio = false,
+                                    int64_t n_ctx_train = kModelNativeContextLength);
 
 // `{"object": "list", "data": [BuildModelEntryJson(...)]}` -- GET /v1/models's shape. This server
 // ever loads exactly one model, so `data` always has exactly one entry (task design point 2).
 nlohmann::json BuildModelsResponse(const std::string& model_id, int64_t created_unix,
                                     int64_t max_ctx, bool default_thinking = false,
-                                    bool has_vision = false, bool has_audio = false);
+                                    bool has_vision = false, bool has_audio = false,
+                                    int64_t n_ctx_train = kModelNativeContextLength);
 
 struct UsageStats {
   int64_t prompt_tokens = 0;

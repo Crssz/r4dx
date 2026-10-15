@@ -16,6 +16,10 @@
 //   Qwen2:   (?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+
 //   Qwen3.5: (?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?[\p{L}\p{M}]+|\p{N}| ?[^\s\p{L}\p{M}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+
 //
+// A third byte-level pattern is accepted: LFM2.5-24B-A2B's Llama-3 regex (`\p{N}{1,3}` digit groups,
+// `\p{L}+` letter runs), no normalizer, `ignore_merges`, ByteLevel post-processor (no automatic BOS:
+// encode() never adds one), decoder flags inert. See docs/lfm2-tokenizer-notes.md.
+//
 // The regex splitter and Unicode codepoint tables are vendored from llama.cpp
 // (src/tokenizer/vendor/llamacpp_unicode/, see NOTICE there); the BPE merge loop and
 // added/special-token splitting are r4dx's own port of the equivalent llama.cpp algorithms onto

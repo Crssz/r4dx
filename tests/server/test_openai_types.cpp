@@ -1226,7 +1226,37 @@ void TestErrorBody() {
 
 }  // namespace
 
+// repetition_penalty (docs/lfm2-plan.md 5.4): an extension field, default 1.0 = the identity, validated > 0.
+void TestRepetitionPenalty() {
+  const json msgs = json::array({{{"role", "user"}, {"content", "hi"}}});
+  // absent -> 1.0 (Qwen/Gemma never see anything else)
+  CHECK(ParseChatCompletionRequest({{"messages", msgs}}).sampling.repetition_penalty == 1.0f);
+  CHECK(ParseCompletionRequest({{"prompt", "x"}}).sampling.repetition_penalty == 1.0f);
+  // the request's own value wins over the server/dialect default; null counts as absent
+  SamplingParams defaults;
+  defaults.repetition_penalty = 1.05f;
+  CHECK(ParseChatCompletionRequest({{"messages", msgs}}, defaults).sampling.repetition_penalty == 1.05f);
+  CHECK(ParseChatCompletionRequest({{"messages", msgs}, {"repetition_penalty", 1.3}}, defaults)
+            .sampling.repetition_penalty == 1.3f);
+  CHECK(ParseChatCompletionRequest({{"messages", msgs}, {"repetition_penalty", 1.0}}, defaults)
+            .sampling.repetition_penalty == 1.0f);  // explicit 1.0 turns the default off
+  CHECK(ParseChatCompletionRequest({{"messages", msgs}, {"repetition_penalty", nullptr}}, defaults)
+            .sampling.repetition_penalty == 1.05f);
+  CHECK(ParseChatCompletionRequest({{"messages", msgs}, {"repetition_penalty", 2}}).sampling.repetition_penalty == 2.0f);
+  CHECK(ParseCompletionRequest({{"prompt", "x"}, {"repetition_penalty", 0.9}}).sampling.repetition_penalty == 0.9f);
+  // invalid
+  for (const json& bad : {json(0), json(0.0), json(-1.0), json("1.1"), json(true), json::array()}) {
+    CHECK(ThrowsApiError([&] { ParseChatCompletionRequest({{"messages", msgs}, {"repetition_penalty", bad}}); }, 400));
+  }
+  // advertised in /v1/models
+  const json m = BuildModelEntryJson("my-model", 1000, 65536);
+  bool listed = false;
+  for (const auto& c : m.at("supported_parameters")) listed = listed || c == "repetition_penalty";
+  CHECK(listed);
+}
+
 int main() {
+  TestRepetitionPenalty();
   TestChatMinimal();
   TestChatSamplingDefaultsApplyOnlyWhenOmitted();
   TestChatFullFields();

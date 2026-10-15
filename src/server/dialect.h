@@ -4,7 +4,7 @@
 // section 5.3's table). Pure data plus a few CPU-only helpers: no HIP, no r4dx::model dependency, so
 // it is unit-testable alone (tests/server/test_dialect.cpp) like reasoning_splitter.h.
 //
-// Selected once (Engine::LoadAndStart, task M1-14) from `--dialect {auto|qwen35|gemma4}`. Qwen3.5 is
+// Selected once (Engine::LoadAndStart, task M1-14) from `--dialect {auto|qwen35|gemma4|lfm2}`. Qwen3.5 is
 // the default and its entries reproduce today's hard-coded server behavior byte for byte.
 #pragma once
 
@@ -19,7 +19,7 @@
 
 namespace r4dx::server {
 
-enum class DialectKind { kQwen35, kGemma4 };
+enum class DialectKind { kQwen35, kGemma4, kLfm2 };
 
 // The historical tokenizer directory (server_args.h / src/cli/cli_args.h defaults), <R4DX_MODELS_ROOT>\Huihui-Qwen3.8-27B-abliterated (root default E:\models): what an empty
 // --tokenizer-dir resolves to for the Qwen dialect, whose ModelDialect::default_tokenizer_dir is empty.
@@ -49,6 +49,20 @@ struct ModelDialect {
   bool chat_template_polyfills = true;   // minja polyfills (must be off for Gemma)
   bool bos_on_raw_prompt = false;        // /v1/completions prepends bos_id()
   bool has_reasoning_effort = true;      // template understands `reasoning_effort`
+  // LFM2.5: the model ALWAYS thinks (the generation prompt ends with an open "<think>", there is no
+  // thinking-off prompt), so the request's enable_thinking / reasoning_effort / --think are ignored and
+  // the resolved enable_thinking is true (usage.reasoning_tokens is always reported). False elsewhere.
+  bool forces_thinking = false;
+  // The model's own generation_config sampling defaults, applied to a request that leaves the field out (and
+  // only where the operator did not pass the matching --default-* flag). Empty (every field nullopt) for Qwen
+  // and Gemma: their requests keep exactly the server's --default-* values, as before this struct existed.
+  struct SamplingDefaults {
+    std::optional<float> temperature;
+    std::optional<int> top_k;
+    std::optional<float> top_p;
+    std::optional<float> min_p;
+    std::optional<float> repetition_penalty;
+  } sampling;
   // Default EOS ids (generation_config.json); empty means "use the tokenizer's own list" (Qwen).
   std::vector<int32_t> eos_ids;
   // Default tokenizer directory (empty: the server's historical hard-coded default).
@@ -74,22 +88,28 @@ struct ModelDialect {
 
 const ModelDialect& Qwen35Dialect();
 const ModelDialect& Gemma4Dialect();
+const ModelDialect& Lfm2Dialect();
 const ModelDialect& DialectFor(DialectKind kind);
 
-// "qwen35" / "gemma4" (case-sensitive). Returns false for anything else (including "auto").
+// "qwen35" / "gemma4" / "lfm2" (case-sensitive). Returns false for anything else (including "auto").
 bool ParseDialectName(std::string_view s, DialectKind* out);
 
 // `--dialect auto`: Gemma iff tokenizer_config.json says `tokenizer_class == "GemmaTokenizer"` or
 // `has_turn_token` (the vocab contains "<|turn>"); otherwise Qwen. Malformed JSON counts as "no
 // information" (falls back on `has_turn_token`).
-DialectKind DetectDialect(std::string_view tokenizer_config_json, bool has_turn_token);
+//
+// LFM2.5 (`has_tool_call_token`: the vocab contains "<|tool_call_start|>"): tokenizer_config.json has
+// `bos_token == "<|startoftext|>"` AND the vocab has that tool token (checked after Gemma, so a Gemma
+// config still wins). The default for `has_tool_call_token` keeps every existing two-argument call as is.
+DialectKind DetectDialect(std::string_view tokenizer_config_json, bool has_turn_token,
+                          bool has_tool_call_token = false);
 
 // The dialect a run uses (shared by r4dx-server's Engine and r4dx-cli, task M1-14): `requested` (an
 // explicit --dialect) wins; otherwise, when `tokenizer_dir` is non-empty, DetectDialect over its
 // tokenizer_config.json and a scan of tokenizer.json for the "<|turn>" token; otherwise (no tokenizer
-// dir given) `container_is_gemma` -- the container header's architecture.
+// dir given) `container_is_gemma` / `container_is_lfm2` -- the container header's architecture.
 DialectKind ResolveDialectKind(std::optional<DialectKind> requested, const std::string& tokenizer_dir,
-                               bool container_is_gemma);
+                               bool container_is_gemma, bool container_is_lfm2 = false);
 
 // `requested` when non-empty; else the dialect's default_tokenizer_dir, else (Qwen) the historical
 // QwenDefaultTokenizerDir().
@@ -99,5 +119,10 @@ std::string ResolveTokenizerDir(const ModelDialect& d, const std::string& reques
 // task M1-24; empty means unknown and always passes). Returns "" when consistent, otherwise a
 // fail-fast error message.
 std::string CheckDialectAgainstArch(const ModelDialect& d, std::string_view model_arch);
+
+// True iff `model_arch` (a container `__metadata__.model_arch` / r4dx::model::ArchName spelling) names the
+// LFM2 family: the "lfm2" prefix ("lfm2_moe"). String-only on purpose: server code must not depend on
+// Arch::kLfm2Moe (lane C's arch.h change), only on the spelling it writes.
+bool ArchNameIsLfm2(std::string_view model_arch);
 
 }  // namespace r4dx::server

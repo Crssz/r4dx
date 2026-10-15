@@ -145,6 +145,7 @@ ToolCallParseResult ParseToolCalls(const std::string& text) {
 
 ToolCallParseResult ParseToolCalls(const std::string& text, const ModelDialect& dialect) {
   if (dialect.kind == DialectKind::kGemma4) return ParseGemmaToolCalls(text, dialect);
+  if (dialect.kind == DialectKind::kLfm2) return ParseLfm2ToolCalls(text, dialect);
   return ParseToolCalls(text);
 }
 

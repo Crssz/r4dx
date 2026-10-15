@@ -64,6 +64,11 @@ struct EngineOptions {
   int64_t max_tokens_default = 128;
   int max_queue = 16;
   SamplingParams sampling_defaults;
+  // Which sampling_defaults fields the operator set explicitly (--default-*). A dialect's own sampling
+  // defaults (ModelDialect::sampling, LFM2 only) replace only the fields still false here (LoadAndStart).
+  struct SamplingGiven {
+    bool temperature = false, top_p = false, top_k = false, min_p = false, repetition_penalty = false;
+  } sampling_given;
   bool default_thinking = false;
   std::string log_level = "info";
   // DFlash2 self-speculative decode (docs/dflash2.md, stage S3): model_opts.dflash_draft_k already
@@ -151,7 +156,14 @@ class Engine {
   int64_t MaxCtx() const { return opts_.model_opts.max_ctx; }
   int64_t MaxTokensDefault() const { return opts_.max_tokens_default; }
   const SamplingParams& SamplingDefaults() const { return opts_.sampling_defaults; }
-  bool DefaultThinking() const { return opts_.default_thinking; }
+  // The server's thinking default as /v1/models reports it: always on for a dialect that forces thinking.
+  bool DefaultThinking() const { return opts_.default_thinking || dialect_->forces_thinking; }
+  // The resolved `enable_thinking` of a chat request (http_server.cpp and RunRequest both call this so they
+  // cannot drift): ResolveEnableThinking, except a dialect that forces thinking (LFM2.5: the generation prompt
+  // always opens "<think>") ignores the request and --think.
+  bool ResolveThinking(const ThinkingControls& t) const {
+    return dialect_->forces_thinking ? true : ResolveEnableThinking(t, opts_.default_thinking);
+  }
   // The image preprocessing policy every image content part is decoded with (docs/vision.md
   // "Large images", --image-max-pixels) -- read by http_server.cpp so ParseChatCompletionRequest
   // can preprocess an image at PARSE time (openai_types.cpp), before the request even reaches this

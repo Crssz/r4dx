@@ -32,7 +32,7 @@ struct ServerArgs {
   // and the engine resolves the default from the dialect (docs/gemma4-plan.md 5.3): Gemma's assembled
   // tokenizer dir, or the Qwen default above (unchanged).
   bool tokenizer_dir_given = false;
-  // --dialect {auto|qwen35|gemma4} (docs/gemma4-plan.md 5.3, task M1-14): the per-family text surface
+  // --dialect {auto|qwen35|gemma4|lfm2} (docs/gemma4-plan.md 5.3, task M1-14): the per-family text surface
   // (reasoning markers, tool-call syntax, EOS list, BOS on raw prompts). auto reads the tokenizer
   // dir (tokenizer_config.json / vocab), then cross-checks the loaded model's architecture.
   std::string dialect = "auto";
@@ -66,6 +66,15 @@ struct ServerArgs {
   float default_top_p = 1.0f;
   int default_top_k = 0;
   float default_min_p = 0.0f;
+  float default_repetition_penalty = 1.0f;
+  // True iff the matching --default-* flag was given. A dialect with its own generation_config defaults (LFM2:
+  // temperature 0.1, top_k 50, repetition_penalty 1.05) fills in only the fields the operator left alone; the
+  // Qwen/Gemma dialects have none, so for them these are never read and the values above apply as before.
+  bool default_temperature_given = false;
+  bool default_top_p_given = false;
+  bool default_top_k_given = false;
+  bool default_min_p_given = false;
+  bool default_repetition_penalty_given = false;
 
   std::string log_level = "info";  // one of debug|info|warn|error
   // --request-log <path> (docs/server.md "Request log"): empty (default) = off, no file is touched.
@@ -185,11 +194,11 @@ struct ServerUsageError : std::runtime_error {
 inline std::string ServerUsageText(const char* argv0) {
   return std::string("usage: ") + argv0 +
          " --model <container.r4dx> --layout {w4a16|bf16|trellis} "
-         "[--tokenizer-dir <dir>] [--dialect {auto|qwen35|gemma4}] [--host <addr>] [--port N] "
+         "[--tokenizer-dir <dir>] [--dialect {auto|qwen35|gemma4|lfm2}] [--host <addr>] [--port N] "
          "[--max-ctx N] [--extended-ctx] "
          "[--max-tokens-default N] [--max-queue N] [--think {on|off}] [--layers N] "
          "[--default-temperature F] [--default-top-p F] [--default-top-k N] "
-         "[--default-min-p F] [--log-level {debug|info|warn|error}] [--mtp N] "
+         "[--default-min-p F] [--default-repetition-penalty F] [--log-level {debug|info|warn|error}] [--mtp N] "
          "[--mtp-head-layout {bf16|layout}] [--mtp-draft-head {reduced|full}] "
          "[--embed-device-resident {on|off}] [--prompt-checkpoint {on|off}] "
          "[--dflash <draft.r4dx>] [--dflash-k N] "
@@ -302,10 +311,11 @@ inline ServerArgs ParseServerArgs(int argc, char** argv) {
     else if (arg == "--max-queue") a.max_queue = ServerParseInt("--max-queue", NextServerArg(argc, argv, i, "--max-queue"));
     else if (arg == "--layers") a.layers = ServerParseI64("--layers", NextServerArg(argc, argv, i, "--layers"));
     else if (arg == "--think") a.think = NextServerArg(argc, argv, i, "--think") == "on";
-    else if (arg == "--default-temperature") a.default_temperature = ServerParseFloat("--default-temperature", NextServerArg(argc, argv, i, "--default-temperature"));
-    else if (arg == "--default-top-p") a.default_top_p = ServerParseFloat("--default-top-p", NextServerArg(argc, argv, i, "--default-top-p"));
-    else if (arg == "--default-top-k") a.default_top_k = ServerParseInt("--default-top-k", NextServerArg(argc, argv, i, "--default-top-k"));
-    else if (arg == "--default-min-p") a.default_min_p = ServerParseFloat("--default-min-p", NextServerArg(argc, argv, i, "--default-min-p"));
+    else if (arg == "--default-temperature") { a.default_temperature = ServerParseFloat("--default-temperature", NextServerArg(argc, argv, i, "--default-temperature")); a.default_temperature_given = true; }
+    else if (arg == "--default-top-p") { a.default_top_p = ServerParseFloat("--default-top-p", NextServerArg(argc, argv, i, "--default-top-p")); a.default_top_p_given = true; }
+    else if (arg == "--default-top-k") { a.default_top_k = ServerParseInt("--default-top-k", NextServerArg(argc, argv, i, "--default-top-k")); a.default_top_k_given = true; }
+    else if (arg == "--default-min-p") { a.default_min_p = ServerParseFloat("--default-min-p", NextServerArg(argc, argv, i, "--default-min-p")); a.default_min_p_given = true; }
+    else if (arg == "--default-repetition-penalty") { a.default_repetition_penalty = ServerParseFloat("--default-repetition-penalty", NextServerArg(argc, argv, i, "--default-repetition-penalty")); a.default_repetition_penalty_given = true; }
     else if (arg == "--log-level") a.log_level = NextServerArg(argc, argv, i, "--log-level");
     else if (arg == "--request-log") {
       a.request_log = NextServerArg(argc, argv, i, "--request-log");
@@ -369,8 +379,8 @@ inline ServerArgs ParseServerArgs(int argc, char** argv) {
   if (a.model_path.empty()) throw ServerUsageError("--model is required");
   if (a.port <= 0 || a.port > 65535) throw ServerUsageError("--port must be in 1..65535");
   if (a.max_ctx <= 0) throw ServerUsageError("--max-ctx must be > 0");
-  if (a.dialect != "auto" && a.dialect != "qwen35" && a.dialect != "gemma4") {
-    throw ServerUsageError("--dialect must be 'auto', 'qwen35' or 'gemma4'");
+  if (a.dialect != "auto" && a.dialect != "qwen35" && a.dialect != "gemma4" && a.dialect != "lfm2") {
+    throw ServerUsageError("--dialect must be 'auto', 'qwen35', 'gemma4' or 'lfm2'");
   }
   if (a.request_log_tokens && a.request_log.empty()) {
     throw ServerUsageError("--request-log-tokens needs --request-log <path> (it adds fields to that file)");
@@ -381,6 +391,7 @@ inline ServerArgs ParseServerArgs(int argc, char** argv) {
   if (a.default_top_p < 0.0f || a.default_top_p > 1.0f) throw ServerUsageError("--default-top-p must be in [0, 1]");
   if (a.default_min_p < 0.0f || a.default_min_p > 1.0f) throw ServerUsageError("--default-min-p must be in [0, 1]");
   if (a.default_top_k < 0) throw ServerUsageError("--default-top-k must be >= 0");
+  if (!(a.default_repetition_penalty > 0.0f)) throw ServerUsageError("--default-repetition-penalty must be > 0");
   if (a.log_level != "debug" && a.log_level != "info" && a.log_level != "warn" && a.log_level != "error") {
     throw ServerUsageError("--log-level must be one of debug|info|warn|error");
   }

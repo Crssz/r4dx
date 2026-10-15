@@ -42,6 +42,10 @@ struct SampleParams {
   float top_p = 1.0f;         // 1.0 = disabled (nucleus sampling)
   float min_p = 0.0f;         // 0.0 = disabled (drop tokens below min_p * max_prob)
   uint64_t seed = 0;
+  // HF repetition penalty (rep_penalty.hpp), 1.0 = off = the exact identity. NOT applied by Sample*() /
+  // SampleFromSummary(): they see logits that are already penalized (the caller applies it before them,
+  // as HF does, and in greedy decoding too). Carried here so one struct describes a request's sampling.
+  float repetition_penalty = 1.0f;
 };
 
 namespace detail {

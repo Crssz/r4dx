@@ -142,6 +142,14 @@ void Engine::LoadAndStart() {
     }
   }
   const bool container_is_lfm2 = ArchNameIsLfm2(container_arch_name);
+  // LFM2's /v1/models meta.n_ctx_train comes from its own config.json (131072), not the Qwen constant (262144).
+  if (container_is_lfm2 && container_meta.is_object() && container_meta.contains("model_config")) {
+    const nlohmann::json& mc = container_meta.at("model_config");
+    const nlohmann::json& tc = (mc.is_object() && mc.contains("text_config")) ? mc.at("text_config") : mc;
+    if (tc.is_object() && tc.contains("max_position_embeddings") && tc.at("max_position_embeddings").is_number_integer()) {
+      native_ctx_ = tc.at("max_position_embeddings").get<int64_t>();
+    }
+  }
   const DialectKind kind = ResolveDialectKind(
       opts_.dialect, opts_.tokenizer_dir,
       !container_is_lfm2 &&

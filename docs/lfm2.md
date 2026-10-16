@@ -50,7 +50,10 @@ r4dx-server --model E:\models\r4dx\lfm2\lfm2-24b-a2b-bf16.r4dx --layout bf16 --t
   Repetition penalty != 1 is rejected together with speculative decode (there is no drafter for this model anyway).
 - Smoke test (needs the GPUs, see below): `tools\server\smoke.ps1 -Model E:\models\r4dx\lfm2\lfm2-24b-a2b-bf16.r4dx -Tp 2 -Dialect lfm2 -Port 8091`
   (`-Dialect lfm2` defaults `-Layout bf16` and `-Layers -1`; add `-TpFault` for the all-reduce fault-recovery steps). It is
-  authored but not yet run: the first GPU run may need small adjustments to its model-dependent checks.
+  run on 2026-10-16: 75 checks pass on the trellis hybrid at `-Layout trellis -Tp 1`; on bf16 TP=2 all but three
+  cosmetic checks passed before they were fixed (streamed vs non-streamed reasoning differ only by surrounding
+  newlines; no checkpoint-VRAM log line for this model), and the bf16 run has not been repeated since the fix.
+  `-TpFault` has not been run.
 
 ### Chat template, thinking, tool calls
 

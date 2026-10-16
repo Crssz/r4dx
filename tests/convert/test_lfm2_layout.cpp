@@ -35,6 +35,7 @@
 #include "nlohmann/json.hpp"
 #include "r4dx/core/dtype.hpp"
 #include "r4dx/models_root.h"
+#include "r4dx_convert/quant_int8.hpp"
 
 namespace fs = std::filesystem;
 namespace lf = r4dx_convert::lfm2;
@@ -754,6 +755,209 @@ void TestExe() {
                 c.tensors.count("text.layers.0.conv.weight") == 1 && c.tensors.count("text.layers.0.conv.weight.w4a16.wq") == 0 &&
                 c.tensors.count("text.layers.3.moe.expert_bias") == 1,
             "w4a16: router, conv.weight and expert_bias are never quantized");
+    }
+  }
+
+  // ---- the w8a16 layout set (docs/w8a16.md 5.2: lfm2_layout.cpp needs no layout code) ----
+  {
+    const std::string base_args = "--input \"" + ckpt.u8string() + "\" --output \"" + out.u8string() + "\" --threads 2 ";
+    auto run = [&](const std::string& extra) {
+      std::error_code ec;
+      fs::remove(out, ec);
+      return Run(base_args + extra, log);
+    };
+    auto strip = [](const std::string& n) { return n.substr(0, n.size() - 7); };  // ".bf16.w"
+    // ExpectedNames(4) with every ".bf16.w" linear for which `is_w8(base)` holds replaced by its w8a16 pair.
+    auto expect = [&](const std::function<bool(const std::string&)>& is_w8, bool keep_bf16_too) {
+      std::set<std::string> want;
+      for (const std::string& n : ExpectedNames(4)) {
+        if (!EndsWith(n, ".bf16.w")) {
+          want.insert(n);
+          continue;
+        }
+        const std::string b = strip(n);
+        if (is_w8(b)) {
+          want.insert(b + ".w8a16.wq");
+          want.insert(b + ".w8a16.ws");
+          if (keep_bf16_too) want.insert(n);
+        } else {
+          want.insert(n);
+        }
+      }
+      return want;
+    };
+    auto all_w8 = [](const std::string&) { return true; };
+    auto is_expert = [](const std::string& b) { return b.find(".moe.experts.") != std::string::npos; };
+
+    // The fp32 truth the exe quantizes: the checkpoint's bf16 floats, fused like the layout fuses them.
+    auto reference = [&](const std::vector<std::string>& hf, int group, int* N, int* K, std::vector<uint8_t>* wq,
+                         std::vector<uint8_t>* ws) {
+      std::vector<float> w;
+      for (const auto& n : hf) {
+        const Tensor& t = base.t.at(static_cast<size_t>(base.Find(n)));
+        *K = static_cast<int>(t.shape[1]);
+        w.insert(w.end(), t.v.begin(), t.v.end());
+      }
+      *N = static_cast<int>(w.size() / static_cast<size_t>(*K));
+      std::vector<uint8_t> q;
+      std::vector<uint16_t> s16;
+      r4dx_convert::QuantizeInt8Symmetric(w.data(), *N, *K, group, 1, q, s16);
+      *wq = r4dx_convert::PackW8Bytes(q, *N, *K, 1);
+      const auto s = r4dx_convert::PackW8a16Scales(s16, *N, *K, group);
+      ws->assign(reinterpret_cast<const uint8_t*>(s.data()), reinterpret_cast<const uint8_t*>(s.data()) + s.size() * 2);
+    };
+    auto bytes_eq = [](const std::string& got, const std::vector<uint8_t>& want) {
+      return got.size() == want.size() && std::memcmp(got.data(), want.data(), want.size()) == 0;
+    };
+
+    // (1) everything w8a16, g128, the head following by default.
+    {
+      const int rc = run("--layouts w8a16 --no-bf16");
+      const Container c = ReadContainer(out);
+      Check(rc == 0 && c.ok, "--layouts w8a16 --no-bf16: converts (rc=" + std::to_string(rc) + ")");
+      if (rc != 0) std::fprintf(stderr, "%s\n", ReadWhole(log).c_str());
+      if (c.ok) {
+        CheckNames(c, expect(all_w8, false), "w8a16: every linear (body, every per-expert pair, the tied head by default) is a .w8a16.wq/.ws pair, nothing else");
+        const json md = c.Meta();
+        const json want_meta = {{"version", 1}, {"group", 128}, {"scale", "f16"}, {"scale_log2_bias", 12},
+                                {"code", "int8_sym127_offset_binary_x80"},
+                                {"fragment_permutation", "wmma16x16x16_f16_b_lane16_k32block"}};
+        Check(md.at("quant").contains("w8a16") && md.at("quant").at("w8a16") == want_meta, "metadata: quant.w8a16 block");
+        Check(md.at("quant").contains("w4a16"), "metadata: quant.w4a16 block still present (unchanged base)");
+        Check(md.at("r4dx_convert_run").at("lm_head").get<std::string>() == "w8a16+bf16", "run record: the derived head spec");
+        // Sizes: wq {N*K}, ws {N*K/128, 2}; and the run record's group totals.
+        uint64_t total_groups = 0;
+        bool shapes_ok = true;
+        for (const auto& kv : c.tensors) {
+          if (!EndsWith(kv.first, ".w8a16.wq")) continue;
+          const std::string b = kv.first.substr(0, kv.first.size() - 9);
+          const std::vector<int64_t> sq = c.Shape(kv.first), ss = c.Shape(b + ".w8a16.ws");
+          shapes_ok = shapes_ok && sq.size() == 1 && ss.size() == 2 && ss[0] * 128 == sq[0] && ss[1] == 2 &&
+                      kv.second.size() == static_cast<size_t>(sq[0]) && c.tensors.at(b + ".w8a16.ws").size() == static_cast<size_t>(ss[0]) * 2 &&
+                      sq[0] % (16 * 128) == 0;
+          total_groups += static_cast<uint64_t>(ss[0]);
+        }
+        Check(shapes_ok, "w8a16: every pair has wq {N*K} bytes and ws {N*K/128, 2}");
+        const json run = md.at("r4dx_convert_run").at("w8a16");
+        const std::string zg = run.at("zero_groups").get<std::string>(), tg = run.at("groups_total").get<std::string>();
+        auto digits20 = [](const std::string& s) {
+          return s.size() == 20 && std::all_of(s.begin(), s.end(), [](char ch) { return ch >= '0' && ch <= '9'; });
+        };
+        Check(run.at("group") == 128 && digits20(zg) && digits20(tg) && std::stoull(tg) == total_groups,
+              "run record: w8a16 group 128, groups_total == sum of ws groups (" + std::to_string(total_groups) + "), zero_groups patched (" + zg + ")");
+        Check(ReadWhole(log).find("[r4dx-convert] w8a16: " + std::to_string(total_groups) + " groups quantized") != std::string::npos,
+              "end-of-run log reports the group and zero-group counts");
+        // Bytes of one linear of every class, from the same quantizer on the checkpoint's floats.
+        struct Probe {
+          std::string cb;
+          std::vector<std::string> hf;
+        };
+        const std::vector<Probe> probes = {
+            {"text.layers.3.moe.experts.2.gate_up", {"model.layers.3.feed_forward.experts.2.w1.weight", "model.layers.3.feed_forward.experts.2.w3.weight"}},
+            {"text.layers.2.moe.experts.0.down", {"model.layers.2.feed_forward.experts.0.w2.weight"}},
+            {"text.layers.0.conv.in_proj", {"model.layers.0.conv.in_proj.weight"}},
+            {"text.layers.2.attn.q", {"model.layers.2.self_attn.q_proj.weight"}},
+            {"text.layers.1.mlp.gate_up", {"model.layers.1.feed_forward.w1.weight", "model.layers.1.feed_forward.w3.weight"}},
+            {"lm_head", {"model.embed_tokens.weight"}}};
+        for (const Probe& p : probes) {
+          int N = 0, K = 0;
+          std::vector<uint8_t> wq, ws;
+          reference(p.hf, 128, &N, &K, &wq, &ws);
+          Check(bytes_eq(c.tensors.at(p.cb + ".w8a16.wq"), wq) && bytes_eq(c.tensors.at(p.cb + ".w8a16.ws"), ws),
+                "w8a16 bytes of " + p.cb + " == the quantizer on the checkpoint weights");
+        }
+      }
+    }
+    // (2) --lm-head bf16 is the alternative.
+    {
+      const int rc = run("--layouts w8a16 --no-bf16 --lm-head bf16");
+      const Container c = ReadContainer(out);
+      Check(rc == 0 && c.ok, "--lm-head bf16 with w8a16 body: converts");
+      if (c.ok)
+        CheckNames(c, expect([](const std::string& b) { return b != "lm_head"; }, false),
+                   "w8a16 body + --lm-head bf16: the head is lm_head.bf16.w only");
+    }
+    // (3) the hybrid recipe: experts w8a16, every other linear and the head kept bf16.
+    {
+      const int rc = run("--layouts w8a16 --no-bf16 --keep-bf16 \"^(?!.*\\.moe\\.experts\\.)\"");
+      const Container c = ReadContainer(out);
+      Check(rc == 0 && c.ok, "--keep-bf16 '^(?!.*\\.moe\\.experts\\.)': converts (rc=" + std::to_string(rc) + ")");
+      if (rc != 0) std::fprintf(stderr, "%s\n", ReadWhole(log).c_str());
+      if (c.ok) {
+        CheckNames(c, expect(is_expert, false), "hybrid: expert linears w8a16 pairs, attention / conv / dense / head bf16-only");
+        const json md = c.Meta();
+        Check(md.at("quant").contains("w8a16"), "hybrid: quant.w8a16 present (some linear is w8a16)");
+        bool summary = false;
+        for (auto it = md.at("quant_summary").begin(); it != md.at("quant_summary").end(); ++it)
+          summary = summary || it.value().get<std::string>().find("w4a16|w8a16|bf16") != std::string::npos;
+        Check(summary, "hybrid: quant_summary rows read w4a16|w8a16|bf16");
+        Check(md.at("r4dx_convert_run").at("keep_bf16_linears").size() > 0, "hybrid: keep_bf16_linears recorded");
+      }
+    }
+    // (4) everything kept: no w8a16 tensors and a header with no w8a16 anywhere.
+    {
+      const int rc = run("--layouts w8a16 --no-bf16 --keep-bf16 \".*\"");
+      const Container c = ReadContainer(out);
+      Check(rc == 0 && c.ok, "--keep-bf16 .* with w8a16: converts");
+      if (c.ok) {
+        bool any = false;
+        for (const auto& kv : c.tensors) any = any || kv.first.find(".w8a16.") != std::string::npos;
+        const json md = c.Meta();
+        Check(!any && !md.at("quant").contains("w8a16") && !md.at("r4dx_convert_run").contains("w8a16"),
+              "all kept: no w8a16 tensor, no quant.w8a16 block, no run record");
+        bool summary = false;
+        for (auto it = md.at("quant_summary").begin(); it != md.at("quant_summary").end(); ++it)
+          summary = summary || it.value().get<std::string>().find("w8a16") != std::string::npos;
+        Check(!summary, "all kept: quant_summary untouched");
+      }
+    }
+    // (5) g64.
+    {
+      const int rc = run("--layouts w8a16 --no-bf16 --w8a16-group 64");
+      const Container c = ReadContainer(out);
+      Check(rc == 0 && c.ok, "--w8a16-group 64: converts");
+      if (c.ok) {
+        Check(c.Meta().at("quant").at("w8a16").at("group") == 64 &&
+                  c.Shape("text.layers.3.moe.experts.1.down.w8a16.ws") == std::vector<int64_t>({kTiny.hidden * kTiny.moe_i / 64, 2}),
+              "g64: metadata group 64, ws {N*K/64, 2}");
+        int N = 0, K = 0;
+        std::vector<uint8_t> wq, ws;
+        reference({"model.layers.3.feed_forward.experts.1.w2.weight"}, 64, &N, &K, &wq, &ws);
+        Check(bytes_eq(c.tensors.at("text.layers.3.moe.experts.1.down.w8a16.wq"), wq) &&
+                  bytes_eq(c.tensors.at("text.layers.3.moe.experts.1.down.w8a16.ws"), ws),
+              "g64: bytes == the quantizer at group 64");
+      }
+    }
+    // (6) bf16 left on: a w8a16 + bf16 pair per linear, the head too.
+    {
+      const int rc = run("--layouts w8a16");
+      const Container c = ReadContainer(out);
+      Check(rc == 0 && c.ok, "--layouts w8a16 (bf16 default on): converts");
+      if (c.ok)
+        CheckNames(c, expect(all_w8, true), "w8a16 + bf16: both layouts of every linear (the old-binary-safe pair)");
+    }
+    // (7) a w4a16 container carries no trace of w8a16 (header untouched).
+    {
+      const int rc = run("--layouts w4a16 --lm-head 4bit");
+      const Container c = ReadContainer(out);
+      Check(rc == 0 && c.ok, "control: --layouts w4a16 converts");
+      if (c.ok) {
+        const json md = c.Meta();
+        bool trace = md.at("quant").contains("w8a16") || md.at("r4dx_convert_run").contains("w8a16");
+        for (auto it = md.at("quant_summary").begin(); it != md.at("quant_summary").end(); ++it)
+          trace = trace || it.value().get<std::string>().find("w8a16") != std::string::npos;
+        Check(!trace, "control: a w4a16 container's header has no w8a16 key, run record or summary text");
+      }
+    }
+    // (8) refusals.
+    {
+      Check(run("--layouts w8a16 --no-bf16 --quant search") != 0 && log_has("--quant search"), "w8a16 + --quant search is refused");
+      Check(run("--layouts w8a16 --no-bf16 --hessian-dir nowhere --ldlq .*") != 0 && log_has("not implemented"), "w8a16 + --ldlq is refused (deferred)");
+      Check(run("--layouts w8a16 --no-bf16 --w8a16-group 96") != 0 && log_has("64 or 128"), "--w8a16-group 96 is refused");
+      Check(run("--layouts w4a16 --w8a16-group 64") != 0 && log_has("needs w8a16"), "--w8a16-group without w8a16 is refused");
+      Check(run("--layouts w8a16 --no-bf16 --trellis-from nowhere") != 0 && log_has("--trellis-from"), "w8a16 + --trellis-from is refused");
+      Check(Run("--dflash-gguf nowhere.gguf --out \"" + out.u8string() + "\" --layouts w8a16", log) != 0 && log_has("do not apply to --dflash"),
+            "w8a16 with --dflash-gguf is refused");
     }
   }
 

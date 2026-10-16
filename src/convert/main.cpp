@@ -3,7 +3,10 @@
 // project. Usage:
 //
 //   r4dx-convert --input <HF checkpoint dir> --output <container path>
-//                [--layouts w4a16] [--lm-head 4bit+bf16]
+//                [--layouts w4a16|w8a16] [--lm-head 4bit+bf16|w8a16|bf16] [--w8a16-group 64|128]
+//                (w8a16, docs/w8a16.md: symmetric int8, f16 group scale, RTN only; an all-w8a16 run is
+//                 `--layouts w8a16 --no-bf16`, its head defaults to w8a16 unless --lm-head says otherwise;
+//                 refuses --quant search/--imatrix/--ldlq/--trellis-from/--reuse-tensors-from)
 //                [--layers N] [--threads T] [--vision on|off] [--mtp on|off] [--no-bf16]
 //                [--kv-calib <tools/reference/kv_calibrate.py JSON>]
 //                [--draft-vocab-ids <tests/model/tool_vocab_calib.cpp output JSON>]
@@ -315,7 +318,11 @@ void ValidateKernelRuleGroups(const r4dx_convert::W4a16GroupRules& rules) {
 // `w4a16_groups` is W4a16GroupRules::GroupsJson(): the linears packed at a group other than
 // `w4a16.group` (docs/quant2.md section 5). Written as `w4a16.groups` only when non-empty, so a
 // container converted without --w4a16-group-rule keeps exactly the header it had before.
-nlohmann::json BuildQuantMetadata(const nlohmann::json& w4a16_groups = nlohmann::json::object()) {
+//
+// `w8a16_group` > 0 adds the `quant.w8a16` block (docs/w8a16.md 3.1; only when some linear is w8a16, so
+// every other container's header is unchanged).
+nlohmann::json BuildQuantMetadata(const nlohmann::json& w4a16_groups = nlohmann::json::object(),
+                                  int w8a16_group = 0) {
   nlohmann::json q = {
       {"w4a16",
        {{"group", r4dx_convert::kW4A16Group},
@@ -324,6 +331,15 @@ nlohmann::json BuildQuantMetadata(const nlohmann::json& w4a16_groups = nlohmann:
         {"fragment_permutation", "wmma16x16x16_lane16_koff_0_8_1_9_2_10_3_11"}}},
   };
   if (!w4a16_groups.empty()) q["w4a16"]["groups"] = w4a16_groups;
+  if (w8a16_group > 0) {
+    namespace w8 = r4dx_convert::w8a16;
+    q[w8::kMetaBlockKey] = {{"version", w8::kMetaVersion},
+                            {"group", w8a16_group},
+                            {"scale", w8::kMetaScaleFormat},
+                            {"scale_log2_bias", w8::kScaleLog2Bias},
+                            {"code", w8::kMetaCode},
+                            {"fragment_permutation", w8::kMetaFragmentPermutation}};
+  }
   return q;
 }
 
@@ -347,11 +363,12 @@ LayoutSet ParseLayoutList(const std::string& spec, bool bf16_default_on) {
   if (!cur.empty()) tokens.push_back(cur);
   for (auto& t : tokens) {
     if (t == "w4a16") ls.w4a16 = true;
+    else if (t == "w8a16") ls.w8a16 = true;
     else if (t == "bf16") ls.bf16 = true;
     else if (t == "4bit") { ls.w4a16 = true; }
     else if (t == "none" || t.empty()) { /* no-op */ }
     else if (t == "mxfp4" || t == "w4a8")
-      throw std::runtime_error("layout token '" + t + "' was retired (supported: w4a16, bf16, "
+      throw std::runtime_error("layout token '" + t + "' was retired (supported: w4a16, w8a16, bf16, "
                                "trellis via --trellis-from)");
     else throw std::runtime_error("unknown layout token: " + t);
   }
@@ -441,6 +458,10 @@ struct AppArgs {
   // --w4a16-group-rule "<regex>=<g>" in command-line order, first match wins. Empty (default) =
   // every w4a16 linear at the build default and a byte-identical container.
   std::vector<std::string> w4a16_group_rules;
+
+  // --w8a16-group {64,128} (docs/w8a16.md 5.1): the run-wide group of every w8a16 linear. Default 128.
+  int w8a16_group = r4dx_convert::kW8A16Group;
+  bool w8a16_group_explicit = false;
 
   // docs/quant2.md 5.2 (this file's header comment, reuse_guard.hpp). `reuse_from`: a baseline
   // container whose unaffected tensors are copied instead of recomputed; implies
@@ -557,6 +578,20 @@ AppArgs ParseArgs(int argc, char** argv) {
       a.rotation_seed_explicit = true;
     }
     else if (arg == "--w4a16-group-rule") a.w4a16_group_rules.push_back(next(i));
+    else if (arg == "--w8a16-group") {
+      const std::string v = next(i);
+      size_t used = 0;
+      int g = 0;
+      try {
+        g = std::stoi(v, &used);
+      } catch (const std::exception&) {
+        used = 0;
+      }
+      if (used != v.size() || !r4dx_convert::IsW8A16GroupSupported(g))
+        throw std::runtime_error("--w8a16-group must be 64 or 128, got '" + v + "'");
+      a.w8a16_group = g;
+      a.w8a16_group_explicit = true;
+    }
     else if (arg == "--reuse-tensors-from") a.reuse_from = next(i);
     else if (arg == "--record-reuse-guard") a.record_reuse_guard = true;
     else if (arg == "--trellis-from") a.trellis.from = next(i);
@@ -700,6 +735,12 @@ AppArgs ParseArgs(int argc, char** argv) {
     throw std::runtime_error("--ldlq/--hessian-dir do not apply to --dflash-gguf (no Hessians are "
                              "captured for the drafter; tools/reference/hessian_capture.py only "
                              "covers the main model's linears)");
+  // The drafter's loader refuses w8a16 by name (docs/w8a16.md 6.1); its layout comes from --layout
+  // (DflashLayoutSet), so any w8a16 flag here could only be a no-op.
+  if (dflash_mode && (a.w8a16_group_explicit || ParseLayoutList(a.layouts_spec, true).w8a16 ||
+                      ParseLayoutList(a.lm_head_spec, false).w8a16))
+    throw std::runtime_error("w8a16 flags do not apply to --dflash-gguf / --dflash-hf (the drafter "
+                             "takes --layout {w4a16,bf16})");
   return a;
 }
 
@@ -763,7 +804,32 @@ class ImatrixSource {
   int64_t hit_ = 0, missing_ = 0;
 };
 
+// LDLQ and --quant search/--imatrix drive the 4-bit grid only: a w8a16 linear is always plain RTN
+// (docs/w8a16.md 5.1, 5.3), so it does NOT count here.
 bool HasQuantizedLayout(const LayoutSet& ls) { return ls.w4a16; }
+
+// The w8a16 flag interplay (docs/w8a16.md 5.1, 6.3 row 6). `any_w8a16` = some layout set of this run
+// (body or head) carries w8a16, `any_w4a16` likewise for w4a16. Everything that would otherwise be
+// silently ignored for a w8a16 linear is refused, so a log never claims a container that is not.
+void CheckW8a16Flags(const AppArgs& a, bool any_w8a16, bool any_w4a16, bool trellis) {
+  if (!any_w8a16) {
+    if (a.w8a16_group_explicit)
+      throw std::runtime_error("--w8a16-group needs w8a16 in --layouts or --lm-head");
+    return;
+  }
+  if (trellis)
+    throw std::runtime_error("w8a16 cannot be combined with --trellis-from (no mixed trellis + w8a16 "
+                             "container in v1, docs/w8a16.md 5.2)");
+  if (!any_w4a16 && (a.quant != "rtn" || !a.imatrix.empty()))
+    throw std::runtime_error("--quant search / --imatrix do not apply to w8a16 (RTN only); they would "
+                             "be silently ignored (docs/w8a16.md 5.1)");
+  if (!a.ldlq.empty() || !a.hessian_dir.empty())
+    throw std::runtime_error("--ldlq / --hessian-dir with w8a16 is not implemented: LDLQ for the int8 "
+                             "grid is deferred (docs/w8a16.md 5.3)");
+  if (a.record_reuse_guard || !a.reuse_from.empty())
+    throw std::runtime_error("--record-reuse-guard / --reuse-tensors-from do not support w8a16 in v1 "
+                             "(the guard records bf16/w4a16 layout sets only)");
+}
 
 double SecondsBetween(std::chrono::steady_clock::time_point a,
                       std::chrono::steady_clock::time_point b) {
@@ -1788,7 +1854,20 @@ int RunConvert(const AppArgs& args) {
   const bool do_mtp = (is_gemma || is_lfm2) ? false : (args.mtp >= 0 ? (args.mtp == 1) : full_run);
 
   LayoutSet layouts = ParseLayoutList(args.layouts_spec, /*bf16_default_on=*/true);
-  LayoutSet lm_head_layouts = ParseLayoutList(args.lm_head_spec, /*bf16_default_on=*/false);
+  // The head follows the body's quantized layout by default (docs/w8a16.md 5.2: "the head is w8a16 by
+  // default"): the default --lm-head spec is "4bit+bf16", which for a w8a16-only run would quietly
+  // give a 4-bit head, so it becomes "w8a16+bf16" (the bf16 half is dropped by --no-bf16 exactly as
+  // before). An explicit --lm-head always wins (`--lm-head bf16` is the alternative).
+  const std::string lm_head_spec =
+      (!args.lm_head_spec_explicit && layouts.w8a16 && !layouts.w4a16) ? std::string("w8a16+bf16")
+                                                                       : args.lm_head_spec;
+  LayoutSet lm_head_layouts = ParseLayoutList(lm_head_spec, /*bf16_default_on=*/false);
+  layouts.w8a16_group = args.w8a16_group;
+  lm_head_layouts.w8a16_group = args.w8a16_group;
+  CheckW8a16Flags(args, layouts.w8a16 || lm_head_layouts.w8a16, layouts.w4a16 || lm_head_layouts.w4a16,
+                  !args.trellis.from.empty());
+  r4dx_convert::W8a16RunTally().groups = 0;
+  r4dx_convert::W8a16RunTally().zero_groups = 0;
   if (args.no_bf16) {
     // --layouts/--lm-head have no way to say "and NOT bf16" (bf16 defaults on for body weights,
     // and "none" in a spec is a no-op rather than a subtractive token) -- --no-bf16 is the
@@ -2679,7 +2758,21 @@ int RunConvert(const AppArgs& args) {
         " -- the trellis layout only (<base>.trellis.w|suh|svh, __metadata__.quant.trellis); "
         "--keep-bf16 bases (r4dx_convert_run.keep_bf16_linears) bf16 only";
   }
-  metadata["quant"] = BuildQuantMetadata(w4a16_groups.GroupsJson());
+  // w8a16 (docs/w8a16.md 3.1): the metadata block and the "w4a16|bf16" summary rows are touched only
+  // when some linear is ACTUALLY written w8a16 (after --keep-bf16), so every other container keeps its
+  // header byte for byte.
+  bool any_w8a16 = false;
+  for (const auto& kv : linear_layouts) any_w8a16 = any_w8a16 || kv.second.w8a16;
+  if (any_w8a16) {
+    for (auto& item : metadata["quant_summary"].items()) {
+      if (!item.value().is_string()) continue;
+      std::string s = item.value().get<std::string>();
+      for (size_t p = s.find("w4a16|bf16"); p != std::string::npos; p = s.find("w4a16|bf16", p + 1))
+        s.replace(p, 10, "w4a16|w8a16|bf16");
+      item.value() = s;
+    }
+  }
+  metadata["quant"] = BuildQuantMetadata(w4a16_groups.GroupsJson(), any_w8a16 ? args.w8a16_group : 0);
   if (trellis.Enabled()) metadata["quant"]["trellis"] = trellis.QuantMetadata();
   metadata["model_config"] = config;
   metadata["r4dx_convert_run"] = {
@@ -2688,7 +2781,7 @@ int RunConvert(const AppArgs& args) {
       {"vision", do_vision},
       {"mtp", do_mtp},
       {"layouts", args.layouts_spec},
-      {"lm_head", args.lm_head_spec},
+      {"lm_head", lm_head_spec},
       {"threads", threads},
       {"kv_calib", have_kv_calib ? args.kv_calib : std::string("none (descale placeholder 1.0)")},
       {"draft_vocab_ids",
@@ -2744,6 +2837,14 @@ int RunConvert(const AppArgs& args) {
     metadata["r4dx_convert_run"]["w4a16_groups"] = w4a16_groups.GroupsJson();
     metadata["r4dx_convert_run"]["w4a16_group_extra_bytes"] = w4a16_groups.ExtraBytes();
   }
+  // w8a16 run record: the group, and the zero-group tallies, which exist only after the emit pass --
+  // two fixed-width placeholders, patched (PatchHeader, same length) once the data is written.
+  const std::string kW8ZeroPh = "w8a16_zero_pending__", kW8TotalPh = "w8a16_total_pending_";
+  if (any_w8a16) {
+    metadata["r4dx_convert_run"]["w8a16"] = {{"group", args.w8a16_group},
+                                              {"groups_total", kW8TotalPh},
+                                              {"zero_groups", kW8ZeroPh}};
+  }
   // --record-reuse-guard / --reuse-tensors-from: only then, so a container converted without them
   // keeps its header byte for byte. `reuse_guard` is identical to a full run's with the same flags
   // (it is written with emit_complete 0 and a zero data_sha256, both patched below once the data is
@@ -2791,6 +2892,9 @@ int RunConvert(const AppArgs& args) {
   writer.FinalizeHeader(write_path, metadata);
   std::cout << "[r4dx-convert] planned " << writer.PlannedTensorCount() << " tensors, "
             << writer.PlannedDataBytes() << " data bytes\n";
+  if (any_w8a16 && (writer.HeaderOccurrences("\"" + kW8ZeroPh + "\"") != 1 ||
+                    writer.HeaderOccurrences("\"" + kW8TotalPh + "\"") != 1))
+    throw std::logic_error("w8a16: the zero-group placeholders do not occur exactly once in the header");
   // The reconstruction check's result is patched over this placeholder once the file is closed, so
   // it must be unambiguous (checked now, not after the emit pass).
   if (trellis.Enabled() && trellis.VerifyFull() &&
@@ -2811,6 +2915,21 @@ int RunConvert(const AppArgs& args) {
     }
   }
   writer.Finish();
+  if (any_w8a16) {
+    const uint64_t zg = r4dx_convert::W8a16RunTally().zero_groups.load();
+    const uint64_t tg = r4dx_convert::W8a16RunTally().groups.load();
+    auto fixed20 = [](uint64_t v) {
+      std::string s = std::to_string(v);
+      return std::string(20 - s.size(), '0') + s;
+    };
+    writer.PatchHeader("\"" + kW8ZeroPh + "\"", "\"" + fixed20(zg) + "\"");
+    writer.PatchHeader("\"" + kW8TotalPh + "\"", "\"" + fixed20(tg) + "\"");
+    std::cout << "[r4dx-convert] w8a16: " << tg << " groups quantized (g" << args.w8a16_group << "), "
+              << zg << " zero groups (scale flushed to f16 zero -> codes 0)"
+              << (tg ? " = " + std::to_string(100.0 * static_cast<double>(zg) / static_cast<double>(tg)) + "%"
+                     : std::string())
+              << "\n";
+  }
   // Every planned tensor was written (Finish throws otherwise): only now can this container become a
   // --reuse-tensors-from baseline. ReadBackDigests syncs the file to disk and hashes every tensor as
   // it is there; a copied tensor must read back as exactly the baseline's verified bytes. Then the
@@ -2922,6 +3041,10 @@ int RunSelftest(const AppArgs& args) {
   if (w4a16_groups.Enabled()) ValidateKernelRuleGroups(w4a16_groups);
   LayoutSet parsed = ParseLayoutList(args.layouts_spec, /*bf16_default_on=*/true);
   if (args.no_bf16) parsed.bf16 = false;
+  parsed.w8a16_group = args.w8a16_group;
+  CheckW8a16Flags(args, parsed.w8a16, parsed.w4a16, /*trellis=*/false);
+  r4dx_convert::W8a16RunTally().groups = 0;
+  r4dx_convert::W8a16RunTally().zero_groups = 0;
   const LayoutSet requested = w4a16_groups.Apply("selftest", parsed);
   // The selftest's single tensor has container base "selftest", so --keep-bf16 is exercisable end
   // to end here in milliseconds, against tests/convert/fixtures/input.safetensors and without a
@@ -2975,7 +3098,7 @@ int RunSelftest(const AppArgs& args) {
   metadata["r4dx_format_version"] = "1";
   metadata["model_id"] = "selftest";
   metadata["produced_by"] = "r4dx-convert --selftest";
-  metadata["quant"] = BuildQuantMetadata(w4a16_groups.GroupsJson());
+  metadata["quant"] = BuildQuantMetadata(w4a16_groups.GroupsJson(), layouts.w8a16 ? layouts.w8a16_group : 0);
   // Only with rules, as in RunConvert (the selftest has no r4dx_convert_run block otherwise).
   if (w4a16_groups.Enabled()) {
     metadata["r4dx_convert_run"] = {{"w4a16_group_rules", w4a16_groups.RulesJson()},
@@ -2999,6 +3122,10 @@ int RunSelftest(const AppArgs& args) {
   }
   writer.Finish();
 
+  if (layouts.w8a16)
+    std::cout << "[r4dx-convert --selftest] w8a16: " << r4dx_convert::W8a16RunTally().groups.load()
+              << " groups (g" << layouts.w8a16_group << "), "
+              << r4dx_convert::W8a16RunTally().zero_groups.load() << " zero groups\n";
   std::cout << "[r4dx-convert --selftest] N=" << N << " K=" << K << " quant="
             << (use_ldlq ? std::string("ldlq (damp ") + std::to_string(args.ldlq_damp) + ")"
                          : args.quant)

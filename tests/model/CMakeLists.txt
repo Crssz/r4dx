@@ -594,6 +594,13 @@ add_executable(test_lfm2_tiny_trellis test_lfm2_tiny_trellis.cpp)
 target_link_libraries(test_lfm2_tiny_trellis PRIVATE r4dx_model r4dx_convert r4dx_core r4d_core)
 add_test(NAME lfm2_tiny_trellis COMMAND test_lfm2_tiny_trellis)
 set_tests_properties(lfm2_tiny_trellis PROPERTIES ENVIRONMENT "HIP_VISIBLE_DEVICES=1" SKIP_RETURN_CODE 77)
+#   lfm2_trellis_shapes test_lfm2_trellis_shapes.cpp (L3-8): ApplyLinear on synthetic trellis linears of the REAL LFM2 shapes
+#                       (K 2048 / 1536 / 11776, the two-part gate_ups) at KB 4 / 5 vs tests/kernels/trellis_ref.hpp, row identity
+add_executable(test_lfm2_trellis_shapes test_lfm2_trellis_shapes.cpp)
+target_link_libraries(test_lfm2_trellis_shapes PRIVATE r4dx_model r4dx_core r4d_core)
+target_include_directories(test_lfm2_trellis_shapes PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../kernels)
+add_test(NAME lfm2_trellis_shapes COMMAND test_lfm2_trellis_shapes)
+set_tests_properties(lfm2_trellis_shapes PROPERTIES ENVIRONMENT "HIP_VISIBLE_DEVICES=1" SKIP_RETURN_CODE 77)
 
 # test_gemma_tp_shard (docs/gemma4-plan.md M1b-1): the Gemma 4 TP=2 sharding contract on the real 12B config -- tp::RuleFor's
 # Gemma table vs GemmaConfig::Shard, the byte plans (bf16 / w4a16 / trellis) partition every linear, and a tiny-model

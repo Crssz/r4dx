@@ -9,7 +9,9 @@
 //   (b) header edits of that container: a missing expert tensor, a wrong expert_bias shape, a stray conv tensor on an
 //       attention layer, an expert past num_experts, a missing lm_head, a wrong model_arch / norm_kind, a rotated
 //       container -- each names its problem;
-//   (c) the real lfm2-l6.r4dx header when one exists (SKIP otherwise).
+//   (c) the real lfm2-l6.r4dx header when one exists (SKIP otherwise);
+//   (d) trellis containers' headers (L3-8) when they exist: the tiny fixture (tools/reference/lfm2/tiny_trellis_golden.py)
+//       and the real lfm2-trellis45.r4dx -- quant.trellis lists exactly the body linears with the loader's byte sizes.
 // The upload half (Lfm2Container::Load) needs a device: see the GPU test list in the lane report.
 #include <algorithm>
 #include <cstdint>
@@ -19,6 +21,7 @@
 #include <filesystem>
 #include <fstream>
 #include <iterator>
+#include <optional>
 #include <set>
 #include <stdexcept>
 #include <string>
@@ -30,6 +33,7 @@
 #include "r4dx/core/dtype.hpp"
 #include "r4dx/models_root.h"
 #include "r4dx_convert/safetensors_reader.hpp"
+#include "trellis_meta.h"
 
 namespace fs = std::filesystem;
 using nlohmann::json;
@@ -312,6 +316,91 @@ void TestRealL6() {
   Check(Throws([&] { InspectLfm2Container(p.u8string()); }, "missing tensor"), "lfm2-l6 is refused as a 40-layer model (layers 6+ are not in it)");
 }
 
+// docs/lfm2-plan.md L3-8: a trellis LFM2 container's header, as Lfm2Container::Load --layout trellis will read it --
+// the table Inspect accepts, and __metadata__.quant.trellis.linears lists EXACTLY the body linears (attn q/k/v/o or
+// ShortConv in/out, dense gate_up [2 parts] / down, every expert's gate_up [2 parts] / down), each with its three
+// tensors at the byte sizes the loader checks and no bf16 copy, while lm_head / router / embedding stay bf16.
+void CheckTrellisContainer(const fs::path& p, const std::string& tag) {
+  const Lfm2ContainerInfo info = InspectLfm2Container(p.u8string());
+  const Lfm2Config& c = info.config;
+  Check(info.has_trellis, tag + ": __metadata__.quant.trellis present");
+  const std::optional<r4dx::model::TrellisSpec> spec = r4dx::model::ParseTrellisMetadata(info.metadata, p.u8string());
+  if (!spec) {
+    Check(false, tag + ": ParseTrellisMetadata returns a spec");
+    return;
+  }
+  const r4dx_convert::SafetensorsReader r(r4dx_convert::Utf8ToWide(p.u8string()));
+  struct Want {
+    std::string base;
+    int64_t n, k, part0;  // part0 > 0: a two-part [part0, n - part0] linear
+  };
+  std::vector<Want> want;
+  const int64_t H = c.hidden_size;
+  for (int64_t i = 0; i < c.num_hidden_layers; ++i) {
+    const std::string b = r4dx::model::Lfm2LayerBase(i);
+    if (c.IsAttentionLayer(i)) {
+      want.push_back({b + "attn.q", c.QDim(), H, 0});
+      want.push_back({b + "attn.k", c.KvDim(), H, 0});
+      want.push_back({b + "attn.v", c.KvDim(), H, 0});
+      want.push_back({b + "attn.o", H, c.QDim(), 0});
+    } else {
+      want.push_back({b + "conv.in_proj", c.ConvInProjRows(), H, 0});
+      want.push_back({b + "conv.out_proj", H, c.conv_dim, 0});
+    }
+    if (c.IsDenseLayer(i)) {
+      want.push_back({b + "mlp.gate_up", 2 * c.intermediate_size, H, c.intermediate_size});
+      want.push_back({b + "mlp.down", H, c.intermediate_size, 0});
+    } else {
+      for (int64_t e = 0; e < c.num_experts; ++e) {
+        want.push_back({r4dx::model::Lfm2ExpertBase(i, e, "gate_up"), c.ExpertGateUpRows(), H, c.moe_intermediate_size});
+        want.push_back({r4dx::model::Lfm2ExpertBase(i, e, "down"), H, c.moe_intermediate_size, 0});
+      }
+    }
+  }
+  std::set<std::string> listed, wanted;
+  for (const auto& kv : spec->linears) listed.insert(kv.first);
+  for (const Want& w : want) wanted.insert(w.base);
+  Check(listed == wanted, tag + ": quant.trellis.linears lists exactly the " + std::to_string(wanted.size()) +
+                              " body linears (" + std::to_string(listed.size()) + " listed)");
+  int bad = 0;
+  std::string first_bad;
+  const auto span = [&](const std::string& n) { return r.Has(n) ? r.Meta(n).end - r.Meta(n).begin : uint64_t{0}; };
+  for (const Want& w : want) {
+    const r4dx::model::TrellisLinearSpec* t = spec->Find(w.base);
+    bool ok = t != nullptr && w.n % 128 == 0 && w.k % 128 == 0 && !r.Has(w.base + ".bf16.w");
+    if (ok) {
+      const int64_t parts = w.part0 > 0 ? 2 : 1;
+      ok = t->Parts() == parts && (parts == 1 || (t->parts.size() == 2 && t->parts[0] == w.part0 && t->parts[1] == w.n - w.part0)) &&
+           (t->bits == 4 || t->bits == 5) &&
+           span(w.base + ".trellis.w") == static_cast<uint64_t>(w.n * w.k * t->bits / 8) &&
+           span(w.base + ".trellis.suh") == static_cast<uint64_t>(parts * w.k * 2) &&
+           span(w.base + ".trellis.svh") == static_cast<uint64_t>(w.n * 2);
+    }
+    if (!ok && bad++ == 0) first_bad = w.base;
+  }
+  Check(bad == 0, tag + ": every trellis linear has its parts, KB 4|5, the loader's byte sizes and no bf16 copy" +
+                      (bad ? " (first bad: " + first_bad + ", " + std::to_string(bad) + " bad)" : std::string()));
+  Check(r.Has("lm_head.bf16.w") && !r.Has("lm_head.trellis.w") && r.Has("text.embed_tokens") &&
+            !spec->Find("lm_head") && !spec->Find(r4dx::model::Lfm2LayerBase(c.num_dense_layers) + "moe.router"),
+        tag + ": lm_head bf16, embedding raw, router not trellis");
+}
+
+void TestTrellis() {
+  std::printf("---- (d) trellis containers (headers) ----\n");
+  bool any = false;
+  for (const auto& [rel, tag] : {std::pair<const char*, const char*>{"r4dx/lfm2/tiny_trellis/tiny_trellis.r4dx", "tiny trellis"},
+                                 std::pair<const char*, const char*>{"r4dx/lfm2/lfm2-trellis45.r4dx", "lfm2-trellis45"}}) {
+    const fs::path p = fs::path(r4dx::ModelsPath(rel));
+    if (!fs::exists(p)) {
+      std::printf("SKIP: %s not present\n", p.string().c_str());
+      continue;
+    }
+    any = true;
+    CheckTrellisContainer(p, tag);
+  }
+  if (!any) ++g_skipped;
+}
+
 }  // namespace
 
 int main() try {
@@ -322,6 +411,7 @@ int main() try {
   ++g_skipped;
 #endif
   TestRealL6();
+  TestTrellis();
   std::printf("\n%s: %d failure(s), %d skipped part(s)\n", g_failures == 0 ? "OK" : "FAILED", g_failures, g_skipped);
   return g_failures == 0 ? 0 : 1;
 } catch (const std::exception& e) {

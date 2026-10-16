@@ -17,10 +17,17 @@
 //                 moe.experts.{e}.gate_up / .down QuantLinears (every expert TP-split). Per layer the expert table:
 //                 `gate_up[e]` / `down[e]` plus, in the bf16 layout, a device array of the weight base pointers
 //                 (uint64 [E] each: what the L4 grouped kernels index by the router's expert id).
+//
+// Trellis (docs/lfm2-plan.md L3-8, `--layout trellis`, TP=1 only -- RefuseLfm2TrellisTp): every body linear above,
+// experts included, loads its `.trellis.{w,suh,svh}` through the same fallback chain (a linear the container left bf16
+// loads bf16 and is counted), and gets its own ticket slice (AssignTrellisTickets). lm_head / embedding / router /
+// expert_bias / conv taps / norms are never trellis. The experts' QuantLinears are called one by one through
+// ApplyLinear (Lfm2MoeFfn), so no pointer table exists for a trellis body.
 #pragma once
 
 #include <cstdint>
 #include <optional>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -121,5 +128,16 @@ class Lfm2Container {
   std::optional<TrellisSpec> trellis_;
   core::DeviceBuffer<uint32_t> trellis_tickets_;
 };
+
+// docs/lfm2-plan.md L3-8: the trellis body (the shipping format) runs at TP=1 only -- the TP=2 shard rules of the
+// per-expert trellis linears (two-part gate_up halves, the pair-grid row split) are not built or validated for LFM2.
+// Throws std::invalid_argument naming `who` when `layout` is trellis or `path`'s header carries
+// __metadata__.quant.trellis (a CPU header read, no HIP call). Called before any device work.
+inline void RefuseLfm2TrellisTp(const std::string& path, Layout layout, int64_t layer_limit, const std::string& who) {
+  const bool trellis = layout == Layout::kTrellis || Lfm2Container::Inspect(path, layer_limit).has_trellis;
+  if (!trellis) return;
+  throw std::invalid_argument(who + ": " + path + " -- an LFM2 trellis container runs at TP=1 only (--tp 1 --layout "
+                              "trellis); tensor parallelism (--tp 2) is supported for the bf16 LFM2 container only");
+}
 
 }  // namespace r4dx::model

@@ -35,6 +35,10 @@ Lfm2Container Lfm2Container::Load(const std::string& path, const Lfm2LoadOptions
   meta.path = path;
   meta.trellis = ParseTrellisMetadata(metadata, path);
   CheckTrellisChoice(meta.trellis, /*rotated=*/false, o.layout, path);
+  if (tp && meta.trellis) {  // docs/lfm2-plan.md L3-8 (RefuseLfm2TrellisTp says the same before any device work)
+    throw std::invalid_argument("r4dx::model::Lfm2Container::Load: " + path +
+                                " is a trellis container; LFM2 trellis runs at TP=1 only");
+  }
 
   SafetensorsReader reader(Utf8ToWide(path));
   CheckW4a16GroupTensors(reader, meta.w4a16.groups, path);

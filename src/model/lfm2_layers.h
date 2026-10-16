@@ -10,6 +10,10 @@
 //                    prefill (T > 1, kAuto):  counting sort of the T x 4 pairs by expert (deterministic), one
 //                                             readback of the counts / offsets, a gather of the sorted rows, per
 //                                             non-empty expert one gate_up / silu_mul / down over its rows
+//                  every expert GEMM is ApplyLinear on that expert's own QuantLinear, so the bf16 and the trellis
+//                  layouts (docs/lfm2-plan.md L3-8: per-expert trellis gate_up [2 parts] / down, M = 1 at decode,
+//                  M = the expert's row count <= 256 in prefill, sliced into <= 64-row launches) take the same path;
+//                  the arena is rewound after each expert, so the GEMM scratch peak is one expert's;
 //                  then r4dx_lfm2_moe_combine_bf16 (fp32 weighted sum over the slots in slot order, one rounding)
 //                  [TP: every expert is split (gate|up halves, down K), so the combined rows are partial sums,
 //                  all-reduced once].

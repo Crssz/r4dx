@@ -66,6 +66,7 @@ Lfm2Model Lfm2Model::Load(const Lfm2ModelOptions& opts) {
   if (is_tp && (opts.tp_comm == nullptr || opts.tp_comm->World() != opts.tp_world || opts.tp_comm->Rank() != opts.tp_rank)) {
     throw std::invalid_argument("Lfm2Model::Load: tp_world > 1 needs a TpComm endpoint of the same world and rank");
   }
+  if (is_tp) RefuseLfm2TrellisTp(opts.container_path, opts.layout, opts.layer_limit, "Lfm2Model::Load");
   if (opts.tp_submit_layers < 0 || opts.tp_submit_layers > 64 || opts.tp_max_inflight_units < 0 ||
       opts.tp_max_inflight_units > 64) {
     throw std::invalid_argument("Lfm2Model::Load: tp_submit_layers and tp_max_inflight_units must be in [0, 64]");
@@ -125,6 +126,9 @@ Lfm2Model Lfm2Model::Load(const Lfm2ModelOptions& opts) {
   m.moe_host_.Allocate(moe_rows, cfg.num_experts_per_tok, cfg.num_experts);
   // The widest 256-row layer scratch: the MoE sorted path (x gathered 1024 x 2048 + slot outputs 1024 x 2048 = 8 MiB,
   // gate_up 256 x 3072) or the dense gate_up 256 x 23552 (12 MiB) + act, plus attention q/k/v/out and GEMM scratch.
+  // A trellis body adds per GEMM call its input transform (parts x 64 x K f16: 512 KiB for an expert gate_up, 1.5 MiB
+  // for the dense down) and split-group partials (< 1 MiB at the fallback tunings); Lfm2MoeFfn rewinds the arena after
+  // each expert, so that is one expert's worth at a time, well inside the reservation.
   m.arena_.Reserve(256ull * 1024 * 1024);
 
   // Attention layers: a contiguous bf16 cache each; conv layers: a slot in the ShortConv state.

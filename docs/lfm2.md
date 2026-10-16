@@ -1,7 +1,8 @@
 # LFM2.5-24B-A2B in r4dx
 
-Status 2026-10-15: **bf16 TP=2 works end to end** (KL gate PASS, server smoke by hand: chat with the reasoning split, Thai,
-a tool call). Trellis (the one-card shipping format) is **in progress**; nothing about it is validated yet. This page is the
+Status 2026-10-16: **bf16 TP=2 works end to end** (KL gate PASS, server smoke by hand: chat with the reasoning split, Thai,
+a tool call). **Trellis on one card works** as an 18.89 GB hybrid (K5 experts, bf16 non-expert and layers 2-5 experts;
+KL gate PASS, about 61 tok/s decode; see "Trellis (one GPU)"). This page is the
 user-facing summary; the design and task list are [lfm2-plan.md](lfm2-plan.md), the verified model facts (each with a
 source line) are [lfm2-semantics.md](lfm2-semantics.md).
 
@@ -97,12 +98,64 @@ HF-bf16's own bf16 noise in every group except `tool` (0.0028 vs 0.0026, inside 
 Speed (bf16, TP=2, one 2.45 B-active model on two R9700): teacher-forced scoring **25 ms per row**; server decode about
 **60 tok/s**. No prefill, TTFT or long-context numbers have been taken yet, and none are claimed.
 
-## Trellis (in progress)
+## Trellis (one GPU)
 
-The shipping plan is a trellis mix of about 4.5 bits per weight (about 14 GB) on one card, built with the Gemma tooling ported
-to the `lfm2_moe` arch (Hessian collection, oracle, mix, import), unrotated. The tooling exists (Hessian / oracle / mix /
-import commands accept `lfm2_moe`); no trellis container has been produced or measured, so there are no trellis accuracy or
-speed numbers and the trellis kernels have not been wired to the expert linears. See lfm2-plan.md sections 7 and 9 (L3).
+Done, 2026-10-16. The one-card format is a **hybrid**: K5 trellis for every expert except layers 2-5, bf16 for everything
+that is not an expert and for the experts of layers 2-5. It passes the KL gate on every group; the 4.5-bit plan of
+lfm2-plan.md 7 did not (details below). Unrotated, built with the Gemma tooling ported to `lfm2_moe`.
+
+### Recipe
+
+- **Calibration:** 1,170 model-generated samples (1.63 M tokens: 3 passes over 390 prompts, temperature 0.7, top_p 0.95,
+  from the r4dx bf16 TP=2 server).
+- **Hessians:** `hessian_capture.py --arch lfm2_moe`, per-expert routed Hessians plus a pooled one: 5,025 files, 31.3 GiB,
+  70 minutes. Minimum routed rows per expert 1,195; 12 expert files were shrunk toward the pooled Hessian; numerically dead
+  `mlp_mid` channels are exempt.
+- **Oracles:** K4 / K5 / K6, `quantize-model --backend hip --hessian-basis matched` on device 1 (103 / 106 / 106 minutes).
+  torch 2.9.1+rocm needs a CPU Cholesky and a chunked `had_r`, because ROCm matmul returns garbage above 2^20 folded rows.
+  **K6 cannot be used**: the kernels and the converter / loader only instantiate KB 4 and 5.
+
+### Results
+
+Increment of `KL(fp32 truth || r4dx)` over r4dx bf16, per chat group (gate: increment <= 0.01 per group; the epsilon 0.005
+version is also used for bf16):
+
+| variant | size | code | english | thai | tool | ALL | gate |
+|---|--:|--:|--:|--:|--:|--:|---|
+| mix4.5 (4.5085 bpw) | 13.4 GB | +.0184 | +.0245 | +.0291 | +.0038 | +.0222 | FAIL |
+| mix4.75 | -- | -- | -- | -- | -- | +.0175 | FAIL |
+| all-K5 (5.02 bpw) | 14.8 GB | +.0121 | +.0188 | +.0197 | +.0022 | +.0156 | FAIL |
+| K5 experts + bf16 non-expert | 15.8 GB | +.0080 | +.0107 | +.0137 | +.0012 | +.0100 | English / Thai FAIL |
+| **hybrid** (K5 + non-expert bf16 + experts of layers 2-5 bf16) | **18.89 GB** | +.0053 | +.0080 | +.0046 | +.0009 | +.0055 | **PASS** all groups |
+
+Layer sweep (K5 base + bf16 non-expert + bf16 experts of layers 2-N), ALL increment / size: 2-3 +.0077 / 17.3 GB; 2-4
++.0072 / 18.1; **2-5 +.0055 / 18.9**; 2-8 +.0046 / 21.2; 2-11 +.0036 / 23.5; 2-14 +.0029 / 25.8. Layers 15-27 only: +.0074;
+layers 28-39 only: +.0090. A 4.75-bit base plus layers 2-5 fails (english +.0109); a 4.5-bit base fails.
+
+Why: HF bf16 keeps the identical 4-expert set against the fp32 truth for only 87 % of tokens (3.3 % of expert slots differ;
+85 % at layers about 20-30). Quantization damage is broad (75 % of the increase sits in the 50th-95th percentile of bf16
+noise, not in outliers) and concentrated in the early layers' experts.
+
+### Hybrid numbers
+
+- Container 18.89 GB; **20.29 GiB** VRAM peak (teacher-forced, 8192 context).
+- Top-1 **96.13 %** (bf16 TP=2 96.83 %, HF-bf16 96.53 %); all-chat test KL **.01545** (r4dx bf16 .00993, HF-bf16 noise .01248).
+- Teacher-forced **17.0 ms/row** on one GPU (bf16 TP=2: 25 ms/row). Server decode about **61 tok/s** on one GPU with the
+  untuned fallback GEMM tuning (bf16 TP=2: about 60-64 tok/s). Smoke suite: 75 checks pass.
+- Not done yet: tuning-table rows for the LFM2 trellis shapes, M = 256 / int8 prefill, grouped MoE kernels, a bf16 attention
+  kernel for head_dim 64, a long-context / needle test, prefill TTFT numbers.
+
+### Reproduce
+
+```powershell
+trellis_quant.py mix --bpw 5.0 --src <q5 dir> --out-dir <mix5.0 dir>
+r4dx-convert --input E:\models\LiquidAI\LFM2.5-24B-A2B --output E:\models\r4dx\lfm2\lfm2-trellis-hybrid.r4dx `
+    --trellis-from <mix5.0 dir> --layouts bf16 --lm-head bf16 `
+    --keep-bf16 '^(?!.*\.moe\.experts\.)|text\.layers\.(2|3|4|5)\.moe\.experts\.'
+r4dx-server --model <container> --layout trellis --dialect lfm2 --tokenizer-dir <ckpt dir>
+```
+
+TP=1 only: trellis at TP=2 is refused.
 
 ## Pointers
 

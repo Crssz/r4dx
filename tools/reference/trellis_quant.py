@@ -762,7 +762,16 @@ def had_r(W: torch.Tensor) -> torch.Tensor:
     """W P_n (blockwise along columns)."""
     k, n = W.shape
     P = hadamard128(str(W.device))
-    return torch.matmul(W.reshape(k, n // HAD, HAD), P).reshape(k, n)
+    # torch 2.9.1+rocm returns garbage once the folded matmul has more than 2^20 rows (k * n/128; seen at
+    # [11776, 11776], LFM2 dense down_proj Hessians), so cap each call well below that.
+    step = max(1, (1 << 19) // max(1, n // HAD))
+    if k <= step:
+        return torch.matmul(W.reshape(k, n // HAD, HAD), P).reshape(k, n)
+    out = torch.empty_like(W)
+    for r0 in range(0, k, step):
+        r1 = min(k, r0 + step)
+        out[r0:r1] = torch.matmul(W[r0:r1].reshape(r1 - r0, n // HAD, HAD), P).reshape(r1 - r0, n)
+    return out
 
 
 def random_signs(n: int, seed: int) -> torch.Tensor:
@@ -824,6 +833,11 @@ def block_ldl(H: torch.Tensor, b: int = 16, sigma_reg: float = SIGMA_REG) -> tup
     its diagonal blocks ZEROED (the finalize step's `L[i, i] = 0`), i.e. the strictly block-lower
     feedback matrix of 7.3. Cholesky failures retry up to 10 times adding 2 sigma_reg mean(diag)
     to the diagonal each time. Returns (L, retries)."""
+    if H.is_cuda:
+        # torch 2.9.1+rocm (the only venv here) has no MAGMA: cholesky / inv on a GPU tensor raise. The factor of a
+        # K x K (<= 2048) Hessian is cheap on the CPU; the result goes back to the caller's device.
+        L, retries = block_ldl(H.cpu(), b, sigma_reg)
+        return L.to(H.device), retries
     k = H.shape[0]
     Hc = H
     retries = 0

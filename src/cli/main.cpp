@@ -706,7 +706,11 @@ int RunMain(int argc, char** argv) {
       // rather than killing the session (std::exit(1)).
       std::fprintf(stderr, "warning: chat template re-render did not extend the previous token "
                             "prefix; dropping state and re-prefilling the whole conversation\n");
-      if (args.tp == 1 && dynamic_cast<r4dx::model::PpModel*>(model.get()) == nullptr) {
+      // LFM2 (thinking template: the next turn's render strips the previous reasoning, so this branch runs on
+      // every turn) must not reload: `model = LoadTextModel(...)` keeps the old model resident until the new one
+      // is built, i.e. 2 x ~26 GB on a 32 GB card, which Windows pages out (decode fell from ~90 to ~18 tok/s).
+      // Reset() drops the per-sequence state (conv state, positions) and keeps the weights.
+      if (args.tp == 1 && dynamic_cast<r4dx::model::PpModel*>(model.get()) == nullptr && !container_is_lfm2) {
         model = r4dx::model::LoadTextModel(opts, tpo, ppo);
       } else {
         // docs/tp.md 2.8: a second full TP load would need twice the VRAM; Reset() drops the same

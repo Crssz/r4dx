@@ -28,6 +28,10 @@ from __future__ import annotations
 
 import re
 
+#: highest rate the mix may use: only K4 and K5 oracles exist (plan 7: no K6 source is planned), so leftover
+#: budget must not buy a K4->K5->K6 second promotion of the top group.
+MAX_K = 5.0
+
 #: promoted-unit names (arch_table.lfm2_arch qgroups)
 EXPERT_GROUPS = ("moe.gu", "moe.d")
 #: the rate of every non-expert linear (the K5 floor of plan 7.1)
@@ -112,11 +116,11 @@ def allocate(tensors: list, bpw: float, rate_floor, rate_next, gaps: dict | None
             extra = 0.0
             for t in g:
                 nr = rate_next(rate[t["name"]])
-                extra += 0.0 if nr is None else t["numel"] * (nr - rate[t["name"]])
+                extra += 0.0 if (nr is None or nr > MAX_K) else t["numel"] * (nr - rate[t["name"]])
             if extra > 0 and used + extra <= budget:
                 for t in g:
                     nr = rate_next(rate[t["name"]])
-                    if nr is not None:
+                    if nr is not None and nr <= MAX_K:
                         rate[t["name"]] = nr
                 used += extra
                 changed = True

@@ -604,6 +604,68 @@ linear and throws "no tensor found" -- that, not `r4dx_format_version` (not bump
 13.546 GiB; `qwen38-27b-q2ab_hv2_q3.r4dx` for comparison 13.680 GiB decode. The recipe and the
 measured quality and speed are in docs/quant2.md section 7 ("Trellis").
 
+## w8a16 body layout (`__metadata__.quant.w8a16`, `<base>.w8a16.*`)
+
+`r4dx-convert --layouts w8a16` (design and outcome: docs/w8a16.md; the constants live in
+`src/convert/include/r4dx_convert/w8a16_format.hpp`). Symmetric int8 weights with one f16 scale per (output row, group of
+`G` along K), `G` in {64, 128} (default 128, run-wide `--w8a16-group`). A container with no w8a16 linear has no
+`quant.w8a16` key and no `.w8a16.*` tensor, and its header is byte-identical to one converted before the layout existed.
+An LFM2 container needs `--no-bf16`, or it also carries the bf16 copy. A w8a16 base is exclusive with trellis.
+
+For a linear `<base>` with W `[N, K]`:
+
+| tensor | dtype | shape | bytes |
+|---|---|---|---|
+| `<base>.w8a16.wq` | U8 | `[N*K]`, 1-D | `N*K` |
+| `<base>.w8a16.ws` | U8 (f16 pairs, little-endian) | `[N*K/G, 2]` | `N*K/G*2` |
+
+**Codes.** Symmetric `-127..127` (`-128` unused), stored offset binary `byte = q + 128` (so `1..255`, 128 is zero), no zero
+point. Quantization is round-half-away-from-zero in float32 against the **stored** scale:
+
+```
+s     = amax / 127                      # amax = max |w| over the group
+s16   = f16(s * 2^12)                   # RNE; inf is an error naming the tensor
+s_use = float(s16) * 2^-12
+q     = clamp(RoundHalfAwayFromZero(w / s_use), -127, 127)
+```
+
+**Scale.** f16, stored biased by `2^12` (`scale_log2_bias = 12`, a format constant: the kernel multiplies the final
+accumulator by `2^-12`, exactly, and the loader refuses any other value). A group whose biased scale flushes to f16 zero is
+written as scale 0 and codes 128 (all zero), and is counted in the converter's log; the largest representable amax is 2031.
+
+**Fragment byte map** (`wq`). The packed block is 16 rows x 32 K = 512 bytes, the WMMA f16 B-fragment of one `global_load_b128`
+per lane (wave32, 2 k-steps). With `t` = row tile (`N/16`), `kb` = 32-K block, `l` = lane 0..31, `j` = 0..3:
+
+```
+dword  ((t*(K/32) + kb)*32 + l)*4 + j
+byte i (0..3) of that dword holds code(row, k) with
+row = 16t + (l & 15)
+k   = 32kb + 16*(j>>1) + 8*(j&1) + 4*(l>>4) + i
+```
+
+Each row tile is one contiguous run of `16*K` bytes. The scales (`ws`) are `u16` index `((t*(K/G) + g)*16 + r)` = the f16
+bits of `s * 2^12` for row `16t + r`, group `g`.
+
+**Divisibility.** `N % 16 == 0` and `K % G == 0` (checked by the converter at plan time, the loader and the kernel); a launch
+also needs `K % (SK*G) == 0`. The loader checks every `wq` is `N*K` bytes and every `ws` is `N*K/G*2`, naming the tensor.
+
+**Metadata block**, written only when a w8a16 linear exists:
+
+```json
+"quant": { "w8a16": { "version": 1, "group": 128, "scale": "f16", "scale_log2_bias": 12,
+                      "code": "int8_sym127_offset_binary_x80",
+                      "fragment_permutation": "wmma16x16x16_f16_b_lane16_k32block" } }
+```
+
+The loader refuses an unknown `version`, `code` or `fragment_permutation`, an uninstantiated `group`, and a bias other
+than 12. `--layout w8a16` on a container without the block is refused before any upload. There is no per-linear `groups`
+map: one group per container.
+
+**TP.** Row tiles are contiguous and K blocks fixed-size, so the layout slices by rows and by K, but `--layout w8a16` at
+TP=2 is refused in v1 (docs/w8a16.md "Deviations").
+
+**Sizes.** LFM2.5-24B-A2B at g128 with `--layouts w8a16 --no-bf16`: 10,146 tensors, 24,875,687,936 planned data bytes
+(24.88 GB); 187,236,352 groups, 153,184 of them zero groups (0.0818 %).
 ## KV descale tables
 
 `text.layers.{i}.attn.k_descale` / `.v_descale`, `fp32[kv_heads]`, one scalar per KV head, feeding

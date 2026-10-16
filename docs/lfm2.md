@@ -2,7 +2,8 @@
 
 Status 2026-10-16: **bf16 TP=2 works end to end** (KL gate PASS, server smoke by hand: chat with the reasoning split, Thai,
 a tool call). **Trellis on one card works** as an 18.89 GB hybrid (K5 experts, bf16 non-expert and layers 2-5 experts;
-KL gate PASS, about 61 tok/s decode; see "Trellis (one GPU)"). This page is the
+KL gate PASS, about 61 tok/s decode; see "Trellis (one GPU)"). **8-bit on one card works** (w8a16 g128, 24.9 GB, KL gate
+PASS with ALL +.0033 over bf16, 88.7 tok/s decode; see "8-bit (one GPU)"). This page is the
 user-facing summary; the design and task list are [lfm2-plan.md](lfm2-plan.md), the verified model facts (each with a
 source line) are [lfm2-semantics.md](lfm2-semantics.md).
 
@@ -159,6 +160,55 @@ r4dx-server --model <container> --layout trellis --dialect lfm2 --tokenizer-dir 
 ```
 
 TP=1 only: trellis at TP=2 is refused.
+
+## 8-bit (one GPU)
+
+Done, 2026-10-16. `w8a16` is the fourth `--layout`: symmetric int8 weights, one f16 scale per 128 K per output row (stored
+biased by 2^12), bf16 activations in memory converted to f16 in registers, f32 accumulation, bf16 output. Every linear of
+the model is w8a16, including the tied head written untied; the embedding stays bf16. Plain round-to-nearest, no
+calibration and no Hessians. Format: [container-format.md](container-format.md) "w8a16 body layout"; design and outcome:
+[w8a16.md](w8a16.md).
+
+### Recipe
+
+```powershell
+r4dx-convert --input E:\models\LiquidAI\LFM2.5-24B-A2B --output E:\models\r4dx\lfm2\lfm2-w8a16-g128.r4dx `
+    --layouts w8a16 --no-bf16
+r4dx-server --model E:\models\r4dx\lfm2\lfm2-w8a16-g128.r4dx --layout w8a16 --tp 1 --dialect lfm2 --tokenizer-dir <ckpt dir>
+```
+
+`--no-bf16` is required (without it the container also carries the 48 GB bf16 copy). The conversion took **108 s** and
+wrote **24.88 GB** (24,875,687,936 planned data bytes, 10,146 tensors); 187,236,352 groups, of which 153,184 are zero groups
+(0.0818 %: groups whose biased scale flushes to f16 zero, written as scale 0 and codes 0).
+
+### Results
+
+Increment of `KL(fp32 truth || r4dx)` over r4dx bf16 (gate: epsilon 0.005, increment <= 0.01 per group):
+
+| code | english | thai | tool | ALL | gate |
+|--:|--:|--:|--:|--:|---|
+| +.0033 | +.0028 | +.0047 | +.0005 | +.0033 | **PASS** all groups |
+
+- All-chat test KL **.01323** (r4dx bf16 .00993, HF-bf16 noise .01248); top-1 **96.41 %** (bf16 TP=2 96.83 %, HF-bf16 96.53 %).
+- Teacher-forced **12.4 ms/row** on one GPU; **26.18 GiB** VRAM peak at 8192 context.
+- Server decode **88.7 tok/s** on one GPU, with the untuned fallback GEMM tuning (the w8a16 tuning table is still the empty
+  placeholder). `tools\server\smoke.ps1 -Layout w8a16 -Tp 1 -Dialect lfm2`: 75 checks pass.
+- TP=1 only: w8a16 at TP=2 is refused.
+- Not done yet: tuning-table rows (`tool_w8a16_gemm_bench --inc-out`; the G128 MT 3/4 + NPW 4 tiles spill VGPRs), LDLQ for
+  w8a16 (deferred), TP=2, the grouped MoE decode kernel, a check of the f16 activation range (values above 65504 saturate;
+  not measured on LFM2), long-context and TTFT numbers.
+
+### Three ways to run LFM2
+
+| | bf16, `--tp 2` | trellis hybrid, TP=1 | w8a16 g128, TP=1 |
+|---|--:|--:|--:|
+| container | 48.5 GB | 18.9 GB | 24.9 GB |
+| GPUs | 2 | 1 | 1 |
+| ALL increment over r4dx bf16 | +0 (reference) | +.0055 | +.0033 |
+| server decode | about 64 tok/s | about 61 tok/s | **88.7 tok/s** |
+
+All three decode numbers use untuned GEMM settings. The trellis hybrid is K5 trellis experts with bf16 non-expert linears and
+bf16 experts of layers 2-5.
 
 ## Pointers
 

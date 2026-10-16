@@ -1,5 +1,17 @@
 # Status
 
+## LFM2.5-24B-A2B: w8a16 (8-bit, one card) validated, 2026-10-16
+
+New `--layout w8a16` (symmetric int8 weights, f16 group scales at g128, bf16 activations, TP=1 only), merged to `main` from
+branch `w8a16`. LFM2 container `lfm2-w8a16-g128.r4dx`, 24.88 GB (converted in 108 s with `--layouts w8a16 --no-bf16`), 26.18
+GiB VRAM peak at 8192 ctx on one GPU. KL gate (epsilon 0.005, increment over r4dx bf16) **PASS**: code +.0033, english +.0028,
+thai +.0047, tool +.0005, ALL +.0033; all-chat test KL .01323 (bf16 .00993, HF-bf16 .01248), top-1 96.41 %. Server decode
+**88.7 tok/s** on one GPU (bf16 TP=2 about 64, trellis hybrid about 61; all untuned), teacher-forced 12.4 ms/row; smoke
+`-Layout w8a16 -Tp 1 -Dialect lfm2` 75 checks pass. Qwen TP=1 identity rows 1, 3, 6, 9 are byte-identical to `main`. Not done:
+tuning-table rows (the w8a16 table is the empty placeholder), LDLQ, TP=2 (refused), grouped MoE decode kernel, f16 activation
+range check, long-context / TTFT numbers. Pages: [w8a16.md](w8a16.md) (design and outcome), [lfm2.md](lfm2.md) "8-bit (one
+GPU)", [container-format.md](container-format.md) "w8a16 body layout".
+
 ## LFM2.5-24B-A2B: bf16 TP=2 and trellis hybrid (one card) work, 2026-10-16
 
 Second-family side model (`lfm2_moe`: 30 short-conv + 10 attention layers, 64-expert top-4 MoE, 2.45 B active of 24 B),

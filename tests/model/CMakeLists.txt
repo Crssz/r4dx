@@ -587,6 +587,13 @@ add_executable(test_lfm2_tiny_e2e test_lfm2_tiny_e2e.cpp)
 target_link_libraries(test_lfm2_tiny_e2e PRIVATE r4dx_model r4dx_convert r4dx_core r4d_core)
 add_test(NAME lfm2_tiny_e2e COMMAND test_lfm2_tiny_e2e)
 set_tests_properties(lfm2_tiny_e2e PROPERTIES ENVIRONMENT "HIP_VISIBLE_DEVICES=1" SKIP_RETURN_CODE 77)
+#   lfm2_tiny_trellis   test_lfm2_tiny_trellis.cpp (L3-8): the tiny fixture as a TRELLIS container (R4DX_LFM2_TINY_TRELLIS_DIR,
+#                       tools/reference/lfm2/tiny_trellis_golden.py) at TP=1 vs the dequantized fp32 truth, per-slot vs sorted
+#                       MoE on trellis experts, determinism, checkpoint / restore, the TP=2 / --layout bf16 refusals
+add_executable(test_lfm2_tiny_trellis test_lfm2_tiny_trellis.cpp)
+target_link_libraries(test_lfm2_tiny_trellis PRIVATE r4dx_model r4dx_convert r4dx_core r4d_core)
+add_test(NAME lfm2_tiny_trellis COMMAND test_lfm2_tiny_trellis)
+set_tests_properties(lfm2_tiny_trellis PROPERTIES ENVIRONMENT "HIP_VISIBLE_DEVICES=1" SKIP_RETURN_CODE 77)
 
 # test_gemma_tp_shard (docs/gemma4-plan.md M1b-1): the Gemma 4 TP=2 sharding contract on the real 12B config -- tp::RuleFor's
 # Gemma table vs GemmaConfig::Shard, the byte plans (bf16 / w4a16 / trellis) partition every linear, and a tiny-model

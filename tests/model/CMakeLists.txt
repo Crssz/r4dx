@@ -602,6 +602,41 @@ target_include_directories(test_lfm2_trellis_shapes PRIVATE ${CMAKE_CURRENT_SOUR
 add_test(NAME lfm2_trellis_shapes COMMAND test_lfm2_trellis_shapes)
 set_tests_properties(lfm2_trellis_shapes PROPERTIES ENVIRONMENT "HIP_VISIBLE_DEVICES=1" SKIP_RETURN_CODE 77)
 
+# ---- W8A16 (docs/w8a16.md 7.1 / 7.3, lane W3) ------------------------------------------------------------------------
+# CPU (no HIP call; HIP_VISIBLE_DEVICES=-1 hides every device from the runtime linking r4dx_model_linear loads):
+#   model_w8a16_meta     w8a16_meta.h's strict quant.w8a16 parse, the 6.3 refusals without a device (rule 1, the v1 TP rule,
+#                        rule 2 against the kernel exports, rule 3 sizes), Layout::kW8a16 = 5, and the tiny w8a16 container's
+#                        header / tensor spans (R4DX_LFM2_TINY_W8A16_DIR; that section SKIPs when absent)
+#   model_w8a16_tuning   PickTuning(kW8a16) legal for every LFM2 TP=1 / TP=2-rank shape, M = 2..16 on the M = 1 row, the 4.5 fallback
+# GPU (one device; NOT RUN by their author; SKIP 77 without their data):
+#   model_w8a16_linear   ApplyLinear on w8a16 linears of the real LFM2 shapes vs DequantW8a16 (M up to 256: the 64-row chunking), row
+#                        identity, determinism; the loader path on the tiny container and the per-linear bf16 fallback
+#   lfm2_tiny_w8a16      the tiny lfm2_moe checkpoint as a w8a16 container end to end (feed, determinism, checkpoint, per-slot ==
+#                        sorted, refusals on doctored copies, a mixed bf16 + w8a16-experts container converted at test time)
+add_executable(test_w8a16_meta test_w8a16_meta.cpp)
+target_link_libraries(test_w8a16_meta PRIVATE r4dx_model_linear r4dx_tp_shard r4dx_convert r4dx_core)
+add_test(NAME model_w8a16_meta COMMAND test_w8a16_meta)
+set_tests_properties(model_w8a16_meta PROPERTIES ENVIRONMENT "HIP_VISIBLE_DEVICES=-1")
+add_executable(test_w8a16_tuning test_w8a16_tuning.cpp)
+target_link_libraries(test_w8a16_tuning PRIVATE r4dx_model_linear)
+add_test(NAME model_w8a16_tuning COMMAND test_w8a16_tuning)
+set_tests_properties(model_w8a16_tuning PROPERTIES ENVIRONMENT "HIP_VISIBLE_DEVICES=-1")
+# /EHc-: PickTuning's refusals are C++ throws, but the illegal-shape rows also reach the extern "C" kernel exports' module.
+set_source_files_properties(test_w8a16_meta.cpp test_w8a16_tuning.cpp PROPERTIES COMPILE_OPTIONS "/EHc-")
+add_executable(test_w8a16_linear test_w8a16_linear.cpp)
+target_link_libraries(test_w8a16_linear PRIVATE r4dx_model r4dx_convert r4dx_core r4d_core)
+add_test(NAME model_w8a16_linear COMMAND test_w8a16_linear)
+set_tests_properties(model_w8a16_linear PROPERTIES ENVIRONMENT "HIP_VISIBLE_DEVICES=1" SKIP_RETURN_CODE 77)
+set_source_files_properties(test_w8a16_linear.cpp PROPERTIES COMPILE_OPTIONS "/EHc-")
+add_executable(test_lfm2_tiny_w8a16 test_lfm2_tiny_w8a16.cpp)
+target_link_libraries(test_lfm2_tiny_w8a16 PRIVATE r4dx_model r4dx_convert r4dx_core r4d_core)
+if(TARGET r4dx-convert)
+  target_compile_definitions(test_lfm2_tiny_w8a16 PRIVATE R4DX_CONVERT_EXE="$<TARGET_FILE:r4dx-convert>")
+  add_dependencies(test_lfm2_tiny_w8a16 r4dx-convert)
+endif()
+add_test(NAME lfm2_tiny_w8a16 COMMAND test_lfm2_tiny_w8a16)
+set_tests_properties(lfm2_tiny_w8a16 PROPERTIES ENVIRONMENT "HIP_VISIBLE_DEVICES=1" SKIP_RETURN_CODE 77)
+
 # test_gemma_tp_shard (docs/gemma4-plan.md M1b-1): the Gemma 4 TP=2 sharding contract on the real 12B config -- tp::RuleFor's
 # Gemma table vs GemmaConfig::Shard, the byte plans (bf16 / w4a16 / trellis) partition every linear, and a tiny-model
 # algebra check that the sharded forward equals the unsharded one. CPU only, no HIP, no container.

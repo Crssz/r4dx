@@ -140,4 +140,13 @@ inline void RefuseLfm2TrellisTp(const std::string& path, Layout layout, int64_t 
                               "trellis); tensor parallelism (--tp 2) is supported for the bf16 LFM2 container only");
 }
 
+// docs/w8a16.md 6.2 (v1): `--layout w8a16` runs at TP=1 only (the w8a16 shard parts are not built). Throws
+// std::invalid_argument naming `who`; no file read, no HIP call. Called before any device work, next to
+// RefuseLfm2TrellisTp (Lfm2Container::Load refuses the same through CheckW8a16Choice).
+inline void RefuseLfm2W8a16Tp(Layout layout, const std::string& who) {
+  if (layout != Layout::kW8a16) return;
+  throw std::invalid_argument(who + ": --layout w8a16 runs at TP=1 only (--tp 1 --layout w8a16); tensor parallelism "
+                              "(--tp 2) of the w8a16 layout is not part of v1 (docs/w8a16.md 6.2)");
+}
+
 }  // namespace r4dx::model

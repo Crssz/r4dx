@@ -79,7 +79,47 @@ constexpr int64_t kRowTile = 16;
 //   M > 16: SKG 1, MT = min(4, ceil(M/16)), the same block, NT 0 -- never split.
 // Legal for every K and N that are multiples of 128 (the loader's rule) and every part boundary
 // that is (Wc = 128 divides it).
+// W8A16 (docs/w8a16.md 4.5) has its own branch, because the generic K % 256 rule is wrong for it (a
+// split must start on a group of 64 or 128, and the LFM2 K values 1536 / 11776 are not SK=4 * 128 ...
+// multiples at every SK): `variant` is the group.
+//   SK = the largest of {8, 4, 2, 1} with K % (SK * G) == 0, WV*SK*32 <= 1024 threads and the block's
+//        LDS reduction WV*NPW*SK KiB <= 64 (the kernel's cap; the design text names only the first two,
+//        but at NPW 4 and WV 4 an SK of 8 would be 128 KiB);
+//   WV = 1 when N/16 < 512 (the expert linears: N 3072 / 2048 would otherwise launch 32-48 blocks), else 4;
+//   M <= 16: MB 1, NPW 1, NT 1 (only ever asked at M = 1: ResolveTuning maps the row tile there);
+//   M > 16: MB = min(4, ceil(M/16)), NPW 4, NT 0.
+// Starting points (UNVERIFIED), replaced by measured rows (gemm_tuning_table_w8a16.inc).
+LinearTuning W8a16FallbackTuning(int64_t N, int64_t K, int64_t M, int group) {
+  if (N <= 0 || N % 16 != 0 || K <= 0 || group <= 0 || K % group != 0) {
+    throw std::runtime_error("r4dx::model::PickTuning: w8a16 [" + std::to_string(N) + ", " + std::to_string(K) +
+                             "] at group " + std::to_string(group) +
+                             " is not legal (N % 16, K % group)");
+  }
+  LinearTuning t{/*WV=*/(N / 16 < 512) ? 1 : 4, /*SK=*/1, /*MB=*/1, /*NPW=*/1, /*NT=*/1};
+  if (M > kRowTile) {
+    t.MB = static_cast<int>(std::min<int64_t>(4, (M + 15) / 16));
+    t.NPW = 4;
+    t.NT = 0;
+  }
+  for (int sk : {8, 4, 2, 1}) {
+    if (K % (static_cast<int64_t>(sk) * group) == 0 && t.WV * sk * 32 <= 1024 && t.WV * t.NPW * sk <= 64) {
+      t.SK = sk;
+      break;
+    }
+  }
+  return t;
+}
+
+// The w8a16 kernel's legality rules for a tuning row (r4dx_gemm_w8a16_nt_m64's own checks, mirrored so a
+// regenerated .inc row the kernel would reject is skipped rather than thrown mid-request).
+bool W8a16RowFits(int64_t K, int group, const LinearTuning& t) {
+  if (t.WV < 1 || t.SK < 1 || t.MB < 1 || t.MB > 4 || (t.NPW != 1 && t.NPW != 4)) return false;
+  if (t.WV * t.SK * 32 > 1024 || t.WV * t.NPW * t.SK > 64) return false;
+  return group > 0 && K % (static_cast<int64_t>(t.SK) * group) == 0;
+}
+
 LinearTuning FallbackTuning(Layout layout, int64_t N, int64_t K, int64_t M, int variant) {
+  if (layout == Layout::kW8a16) return W8a16FallbackTuning(N, K, M, variant);
   if (layout == Layout::kTrellis) {
     if (K <= 0 || N <= 0 || K % 128 != 0 || N % 128 != 0) {
       throw std::runtime_error("r4dx::model::PickTuning: trellis [" + std::to_string(N) + ", " +
@@ -165,6 +205,13 @@ namespace trellis_tp2 {
 #include "gemm_tuning_table_trellis_i8_tp2.inc"
 #include "gemm_tuning_table_trellis_i8c_tp2.inc"
 
+// W8A16 (docs/w8a16.md 4.5): tests/kernels/tool_w8a16_gemm_bench.exe --inc-out's rows, keyed by
+// GemmTuningRow::group. A one-row placeholder (N == 0, matching nothing) until the bench has run, so
+// every w8a16 linear takes W8a16FallbackTuning. Consulted for kW8a16 only, after the TP and main tables.
+namespace w8a16 {
+#include "gemm_tuning_table_w8a16.inc"
+}  // namespace w8a16
+
 thread_local bool t_tp2_tuning = false;
 
 // The trellis kernel's legality rules that depend on the tuning and the chunk
@@ -236,6 +283,10 @@ const GemmTuningRow* BestRow(const GemmTuningRow (&table)[kRows], Layout layout,
       if (row.rate != variant) continue;
       if (!TrellisRowFits(N, K, M, row.rate, row.tuning)) continue;
     }
+    if (layout == Layout::kW8a16) {
+      if (row.group != variant) continue;
+      if (!W8a16RowFits(K, variant, row.tuning)) continue;
+    }
     if (best == nullptr || row.M < best->M) best = &row;
   }
   return best;
@@ -269,7 +320,7 @@ static LinearTuning ResolveTuning(Layout layout, int64_t N, int64_t K, int64_t M
   // M=1 band's NT as well (docs/trellis-kernel.md 10.1: its measured M <= 16 pick is NT 1).
   if (M > 1 && M <= kRowTile) {
     LinearTuning t = ResolveTuning(layout, N, K, 1, tp2, variant);
-    if (layout == Layout::kW4a16) t.NT = 0;
+    if (layout == Layout::kW4a16 || layout == Layout::kW8a16) t.NT = 0;  // docs/w8a16.md 4.4: w4a16's rule
     return t;
   }
   if (tp2) {
@@ -288,6 +339,11 @@ static LinearTuning ResolveTuning(Layout layout, int64_t N, int64_t K, int64_t M
       }
     }
     if (const GemmTuningRow* row = BestRow(trellis::kGemmTuningTable, layout, N, K, M, variant)) {
+      return row->tuning;
+    }
+  }
+  if (layout == Layout::kW8a16) {
+    if (const GemmTuningRow* row = BestRow(w8a16::kGemmTuningTable, layout, N, K, M, variant)) {
       return row->tuning;
     }
   }
@@ -313,9 +369,11 @@ LinearTuning PickTuning(Layout layout, int64_t N, int64_t K, int64_t M, int vari
   // two apart.
   static thread_local std::unordered_map<int64_t, LinearTuning> cache;
   const bool tp2 = t_tp2_tuning;
+  // w8a16 (docs/w8a16.md 4.5): its group (64 / 128) in the same variant bits; the layout field (5)
+  // keeps it apart from a w4a16 group.
   const int v = layout == Layout::kW4a16 ? EffectiveW4a16Group(variant)
-                : layout == Layout::kTrellis ? variant
-                                             : 0;
+                : (layout == Layout::kTrellis || layout == Layout::kW8a16) ? variant
+                                                                            : 0;
   if (v < 0 || v >= 512) {
     throw std::runtime_error("r4dx::model::PickTuning: variant " + std::to_string(v) +
                              " does not fit the tuning cache key");
@@ -361,6 +419,9 @@ int EpilogueForLayout(Layout layout) {
       // producer epilogue can name -- ApplyLinear runs it (v1), or a fused producer hands it over
       // through PreQuantizedActivation::transform_id (M5). Every layer's own epilogue plumbing then
       // takes its plain bf16 path.
+      return r4dx_epilogue_none;
+    case Layout::kW8a16:
+      // docs/w8a16.md 3.4: the bf16 -> f16 conversion of A is inside the GEMM, so nothing to fuse.
       return r4dx_epilogue_none;
   }
   return r4dx_epilogue_none;
@@ -1081,6 +1142,7 @@ void ApplyLinear(hipStream_t stream, core::Arena& arena, const QuantLinear& w, c
   if (!have_pre) {
     switch (w.layout) {
       case Layout::kBf16:
+      case Layout::kW8a16:  // docs/w8a16.md 6.1: no arena scratch (A is converted in registers)
         break;
       case Layout::kW4a16:
         f16_scratch = arena.Alloc<uint16_t>(static_cast<size_t>(kMaxChunkM * K));
@@ -1122,7 +1184,8 @@ void ApplyLinear(hipStream_t stream, core::Arena& arena, const QuantLinear& w, c
     // chunk's pick is also checked against the linear's part boundary (TrellisChunkTuning).
     LinearTuning t = w.layout == Layout::kTrellis
                          ? TrellisChunkTuning(w, m)
-                         : PickTuning(w.layout, N, K, m, w.w4a16_group);
+                         : PickTuning(w.layout, N, K, m,
+                                      w.layout == Layout::kW8a16 ? w.w8a16_group : w.w4a16_group);
     // linear.h: the caller asked for normal weight loads (a cache hint; the same bits).
     if (temporal_weight_loads && w.layout == Layout::kTrellis) t.NT = 0;
     // R4DX_PROFILE_LINEARS (debug_probe.h): the stamp between the input stage and the GEMM, inside
@@ -1217,6 +1280,20 @@ void ApplyLinear(hipStream_t stream, core::Arena& arena, const QuantLinear& w, c
                                     trellis_ws, w.trellis_tickets, m, static_cast<int>(K),
                                     static_cast<int>(N), w.trellis_bits, t.WV, t.SK, t.MB, t.NPW,
                                     t.SKG, t.U, t.NT, out_scale, s);
+        break;
+      }
+      case Layout::kW8a16: {
+        // docs/w8a16.md 4.4 / 6.1: one launch per <= 64-row chunk, A read as bf16 straight from x (the
+        // kernel converts it to f16 in registers), no scratch, no tickets; the debug probe's MarkInput has
+        // no input stage to mark. EpilogueForLayout is none, so `pre` never reaches here.
+        if (w.w8_wq.empty() || w.w8_ws.empty() || w.w8a16_group <= 0) {
+          throw std::runtime_error("r4dx::model::ApplyLinear: w8a16 weight [" + std::to_string(N) + ", " +
+                                   std::to_string(K) + "] is not a loaded one (wq / ws / group)");
+        }
+        r4dx_gemm_w8a16_nt_m64(reinterpret_cast<int64_t>(xc), reinterpret_cast<int64_t>(w.w8_wq.data()),
+                               reinterpret_cast<int64_t>(w.w8_ws.data()), reinterpret_cast<int64_t>(yc), m,
+                               static_cast<int>(K), static_cast<int>(N), w.w8a16_group, t.WV, t.SK, t.MB, t.NPW,
+                               t.NT, reinterpret_cast<int64_t>(s));
         break;
       }
     }

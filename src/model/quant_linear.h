@@ -12,13 +12,16 @@
 
 #include "r4d.h"  // r4d_gemm_w4a16_nt_m64_group()/_has_group() -- see CheckW4a16Group below
 #include "r4dx/core/device_buffer.hpp"
+#include "r4dx/kernels/w8a16_gemm.h"  // r4dx_gemm_w8a16_has_group / _scale_log2_bias -- CheckW8a16Meta
+#include "w8a16_meta.h"
 
 namespace r4dx::model {
 
 // The numeric values are load-bearing (PickTuning's cache key in linear.cpp, the tuning tables,
 // TP part serialisation) and predate the retirement of the mxfp4 (1) and w4a8 (3) layouts, so
-// they are pinned explicitly: kBf16 = 0, kW4a16 = 2, kTrellis = 4. Do not renumber.
-enum class Layout { kBf16 = 0, kW4a16 = 2, kTrellis = 4 };
+// they are pinned explicitly: kBf16 = 0, kW4a16 = 2, kTrellis = 4, kW8a16 = 5 (docs/w8a16.md 6.1;
+// it does not reuse the retired 1 or 3). Do not renumber.
+enum class Layout { kBf16 = 0, kW4a16 = 2, kTrellis = 4, kW8a16 = 5 };
 
 const char* LayoutName(Layout l);
 Layout LayoutFromName(const std::string& name);  // throws on an unrecognized name
@@ -81,7 +84,17 @@ inline void CheckTrellisRate(int bits, const std::string& base, const std::strin
                            "build's r4d_gemm_trellis_nt_m64 does not instantiate");
 }
 
-// One linear weight W[N,K], uploaded in exactly one of the three on-disk layouts
+// W8A16 (docs/w8a16.md 6.1, 6.3 rule 2): the container's `quant.w8a16` group and scale bias against
+// what THIS build's r4dx_gemm_w8a16_nt_m64 instantiates and undoes. A group the kernel does not
+// instantiate would throw at the first GEMM; a different bias would scale every output by a power of
+// two with no other symptom. The decision itself is the CPU-testable CheckW8a16MetaAgainst
+// (w8a16_meta.h); this asks the kernel exports. Throws W8a16FormatMismatch.
+inline void CheckW8a16Meta(int group, int scale_log2_bias, const std::string& what) {
+  CheckW8a16MetaAgainst(group, scale_log2_bias, r4dx_gemm_w8a16_has_group(group) != 0,
+                        r4dx_gemm_w8a16_scale_log2_bias(), what);
+}
+
+// One linear weight W[N,K], uploaded in exactly one of the on-disk layouts
 // (docs/container-format.md "Quantized layout tensors"). linear.cpp's ApplyLinear is the only
 // thing that reads the layout-specific buffers below; Container's job stops at "the right bytes
 // are on the device in the container's documented byte order".
@@ -148,6 +161,15 @@ struct QuantLinear {
   //     even when its shape equals a TP = 1 class's -- the rank's attn.qg is gdn.in_proj_z's 6144 x 5120), docs/int8-prefill.md
   //     "Tensor parallel". Nothing else reads it.
   bool trellis_tp_shard = false;
+
+  // layout == kW8a16 (docs/w8a16.md 3.1-3.2): separate from w4a16's `wq` so no code path keyed on
+  // `wq` changes meaning.
+  //   w8_wq: the offset-binary int8 codes in the kernel's fragment order, uint8[N*K].
+  //   w8_ws: the f16 bits of s * 2^12 per (row, group), uint16[N*K/w8a16_group], row-tile major.
+  //   w8a16_group: the container's `quant.w8a16.group` (64 or 128), checked against the kernel.
+  core::DeviceBuffer<uint8_t> w8_wq;
+  core::DeviceBuffer<uint16_t> w8_ws;
+  int w8a16_group = 0;
 };
 
 }  // namespace r4dx::model

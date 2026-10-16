@@ -74,6 +74,9 @@ target_link_libraries(r4dx_model_linear PUBLIC
   r4d_core
   r4dx_hip_runtime
   r4dx_model_kernels
+  # w8a16 (docs/w8a16.md 6.1): quant_linear.h's w8a16_meta.h reads the format constants of
+  # r4dx_convert/w8a16_format.hpp (header-only INTERFACE target, also brings nlohmann/json).
+  r4dx_convert
 )
 
 # ---- r4dx_tp_shard: tensor-parallel sharding rules and byte plans (docs/tp.md 5.2) ---------------

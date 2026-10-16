@@ -103,7 +103,8 @@ inline std::vector<std::string> GemmaTensorTableProblems(const r4dx_convert::Saf
     }
   };
   const auto linear = [&](const std::string& base, int64_t N, int64_t K) {
-    const bool any = r.Has(base + ".bf16.w") || r.Has(base + ".w4a16.wq") || r.Has(base + ".trellis.w");
+    const bool any = r.Has(base + ".bf16.w") || r.Has(base + ".w4a16.wq") || r.Has(base + ".trellis.w") ||
+                     r.Has(base + ".w8a16.wq");
     // A bf16 form on disk is always shape-checked; other forms (w4a16 / trellis) are checked by their own loaders.
     if (r.Has(base + ".bf16.w") || bf16_body || !any) {
       need(base + ".bf16.w", {N, K, 2});
@@ -114,7 +115,8 @@ inline std::vector<std::string> GemmaTensorTableProblems(const r4dx_convert::Saf
   if (layers < 0 || layers > c.num_hidden_layers) bad.push_back("layer count out of range");
   need("text.embed_tokens", {c.vocab_size, H, 2});
   need("text.final_norm", {H, 2});
-  if (!(r.Has("lm_head.bf16.w") || r.Has("lm_head.w4a16.wq"))) bad.push_back("missing lm_head (bf16 or w4a16)");
+  if (!(r.Has("lm_head.bf16.w") || r.Has("lm_head.w4a16.wq") || r.Has("lm_head.w8a16.wq")))
+    bad.push_back("missing lm_head (bf16, w4a16 or w8a16)");
   else if (r.Has("lm_head.bf16.w")) need("lm_head.bf16.w", {c.vocab_size, H, 2});
   for (int64_t i = 0; i < layers && i < c.num_hidden_layers; ++i) {
     const std::string b = "text.layers." + std::to_string(i) + ".";
@@ -132,7 +134,8 @@ inline std::vector<std::string> GemmaTensorTableProblems(const r4dx_convert::Saf
     linear(b + "attn.q", c.QDim(i), H);
     linear(b + "attn.k", c.KvDim(i), H);
     if (full) {
-      if (r.Has(b + "attn.v.bf16.w") || r.Has(b + "attn.v.w4a16.wq") || r.Has(b + "attn.v.trellis.w"))
+      if (r.Has(b + "attn.v.bf16.w") || r.Has(b + "attn.v.w4a16.wq") || r.Has(b + "attn.v.trellis.w") ||
+          r.Has(b + "attn.v.w8a16.wq"))
         bad.push_back("layer " + std::to_string(i) + " is a k_eq_v full layer but the container carries attn.v");
     } else {
       linear(b + "attn.v", c.KvDim(i), H);

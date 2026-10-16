@@ -18,7 +18,7 @@
 //                   feed_forward.experts.{e}.{w1,w2,w3}.weight   (PER-EXPERT; the fused 3-D `experts.gate_up_proj`
 //                   style of transformers 5 is refused by name, never converted wrongly)
 //
-// Container tensors ({L} = the layout suffix the converter appends: .bf16.w, .w4a16.wq/.wsz, .trellis.*):
+// Container tensors ({L} = the layout suffix the converter appends: .bf16.w, .w4a16.wq/.wsz, .w8a16.wq/.ws, .trellis.*):
 //   text.embed_tokens                       bf16 [vocab, hidden], no scale
 //   text.final_norm                         bf16 [hidden], plain weight
 //   lm_head.{L}                             the SAME embed_tokens tensor (tied), written untied like Gemma's

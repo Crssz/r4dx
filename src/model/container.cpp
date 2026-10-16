@@ -164,6 +164,9 @@ Container Container::Load(const std::string& path, const ContainerLoadOptions& o
   // parsed and checked against the requested layout before any upload. nullopt: not trellis.
   meta.trellis = ParseTrellisMetadata(metadata, path);
   CheckTrellisChoice(meta.trellis, rotation.has_value(), layout, path);
+  // docs/w8a16.md 6.1 / 6.3 rules 1-2: gated on a requested w8a16 layout, a no-op otherwise.
+  meta.w8a16 = CheckW8a16Choice(metadata, path, layout, lm_head_layout, mtp_head_layout);
+  if (meta.w8a16) LogW8a16(*meta.w8a16, path);
 
   SafetensorsReader reader(Utf8ToWide(path));
   // quant2 Q3: a no-op for a container without a per-tensor group map.
@@ -522,6 +525,8 @@ Container Container::LoadShard(const std::string& path, const ContainerLoadOptio
   // spec travels into ShardLoader, whose kTrellis case needs each linear's rate and parts.
   meta.trellis = ParseTrellisMetadata(metadata, path);
   CheckTrellisChoice(meta.trellis, rotation.has_value(), o.layout, path);
+  // docs/w8a16.md 6.2: w8a16 is TP=1 only in v1 -- refused here, before any upload, when requested.
+  meta.w8a16 = CheckW8a16Choice(metadata, path, o.layout, o.lm_head_layout, o.mtp_head_layout, o.tp_world);
 
   SafetensorsReader reader(Utf8ToWide(path));
   CheckW4a16GroupTensors(reader, w4a16.groups, path);  // quant2 Q3; see Container::Load

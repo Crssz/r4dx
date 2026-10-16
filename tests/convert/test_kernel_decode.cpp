@@ -24,7 +24,10 @@
 #include <vector>
 
 #include "r4dx/core/dtype.hpp"
+#include <cstring>
+
 #include "r4dx_convert/quant_int4.hpp"
+#include "r4dx_convert/quant_int8.hpp"
 
 namespace {
 
@@ -96,6 +99,76 @@ void CheckW4A16(const std::vector<float>& w, int N, int K, int group) {
               group, g_failures);
 }
 
+// ---- w8a16 (docs/w8a16.md 3.2, 3.4; the kernel itself is src/kernels/src/w8a16_gemm.hip) ---------
+//
+// Decoded from the f16 WMMA B-fragment map, NOT from the packer's closed-form (and not from
+// DequantW8a16): lane l, element e = 0..7 of k-step s holds W[n0 + (l&15)][16s + 8*(e>>2) + 4*(l>>4) +
+// (e&3)]. A lane loads ONE b128 (4 dwords) per 32-K block = 2 k-steps: dword j = 2*(s&1) + (e>>2),
+// byte (e&3) of it holds element e. The b128 of (row tile t, 32-K block kb, lane) is at uint4 index
+// (t*(K/32) + kb)*32 + lane. Scales: u16 index (t*(K/G) + k/G)*16 + (l&15). The kernel widens a byte b
+// as the f16 0x6400|b (= 1024 + b exactly) minus 1152, i.e. the code b - 128.
+void CheckW8a16(const std::vector<float>& w, int N, int K, int group) {
+  std::vector<uint8_t> q;
+  std::vector<uint16_t> s16;
+  QuantizeInt8Symmetric(w.data(), N, K, group, /*nthreads=*/4, q, s16);
+  const auto wq = PackW8Bytes(q, N, K, 4);
+  const auto ws = PackW8a16Scales(s16, N, K, group);
+  Expect(wq.size() == static_cast<size_t>(N) * K, "w8a16 wq size");
+  Expect(ws.size() == static_cast<size_t>(N) * (K / group), "w8a16 ws size");
+
+  const int ntiles = N / 16, kblocks = K / 32, gpr = K / group;
+  size_t checked = 0;
+  for (int t = 0; t < ntiles; ++t)
+    for (int kb = 0; kb < kblocks; ++kb)
+      for (int lane = 0; lane < 32; ++lane) {
+        const size_t uint4_idx = (static_cast<size_t>(t) * kblocks + kb) * 32 + lane;
+        uint32_t dw[4];
+        std::memcpy(dw, wq.data() + uint4_idx * 16, 16);  // one global_load_b128, little endian
+        const int row = t * 16 + (lane & 15);
+        for (int s = 0; s < 2; ++s)
+          for (int e = 0; e < 8; ++e) {
+            const uint32_t d = dw[2 * s + (e >> 2)];
+            const uint8_t byte = static_cast<uint8_t>((d >> (8 * (e & 3))) & 0xFFu);
+            const int k = 16 * (2 * kb + s) + 8 * (e >> 2) + 4 * (lane >> 4) + (e & 3);
+            // magic-exponent widening: f16 bits 0x6400 | byte is 1024 + byte; minus 1152 is the code
+            const float widened =
+                r4dx::core::F16ToFloat(static_cast<uint16_t>(0x6400u | byte)) - 1152.0f;
+            const float want_code = static_cast<float>(static_cast<int>(q[static_cast<size_t>(row) * K + k]) - 128);
+            if (byte != q[static_cast<size_t>(row) * K + k] || widened != want_code) {
+              std::fprintf(stderr, "w8a16 code mismatch row=%d k=%d byte=%d want=%d widened=%g\n", row,
+                           k, byte, q[static_cast<size_t>(row) * K + k], widened);
+              ++g_failures;
+            }
+            const uint16_t sc = ws[(static_cast<size_t>(t) * gpr + k / group) * 16 + (lane & 15)];
+            if (sc != s16[static_cast<size_t>(row) * gpr + k / group]) {
+              std::fprintf(stderr, "w8a16 scale mismatch row=%d k=%d\n", row, k);
+              ++g_failures;
+            }
+            ++checked;
+          }
+      }
+  Expect(checked == static_cast<size_t>(N) * K, "w8a16 fragment decode visited every (row, k) once");
+  // The widening trick is exact for every byte.
+  for (int b = 0; b < 256; ++b)
+    Expect(r4dx::core::F16ToFloat(static_cast<uint16_t>(0x6400u | b)) - 1152.0f == static_cast<float>(b - 128),
+           "w8a16 magic exponent widening is exact for every byte");
+  // And the reference dequant agrees with the fragment-decoded weights.
+  const auto dq = DequantW8a16(wq, ws, N, K, group);
+  for (size_t i = 0; i < dq.size(); ++i) {
+    const int row = static_cast<int>(i / K), k = static_cast<int>(i % K);
+    const float want = static_cast<float>(static_cast<int>(q[i]) - 128) *
+                       (r4dx::core::F16ToFloat(s16[static_cast<size_t>(row) * gpr + k / group]) *
+                        (1.0f / 4096.0f));
+    if (dq[i] != want) {
+      ++g_failures;
+      std::fprintf(stderr, "w8a16 DequantW8a16 mismatch at %zu\n", i);
+      break;
+    }
+  }
+  std::printf("w8a16 kernel-literal decode: N=%d K=%d group=%d checked %zu, failures so far=%d\n", N,
+              K, group, checked, g_failures);
+}
+
 }  // namespace
 
 int main() {
@@ -114,6 +187,10 @@ int main() {
   // `t*nsz + kbase/32 + 2b`, k steps 2,3 dword `... + 2b + 1` -- which is k / 32 for every k of the
   // block, i.e. the same `(t * K/g + k/g) * 16 + r` index CheckW4A16 decodes by.
   CheckW4A16(w, N, K, 32);
+
+  // w8a16 at both instantiated groups (K = 512: 16 blocks of 32, 4 groups of 128 / 8 of 64).
+  CheckW8a16(w, N, K, 128);
+  CheckW8a16(w, N, K, 64);
 
   if (g_failures != 0) {
     std::fprintf(stderr, "FAIL: %d kernel-literal decode mismatches\n", g_failures);

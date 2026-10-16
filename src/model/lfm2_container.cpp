@@ -39,6 +39,9 @@ Lfm2Container Lfm2Container::Load(const std::string& path, const Lfm2LoadOptions
     throw std::invalid_argument("r4dx::model::Lfm2Container::Load: " + path +
                                 " is a trellis container; LFM2 trellis runs at TP=1 only");
   }
+  // docs/w8a16.md 6.1 / 6.3: `--layout w8a16` needs the block (rule 1: a bf16 container never loads on one card
+  // this way), a format this build's kernel reads (rule 2), and TP=1 (v1). A no-op for any other layout.
+  meta.w8a16 = CheckW8a16Choice(metadata, path, o.layout, o.lm_head_layout, Layout::kBf16, o.tp_world);
 
   SafetensorsReader reader(Utf8ToWide(path));
   CheckW4a16GroupTensors(reader, meta.w4a16.groups, path);
@@ -132,6 +135,8 @@ Lfm2Container Lfm2Container::Load(const std::string& path, const Lfm2LoadOptions
                            " rows on this rank, expected " + std::to_string(head_rows));
   }
   const bool trellis_bf16_head = TakeTrellisBf16Head(meta, c.lm_head_, fb_before_head, &fallbacks);
+  const bool w8a16_bf16_head =
+      o.lm_head_layout == Layout::kW8a16 && TakeW8a16Bf16Head(meta, c.lm_head_, fb_before_head, &fallbacks);
   if (fallbacks > 0) {
     std::fprintf(stderr, "r4dx: %d linear(s) in %s do not carry the requested layout and were loaded as bf16\n",
                  fallbacks, path.c_str());
@@ -143,6 +148,10 @@ Lfm2Container Lfm2Container::Load(const std::string& path, const Lfm2LoadOptions
       LogTrellis(*c.trellis_, path);
       if (trellis_bf16_head) LogTrellisBf16Head(path);
     }
+  }
+  if (meta.w8a16 && o.tp_rank == 0) {
+    LogW8a16(*meta.w8a16, path);
+    if (w8a16_bf16_head) LogW8a16Bf16Head(path);
   }
   if (shard) {
     const container_util::ShardLoadStats& st = shard->Stats();

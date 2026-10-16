@@ -176,6 +176,12 @@ class ShardLoader {
       case Layout::kTrellis:
         TrellisSlice(q, base, rule, rows, cols, N, K);
         break;
+      case Layout::kW8a16:
+        // docs/w8a16.md 6.2: the w8a16 shard parts (PlanRows / PlanCols over 16-row tiles and whole groups)
+        // are not part of v1; every loader refuses w8a16 at TP=2 up front (CheckW8a16Choice), so this is the
+        // second line.
+        throw std::invalid_argument("r4dx::model::Container: '" + base +
+                                    "' requested as w8a16 under tensor parallelism -- w8a16 runs at TP=1 only (v1)");
     }
     return q;
   }

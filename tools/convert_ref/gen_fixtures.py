@@ -95,7 +95,59 @@ def main() -> None:
             w4_ref.pack_w4a16_scales(sc16s, z16s, N, K, group=group).tofile(
                 str(out_dir / f"search{suffix}_w4a16_wsz{g}.bin"))
 
+    write_w8a16_fixtures(out_dir)
     print("fixtures written to", out_dir)
+
+
+def w8a16_fixture_weights(N: int = 32, K: int = 256) -> np.ndarray:
+    """The w8a16 fixture weight [N,K] float32 (already bf16-rounded): every case the quantizer has a
+    rule for -- ordinary rows at several scales, an all-zero row, a dead row (1e-25: its biased scale
+    flushes to f16 zero), an f16-subnormal-scale row, a constant row, a row with amax 2000 (near the
+    2031 limit), exact half-integer ties (round away from zero), and outlier-dominated groups."""
+    rng = np.random.default_rng(8128)
+    w = np.zeros((N, K), dtype=np.float32)
+    for r in range(N):
+        w[r] = rng.normal(0.0, 1.0, size=K).astype(np.float32) * np.float32(10.0 ** (-(r % 12) / 4.0))
+    w[12] = 0.0
+    w[13] = np.float32(1e-25)
+    w[14] = rng.normal(0.0, 5e-10, size=K).astype(np.float32)  # biased scale lands in f16 subnormals
+    w[15] = rng.normal(0.0, 0.003, size=K).astype(np.float32)  # LFM2-like
+    w[16] = np.float32(0.5)
+    w[17, :] = rng.normal(0.0, 1.0, size=K).astype(np.float32)
+    w[17, 3] = np.float32(2000.0)
+    s = np.float32(2.0 ** -7)  # s*2^12 = 32 exactly: the stored scale is exactly s, ties stay ties
+    ks = np.arange(K)
+    w[18] = ((ks % 126) + 0.5).astype(np.float32) * s * np.where(ks % 2 == 0, 1.0, -1.0).astype(np.float32)
+    for g0 in range(0, K, 64):  # one +-127 s element in every 64-group pins amax = 127 s
+        w[18, g0] = np.float32(127.0) * s
+        w[18, g0 + 1] = np.float32(-127.0) * s
+    w[19] = rng.normal(0.0, 1e-3, size=K).astype(np.float32)
+    w[19, ::37] = np.float32(0.9)
+    w[20, :] = np.float32(-3.25)
+    return bf16_u16_to_float(float_to_bf16_u16(w))
+
+
+def write_w8a16_fixtures(out_dir: pathlib.Path) -> None:
+    """tests/convert/test_quant_int8.cpp's fixtures: the weight, and at G in {64, 128} the packed
+    `.w8a16.wq`, `.w8a16.ws` and the float32 dequantization (w8_ref.py's, from the PACKED bytes)."""
+    import w8_ref
+
+    N, K = 32, 256
+    w = w8a16_fixture_weights(N, K)
+    bf16_u16 = float_to_bf16_u16(w).reshape(N, K)
+    write_bf16_safetensors(str(out_dir / "w8a16_input.safetensors"), "w", bf16_u16, (N, K))
+    groups, zero_groups = [64, 128], {}
+    for g in groups:
+        q, s16, zg = w8_ref.quantize_int8_symmetric(w, group=g)
+        wq = w8_ref.pack_w8_bytes(q, N, K)
+        ws = w8_ref.pack_w8a16_scales(s16, N, K, group=g)
+        wq.tofile(str(out_dir / f"w8a16_wq_g{g}.bin"))
+        ws.astype("<u2").tofile(str(out_dir / f"w8a16_ws_g{g}.bin"))
+        w8_ref.dequant_w8a16(wq, ws, N, K, group=g).astype("<f4").tofile(
+            str(out_dir / f"w8a16_dq_g{g}.bin"))
+        zero_groups[str(g)] = zg
+    (out_dir / "w8a16_manifest.json").write_text(
+        json.dumps({"N": N, "K": K, "groups": groups, "zero_groups": zero_groups}, indent=2))
 
 
 if __name__ == "__main__":

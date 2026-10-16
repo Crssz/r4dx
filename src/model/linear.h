@@ -74,7 +74,10 @@ struct GemmTuningRow {
 // consulted after the TP table (on a TP thread) and the main table, then the M-aware fallback of
 // docs/trellis-kernel.md 4.4 -- an M <= 16 chunk gets the M = 1 pick whole (NT included, 10.1), an
 // M > 16 chunk the prefill row of the smallest M >= its own that fits it, else an unsplit
-// 128-column block with every row tile in it. Every other layout ignores it.
+// 128-column block with every row tile in it. For kW8a16 (docs/w8a16.md 4.5) it is the linear's group
+// (QuantLinear::w8a16_group, 64 or 128), matched against GemmTuningRow::group in
+// gemm_tuning_table_w8a16.inc, then the w8a16 fallback (SK from {8, 4, 2, 1} on whole groups).
+// Every other layout ignores it.
 LinearTuning PickTuning(Layout layout, int64_t N, int64_t K, int64_t M, int variant = 0);
 
 // The group an r4d_gemm_w4a16_nt_m64 launch for a QuantLinear with this w4a16_group runs at: 0

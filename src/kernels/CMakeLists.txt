@@ -231,3 +231,23 @@ add_custom_command(
 )
 set_source_files_properties("${R4DX_REP_OBJ}" PROPERTIES EXTERNAL_OBJECT TRUE GENERATED TRUE)
 target_sources(r4dx_kernels PRIVATE "${R4DX_REP_OBJ}")
+
+# ---- W8A16 weight-only GEMM (docs/w8a16.md 4) -----------------------------------------------------------
+# w8a16_gemm.hip: r4dx_gemm_w8a16_nt_m64 (include/r4dx/kernels/w8a16_gemm.h). Own hipcc object, r4dx_kernels.hip's
+# flags (-ffp-contract=off), attached with target_sources; uses libr4d's r4d_gdn_wmma.h through the -I above.
+# libr4d itself is untouched.
+set(R4DX_W8A16_SRC "${CMAKE_CURRENT_SOURCE_DIR}/src/w8a16_gemm.hip")
+set(R4DX_W8A16_OBJ "${R4DX_KERNELS_OBJ_DIR}/w8a16_gemm.obj")
+add_custom_command(
+  OUTPUT "${R4DX_W8A16_OBJ}"
+  COMMAND "${CMAKE_COMMAND}" -E env "PATH=${R4DX_KERNELS_HIPCC_PATH}"
+          "${R4DX_HIPCC}" ${R4DX_KERNELS_FLAGS} -c "${R4DX_W8A16_SRC}" -o "${R4DX_W8A16_OBJ}"
+  DEPENDS "${R4DX_W8A16_SRC}"
+          "${CMAKE_CURRENT_SOURCE_DIR}/include/r4dx/kernels/w8a16_gemm.h"
+          "${CMAKE_CURRENT_SOURCE_DIR}/include/r4dx/kernels/kernels.h"
+          "${CMAKE_CURRENT_SOURCE_DIR}/../../third_party/libr4d/r4d_gdn_wmma.h"
+  COMMENT "hipcc (${R4D_GFX_ARCH}) w8a16_gemm.obj"
+  VERBATIM
+)
+set_source_files_properties("${R4DX_W8A16_OBJ}" PROPERTIES EXTERNAL_OBJECT TRUE GENERATED TRUE)
+target_sources(r4dx_kernels PRIVATE "${R4DX_W8A16_OBJ}")

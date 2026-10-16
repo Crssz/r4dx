@@ -27,6 +27,7 @@
 #include "rotation_meta.h"
 #include "trellis_meta.h"
 #include "w4a16_group_meta.h"
+#include "w8a16_meta.h"
 
 namespace r4dx::model::container_util {
 
@@ -94,7 +95,28 @@ struct LinearLoadMeta {
   W4a16LoadGroups w4a16;
   std::optional<TrellisSpec> trellis;
   std::string path;
+  // docs/w8a16.md 6.1: the parsed `quant.w8a16` block, set (by CheckW8a16Choice) only when this load
+  // requested w8a16 for some linear; nullopt otherwise, and then no `.w8a16.*` tensor is ever read.
+  std::optional<W8a16Spec> w8a16;
 };
+
+// docs/w8a16.md 6.1 / 6.3 rules 1-2, run by every loader right after the metadata read, before any upload,
+// gated like CheckQuantGroups on a requested layout being kW8a16 (body or a head): the strict parse of
+// `quant.w8a16`, the refusal of a container without it (rule 1) or of tp_world > 1 (v1 is TP=1 only), and
+// the kernel check (CheckW8a16Meta). Returns the block for LinearLoadMeta::w8a16 (nullopt when no layout
+// requested w8a16).
+std::optional<W8a16Spec> CheckW8a16Choice(const nlohmann::json& metadata, const std::string& path,
+                                          Layout layout, Layout lm_head_layout, Layout mtp_head_layout,
+                                          int tp_world = 1);
+// docs/w8a16.md 6.3 rule 3: W8a16ShapeProblem on the tensors' byte spans, thrown naming the tensor.
+void CheckW8a16Shape(const SafetensorsReader& r, const std::string& base, int64_t N, int64_t K, int group);
+// One stderr line per w8a16 load (group, bias), so a log says which format the body was read as.
+void LogW8a16(const W8a16Spec& spec, const std::string& path);
+// A w8a16 container converted with `--lm-head bf16` (docs/w8a16.md 9.5) stores lm_head as bf16 only, so the
+// w8a16 head a `--layout w8a16` load asks for falls back by design: taken out of the fallback count (true)
+// so the "N linears loaded as bf16" line counts body linears only; the caller says so on its own line.
+bool TakeW8a16Bf16Head(const LinearLoadMeta& meta, const QuantLinear& head, int fallbacks_before, int* fallbacks);
+void LogW8a16Bf16Head(const std::string& path);
 
 // docs/trellis-kernel.md 2.5, the refusals that need only the metadata and the requested body layout.
 // `allow_rotated`: the Gemma loader accepts trellis + __metadata__.rotation (option A, docs/gemma4-plan.md 10.2);

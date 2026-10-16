@@ -55,6 +55,9 @@ GemmaContainer GemmaContainer::Load(const std::string& path, const GemmaLoadOpti
   meta.trellis = ParseTrellisMetadata(metadata, path);
   CheckTrellisChoice(meta.trellis, c.info_.rotation.has_value(), o.layout, path,
                      /*allow_rotated=*/true);
+  // docs/w8a16.md 6.1 / 6.3 rules 1-2 and the v1 TP=1 rule: gated on a requested w8a16 layout.
+  meta.w8a16 = CheckW8a16Choice(metadata, path, o.layout, o.lm_head_layout, Layout::kBf16, o.tp_world);
+  if (meta.w8a16 && o.tp_rank == 0) LogW8a16(*meta.w8a16, path);
 
   SafetensorsReader reader(Utf8ToWide(path));
   CheckW4a16GroupTensors(reader, meta.w4a16.groups, path);

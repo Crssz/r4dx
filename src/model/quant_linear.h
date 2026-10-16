@@ -73,7 +73,7 @@ inline void CheckW4a16MappedGroup(int group, const std::string& base, const std:
                            "r4d_gemm_w4a16_nt_m64_g does not instantiate");
 }
 
-// Trellis (docs/trellis-kernel.md 2.5): a linear's per-linear rate (`bits`, 4 or 5) must be one
+// Trellis (docs/trellis-kernel.md 2.5): a linear's per-linear rate (`bits`, 3, 4 or 5) must be one
 // r4d_gemm_trellis_nt_m64 instantiates, or every GEMM of it would throw mid-decode; the loader asks
 // the kernel once per linear instead. Inline for the same reason as the two checks above.
 inline void CheckTrellisRate(int bits, const std::string& base, const std::string& what) {

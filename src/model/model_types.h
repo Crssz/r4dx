@@ -14,6 +14,7 @@
 
 #include "preprocess.h"  // src/vision: vision::GridThw
 #include "r4dx/core/device_buffer.hpp"
+#include "batch_row.h"      // BatchDecodeRow (HIP-free; the server's batch executor needs it without HIP)
 
 namespace r4dx::model {
 

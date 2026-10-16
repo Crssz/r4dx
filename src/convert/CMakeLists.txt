@@ -23,7 +23,15 @@ add_library(r4dx_convert_lfm2 STATIC lfm2_layout.cpp)
 target_include_directories(r4dx_convert_lfm2 PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(r4dx_convert_lfm2 PUBLIC r4dx_convert)
 
+# r4dx_convert_qwen4exp: the qwen4_exp branch -- its tensor layout, coverage audit, per-(layer, class)
+# trellis KB rule and n-gram sidecar record (qwen4exp_layout.hpp), and the virtual AWQ source that
+# presents compressed-tensors pack-quantized linears as bf16 `<b>.weight` tensors (awq_source.hpp).
+# Plain C++, no HIP, no weights.
+add_library(r4dx_convert_qwen4exp STATIC qwen4exp_layout.cpp awq_source.cpp)
+target_include_directories(r4dx_convert_qwen4exp PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
+target_link_libraries(r4dx_convert_qwen4exp PUBLIC r4dx_convert)
+
 if(R4DX_BUILD_CONVERT)
   add_executable(r4dx-convert main.cpp)
-  target_link_libraries(r4dx-convert PRIVATE r4dx_convert r4dx_convert_gemma r4dx_convert_lfm2)
+  target_link_libraries(r4dx-convert PRIVATE r4dx_convert r4dx_convert_gemma r4dx_convert_lfm2 r4dx_convert_qwen4exp)
 endif()

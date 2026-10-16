@@ -189,8 +189,19 @@ void GdnLayer::Forward(core::Stream& stream, core::Arena& arena, GdnStateManager
   if (p.conv_prep < 0 || p.conv_prep > kGdnConvV2) {
     throw std::runtime_error("GdnLayer::Forward: conv_prep must be 0, 1 or 2");
   }
-  const int32_t* cu_dev = control.CuPair(slice);
-  const int32_t* cache_idx_dev = control.CacheIdx(p.slot);
+  // Batched decode (GdnLayerParams::num_seqs): the per-step arrays come from the caller, not the control cache.
+  const bool batched = p.num_seqs > 0;
+  if (batched) {
+    if (p.is_prefill || p.num_seqs != T || p.batch_cu == nullptr || p.batch_cache_idx == nullptr ||
+        p.batch_sidx == nullptr || p.num_accepted != nullptr || states.WriteOnce() || states.MaxDecodeWindow() != 1) {
+      throw std::runtime_error(
+          "GdnLayer::Forward: a batched call is a plain decode (T == num_seqs rows of one token, window 1, no "
+          "write-once state, no num_accepted) with all three batch arrays set");
+    }
+  }
+  const int32_t* cu_dev = batched ? p.batch_cu : control.CuPair(slice);
+  const int32_t* cache_idx_dev = batched ? p.batch_cache_idx : control.CacheIdx(p.slot);
+  const int n_seqs = batched ? p.num_seqs : 1;
 
   uint16_t* q_buf = arena.Alloc<uint16_t>(static_cast<size_t>(T * Hg * K));
   uint16_t* k_buf = arena.Alloc<uint16_t>(static_cast<size_t>(T * Hg * K));
@@ -263,7 +274,7 @@ void GdnLayer::Forward(core::Stream& stream, core::Arena& arena, GdnStateManager
     // T=1, with mtp_draft_k>0 widening MaxDecodeWindow() beyond 1 -- previously read/wrote past the
     // kernel's fixed-size hist[]/x[] arrays; see gdn_state.h's own file comment for the identical
     // bug class that manifested as a hang for the analogous sidx array).
-    if (T > states.MaxDecodeWindow()) {
+    if (!batched && T > states.MaxDecodeWindow()) {
       throw std::runtime_error(
           "GdnLayer::Forward: decode T exceeds GdnStateManager::MaxDecodeWindow()");
     }
@@ -272,7 +283,7 @@ void GdnLayer::Forward(core::Stream& stream, core::Arena& arena, GdnStateManager
                                 states.ConvBase(), states.ConvSeqStride(), states.ConvDimStride(),
                                 states.ConvTokStride(), static_cast<int>(states.StateLenMax()),
                                 cache_idx_dev, /*ci_stride=*/1, p.num_accepted, q_buf,
-                                k_buf, v_buf, cu_dev, /*N=*/1, H, Hg, K, V,
+                                k_buf, v_buf, cu_dev, /*N=*/n_seqs, H, Hg, K, V,
                                 static_cast<int>(width),
                                 /*max_query_len=*/static_cast<int>(states.MaxDecodeWindow()), s);
     });
@@ -285,7 +296,7 @@ void GdnLayer::Forward(core::Stream& stream, core::Arena& arena, GdnStateManager
     // call (T==draft_k+1) writes one snapshot per candidate into its own window slot, and
     // p.num_accepted (carried from the PREVIOUS call) selects which slot THIS call seeds from.
     const int64_t window = states.MaxDecodeWindow();
-    const int32_t* sidx_dev = control.SidxBase(p.slot, window);
+    const int32_t* sidx_dev = batched ? p.batch_sidx : control.SidxBase(p.slot, window);
 
     if (!states.WriteOnce()) {
       ProfiledCall(prof, s, "gdn.recurrent_update", [&] {
@@ -294,7 +305,7 @@ void GdnLayer::Forward(core::Stream& stream, core::Arena& arena, GdnStateManager
             w_.dt_bias.data(), states.RecurrentBase(), states.RecurrentSlotStride(),
             states.RecurrentHeadStride(), out_core, cu_dev, sidx_dev,
             /*indices_stride=*/window, p.num_accepted, z_buf, w_.norm_weight.data(), eps,
-            kGdnActSilu, /*N=*/1, H, Hg, K, V, scale, kSoftplusThr, s);
+            kGdnActSilu, /*N=*/n_seqs, H, Hg, K, V, scale, kSoftplusThr, s);
       });
     } else {
       // Write-once state (docs/gdn-write-once.md 2.2): one state B per sequence, at sidx[0] == p.slot.

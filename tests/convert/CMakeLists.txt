@@ -182,6 +182,13 @@ add_executable(convert_sharded_single_file test_sharded_single_file.cpp)
 target_link_libraries(convert_sharded_single_file PRIVATE r4dx_convert)
 add_test(NAME convert_sharded_single_file COMMAND convert_sharded_single_file)
 
+# SafetensorsReader hardening (safetensors_reader.hpp): a header length / data_offsets end near 2^64 and a negative shape
+# dimension are refused with runtime_error (no wrap-around, no read off the mapping), and a throwing open releases its
+# handles. Writes tiny hand-built shards into a temp dir. CPU-only.
+add_executable(convert_safetensors_reader test_safetensors_reader.cpp)
+target_link_libraries(convert_safetensors_reader PRIVATE r4dx_convert)
+add_test(NAME convert_safetensors_reader COMMAND convert_safetensors_reader)
+
 # bf16 linear-weight layout (task item 2: --layouts bf16 for all linear weights): plain row-major
 # on-disk bytes, no WMMA-fragment permutation, plan/emit byte-size agreement.
 add_executable(convert_bf16_layout test_bf16_layout.cpp)
@@ -259,3 +266,29 @@ add_test(NAME convert_dflash_container COMMAND convert_dflash_container)
 add_executable(convert_dflash_hf test_dflash_hf.cpp)
 target_link_libraries(convert_dflash_hf PRIVATE r4dx_convert)
 add_test(NAME convert_dflash_hf COMMAND convert_dflash_hf)
+
+# qwen4_exp converter branch (docs/qwen4exp-plan.md 4.11 item 3, task M1-2). All CPU-only.
+#  convert_qwen4exp_layout: src/convert/qwen4exp_layout.cpp over the real 48-layer / 512-expert geometry through a
+#    recording kit (names, roles, coverage audit, per-(layer, class) KB rule, n-gram sidecar header), no weights.
+#  convert_qwen4exp_awq: the virtual AWQ source (src/convert/awq_source.cpp): DequantRows vs an independent model,
+#    the ShardedModel overlay (threads), refusals, and bit-equality with tools/reference/qwen4exp/awq_dequant.py on
+#    the fixtures tools/reference/qwen4exp/convert_fixtures.py writes (awq-mini, real-spot; SKIP lines without them).
+#  convert_qwen4exp: r4dx-convert on the awq-mini fixture and on E:/models/r4dx/tiny-q4exp (bf16, w4a16 and the
+#    trellis oracles convert_fixtures.py tiny-trellis writes): tensor names / shapes / dtypes against the plan and
+#    bf16 contents against the HF tensors; exits 77 (SKIPPED) without the fixtures.
+add_executable(convert_qwen4exp_layout test_convert_qwen4exp_layout.cpp)
+target_link_libraries(convert_qwen4exp_layout PRIVATE r4dx_convert_qwen4exp)
+add_test(NAME convert_qwen4exp_layout COMMAND convert_qwen4exp_layout)
+
+add_executable(convert_qwen4exp_awq test_convert_qwen4exp_awq.cpp)
+target_link_libraries(convert_qwen4exp_awq PRIVATE r4dx_convert_qwen4exp)
+add_test(NAME convert_qwen4exp_awq COMMAND convert_qwen4exp_awq)
+
+add_executable(convert_qwen4exp test_convert_qwen4exp.cpp)
+target_link_libraries(convert_qwen4exp PRIVATE r4dx_convert_qwen4exp)
+if(TARGET r4dx-convert)
+  target_compile_definitions(convert_qwen4exp PRIVATE R4DX_CONVERT_EXE="$<TARGET_FILE:r4dx-convert>")
+  add_dependencies(convert_qwen4exp r4dx-convert)
+endif()
+add_test(NAME convert_qwen4exp COMMAND convert_qwen4exp)
+set_tests_properties(convert_qwen4exp PROPERTIES SKIP_RETURN_CODE 77)

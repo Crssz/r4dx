@@ -156,6 +156,14 @@ set(R4DX_MODEL_SOURCES
   # The hybrid serving mode inside TpModel (docs/pp-tp2-hybrid.md, P3 step 2): the stage Models next to the ranks, the pipelined prefill
   # command, the reshard over the pinned host ring, the dispatch -- TpModel members, split out of tp_model.cpp.
   tp_model_hybrid.cpp
+  # qwen4_exp (docs/qwen4exp-plan.md 4.11, M1-3): the layer-range weight loader (a separate type from Container).
+  qwen4exp_container.cpp
+  # qwen4_exp runtime (docs/qwen4exp-plan.md 4.11, M1-16..18): the GDN mixer, the per-device stage (kernel side: it must not see
+  # qwen4exp_weights.h), the two-stage model (container side) and the TextModel wrapper + LoadQwen4ExpTextModel.
+  qwen4exp_gdn.cpp
+  qwen4exp_stage.cpp
+  qwen4exp_model.cpp
+  qwen4exp_local_text_model.cpp
 )
 # r4dx_model_tptest: the SAME sources compiled with R4DX_TP_TESTING, which adds the tensor-parallel
 # test hooks (Model::DflashDebugLastTop16 and friends, docs/tp.md 10.1 "P5 additions") -- linked only
@@ -195,3 +203,9 @@ if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/attention/CMakeLists.txt")
     target_link_libraries(r4dx_model_tptest PUBLIC r4dx_model_attention)
   endif()
 endif()
+
+# src/model/qwen4exp: kernels + host helpers of the qwen4_exp arch (docs/qwen4exp-plan.md). Linked into
+# r4dx_model (never the other way round); the arch's Container/Model files are listed in r4dx_model above.
+add_subdirectory(qwen4exp)
+target_link_libraries(r4dx_model PUBLIC r4dx_model_qwen4exp_kernels)
+target_link_libraries(r4dx_model_tptest PUBLIC r4dx_model_qwen4exp_kernels)

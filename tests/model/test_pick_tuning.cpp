@@ -681,8 +681,8 @@ void CheckFallbackRelaxation(int& checked, int& failures) {
   }
   r4dx::model::SetTp2TuningForThisThread(false);
 
-  // The relaxed rule is exactly K % 256: K = 3840 (not a multiple of 512) takes SK = 4, and a K that
-  // is not a multiple of 256 (or N not of 16) still throws rather than launching illegally.
+  // The rule is K % 256 -> SK 4 (every Qwen / Gemma shape), else K % 128 -> SK 2, else K % 64 -> SK 1; a
+  // K that is not a multiple of 64 (or N not of 16) still throws rather than launching illegally.
   const auto throws = [](Layout layout, int64_t N, int64_t K) {
     try {
       (void)r4dx::model::PickTuning(layout, N, K, 1, 0);
@@ -694,10 +694,35 @@ void CheckFallbackRelaxation(int& checked, int& failures) {
   expect(r4dx::model::PickTuning(Layout::kBf16, 4096, 3840, 1, 0).SK == 4 &&
              r4dx::model::PickTuning(Layout::kW4a16, 4096, 3840, 1, 0).SK == 4,
          "K = 3840 takes the fallback SK = 4");
-  expect(throws(Layout::kBf16, 4096, 3840 + 128) && throws(Layout::kW4a16, 4096, 3840 + 128),
-         "K = 3968 (not a multiple of 256) still throws");
+  expect(throws(Layout::kBf16, 4096, 3840 + 32) && throws(Layout::kW4a16, 4096, 3840 + 32),
+         "K = 3872 (not a multiple of 64) still throws");
   expect(throws(Layout::kBf16, 4096, 0), "K = 0 throws");
   expect(throws(Layout::kBf16, 4104, 3840), "N not a multiple of 16 still throws");
+  // qwen4_exp's expert down (N 2560, K 640 = 5 * 128): SK 2, launchable at w4a16 groups 0/32/64 and bf16,
+  // every M; K = 3968 (31 * 128) SK 2 and K = 192 (3 * 64) SK 1.
+  struct Relaxed {
+    int64_t N, K;
+    int sk;
+  };
+  for (const Relaxed& s : {Relaxed{2560, 640, 2}, Relaxed{4096, 3968, 2}, Relaxed{256, 192, 1}}) {
+    for (Layout layout : {Layout::kBf16, Layout::kW4a16}) {
+      ForEachGroup(layout, [&](int g) {
+        for (int64_t m = 1; m <= 64; ++m) {
+          LinearTuning t{};
+          try {
+            t = r4dx::model::PickTuning(layout, s.N, s.K, m, g);
+          } catch (const std::exception& e) {
+            expect(false, "relaxed shape threw");
+            std::fprintf(stderr, "  layout=%d N=%lld K=%lld M=%lld g=%d: %s\n", static_cast<int>(layout),
+                         static_cast<long long>(s.N), static_cast<long long>(s.K),
+                         static_cast<long long>(m), g, e.what());
+            continue;
+          }
+          expect(t.SK == s.sk && Launchable(layout, s.K, t, g), "relaxed shape: SK and launchable");
+        }
+      });
+    }
+  }
 }
 
 }  // namespace

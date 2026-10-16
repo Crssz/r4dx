@@ -290,11 +290,11 @@ const Tuning kAccTunings[] = {
     {1, 8, 1, 1, 4, 2, 1},    // Wc 32, SKG 4
 };
 
-void TestAccuracyAt(std::mt19937_64& rng, int K, int N, int min_calls) {
+void TestAccuracyAt(std::mt19937_64& rng, int K, int N, int min_calls, std::vector<int> kbs = {4, 5}) {
   const int Ms[] = {1, 3, 8, 16, 17, 64};
   double worst = 0.0, worst_fro = 0.0;
   int calls = 0, skipped = 0;
-  for (int KB : {4, 5}) {
+  for (int KB : kbs) {
     for (int parts : {1, 2}) {
       const int n_split = parts == 2 ? N / 2 : N;
       std::unique_ptr<Linear> L = RandomLinear(rng, K, N, KB, n_split, true);
@@ -353,9 +353,12 @@ void TestAccuracyAt(std::mt19937_64& rng, int K, int N, int min_calls) {
       }
     }
   }
-  std::printf("  accuracy K=%d N=%d, KB 4/5, P 1/2, prescale 0/4, M 1..64, %zu tunings: %d calls (%d not "
+  std::string kbl;
+  for (int k : kbs) kbl += (kbl.empty() ? std::string() : std::string("/")) + std::to_string(k);
+  std::printf("  accuracy K=%d N=%d, KB %s, P 1/2, prescale 0/4, M 1..64, %zu tunings: %d calls (%d not "
               "instantiated), worst element %.3f of the tolerance, worst ||C-y||/||y|| %.2e\n",
-              K, N, sizeof(kAccTunings) / sizeof(kAccTunings[0]), calls, skipped, worst, worst_fro);
+              K, N, kbl.c_str(), sizeof(kAccTunings) / sizeof(kAccTunings[0]), calls, skipped, worst,
+              worst_fro);
   Check(calls >= min_calls, "accuracy: too few calls ran (" + std::to_string(calls) + ")");
 }
 
@@ -376,7 +379,7 @@ void TestAccuracy(std::mt19937_64& rng) {
 // finishing path: unsplit 128- and 256-wide blocks (the in-LDS finish, one and two groups per block),
 // split groups of Wc 32 / 64 / 128 / 256 blocks at SKG 1-8 (the last block's finish, the 256-wide one
 // with two groups per ticket), MT up to 4 and SK up to 16.
-void TestEpilogueExact(std::mt19937_64& rng) {
+void TestEpilogueExact(std::mt19937_64& rng, std::vector<int> kbs = {4, 5}) {
   const int K = 2048, N = 1024;
   std::vector<Tuning> tunings(std::begin(kAccTunings), std::end(kAccTunings));
   tunings.push_back({1, 8, 1, 1, 1, 4, 1});   // Wc 32, SKG 1
@@ -384,7 +387,7 @@ void TestEpilogueExact(std::mt19937_64& rng) {
   tunings.push_back({4, 2, 1, 2, 2, 2, 1});   // Wc 256, split (SKG 2): two groups, one ticket
   tunings.push_back({2, 2, 1, 4, 4, 1, 0});   // Wc 256, NP 4, SKG 4
   int calls = 0, bad_calls = 0;
-  for (int KB : {4, 5})
+  for (int KB : kbs)
     for (int parts : {1, 2}) {
       std::unique_ptr<Linear> L = RandomLinear(rng, K, N, KB, parts == 2 ? N / 2 : N, false);
       L->a0.CopyFromHost(RandomA(rng, static_cast<size_t>(64) * K));
@@ -412,18 +415,20 @@ void TestEpilogueExact(std::mt19937_64& rng) {
                                    "out_scale)");
           }
     }
-  std::printf("  epilogue K=%d N=%d, KB 4/5, P 1/2, prescale 0/4, M 1..64, %zu tunings: %d calls, %d with an "
+  std::string kbl;
+  for (int k : kbs) kbl += (kbl.empty() ? std::string() : std::string("/")) + std::to_string(k);
+  std::printf("  epilogue K=%d N=%d, KB %s, P 1/2, prescale 0/4, M 1..64, %zu tunings: %d calls, %d with an "
               "element off bf16((FwhtLds(raw) * svh) * out_scale)\n",
-              K, N, tunings.size(), calls, bad_calls);
-  Check(calls >= 300, "epilogue: too few calls ran (" + std::to_string(calls) + ")");
+              K, N, kbl.c_str(), tunings.size(), calls, bad_calls);
+  Check(calls >= 150 * static_cast<int>(kbs.size()), "epilogue: too few calls ran (" + std::to_string(calls) + ")");
 }
 
 // ---- tuning invariance ------------------------------------------------------------------------------
-void TestInvariance(std::mt19937_64& rng) {
+void TestInvariance(std::mt19937_64& rng, std::vector<int> kbs = {4, 5}) {
   const int K = 2048, N = 512;
   int legal_total = 0, classes_total = 0;
   double worst = 0.0;
-  for (int KB : {4, 5}) {
+  for (int KB : kbs) {
     std::unique_ptr<Linear> L = RandomLinear(rng, K, N, KB, N / 2, true);
     const std::vector<uint16_t> a0 = RandomA(rng, static_cast<size_t>(64) * K), a1 = RandomA(rng, static_cast<size_t>(64) * K);
     L->a0.CopyFromHost(a0);
@@ -471,8 +476,10 @@ void TestInvariance(std::mt19937_64& rng) {
     }
   }
   std::printf("  invariance: class references within %.3f of the tolerance\n", worst);
-  Check(legal_total > 2000, "invariance: suspiciously few legal tunings (" + std::to_string(legal_total) + ")");
-  Check(classes_total >= 60, "invariance: too few (SK, SKG) classes (" + std::to_string(classes_total) + ")");
+  Check(legal_total > 1000 * static_cast<int>(kbs.size()),
+        "invariance: suspiciously few legal tunings (" + std::to_string(legal_total) + ")");
+  Check(classes_total >= 30 * static_cast<int>(kbs.size()),
+        "invariance: too few (SK, SKG) classes (" + std::to_string(classes_total) + ")");
 }
 
 // ---- row identity -----------------------------------------------------------------------------------
@@ -620,13 +627,13 @@ void TestPrefillRows(std::mt19937_64& rng) {
 }
 
 // ---- determinism --------------------------------------------------------------------------------------
-void TestDeterminism(std::mt19937_64& rng) {
+void TestDeterminism(std::mt19937_64& rng, std::vector<int> kbs = {4, 5}, bool qwen4exp = false) {
   struct Case {
     const char* label;
     int N, K;
     std::vector<Tuning> tunings;
   };
-  const Case cases[] = {
+  std::vector<Case> cases = {
       // SKG 4 on 128-wide blocks, and Wc 32 at SKG 1 and 2.
       {"mlp.down", 5120, 17408, {{4, 4, 1, 1, 4, 4, 1}, {1, 4, 1, 1, 1, 4, 1}, {1, 4, 1, 1, 2, 4, 1}}},
       // SKG 8, the kernel's largest (the first revision's fallback for this shape: 8 blocks per
@@ -637,8 +644,12 @@ void TestDeterminism(std::mt19937_64& rng) {
       {"g.k_full", 512, 3840, {Fallback(512, 3840, 8), {1, 1, 1, 1, 8, 2, 1}}},
       {"g.down", 3840, 15360, {Fallback(3840, 15360), {1, 4, 1, 1, 2, 4, 1}}},
   };
+  if (qwen4exp)   // qwen4_exp's expert linears (gate_up as one N = 1280 weight) and its attention k / v
+    cases = {{"q4.gate_up", 1280, 2560, {Fallback(1280, 2560), {1, 4, 1, 1, 4, 2, 1}}},
+             {"q4.down", 2560, 640, {Fallback(2560, 640), {1, 2, 1, 1, 2, 2, 1}}},
+             {"q4.k/v", 512, 2560, {Fallback(512, 2560, 8), {1, 2, 1, 1, 8, 2, 1}}}};
   for (const Case& cs : cases)
-    for (int KB : {4, 5}) {
+    for (int KB : kbs) {
       std::unique_ptr<Linear> L = RandomLinear(rng, cs.K, cs.N, KB, cs.N, false);
       L->a0.CopyFromHost(RandomA(rng, static_cast<size_t>(64) * cs.K));
       for (const Tuning& t : cs.tunings) {
@@ -698,12 +709,13 @@ void TestPreconditions() {
   Check(Throws([&] { call(65, K, N, N, 4, 4, 2, 1, 1, 1, 2, 16, 16); }), "M = 65 accepted");
   Check(Throws([&] { call(1, 1000, N, N, 4, 4, 2, 1, 1, 1, 2, 16, 16); }), "K % 128 accepted");
   Check(Throws([&] { call(1, K, 500, 500, 4, 4, 2, 1, 1, 1, 2, 16, 16); }), "N % 128 accepted");
-  Check(Throws([&] { call(1, K, N, N, 3, 4, 2, 1, 1, 1, 2, 16, 16); }), "KB = 3 accepted");
+  Check(Throws([&] { call(1, K, N, N, 2, 4, 2, 1, 1, 1, 2, 16, 16); }), "KB = 2 accepted");
   Check(Throws([&] { call(1, K, N, N, 6, 4, 2, 1, 1, 1, 2, 16, 16); }), "KB = 6 accepted");
   Check(Throws([&] { call(1, K, N, N, 4, 1, 2, 1, 4, 1, 4, 16, 16); }), "NP*U = 16 accepted");
   Check(Throws([&] { call(1, K, N, N, 4, 1, 2, 1, 2, 1, 8, 16, 16); }), "U = 8 accepted");
   Check(Throws([&] { call(1, K, N, N, 4, 1, 2, 2, 4, 1, 2, 16, 16); }), "(NP 4, U 2, MT 2) accepted");
   Check(Throws([&] { call(1, K, N, N, 5, 1, 2, 3, 2, 1, 4, 16, 16); }), "(KB 5, NP 2, U 4, MT 3) accepted");
+  Check(Throws([&] { call(1, K, N, N, 3, 1, 2, 3, 2, 1, 4, 16, 16); }), "(KB 3, NP 2, U 4, MT 3) accepted");
   Check(Throws([&] { call(1, K, N, N, 4, 4, 2, 1, 4, 1, 1, 16, 16); }), "Wc = 512 accepted");
   Check(Throws([&] { call(1, K, N, N, 4, 2, 16, 1, 4, 1, 1, 16, 16); }), "SK*Wc*32 = 128 KiB of LDS accepted");
   Check(Throws([&] { call(1, K, N, N, 4, 4, 16, 1, 1, 1, 1, 16, 16); }), "2048 threads accepted");
@@ -714,9 +726,10 @@ void TestPreconditions() {
   Check(Throws([&] { call(1, K, N, 128, 4, 4, 2, 1, 2, 1, 2, 16, 16); }), "n_split % Wc (256) accepted");
   Check(Throws([&] { call(1, K, N, N, 4, 3, 2, 1, 1, 1, 2, 16, 16); }), "WV = 3 accepted");
   Check(Throws([&] { call(1, K, N, N, 4, 4, 2, 1, 1, 3, 2, 16, 16); }), "SKG = 3 accepted");
-  Check(r4d_gemm_trellis_nt_m64_has_rate(4) == 1 && r4d_gemm_trellis_nt_m64_has_rate(5) == 1 &&
-            r4d_gemm_trellis_nt_m64_has_rate(3) == 0 && r4d_gemm_trellis_nt_m64_has_rate(6) == 0,
-        "has_rate: 4 and 5 yes, 3 and 6 no");
+  Check(r4d_gemm_trellis_nt_m64_has_rate(3) == 1 && r4d_gemm_trellis_nt_m64_has_rate(4) == 1 &&
+            r4d_gemm_trellis_nt_m64_has_rate(5) == 1 && r4d_gemm_trellis_nt_m64_has_rate(2) == 0 &&
+            r4d_gemm_trellis_nt_m64_has_rate(6) == 0,
+        "has_rate: 3, 4 and 5 yes, 2 and 6 no");
   Check(r4d_gemm_trellis_nt_m64_max_m() == 64, "max_m 64");
   Check(r4d_gemm_trellis_nt_m64_ws_bytes(16, 5120, 4) == static_cast<size_t>(4) * 16 * 5120 * 4, "ws_bytes");
   Check(r4d_gemm_trellis_nt_m64_tickets_bytes(5120) == 160, "tickets_bytes(5120) = 40 u32");
@@ -817,6 +830,15 @@ int main() {
   TestRowIdentity(rng);
   TestPrefillRows(rng);
   TestDeterminism(rng);
+
+  // KB = 3 (qwen4_exp's expert rate), after every KB 4 / 5 case so their random draws are unchanged.
+  TestAccuracyAt(rng, 5120, 1024, 120, {3});
+  TestAccuracyAt(rng, 2560, 1280, 40, {3});    // expert gate_up as one two-part weight (n_split 640)
+  TestAccuracyAt(rng, 640, 2560, 20, {3});     // expert down
+  TestAccuracyAt(rng, 6144, 2560, 40, {3});    // out_proj / o_proj
+  TestEpilogueExact(rng, {3});
+  TestInvariance(rng, {3});
+  TestDeterminism(rng, {3}, true);
 
   const bool golden = GoldenAvailable();
   if (golden) {

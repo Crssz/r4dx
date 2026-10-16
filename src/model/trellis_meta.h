@@ -153,9 +153,9 @@ inline std::optional<TrellisSpec> ParseTrellisMetadata(const nlohmann::json& met
       fail("\"" + where + "bits\" is missing or not an integer");
     }
     const int64_t bits = e.at("bits").get<int64_t>();
-    if (bits != 4 && bits != 5) {
+    if (bits != 3 && bits != 4 && bits != 5) {
       fail("\"" + where + "bits\" = " + std::to_string(bits) +
-           " is not a rate of this format (4, 5)");
+           " is not a rate of this format (3, 4, 5)");
     }
     L.bits = static_cast<int>(bits);
     if (e.contains("parts")) {

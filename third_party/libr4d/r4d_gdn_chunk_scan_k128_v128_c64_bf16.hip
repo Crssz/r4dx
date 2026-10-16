@@ -24,6 +24,17 @@
 #include <hip/hip_runtime.h>
 #include "r4d.h"
 #include "r4d_gdn_wmma.h"
+// R4D_GDN_SCAN_STABLE: 0 (the default) is THE SHIPPED KERNEL -- every `#if R4D_GDN_SCAN_STABLE` below keeps the original text in its
+// `#else` arm, so this file compiles to the same code as before. 1 is the span-safe variant, built as a unit of its own
+// (r4d_gdn_chunk_scan_stable_k128_v128_c64_bf16.hip, which defines it and includes this file; the shipped unit is not recompiled with it).
+// Why it exists: the split form below is exact only while the chunk's gate span (G_first - G_last) stays under ~160 (e^80 per half) and
+// attenuates beyond that; Qwen3.8-Flash-Next's GDN layers reach spans of thousands (A = e^A_log up to 158), which zeroes the weights of
+// neighbouring tokens. The variant changes three things, all with every exponent <= 0: the score step applies e^{G_i - G_j} per element
+// (sA = scale * e^{G_i - G_j} * tril(P)), V' = A W is stored unweighted, and the state update weights the K ROWS by w_t = e^{G_last - G_t}
+// (K is dead for P and U once barrier (2) is passed) instead of V' by gv: S <- e^{G_last} S + (w K)^T V'.
+#ifndef R4D_GDN_SCAN_STABLE
+#define R4D_GDN_SCAN_STABLE 0
+#endif
 // TRIL: skip GEMM tiles above the diagonal (A from solve_tril is unit lower
 // triangular, and sA is masked). 2.4% slower, and left off; the reason is
 // structural rather than tuning: the waves rendezvous at a workgroup barrier, so only
@@ -115,6 +126,9 @@ struct Smem {
                                 // Both live inside one chunk and never overlap: V dies
                                 // in the W update, V' is written after barrier (2).
   float ge[BT], gv[BT], rs[BT], bt[BT];
+#if R4D_GDN_SCAN_STABLE
+  float gc[BT];                 // the chunk's gate cumsum G_t (rows past the chunk end hold G_last)
+#endif
 };
 
 // LDSO: hold each LDS row pointer as one opaque 32-bit byte offset (see fragO).
@@ -486,8 +500,14 @@ __global__ __launch_bounds__(NTHR) void r4d_gdn_chunk_scan_kernel(
       // value is measured, not assumed: WikiText-2 PPL over 208,539 tokens, no other mitigation --
       // 70 -> 8.3841, 80 -> 8.3706, 83 -> 8.3728, reference 8.3335, stock 653586. Where both
       // halves fit (every ordinary chunk) nothing changes.
+#if R4D_GDN_SCAN_STABLE
+      s.gv[tid] = ok ? __expf(fminf(gl - ggr, 0.0f)) : 0.f;   // w_t = e^{G_last - G_t} <= 1: weights the K rows of the state update
+      s.rs[tid] = ok ? scale : 0.f;                           // sA's row factor; the pair weight e^{G_i - G_j} is applied per element
+      s.gc[tid] = ok ? ggr : gl;
+#else
       s.gv[tid] = ok ? __expf(fminf(cref - ggr, 80.0f)) : 0.f;
       s.rs[tid] = ok ? scale * __expf(fminf(ggr - cref, 80.0f)) : 0.f;
+#endif
     }
     BAR();                                                   // (1)
 #if PFIN && PFV == 4
@@ -667,7 +687,12 @@ __global__ __launch_bounds__(NTHR) void r4d_gdn_chunk_scan_kernel(
         const int j0 = (ntb + i) * 16 + 8 * hi;
         float a[8];
 #pragma unroll
+#if R4D_GDN_SCAN_STABLE
+        for (int e = 0; e < 8; ++e)
+          a[e] = (j0 + e <= ii) ? p[i][e] * r * __expf(fminf(s.gc[ii] - s.gc[j0 + e], 0.0f)) : 0.f;
+#else
         for (int e = 0; e < 8; ++e) a[e] = (j0 + e <= ii) ? p[i][e] * r : 0.f;
+#endif
         if (doP[i]) {
           *(uint2*)&s.A[ii][j0]     = F2BF4I(a[0], a[1], a[2], a[3]);
           *(uint2*)&s.A[ii][j0 + 4] = F2BF4I(a[4], a[5], a[6], a[7]);
@@ -724,7 +749,11 @@ __global__ __launch_bounds__(NTHR) void r4d_gdn_chunk_scan_kernel(
 #endif
       float gvv[8];
 #pragma unroll
+#if R4D_GDN_SCAN_STABLE
+      for (int e = 0; e < 8; ++e) gvv[e] = 1.0f;   // V' stays unweighted: the pair weights are in sA, the state weights on K
+#else
       for (int e = 0; e < 8; ++e) gvv[e] = s.gv[mt * 16 + 8 * hi + e];
+#endif
 #pragma unroll
       for (int i = 0; i < NTV; ++i) {
         unsigned short* dp = &s.D[(ntb + i) * 16 + lo][mt * 16 + 8 * hi];
@@ -734,6 +763,21 @@ __global__ __launch_bounds__(NTHR) void r4d_gdn_chunk_scan_kernel(
                                    d[i][6]*gvv[6], d[i][7]*gvv[7]);
       }
     }
+#if R4D_GDN_SCAN_STABLE
+    {
+      static_assert(NTHR == 256 && BT == 64 && KD == 128, "the K-row weighting maps 4 threads to each of the 64 rows of 128 shorts");
+      // K rows <- w_t K_t, w_t = e^{G_last - G_t} (0 past the chunk end). Every wave is past the main loop (barrier (2)), nothing reads
+      // s.k until the state update, and barrier (3) below orders this before it. One row per 4 threads, 32 shorts each.
+      const float wt = s.gv[tid >> 2];
+      unsigned short* kp = &s.k[tid >> 2][(tid & 3) * 32];
+#pragma unroll
+      for (int u = 0; u < 8; ++u) {
+        const uint2 x = *(const uint2*)(kp + 4 * u);
+        *(uint2*)(kp + 4 * u) = F2BF4I(wt * bf2f((unsigned short)(x.x & 0xffffu)), wt * bf2f((unsigned short)(x.x >> 16)),
+                                       wt * bf2f((unsigned short)(x.y & 0xffffu)), wt * bf2f((unsigned short)(x.y >> 16)));
+      }
+    }
+#endif
     BAR();                                                   // (3)
 
     // ---- O += sA @ V' ; store.  V' also feeds the state update, unchanged.
@@ -788,7 +832,11 @@ __global__ __launch_bounds__(NTHR) void r4d_gdn_chunk_scan_kernel(
 
     // ---- S = lam * (e^c * S + V'^T @ K)   (B needs K as [dim][token] -> strided fragT)
     {
+#if R4D_GDN_SCAN_STABLE
+      const float ec = __expf(gl), lam = 1.0f;   // S <- e^{G_last} S + (w K)^T V': every exponent <= 0
+#else
       const float ec = __expf(cref), lam = __expf(gl - cref);
+#endif
 #pragma unroll
       for (int t = 0; t < NST; ++t)
 #pragma unroll

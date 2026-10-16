@@ -138,6 +138,18 @@ class TpModel final : public TextModel, public TpDiagnostics {
                                                const kernels::SampleParams& params, std::mt19937_64& rng,
                                                int64_t* walk_len_out = nullptr) override;
 
+  // ---- batched decode (docs/batch-decode.md): each a collective command, every rank holding the same slots over its own shards. In the
+  // hybrid mode (--tp 2 --pp 2) the PP-2 prefill reshards its state into the rank Models at its end, so BatchImport after it copies
+  // the same state a plain --tp 2 prefill would have left -- and a batch step runs on the ranks alone, never on the stages, and
+  // leaves the single-sequence state (and so the stages' mirrors) where it was.
+  int BatchSlots() const override { return batch_slots_; }
+  int64_t BatchSlotCtx() const override { return batch_slot_ctx_; }
+  void BatchImport(int slot) override;
+  void BatchRelease(int slot) override;
+  // Every rank gets its own copy of each sampled row's generator; the copies must end in the same state (same draws), and the
+  // caller's generators then take rank 0's (docs/tp.md 2.3, as DecodeStepSampled).
+  std::vector<int32_t> DecodeBatch(const std::vector<BatchDecodeRow>& rows) override;
+
   // Profiling is not supported under tensor parallelism (docs/tp.md 1.2): core::TpUnsupportedError.
   StepProfile DecodeStepProfiled(int32_t token_id) override;
   StepProfile PrefillProfiled(const std::vector<int32_t>& token_ids) override;
@@ -437,6 +449,8 @@ class TpModel final : public TextModel, public TpDiagnostics {
   bool mtp_reduced_vocab_ = false;
   bool dflash_enabled_ = false;
   int64_t num_loaded_layers_ = 0;
+  int batch_slots_ = 0;          // ModelOptions::batch_slots / batch_ctx, as every rank loaded them
+  int64_t batch_slot_ctx_ = 0;
   int64_t cached_position_ = 0;
   int64_t cached_fallback_rows_ = 0;
   bool dflash_injection_ = true;  // the Model default (model.h's SetDflashInjectionEnabled)

@@ -73,6 +73,16 @@ struct GdnLayerParams {
   // it from its load-time choice (prefill_chunk.h's DecideGdnConv -- 2 on a wide Model unless
   // R4DX_GDN_CONV=1), tests pin it.
   int conv_prep = 0;
+  // Batched decode (docs/batch-decode.md 3.1; decode only, plain: window 1, no write-once state, num_accepted null):
+  // the call's T rows are T DIFFERENT sequences of one token each, and the three arrays below -- device int32, built
+  // per step by Model::DecodeBatch from batch_plan.h's metadata -- replace the single-sequence cu / cache_idx / sidx
+  // GdnControlCache serves: cu[0..T] = 0, 1, ..., T; cache_idx[n] = sequence n's conv-state line (physical slot, >= 1);
+  // sidx[n] = the slot its new recurrent state is written to (the same slot: one window position). `slot` and the
+  // control cache are not read. 0 (the default, and every non-batch caller) is the single-sequence call.
+  int num_seqs = 0;
+  const int32_t* batch_cu = nullptr;
+  const int32_t* batch_cache_idx = nullptr;
+  const int32_t* batch_sidx = nullptr;
 };
 
 class GdnLayer {

@@ -2204,3 +2204,66 @@ Two reviews of the branch (correctness; merge readiness). Fixed:
 portable reference tests now among them (`E:\models\r4dx\trellis-m6\review\ctest.log`). G6 steps
 that load through the changed code, on mix4.5m: `validate_dflash` 3/3 byte-identical, with the same
 three hashes as M6's `g6-mix45m`; `smoke -Tp 2 -TpMode emulate -Dflash` all checks passed.
+
+---
+
+## 11. KB = 3 (2026-10-10, qwen4_exp; `docs/qwen4exp-plan.md` 4.3, 4.11 item 6)
+
+The trellis GEMM now decodes KB = 3 as well as 4 and 5: 3 bits per weight, 24 uint32 words per 16 x 16
+tile (`N*K*3/8` bytes per linear), a (tile pair, k-tile) block of 48 words = 192 bytes. The format is the
+same ring: position p owns stream bits `[3p, 3p+3)`, its 16-bit state is the 16 ring bits ending at bit
+`3(p+1)` mod 768 (tail-biting), the codebook is mul1, the tensor-core position order and the pair grid
+(`idx = (((tn>>1)*(K/16)+tk)*2 + (tn&1))*8*KB + w`) are unchanged. `trellis_quant.py` already handled K = 3
+(widths, Viterbi, packing, `LDLQ_DRIFT[3]`); `tests/reference/test_trellis_kb3.py` checks it (Gaussian MSE
+0.0177 at K = 3 against 0.0046 / 0.0012 at 4 / 5, the word layout against a slow bit-string packer,
+`quantize_group` proxy 0.0133 / 0.0034 / 0.0009 at K = 3 / 4 / 5).
+
+**Lane map.** Lane (t, c, h) of a WMMA B fragment needs positions `32c + 16h .. +15` of tile t (runs
+m = 2h, 2h+1 of column c, positions 0-3 of each run F0's and 4-7 F1's), i.e. 16 states ending at ring
+bits `96c + 48h + 3(q+1)`. Their 16-bit windows span ring bits `[96c + 48h - 13, 96c + 48h + 48)`: 61
+bits, always inside four consecutive words. The lane loads the four dwords
+`ring[(3c + 2h - 2 + i) mod 24]`, i = 0..3 (block word index `+ 24t`), pre-aligns them with KB 5's shift
+(`V_i = alignbit(W_i, W_{i+1}, 16h)`), and then state q is the big-endian 16-bit window at bit `19 + 3q`
+of `V0:V1:V2` on every lane:
+
+```
+q = 0..4   alignbit(V0, V1, 48 - r)   r = 19, 22, 25, 28, 31   (straddle V0 / V1)
+q = 5..9   V1 >> (16 - r)             r = 2, 5, 8, 11, 14
+q = 10..14 alignbit(V1, V2, 48 - r)   r = 17, 20, 23, 26, 29
+q = 15     V2's high half (op_sel, no extract)
+```
+
+F0 takes q {0,1,8,9,2,3,10,11} and F1 q {4,5,12,13,6,7,14,15} (as KB 5), the hash / byte-sum / affine
+tail is KB 5's. `r4d_trellis_k3_decode` is one asm block of 74 VALU per (pair, k-tile) (3 alignbit, 15
+extracts, 16 mad_u32_u16, 16 pk_mad_u16, 16 sad, 8 pk_fma) = 4.625 per weight (KB 4: 3.875, KB 5: 4.6875),
+with an `s_delay_alu` before the first extract (the only dependency closer than 4 VALU) and one at the end.
+Four b32 loads per lane per (pair, k-tile) (KB 4: b64 + b32, KB 5: five b32).
+
+**Kernel.** `r4d_gemm_trellis_nt_m64` and `r4d_trellis_reconstruct_f16` take KB = 3; `has_rate(3) == 1`; the
+registry rows list `trellis_mul1_k3`. The instantiation table is KB 5's (48 kernels, 68-187 VGPRs, no
+scratch, checked by `check_trellis_isa.cmake`; the loop's whole VALU count is exactly 74 per pair per
+k-tile in every instantiation). NOT extended: the `_wq` measurement entries, the M = 256 GEMM and the int8
+prefill GEMM (`PlanTrellisM256` / `PlanTrellisI8` refuse rate 3 with a reason; the arch never opens those
+scopes). The KB 4 / 5 kernels are unchanged: their device listings (98 GEMM instantiations, both
+reconstruct kernels, and the `_wq`, M = 256 and int8 units) are byte-identical to the pre-change libr4d's.
+
+**Runtime and converter.** Accepted at every rate check: `trellis_meta.h` (`bits` in {3, 4, 5}),
+`linear_layouts.hpp` (`trellis.k3`, `CheckTrellisLayout`), `trellis_import.hpp` (ring tables, `K` in
+{3, 4, 5}), `TrellisMaxMt` (KB 3 takes KB 5's MT table) and `CheckTrellisRate` (through `has_rate`). There
+are no KB 3 rows in the tuning tables: a KB 3 linear takes `FallbackTuning` (4.4), which is legal for every
+qwen4_exp shape (N, K in {1280 x 2560 (2 parts of 640), 2560 x 640, 12288 x 2560, 10240 x 2560,
+6144 x 2560, 2560 x 6144, 512 x 2560}; tuning rows are optional).
+
+**Tests.** `test_trellis_decode` (KB 3: reconstruct, 48 instantiations x split / unsplit at K = 1024 and
+1152, the whole legal tuning space at K = 8192 (2568 legal), the fp64 / row-identity / determinism test,
+every k of the qwen4_exp shapes at the decode fallback and the 64-row tuning), `test_trellis_gemm`
+(accuracy, epilogue bit-exactness, tuning invariance, determinism at KB 3), and
+`tests/model/qwen4exp/test_gpu_trellis_kb3` (the shapes above through `ApplyLinear`, M in
+{1, 2, 8, 16, 17, 64}, against the CPU reference; reconstruct bit-exact; verify rows == decode rows).
+
+**Measured** (device 1, M = 1, graph of 64 launches, per-launch GPU time; `R4DX_KB3_BENCH=1` on
+`test_gpu_trellis_kb3`; weights cycled through 96 copies, "warm" = one copy). Expert gate_up (N 1280,
+K 2560, 2 parts): fallback tuning 8.6 us at KB 3 against 8.3 us at KB 4 and 8.9 us at KB 5 (cycled; warm
+9.3 / 8.7 / 9.2); best of a sweep 6.5 / 6.8 / 7.7 us (KB 3 / 4 / 5, cycled). Expert down (N 2560, K 640):
+fallback 5.6 / 5.6 / 6.0 us (cycled; warm 5.3 / 5.1 / 6.6), best 4.3 / 4.3 / 4.8 us. At these sizes the
+launch is latency-bound, so 3 bits per weight costs the same as 4.

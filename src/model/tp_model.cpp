@@ -545,6 +545,8 @@ std::unique_ptr<TpModel> TpModel::Load(const ModelOptions& opts, const TpOptions
   m->mtp_reduced_vocab_ = caps[0].mtp_reduced;
   m->dflash_enabled_ = caps[0].dflash;
   m->num_loaded_layers_ = caps[0].layers;
+  m->batch_slots_ = opts.batch_slots;
+  m->batch_slot_ctx_ = opts.batch_slots > 0 ? opts.batch_ctx : 0;
   m->dflash_injection_ = true;  // the Model default (model.h)
   m->cached_position_ = 0;
   m->cached_fallback_rows_ = 0;
@@ -1136,6 +1138,63 @@ int32_t TpModel::DecodeStepSampled(int32_t token_id, const kernels::SampleParams
   return r[0];
 }
 
+void TpModel::BatchImport(int slot) {
+  RequireReady();
+  if (batch_slots_ == 0) throw std::runtime_error("TpModel::BatchImport: loaded without batch slots (ModelOptions::batch_slots)");
+  // A local copy on every rank (its own shard of the KV and GDN state; no TpComm), run as a collective command only for its state
+  // rules: TpStateError unless kReady, and a failure makes the group kNeedsRecovery. The single-sequence state does not move, so the
+  // hybrid's mirrors (NoteTpMoved) are left alone.
+  try {
+    RunCollective([slot](Model& m, int) { m.BatchImport(slot); });
+  } catch (...) {
+    // A rank whose copies succeeded activated the slot, one whose copies failed did not: make every rank agree it is free (a later step
+    // naming it would otherwise pass one rank's validation and fail the other's before the lockstep check). Best effort.
+    try {
+      if (state_ != State::kFatal) RunAll([slot](Model& m, int) { m.BatchRelease(slot); });
+    } catch (...) {
+    }
+    throw;
+  }
+}
+
+void TpModel::BatchRelease(int slot) {
+  if (batch_slots_ == 0) throw std::runtime_error("TpModel::BatchRelease: loaded without batch slots (ModelOptions::batch_slots)");
+  // Host bookkeeping on every rank, legal in any non-fatal state (a failed step's slots are released while the group needs recovery).
+  if (state_ == State::kFatal) throw core::TpStateError("tp: fatal, restart the process");
+  RunAll([slot](Model& m, int) { m.BatchRelease(slot); });
+}
+
+std::vector<int32_t> TpModel::DecodeBatch(const std::vector<BatchDecodeRow>& rows) {
+  RequireReady();
+  if (batch_slots_ == 0) throw std::runtime_error("TpModel::DecodeBatch: loaded without batch slots (ModelOptions::batch_slots)");
+  const size_t n = rows.size();
+  // rank -> row -> that rank's copy of the row's generator (a greedy row has none)
+  auto rngs = std::make_shared<std::vector<std::vector<std::mt19937_64>>>(ranks_.size());
+  for (auto& per_rank : *rngs) {
+    per_rank.resize(n);
+    for (size_t i = 0; i < n; ++i) {
+      if (rows[i].rng != nullptr) per_rank[i] = *rows[i].rng;
+    }
+  }
+  auto plain = std::make_shared<std::vector<BatchDecodeRow>>(rows);  // the rng pointers are replaced per rank below
+  const std::vector<std::vector<int32_t>> r = RunCollective([plain, rngs](Model& m, int slot) {
+    std::vector<BatchDecodeRow> mine = *plain;
+    for (size_t i = 0; i < mine.size(); ++i) {
+      mine[i].rng = mine[i].params.temperature > 0.0f ? &(*rngs)[static_cast<size_t>(slot)][i] : nullptr;
+    }
+    return m.DecodeBatch(mine);
+  });
+  RequireAllEqual(r, "DecodeBatch tokens");
+  for (size_t i = 0; i < n; ++i) {
+    if (rows[i].rng == nullptr || !(rows[i].params.temperature > 0.0f)) continue;
+    std::vector<std::mt19937_64> per_rank;
+    for (const auto& pr : *rngs) per_rank.push_back(pr[i]);
+    RequireRngsEqual(per_rank, "DecodeBatch");
+    *rows[i].rng = per_rank[0];
+  }
+  return r[0];
+}
+
 std::vector<int32_t> TpModel::DecodeStepMtpGreedy(int32_t token_id, int64_t k) {
   RequireReady();
   if (!mtp_enabled_) {
@@ -1217,15 +1276,32 @@ std::unique_ptr<TextModel> LoadTextModel(const ModelOptions& opts, const TpOptio
   // The pipeline switch (docs/pp-prefill.md Phase 2): ModelOptions::pp, -1 following R4DX_PP; off by default.
   const bool pp_on = ResolvePpSwitch(opts.pp);
   // Arch dispatch (docs/gemma4-plan.md 3.2): the container header alone decides. DetectArch answers
-  // kQwen35 for every container without a `model_arch` / Gemma model_config -- including a file it
-  // cannot read -- so the Qwen branches below see exactly what they saw before.
+  // kQwen35 for every container without a `model_arch` / Gemma, LFM2 or qwen4_exp model_config --
+  // including a file it cannot read -- so the Qwen branches below see exactly what they saw before.
   const Arch arch = DetectArch(opts.container_path);
+  if (arch == Arch::kQwen4Exp) {
+    if (pp_on) {
+      throw std::invalid_argument("LoadTextModel: --pp 2 does not support qwen4_exp (it splits its layers over the two "
+                                  "cards itself; R4DX_Q4_DEVICES / R4DX_Q4_SPLIT)");
+    }
+    if (tp.world != 1) {
+      throw std::invalid_argument("LoadTextModel: --tp " + std::to_string(tp.world) +
+                                  " does not support qwen4_exp (it splits its layers over the two cards itself)");
+    }
+    return LoadQwen4ExpTextModel(opts, tp);
+  }
   if (arch == Arch::kGemma4) {
     if (pp_on) throw std::invalid_argument("LoadTextModel: --pp 2 does not support Gemma 4 (it has its own RunChunk)");
     return LoadGemmaTextModel(opts, tp);
   }
   if (arch == Arch::kLfm2Moe) {
     if (pp_on) throw std::invalid_argument("LoadTextModel: --pp 2 does not support LFM2 (it has its own RunChunk)");
+    // Batched decode (docs/batch-decode.md) is Model's (Qwen3.5) alone; the Lfm2 TextModels keep TextModel's refusing
+    // defaults (BatchSlots() == 0), so refuse the request here instead of loading a model that would ignore it.
+    if (opts.batch_slots > 0) {
+      throw std::invalid_argument("LoadTextModel: --batch " + std::to_string(opts.batch_slots) +
+                                  " does not support LFM2 (no batched decode path; drop --batch)");
+    }
     return LoadLfm2TextModel(opts, tp);
   }
   if (pp_on) {

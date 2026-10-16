@@ -10,6 +10,9 @@ set(R4DX_KERNEL_TESTS
   # outputs at the unsplit kernel's own error against a CPU fp32 reference, deterministic.
   test_attn_prefill_splitkv
   test_gdn_chunk_scan
+  # r4d_gdn_chunk_scan_stable_*: the span-safe GDN chunk scan (qwen4_exp's) against the exact recurrence at gate spans up to the thousands,
+  # next to the shipped scan (whose error beyond a span of ~176 is reported, not bounded).
+  test_gdn_chunk_scan_stable
   test_kernel_bandwidth
   test_fused_quant
   test_embedding_gather

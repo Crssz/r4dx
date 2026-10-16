@@ -157,6 +157,16 @@ int r4d_gdn_chunk_scan_k128_v128_c64_bf16(
         const void* cu, int N, int H, int Hg, int K, int V, int bt,
         float scale, void* stream);
 void r4d_gdn_dims(int* head_k, int* head_v, int* chunk);
+// The span-safe variant of r4d_gdn_chunk_scan_k128_v128_c64_bf16 (r4d_gdn_chunk_scan_stable_*.hip): the same arguments, geometry and
+// layouts. The shipped scan splits the pair decay e^{G_i-G_j} around the chunk midpoint and is exact only while the chunk's gate span
+// (G_first - G_last, G = the chunk's gate cumsum) stays under ~160; this one applies e^{G_i-G_j} per element and weights the state update
+// by e^{G_last-G_t}, every exponent <= 0, so it is right at any span (a gate A = e^A_log in the hundreds gives spans in the thousands).
+// Slightly more work per chunk; the shipped entry point is untouched and is what the Qwen3.5 and Gemma models call.
+int r4d_gdn_chunk_scan_stable_k128_v128_c64_bf16(
+        const void* q, const void* k, const void* v, const void* A,
+        const void* g, const void* beta, const void* h0, void* o, void* ht,
+        const void* cu, int N, int H, int Hg, int K, int V, int bt,
+        float scale, void* stream);
 
 // The chunk preamble: A = (I + strict_lower(diag(beta) K K^T e^{g_i-g_j}))^-1 per chunk, which is
 // FLA's chunk_scaled_dot_kkt_fwd followed by solve_tril with the fp32 gram in between never
@@ -307,7 +317,7 @@ void r4d_gemm_w4a16_nt_m64_g(int group, int64_t a, int64_t wq, int64_t wsz, int6
 // per block, U k-tiles per step, NT for non-temporal weight loads. Legal only when K and N are
 // multiples of 128, N and n_split of Wc, (K/16) of SK*SKG*U, SK*Wc*32 <= 64 KiB, WV*SK*32 <= 1024,
 // and (KB, NP, U, MT) is instantiated (NP, U in {1,2,4}, NP*U <= 8; MT up to 4 at NP 1 and at
-// (NP, U) = (2, 1), 3 at (2, 2), 3 at KB 4 / 2 at KB 5 at (2, 4), 2 at (4, 1), 1 at (4, 2) -- what
+// (NP, U) = (2, 1), 3 at (2, 2), 3 at KB 4 / 2 at KB 3 and 5 at (2, 4), 2 at (4, 1), 1 at (4, 2) -- what
 // fits 190 VGPRs); anything else throws. A 128-column group whose sums come from more than one
 // block (SKG > 1 or Wc < 128) is finished (summed, transformed, rounded) by the last block to
 // arrive, through `ws` (fp32, ws_bytes(M, N, SKG)) and `tickets` (u32 [N/128], tickets_bytes(N);
@@ -328,14 +338,14 @@ void r4d_gemm_trellis_nt_m64_raw(int64_t a0, int64_t a1, int n_split, int64_t w,
                                  int64_t ws, int64_t tickets, int M, int K, int N, int KB, int WV,
                                  int SK, int MT, int NP, int SKG, int U, int NT, int64_t clk,
                                  int64_t stream);
-int    r4d_gemm_trellis_nt_m64_has_rate(int KB);   // 1 for an instantiated KB (4, 5), else 0
+int    r4d_gemm_trellis_nt_m64_has_rate(int KB);   // 1 for an instantiated KB (3, 4, 5), else 0
 int    r4d_gemm_trellis_nt_m64_max_m(void);         // 64
 size_t r4d_gemm_trellis_nt_m64_ws_bytes(int M, int N, int SKG);   // SKG * M * N * 4
 size_t r4d_gemm_trellis_nt_m64_tickets_bytes(int N);              // (N / 128) * 4
 // hipMemsetAsync(tickets, 0, bytes) on `stream`: the reset after a launch that did not complete.
 void   r4d_gemm_trellis_nt_m64_zero_tickets(int64_t tickets, size_t bytes, int64_t stream);
 // The whole decoded Q[K,N] as f16 bits (row-major, K rows), from the same pair-grid words and the
-// same device decode as the GEMM, bit-exact against the format's reference decode. KB 4 or 5; K a
+// same device decode as the GEMM, bit-exact against the format's reference decode. KB 3, 4 or 5; K a
 // multiple of 16, N of 32.
 void   r4d_trellis_reconstruct_f16(int64_t w, int64_t q, int K, int N, int KB, int64_t stream);
 

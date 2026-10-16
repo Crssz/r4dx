@@ -57,6 +57,12 @@ int main(int argc, char** argv) {
     }
   }
   opts.model_opts.container_path = args.model_path;
+  // qwen4_exp (docs/qwen4exp.md): a container with a trellis payload and no explicit --layout runs the trellis
+  // layout; every other arch and every explicit --layout keeps exactly what was asked for.
+  if (!args.layout_given && r4dx::model::Qwen4ExpDefaultsToTrellis(args.model_path)) {
+    args.layout = "trellis";
+    std::fprintf(stderr, "[r4dx-server] qwen4_exp container with a trellis payload: --layout defaults to trellis\n");
+  }
   try {
     opts.model_opts.layout = r4dx::model::LayoutFromName(args.layout);
   } catch (const std::exception& e) {
@@ -80,7 +86,11 @@ int main(int argc, char** argv) {
                                          ? std::optional<r4dx::model::Layout>(r4dx::model::Layout::kBf16)
                                          : std::nullopt;
   opts.model_opts.embed_device_resident = (args.embed_device_resident != "off");
-  opts.model_opts.prompt_checkpoint = (args.prompt_checkpoint != "off");
+  // --batch N (docs/batch-decode.md): batch slots next to the single-sequence state; every request prefills from scratch into its own
+  // slot, so the prompt checkpoint (a prefix-reuse device) has nothing to do and is off.
+  opts.model_opts.batch_slots = args.batch;
+  opts.model_opts.batch_ctx = args.batch_ctx;
+  opts.model_opts.prompt_checkpoint = (args.prompt_checkpoint != "off") && args.batch == 0;
   opts.model_opts.mtp_draft_reduced_vocab = (args.mtp_draft_head != "full");
   // docs/vision.md "Load policy" -- same three-way policy as r4dx-cli's --vision.
   opts.model_opts.vision = args.vision == "on"    ? r4dx::model::ModelOptions::VisionMode::kOn
@@ -148,6 +158,11 @@ int main(int argc, char** argv) {
     } else {
       std::fprintf(stderr, "[r4dx-server] loading model %s (layout=%s, --tp 2 --tp-mode %s) ...\n",
                    args.model_path.c_str(), args.layout.c_str(), args.tp_mode.c_str());
+    }
+    if (args.batch > 0) {
+      std::fprintf(stderr, "[r4dx-server] batched decode: --batch %d --batch-ctx %lld%s\n", args.batch,
+                   static_cast<long long>(args.batch_ctx),
+                   args.prompt_checkpoint != "off" ? " (the prompt checkpoint is off in batch mode)" : "");
     }
     engine.LoadAndStart();
     std::fprintf(stderr, "[r4dx-server] model loaded: %s\n", engine.ModelId().c_str());

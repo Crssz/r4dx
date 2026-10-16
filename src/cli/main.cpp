@@ -416,6 +416,12 @@ int RunMain(int argc, char** argv) {
 
   r4dx::model::ModelOptions opts;
   opts.container_path = args.model_path;
+  // qwen4_exp (docs/qwen4exp.md): a container with a trellis payload and no explicit --layout runs the trellis
+  // layout; every other arch and every explicit --layout keeps exactly what was asked for.
+  if (!args.layout_given && r4dx::model::Qwen4ExpDefaultsToTrellis(args.model_path)) {
+    args.layout = "trellis";
+    std::fprintf(stderr, "[r4dx-cli] qwen4_exp container with a trellis payload: --layout defaults to trellis\n");
+  }
   try {
     opts.layout = r4dx::model::LayoutFromName(args.layout);
   } catch (const std::exception& e) {
@@ -467,23 +473,26 @@ int RunMain(int argc, char** argv) {
     r4dx::server::DialectKind k;
     if (r4dx::server::ParseDialectName(args.dialect, &k)) requested_dialect = k;
   }
-  // The container's arch spelling when its header carries `model_arch` (Gemma and LFM2 do): the dialect is
-  // cross-checked by name, as r4dx-server does (src/server/engine.cpp), so no Arch enum value is needed for LFM2.
-  const nlohmann::json container_meta = r4dx::model::ReadContainerMetadata(args.model_path);
-  std::string container_arch_name;
-  if (container_meta.is_object()) {
-    container_arch_name =
-        container_meta.contains("model_arch") && container_meta.at("model_arch").is_string()
-            ? container_meta.at("model_arch").get<std::string>()
-            : std::string(r4dx::model::ArchName(r4dx::model::DetectArchFromMetadata(container_meta)));
-  }
-  const bool container_is_lfm2 = r4dx::server::ArchNameIsLfm2(container_arch_name);
-  const r4dx::server::ModelDialect& dialect = r4dx::server::DialectFor(r4dx::server::ResolveDialectKind(
+  const r4dx::model::Arch container_arch = r4dx::model::DetectArch(args.model_path);
+  const bool container_is_lfm2 = container_arch == r4dx::model::Arch::kLfm2Moe;
+  const r4dx::server::ModelDialect& dialect = r4dx::server::DialectFor(r4dx::server::ResolveDialectKindForArch(
       requested_dialect, args.tokenizer_dir_given ? args.tokenizer_dir : std::string(),
-      !container_is_lfm2 && r4dx::model::DetectArch(args.model_path) == r4dx::model::Arch::kGemma4,
-      container_is_lfm2));
-  if (container_meta.is_object()) {
-    const std::string err = r4dx::server::CheckDialectAgainstArch(dialect, container_arch_name);
+      r4dx::model::ArchName(container_arch)));
+  {
+    const nlohmann::json meta = r4dx::model::ReadContainerMetadata(args.model_path);
+    if (meta.is_object()) {
+      const std::string err = r4dx::server::CheckDialectAgainstArch(
+          dialect, r4dx::model::ArchName(r4dx::model::DetectArchFromMetadata(meta)));
+      if (!err.empty()) {
+        std::fprintf(stderr, "error: %s\n", err.c_str());
+        return 2;
+      }
+    }
+  }
+  // qwen4_exp (docs/qwen4exp.md): refuse what it cannot serve with the precise message, before any model load.
+  if (container_arch == r4dx::model::Arch::kQwen4Exp) {
+    const std::string err = r4dx::server::CheckQwen4ExpFlags(r4dx::server::MakeQwen4ExpFlags(
+        args.tp, args.pp, args.mtp, !args.dflash.empty(), args.vision == "on", !args.image_paths.empty()));
     if (!err.empty()) {
       std::fprintf(stderr, "error: %s\n", err.c_str());
       return 2;
@@ -491,6 +500,13 @@ int RunMain(int argc, char** argv) {
   }
   const std::string tokenizer_dir =
       r4dx::server::ResolveTokenizerDir(dialect, args.tokenizer_dir_given ? args.tokenizer_dir : std::string());
+  {
+    const std::string err = r4dx::server::CheckDefaultTokenizerDir(dialect, tokenizer_dir, args.tokenizer_dir_given);
+    if (!err.empty()) {
+      std::fprintf(stderr, "error: %s\n", err.c_str());
+      return 2;
+    }
+  }
   tok_options.keep_special_on_decode = dialect.keep_special_on_decode;
   r4dx::ChatTemplateOptions tmpl_options;
   tmpl_options.apply_polyfills = dialect.chat_template_polyfills;
@@ -599,7 +615,7 @@ int RunMain(int argc, char** argv) {
   }
   r4dx::ChatJson extra_context = r4dx::ChatJson::object();
   extra_context["enable_thinking"] = args.thinking;
-
+  if (container_arch == r4dx::model::Arch::kQwen4Exp) extra_context["preserve_thinking"] = true;
   std::vector<int32_t> fed_tokens;  // everything already committed to model's KV/GDN state
 
   // Vision (docs/vision.md "Text-side splicing", --image): one entry per TURN that attached at
@@ -710,11 +726,12 @@ int RunMain(int argc, char** argv) {
       // every turn) must not reload: `model = LoadTextModel(...)` keeps the old model resident until the new one
       // is built, i.e. 2 x ~26 GB on a 32 GB card, which Windows pages out (decode fell from ~90 to ~18 tok/s).
       // Reset() drops the per-sequence state (conv state, positions) and keeps the weights.
-      if (args.tp == 1 && dynamic_cast<r4dx::model::PpModel*>(model.get()) == nullptr && !container_is_lfm2) {
+      if (args.tp == 1 && dynamic_cast<r4dx::model::PpModel*>(model.get()) == nullptr && !container_is_lfm2 &&
+          container_arch != r4dx::model::Arch::kQwen4Exp) {
         model = r4dx::model::LoadTextModel(opts, tpo, ppo);
       } else {
         // docs/tp.md 2.8: a second full TP load would need twice the VRAM; Reset() drops the same
-        // per-sequence state without touching a weight.
+        // per-sequence state without touching a weight. qwen4_exp's 50+ GB container is never reloaded either.
         model->Reset();
       }
       new_tokens.assign(full_tokens.begin(), full_tokens.end());
@@ -757,7 +774,25 @@ int RunMain(int argc, char** argv) {
     // see TurnResult::committed_tokens's own comment / docs/mtp.md's "mid-round" gap (fixed here).
     fed_tokens = full_tokens;
     fed_tokens.insert(fed_tokens.end(), r.committed_tokens.begin(), r.committed_tokens.end());
-    messages.push_back({{"role", "assistant"}, {"content", r.generated_text}});
+    r4dx::ChatJson asst_msg = {{"role", "assistant"}, {"content", r.generated_text}};
+    if (container_arch == r4dx::model::Arch::kQwen4Exp) {
+      // qwen4_exp's template wants the thinking block as reasoning_content, not inline in content
+      std::string reasoning_content;
+      std::string content = r.generated_text;
+      constexpr std::string_view kThinkClose = "</think>";
+      const size_t close_pos = content.find(kThinkClose);
+      if (close_pos != std::string::npos) {
+        reasoning_content = content.substr(0, close_pos);
+        size_t answer_start = close_pos + kThinkClose.size();
+        while (answer_start < content.size() && (content[answer_start] == '\n' || content[answer_start] == '\r')) {
+          ++answer_start;
+        }
+        content = content.substr(answer_start);
+        asst_msg["content"] = content;
+        if (!reasoning_content.empty()) asst_msg["reasoning_content"] = reasoning_content;
+      }
+    }
+    messages.push_back(asst_msg);
 
     // --dump-token-ids (docs/validation.md "Rung 4 tooling", cli_args.h's own comment): the exact
     // ids now resident in the model's KV/GDN state, in the Rung 4 tokens.json shared format, so

@@ -142,22 +142,25 @@ LinearTuning FallbackTuning(Layout layout, int64_t N, int64_t K, int64_t M, int 
     return t;
   }
   const int w4a16_group = variant;
-  if (K <= 0 || K % 256 != 0) {
+  // SK = 4 wherever K % 256 == 0 (every Qwen and Gemma shape: their picks are unchanged); a K that is
+  // only a whole number of 128 / 64-K blocks (qwen4_exp's expert down, K = 640) takes SK = 2 / 1, the
+  // largest split the kernels' K % (SK * 64) rule allows. Anything else still throws.
+  if (K <= 0 || K % 64 != 0) {
     throw std::runtime_error("r4dx::model::PickTuning: K=" + std::to_string(K) +
-                              " is not a multiple of 256 (SK=4 * 64, the fallback's rule) -- this "
-                              "model shape was not anticipated, pick a smaller SK");
+                              " is not a multiple of 64 (SK=1 * 64, the fallback's rule) -- this "
+                              "model shape was not anticipated");
   }
   if (N % 16 != 0) {
     throw std::runtime_error("r4dx::model::PickTuning: N=" + std::to_string(N) +
                               " is not a multiple of 16");
   }
-  constexpr int kSk = 4;
-  if (layout == Layout::kW4a16 && K % (kSk * std::max(w4a16_group, 64)) != 0) {
+  const int sk = K % 256 == 0 ? 4 : K % 128 == 0 ? 2 : 1;
+  if (layout == Layout::kW4a16 && K % (sk * std::max(w4a16_group, 64)) != 0) {
     throw std::runtime_error("r4dx::model::PickTuning: K=" + std::to_string(K) +
-                              " does not split into SK=4 whole groups at w4a16 group " +
-                              std::to_string(w4a16_group));
+                              " does not split into SK=" + std::to_string(sk) +
+                              " whole groups at w4a16 group " + std::to_string(w4a16_group));
   }
-  return LinearTuning{/*WV=*/4, /*SK=*/kSk, /*MB=*/1, /*NPW=*/1, /*NT=*/1};
+  return LinearTuning{/*WV=*/4, /*SK=*/sk, /*MB=*/1, /*NPW=*/1, /*NT=*/1};
 }
 
 // r4d_gemm_w4a16_nt_m64_group(): the group the historical entry serves and every row with
@@ -228,7 +231,7 @@ thread_local bool t_tp2_tuning = false;
 // MT) instantiation table -- a copy of libr4d's r4d_tq_max_mt (r4d_gemm_trellis_nt_m64.hip), which
 // must be kept in step with it (the kernel's own check still throws if they drift).
 int TrellisMaxMt(int kb, int np, int u) {
-  if (kb != 4 && kb != 5) return 0;
+  if (kb != 3 && kb != 4 && kb != 5) return 0;
   switch (np) {
     case 1: return u == 1 || u == 2 || u == 4 ? 4 : 0;
     case 2: return u == 1 ? 4 : u == 2 ? 3 : u == 4 ? (kb == 4 ? 3 : 2) : 0;
@@ -365,7 +368,7 @@ LinearTuning PickTuning(Layout layout, int64_t N, int64_t K, int64_t M, int vari
   // served a row resolved under the other setting. Bits 53 and up hold the effective w4a16 group
   // (quant2 Q3; 0 for every other layout, so their keys do not split by it), which is at most 256
   // for any build r4dx configures -- 9 bits, 53..61, clear of the sign bit. A trellis linear's rate
-  // (4 or 5, docs/trellis-kernel.md 5.3) takes the same bits: the layout field already keeps the
+  // (3, 4 or 5, docs/trellis-kernel.md 5.3) takes the same bits: the layout field already keeps the
   // two apart.
   static thread_local std::unordered_map<int64_t, LinearTuning> cache;
   const bool tp2 = t_tp2_tuning;

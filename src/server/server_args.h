@@ -21,10 +21,14 @@ namespace r4dx::server {
 inline constexpr int64_t kMaxMtpDraftK = 63;
 // ... and 7 under --tp 2: src/cli/cli_args.h's kMaxMtpDraftKTp (docs/tp.md Appendix B N80).
 inline constexpr int64_t kMaxMtpDraftKTp = 7;
+// r4dx::model::batch::kMaxSlots (src/model/batch_plan.h): the most batch slots one server can hold.
+inline constexpr int kMaxBatchSlots = 16;
 
 struct ServerArgs {
   std::string model_path;
   std::string layout = "bf16";
+  // --layout given on the command line (a qwen4_exp trellis container otherwise defaults to trellis, docs/qwen4exp.md).
+  bool layout_given = false;
   // Same default as src/cli/cli_args.h: the Huihui abliterated checkpoint dir, whose four tokenizer /
   // chat-template files are byte-identical to the base Qwen3.8-27B's.
   std::string tokenizer_dir = QwenDefaultTokenizerDir();  // dialect.h
@@ -32,7 +36,7 @@ struct ServerArgs {
   // and the engine resolves the default from the dialect (docs/gemma4-plan.md 5.3): Gemma's assembled
   // tokenizer dir, or the Qwen default above (unchanged).
   bool tokenizer_dir_given = false;
-  // --dialect {auto|qwen35|gemma4|lfm2} (docs/gemma4-plan.md 5.3, task M1-14): the per-family text surface
+  // --dialect {auto|qwen35|gemma4|lfm2|qwen4_exp} (docs/gemma4-plan.md 5.3, task M1-14): the per-family text surface
   // (reasoning markers, tool-call syntax, EOS list, BOS on raw prompts). auto reads the tokenizer
   // dir (tokenizer_config.json / vocab), then cross-checks the loaded model's architecture.
   std::string dialect = "auto";
@@ -182,6 +186,17 @@ struct ServerArgs {
   int pp_submit_layers = -1;  // default 32
   int pp_max_inflight = -1;   // default 1
   bool pp_options_given = false;
+
+  // ---- batched decode (docs/batch-decode.md) -------------------------------------------------------------------
+  // --batch N: serve up to N requests at once, one decode forward pass per token for all of them (continuous batching with
+  // serialized prefill). 0 (default) is the one-request-at-a-time server, byte for byte. N in [2, 16] needs a plain Model (no
+  // --mtp, no --dflash), turns the prompt checkpoint and cross-request prefix reuse off (every request prefills on its own and
+  // owns a slot), and works with --tp 2 and the hybrid --tp 2 --pp 2 (decode of the slots runs as TP=2 after the pipelined
+  // prefill). --batch-ctx N: tokens one slot holds (a multiple of 16; default 32768): a longer prompt is refused with a 400;
+  // the slots cost N x batch-ctx x 32 KiB of VRAM at --tp 1, half of that per rank at --tp 2.
+  int batch = 0;
+  int64_t batch_ctx = 32768;
+  bool batch_ctx_given = false;
 };
 
 // Thrown for a malformed/incomplete argument list -- ParseArgs never calls std::exit() itself, so
@@ -194,7 +209,7 @@ struct ServerUsageError : std::runtime_error {
 inline std::string ServerUsageText(const char* argv0) {
   return std::string("usage: ") + argv0 +
          " --model <container.r4dx> --layout {w4a16|bf16|trellis|w8a16} "
-         "[--tokenizer-dir <dir>] [--dialect {auto|qwen35|gemma4|lfm2}] [--host <addr>] [--port N] "
+         "[--tokenizer-dir <dir>] [--dialect {auto|qwen35|gemma4|lfm2|qwen4_exp}] [--host <addr>] [--port N] "
          "[--max-ctx N] [--extended-ctx] "
          "[--max-tokens-default N] [--max-queue N] [--think {on|off}] [--layers N] "
          "[--default-temperature F] [--default-top-p F] [--default-top-k N] "
@@ -207,7 +222,8 @@ inline std::string ServerUsageText(const char* argv0) {
          "[--request-log-tokens] [--tp {1|2}] [--tp-mode {real|emulate|noop}] [--tp-devices a[,b]] [--tp-rank r] "
          "[--tp-ar-timeout-ms N] [--tp-ar-nb N] [--tp-ar-nb-large N] [--tp-submit-layers N] "
          "[--tp-max-inflight K] [--pp {1|2}] [--pp-devices B,A] [--pp-split N|auto] [--pp-min-rows N] [--pp-verify] "
-         "[--pp-submit-layers N] [--pp-max-inflight K] [--hybrid {on|off}] [--hybrid-ctx N|auto] [--hybrid-reserve-gib X]";
+         "[--pp-submit-layers N] [--pp-max-inflight K] [--hybrid {on|off}] [--hybrid-ctx N|auto] [--hybrid-reserve-gib X] "
+         "[--batch N] [--batch-ctx N]";
 }
 
 inline std::string NextServerArg(int argc, char** argv, int& i, const char* flag) {
@@ -300,7 +316,7 @@ inline ServerArgs ParseServerArgs(int argc, char** argv) {
   for (int i = 1; i < argc; ++i) {
     const std::string arg = argv[i];
     if (arg == "--model") a.model_path = NextServerArg(argc, argv, i, "--model");
-    else if (arg == "--layout") a.layout = NextServerArg(argc, argv, i, "--layout");
+    else if (arg == "--layout") { a.layout = NextServerArg(argc, argv, i, "--layout"); a.layout_given = true; }
     else if (arg == "--tokenizer-dir") { a.tokenizer_dir = NextServerArg(argc, argv, i, "--tokenizer-dir"); a.tokenizer_dir_given = true; }
     else if (arg == "--dialect") a.dialect = NextServerArg(argc, argv, i, "--dialect");
     else if (arg == "--extended-ctx") a.extended_ctx = true;
@@ -373,14 +389,17 @@ inline ServerArgs ParseServerArgs(int argc, char** argv) {
       if (!(a.hybrid_reserve_gib >= 0.0) || a.hybrid_reserve_gib > 24.0) throw ServerUsageError("--hybrid-reserve-gib must be in [0, 24]");
       a.hybrid_options_given = true;
     }
+    else if (arg == "--batch") a.batch = ServerParseInt("--batch", NextServerArg(argc, argv, i, "--batch"));
+    else if (arg == "--batch-ctx") { a.batch_ctx = ServerParseI64("--batch-ctx", NextServerArg(argc, argv, i, "--batch-ctx")); a.batch_ctx_given = true; }
     else if (arg == "--help" || arg == "-h") throw ServerUsageError("help requested");
     else throw ServerUsageError("unrecognized argument: " + arg);
   }
   if (a.model_path.empty()) throw ServerUsageError("--model is required");
   if (a.port <= 0 || a.port > 65535) throw ServerUsageError("--port must be in 1..65535");
   if (a.max_ctx <= 0) throw ServerUsageError("--max-ctx must be > 0");
-  if (a.dialect != "auto" && a.dialect != "qwen35" && a.dialect != "gemma4" && a.dialect != "lfm2") {
-    throw ServerUsageError("--dialect must be 'auto', 'qwen35', 'gemma4' or 'lfm2'");
+  if (a.dialect != "auto" && a.dialect != "qwen35" && a.dialect != "gemma4" && a.dialect != "lfm2" &&
+      a.dialect != "qwen4_exp") {
+    throw ServerUsageError("--dialect must be 'auto', 'qwen35', 'gemma4', 'lfm2' or 'qwen4_exp'");
   }
   if (a.request_log_tokens && a.request_log.empty()) {
     throw ServerUsageError("--request-log-tokens needs --request-log <path> (it adds fields to that file)");
@@ -428,6 +447,29 @@ inline ServerArgs ParseServerArgs(int argc, char** argv) {
   if (!a.dflash.empty() && (a.dflash_k < 1 || a.dflash_k > 7)) {
     throw ServerUsageError("--dflash-k must be in [1, 7] (DFlash2's block is 8 wide: anchor + up "
                             "to block_size-1 drafted tokens)");
+  }
+  // ---- batched decode (docs/batch-decode.md) --------------------------------------------------------------------
+  // 0 = off, else 2..16 (one slot is the one-at-a-time server, which --batch 0 already is); the same bound as
+  // r4dx::model::batch::kMaxSlots (src/model/batch_plan.h, HIP-free but not on this header's include path).
+  if (a.batch != 0 && (a.batch < 2 || a.batch > kMaxBatchSlots)) {
+    throw ServerUsageError("--batch must be 0 (off) or in [2, " + std::to_string(kMaxBatchSlots) + "]");
+  }
+  if (a.batch == 0 && a.batch_ctx_given) throw ServerUsageError("--batch-ctx needs --batch N");
+  if (a.batch_ctx < 16 || a.batch_ctx % 16 != 0 || a.batch_ctx > (int64_t{1} << 24)) {
+    throw ServerUsageError("--batch-ctx must be a multiple of 16 (the KV block) in [16, 16777216]");
+  }
+  if (a.batch > 0) {
+    if (a.mtp > 0) throw ServerUsageError("--batch and --mtp cannot be combined (a batched step decodes one plain token per sequence)");
+    if (!a.dflash.empty()) throw ServerUsageError("--batch and --dflash cannot be combined (a batched step decodes one plain token per sequence)");
+    if (a.max_queue < a.batch) {
+      throw ServerUsageError("--max-queue must be >= --batch (" + std::to_string(a.batch) + "): the queue feeds the slots");
+    }
+  }
+  // Under TP a step is never split into device-0 submission units (tp_submit.h's kMaxUnsplitDraftK, docs/tp.md Appendix B N80: at most 8
+  // rows), and a batched step has one row per slot.
+  if (a.batch > 8 && a.tp == 2) {
+    throw ServerUsageError("--batch must be at most 8 with --tp 2 (a decode step is not split into device-0 submission units, so it stays at "
+                           "most 8 rows; docs/tp.md Appendix B N80)");
   }
   // ---- tensor parallel (docs/tp.md 9.1): src/cli/cli_args.h's rules, minus --profile* (the server
   // has no profiling flags) ------------------------------------------------------------------------

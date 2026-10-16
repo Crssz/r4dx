@@ -147,6 +147,25 @@ inline int PrefillSplitKvMinOverride() {
   return v;
 }
 
+// Batched decode (docs/batch-decode.md 3.2): `rows` sequences, ONE decode token each, whose K/V live in one shared
+// PagedKvCache (slot s owns cache positions [s * slot_ctx, (s + 1) * slot_ctx)). Passed as AttentionLayer::Forward's
+// last argument; Forward then takes T == rows, `positions` as the per-row ROPE position (the KV slot differs from it,
+// so the fused precore launch -- which uses one array for both -- is not taken), and runs the attention core as one
+// plain num_seqs = 1 / q_len = 1 decode launch per row against that row's slice of the cache's identity block
+// table: the launch the single-sequence decode makes, byte for byte, so a row's attention output equals what a
+// sequence decoded alone would get. Every row-independent op (norms, the projections, the gate, the residual) sees
+// all the rows in one launch.
+struct AttnBatchView {
+  int rows = 0;
+  const int32_t* slot_mapping = nullptr;  // device int32[rows]: the KV write slot of row r (slot * slot_ctx + position)
+  const int32_t* seqused_k = nullptr;     // device int32[rows]: row r's key count (position + 1)
+  const int* row_slot = nullptr;          // HOST int[rows]: row r's batch slot (selects its block-table row)
+  int blocks_per_slot = 0;                // slot_ctx / block size: R4DArgs::max_blocks of every launch
+  int split_max_ctx = 0;                  // R4DArgs::max_ctx of every launch: the split-KV law's context bound. Pass the
+                                          // single-sequence cache's CapacityTokens() and a row takes the split count
+                                          // (so the reduction order) a lone decode of that Model takes
+};
+
 class AttentionLayer {
  public:
   explicit AttentionLayer(const AttnConfig& cfg) : cfg_(cfg) {
@@ -215,7 +234,7 @@ class AttentionLayer {
                const void* x_normed_pre_data = nullptr, int next_epilogue = 0,
                void* next_epilogue_out = nullptr, const int32_t* rope_pos3 = nullptr,
                bool prefill_split_kv = false, int attn_slice = 0,
-               const int32_t* seqused_k_slices = nullptr) {
+               const int32_t* seqused_k_slices = nullptr, const AttnBatchView* batch = nullptr) {
     // `attn_slice` (256-row prefill chunk, Model's R4DX_PREFILL_CHUNK=256, docs/trellis-m256.md): 0 --
     // the default, every caller before it -- is the T = 1..64 call as always. 64: T is a multiple of 64
     // (up to 256) and everything row-independent (norms, the linears, split_qg, qk-norm, rope, the KV
@@ -226,6 +245,17 @@ class AttentionLayer {
     // sub-slices' rows from it, so the bytes equal T / 64 consecutive 64-row calls.
     // `seqused_k_slices`: device int32 [T / 64], entry j = start_pos + 64 (j + 1), the caller's persistent
     // buffer like `seqused_k`. `positions` then has T entries.
+    // `batch` (batched decode, AttnBatchView above): T == batch->rows decode rows of different sequences. `kv` is the
+    // shared batch cache, `positions` the per-row rope positions, `start_pos` / `seqused_k` / `seqused_k_slices` are
+    // ignored (the view carries each row's own), and it excludes the sliced and the prompt-prefill paths.
+    if (batch != nullptr &&
+        (batch->rows != T || T < 1 || T > 64 || attn_slice != 0 || prefill_split_kv || batch->slot_mapping == nullptr ||
+         batch->seqused_k == nullptr || batch->row_slot == nullptr || batch->blocks_per_slot < 1 ||
+         batch->split_max_ctx < 1)) {
+      throw std::invalid_argument(
+          "AttentionLayer::Forward: a batch view needs T == rows in 1..64, no slicing / prefill split, and every "
+          "view field set");
+    }
     const bool sliced = attn_slice > 0 && T > attn_slice;
     if (sliced) {
       if (attn_slice != 64 || T % 64 != 0 || T > 256 || seqused_k_slices == nullptr) {
@@ -237,7 +267,7 @@ class AttentionLayer {
       throw std::invalid_argument(
           "AttentionLayer::Forward: T must be 1..64 (interim skinny-GEMM/paged-attention band)");
     }
-    kv.CheckCapacity(start_pos, T);
+    if (batch == nullptr) kv.CheckCapacity(start_pos, T);
 
     const int hidden = cfg_.hidden;
     const int H = cfg_.num_heads;
@@ -320,7 +350,7 @@ class AttentionLayer {
     // rope path (no image in the prompt) wherever the replaced norm kernel took its vector path.
     // R4DX_DECODE_LEGACY=attn keeps the five launches.
     const bool precore_fused =
-        rope_pos3 == nullptr && !core::DecodeLegacy(core::DecodeItem::kAttn) &&
+        batch == nullptr && rope_pos3 == nullptr && !core::DecodeLegacy(core::DecodeItem::kAttn) &&
         r4dx_attn_precore_supported(D, cfg_.rotary_dim, reinterpret_cast<int64_t>(qg_raw),
                                      reinterpret_cast<int64_t>(k), reinterpret_cast<int64_t>(w.q_norm),
                                      reinterpret_cast<int64_t>(w.k_norm), reinterpret_cast<int64_t>(q),
@@ -400,7 +430,8 @@ class AttentionLayer {
     if (!precore_fused) ProfiledCall(prof, stream, "attn.kv_write", [&] {
       r4dx_kv_write_paged_fp8_hnd(
           reinterpret_cast<int64_t>(k), reinterpret_cast<int64_t>(v),
-          reinterpret_cast<int64_t>(positions), reinterpret_cast<int64_t>(w.k_descale),
+          reinterpret_cast<int64_t>(batch != nullptr ? batch->slot_mapping : positions),
+          reinterpret_cast<int64_t>(w.k_descale),
           reinterpret_cast<int64_t>(w.v_descale), reinterpret_cast<int64_t>(kv.Data()), T, Hkv, D,
           kv.BlockSize(), kv.KvBlockStride(), kv.KvHeadStride(), reinterpret_cast<int64_t>(stream));
     });
@@ -434,7 +465,26 @@ class AttentionLayer {
     a.max_ctx = kv.CapacityTokens();
 
     const int max_decode_q_len = 64 / gqa;  // r4d.h A_MAX_DECODE_ROWS=64 (q_len*gqa)
-    if (T <= max_decode_q_len) {
+    if (batch != nullptr) {
+      // Batched decode: one plain single-row decode launch per sequence (AttnBatchView's comment). Every launch has
+      // the same shape, so one scratch serves them all (stream order serialises its use).
+      a.num_seqs = 1;
+      a.q_len = 1;
+      a.max_blocks = batch->blocks_per_slot;
+      a.max_ctx = batch->split_max_ctx;
+      const int64_t scratch_bytes = r4dx::core::r4d::AttnDecodeScratchBytes(a);
+      a.scratch = scratch_bytes > 0
+                      ? arena.Alloc<uint8_t>(static_cast<size_t>(scratch_bytes), /*align_bytes=*/16)
+                      : nullptr;
+      for (int r = 0; r < T; ++r) {
+        a.q = q + static_cast<size_t>(r) * H * D;
+        a.out = attn_out + static_cast<size_t>(r) * H * D;
+        a.seqused_k = batch->seqused_k + r;
+        a.block_table = kv.BlockTable() + static_cast<size_t>(batch->row_slot[r]) * batch->blocks_per_slot;
+        ProfiledCall(prof, stream, "attn.core_decode",
+                     [&] { r4dx::core::r4d::AttnDecodeFp8Kv(a, stream); });
+      }
+    } else if (T <= max_decode_q_len) {
       const int64_t scratch_bytes = r4dx::core::r4d::AttnDecodeScratchBytes(a);
       // align_bytes=16 (review finding, 2026-09-20): this feeds third_party/libr4d's own attention
       // decode kernel, which reads it with wide (16-byte) vector loads -- same alignment the P2

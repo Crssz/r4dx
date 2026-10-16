@@ -22,7 +22,7 @@
 //             numbers are medians of per-round values and the ratios are medians of per-round ratios.
 //
 // Build: tests/kernels/build_int8_gemm_proto.ps1 (hipcc; links the shipped r4d_gemm_trellis_nt_m256 unit).
-//   tool_int8_gemm_proto.exe [--mode all|probe|selftest|verify|time] [--shape gate_up|down|qkv|z|out|qg|kv|all]
+//   tool_int8_gemm_proto.exe [--mode all|probe|chains|selftest|verify|time] [--shape gate_up|down|qkv|z|out|qg|kv|all]
 //                            [--kb 4|5|both] [--rounds 11] [--batch 6] [--quick] [--noverify] [--no-resc]
 //                            [--simds 128] [--verbose] [--out x.json] [--emit-rows src/model/gemm_tuning_table_trellis_i8.inc]
 //                            [--no-coarse] [--emit-rows-coarse src/model/gemm_tuning_table_trellis_i8c.inc] [--tp 1|2]
@@ -150,6 +150,67 @@ __global__ __launch_bounds__(256) void ProbeKernel(float* sink, unsigned long lo
     clk[blockIdx.x * 2 + 1] = w1 - w0;
   }
   if (s == 1234.5f) sink[blockIdx.x * 256 + threadIdx.x] = s;
+}
+
+static double Median(std::vector<double> v);
+
+// iu8 with CH independent accumulator chains per wave (the production kernel's pass runs 2): how much of the probe's
+// peak a wave reaches when each WMMA waits on the previous one of its chain, at a given number of resident waves
+template <int CH>
+__global__ __launch_bounds__(256) void ProbeChainsKernel(float* sink, int iters) {
+  const unsigned lane = threadIdx.x & 31, seed = blockIdx.x * 977u + (threadIdx.x >> 5) * 31u;
+  const pv2i a = {(int)(0x01020304u ^ lane), (int)(0x05060708u ^ seed)}, b = {(int)(0x01010101u ^ seed), (int)(0x7F7F0101u ^ lane)};
+  pv8i acc[CH];
+#pragma unroll
+  for (int j = 0; j < CH; ++j) acc[j] = (pv8i)(0);
+  for (int it = 0; it < iters; ++it)
+#pragma unroll
+    for (int j = 0; j < CH; ++j) acc[j] = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32_gfx12(true, a, true, b, acc[j], false);
+  float s = 0.f;
+#pragma unroll
+  for (int j = 0; j < CH; ++j) s += (float)(acc[j][0] + acc[j][7]);
+  if (s == 1234.5f) sink[blockIdx.x * 256 + threadIdx.x] = s;
+}
+
+static void RunProbeChains(const hipDeviceProp_t& prop, int simds, int reps) {
+  const int mp = prop.multiProcessorCount;
+  float* sink;
+  CK(hipMalloc(&sink, (size_t)32 * mp * 256 * 4));
+  hipEvent_t e0, e1;
+  CK(hipEventCreate(&e0));
+  CK(hipEventCreate(&e1));
+  std::printf("== probe chains: iu8 WMMA TOPS by independent chains per wave (rows) and waves per SIMD (columns), %d simds assumed ==\n", simds);
+  const int wps[] = {1, 2, 4, 8, 16};
+  std::printf("  chains ");
+  for (int w : wps) std::printf("  %5d w/SIMD", w);
+  std::printf("\n");
+  auto row = [&](int ch, auto kernel) {
+    std::printf("  %6d ", ch);
+    for (int w : wps) {
+      const int grid = std::max(1, simds * w / 8);   // 8 waves per block
+      const int iters = 320000 / ch / (w < 4 ? 1 : w / 2);
+      std::vector<double> tops;
+      for (int rep = 0; rep < reps + 1; ++rep) {
+        CK(hipEventRecord(e0, 0));
+        hipLaunchKernelGGL(kernel, dim3(grid), dim3(256), 0, 0, sink, iters);
+        CK(hipEventRecord(e1, 0));
+        CK(hipEventSynchronize(e1));
+        if (rep == 0) continue;
+        float ms = 0;
+        CK(hipEventElapsedTime(&ms, e0, e1));
+        tops.push_back((double)grid * 8 * iters * ch * 8192.0 / (ms * 1e-3) / 1e12);
+      }
+      std::printf("  %8.1f TOPS", Median(tops));
+    }
+    std::printf("\n");
+  };
+  row(1, ProbeChainsKernel<1>);
+  row(2, ProbeChainsKernel<2>);
+  row(4, ProbeChainsKernel<4>);
+  row(8, ProbeChainsKernel<8>);
+  CK(hipEventDestroy(e0));
+  CK(hipEventDestroy(e1));
+  CK(hipFree(sink));
 }
 
 static double Median(std::vector<double> v) {
@@ -1258,6 +1319,7 @@ static int RealMain(int argc, char** argv) {
   const bool do_verify = (mode == "all" || mode == "verify" || mode == "time") && !noverify;
   const bool do_time = mode == "all" || mode == "time";
   const bool do_shapes = mode == "all" || mode == "verify" || mode == "time";
+  if (mode == "chains") RunProbeChains(prop, simds, quick ? 3 : 5);
   if (do_probe) {
     RunProbe(prop, simds, quick ? 3 : 5);
     if (json)

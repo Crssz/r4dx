@@ -137,6 +137,11 @@ __global__ __launch_bounds__(1024) void w8a16_gemm_nt_m64_kernel(
       for (int j = 0; j < NPW; j++) sc[j] = __half2float(__ushort_as_half(ps[j][(size_t)g * 16]));
 
       v8f g_acc[NPW][MT];
+      // The group's bpg blocks fully unrolled (all their loads in flight at once), the first WMMA with an
+      // inline zero C: w4a16's loop. VGPR note (hipcc -S, 1024-thread cap = 192 VGPRs): no spills up to
+      // MT*NPW = 4 and at MT 2 NPW 4; MT 3/4 with NPW 4 spill (G 64: 5 / 53 VGPRs, like w4a16's 3 / 54;
+      // G 128: 100 / 201) because the two accumulator sets alone are 16*MT*NPW VGPRs. Rolling the blocks or
+      // fencing the schedule was tried and spilled more; the tuning sweep decides whether those tiles are used.
 #pragma unroll
       for (int b = 0; b < bpg; b++) {
         uint4v wv[NPW];

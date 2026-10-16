@@ -661,8 +661,7 @@ The loader refuses an unknown `version`, `code` or `fragment_permutation`, an un
 than 12. `--layout w8a16` on a container without the block is refused before any upload. There is no per-linear `groups`
 map: one group per container.
 
-**TP.** Row tiles are contiguous and K blocks fixed-size, so the layout slices by rows and by K, but `--layout w8a16` at
-TP=2 is refused in v1 (docs/w8a16.md "Deviations").
+**TP.** Row tiles are contiguous and K blocks fixed-size, so the layout slices by rows and by K (tp::Part::kW8Wq / kW8a16Ws); `--layout w8a16` runs at TP=2 on LFM2 (docs/w8a16.md "TP=2").
 
 **Sizes.** LFM2.5-24B-A2B at g128 with `--layouts w8a16 --no-bf16`: 10,146 tensors, 24,875,687,936 planned data bytes
 (24.88 GB); 187,236,352 groups, 153,184 of them zero groups (0.0818 %).

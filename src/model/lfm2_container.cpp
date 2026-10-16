@@ -41,7 +41,7 @@ Lfm2Container Lfm2Container::Load(const std::string& path, const Lfm2LoadOptions
   }
   // docs/w8a16.md 6.1 / 6.3: `--layout w8a16` needs the block (rule 1: a bf16 container never loads on one card
   // this way), a format this build's kernel reads (rule 2), and TP=1 (v1). A no-op for any other layout.
-  meta.w8a16 = CheckW8a16Choice(metadata, path, o.layout, o.lm_head_layout, Layout::kBf16, o.tp_world);
+  meta.w8a16 = CheckW8a16Choice(metadata, path, o.layout, o.lm_head_layout, Layout::kBf16);  // LFM2 shards w8a16 (tp_world is not a refusal here)
 
   SafetensorsReader reader(Utf8ToWide(path));
   CheckW4a16GroupTensors(reader, meta.w4a16.groups, path);

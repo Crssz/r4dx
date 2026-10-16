@@ -34,6 +34,8 @@ inline uint64_t PartBytes(const tp::PartShape& s) {
     case tp::Part::kBf16: return N * K * 2;
     case tp::Part::kW4Wq: return N * K / 2;
     case tp::Part::kW4a16Wsz: return N * (K / static_cast<uint64_t>(s.group)) * 4;
+    case tp::Part::kW8Wq: return N * K;
+    case tp::Part::kW8a16Ws: return N * (K / static_cast<uint64_t>(s.group)) * 2;
     case tp::Part::kElem: return N * static_cast<uint64_t>(s.row_bytes);
     case tp::Part::kTrellisW: return N * K * static_cast<uint64_t>(s.rate) / 8;
   }
@@ -176,12 +178,21 @@ class ShardLoader {
       case Layout::kTrellis:
         TrellisSlice(q, base, rule, rows, cols, N, K);
         break;
-      case Layout::kW8a16:
-        // docs/w8a16.md 6.2: the w8a16 shard parts (PlanRows / PlanCols over 16-row tiles and whole groups)
-        // are not part of v1; every loader refuses w8a16 at TP=2 up front (CheckW8a16Choice), so this is the
-        // second line.
-        throw std::invalid_argument("r4dx::model::Container: '" + base +
-                                    "' requested as w8a16 under tensor parallelism -- w8a16 runs at TP=1 only (v1)");
+      case Layout::kW8a16: {
+        // docs/w8a16.md 6.2: wq slices by whole 16-row tiles / 32-K blocks, ws by whole tiles / groups; the rank's
+        // ranges are whole 128-K groups (docs/w8a16.md 3.3), checked by PlanRows / PlanCols.
+        if (!meta_.w8a16) {
+          throw std::logic_error("r4dx::model::Container: '" + base + "' read as w8a16 without a checked "
+                                 "__metadata__.quant.w8a16 (CheckW8a16Choice)");
+        }
+        const int group = meta_.w8a16->group;
+        CheckW8a16Shape(r_, base, N, K, group);
+        q.w8a16_group = group;
+        q.w8_wq = Part<uint8_t>(base + r4dx_convert::w8a16::kWqSuffix, shape(tp::Part::kW8Wq, group), rule, rows, cols);
+        q.w8_ws = Part<uint16_t>(base + r4dx_convert::w8a16::kWsSuffix, shape(tp::Part::kW8a16Ws, group), rule, rows,
+                                 cols);
+        break;
+      }
     }
     return q;
   }

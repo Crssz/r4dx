@@ -35,6 +35,7 @@
 #include <vector>
 
 #include "r4dx_convert/quant_int4.hpp"
+#include "r4dx_convert/quant_int8.hpp"
 #include "r4dx_convert/quant_search.hpp"
 #include "r4dx_convert/tensor_codec.hpp"
 #include "r4dx_convert/trellis_import.hpp"  // RegridToPairGrid: the trellis packer (7. below)
@@ -113,7 +114,7 @@ ModelConfig SmallConfig() {
 
 // ---- layouts: the converter's packers -----------------------------------------------------------
 
-enum class Scheme { kBf16, kW4a16, kW4a16Search };
+enum class Scheme { kBf16, kW4a16, kW4a16Search, kW8a16 };
 struct Variant {
   const char* name;
   Scheme scheme;
@@ -127,6 +128,8 @@ const Variant kVariants[] = {
     {"w4a16 search+imatrix g32", Scheme::kW4a16Search, 32},
     {"w4a16 g64", Scheme::kW4a16, 64},
     {"w4a16 search+imatrix g64", Scheme::kW4a16Search, 64},
+{"w8a16 g128", Scheme::kW8a16, 128},
+{"w8a16 g64", Scheme::kW8a16, 64},
 };
 
 struct PackedPart {
@@ -135,6 +138,11 @@ struct PackedPart {
   std::vector<uint8_t> bytes;
 };
 
+std::vector<uint8_t> AsBytes(const std::vector<uint16_t>& v) {
+  std::vector<uint8_t> b(v.size() * 2);
+  std::memcpy(b.data(), v.data(), b.size());
+  return b;
+}
 std::vector<uint8_t> AsBytes(const std::vector<uint32_t>& v) {
   std::vector<uint8_t> b(v.size() * 4);
   std::memcpy(b.data(), v.data(), b.size());
@@ -145,6 +153,7 @@ std::vector<uint8_t> AsBytes(const std::vector<uint32_t>& v) {
 bool Packable(const Variant& v, int64_t N, int64_t K) {
   if (v.scheme == Scheme::kBf16) return true;
   if (N % 16 != 0) return false;
+  if (v.scheme == Scheme::kW8a16) return K % 32 == 0 && K % v.group == 0;
   return K % 64 == 0 && K % v.group == 0;
 }
 
@@ -159,6 +168,15 @@ std::vector<PackedPart> Pack(const Variant& v, const std::vector<float>& w, int 
     case Scheme::kBf16:
       out.push_back({Part::kBf16, 0, EncodeBf16(w)});
       break;
+    case Scheme::kW8a16: {
+      std::vector<uint8_t> q;
+      std::vector<uint16_t> s16;
+      QuantizeInt8Symmetric(w.data(), N, K, v.group, kThreads, q, s16);
+      out.push_back({Part::kW8Wq, v.group, PackW8Bytes(q, N, K, kThreads)});
+      const std::vector<uint16_t> ws = PackW8a16Scales(s16, N, K, v.group);
+      out.push_back({Part::kW8a16Ws, v.group, AsBytes(ws)});
+      break;
+    }
     case Scheme::kW4a16:
     case Scheme::kW4a16Search: {
       std::vector<uint8_t> q, zero;
@@ -182,6 +200,8 @@ int64_t ColAlign(const PackedPart& p) {
   switch (p.part) {
     case Part::kW4Wq: return 64;
     case Part::kW4a16Wsz: return p.group;
+    case Part::kW8Wq: return p.group;  // whole groups keep whole 32-K blocks
+    case Part::kW8a16Ws: return p.group;
     default: return 1;
   }
 }
@@ -922,9 +942,10 @@ void TestDesignCases() {
   // group any layout uses; the slicer takes any) cannot split there.
   {
     const auto w = RandomW(64, 2176, 24);
-    Check(CheckColSlice("10.2 N=64 K=2176 (rank K 17x64)", w, 64, 2176, {0, 1088}) == 0 &&
-              CheckColSlice("10.2 N=64 K=2176 (rank K 17x64)", w, 64, 2176, {1088, 1088}) == 0,
-          "10.2 rank K 17 x 64: every layout splits");
+    // w8a16 g128 is the one layout that cannot: 1088 is not whole 128-groups (docs/w8a16.md 3.3), so it is refused.
+    Check(CheckColSlice("10.2 N=64 K=2176 (rank K 17x64)", w, 64, 2176, {0, 1088}) == 1 &&
+              CheckColSlice("10.2 N=64 K=2176 (rank K 17x64)", w, 64, 2176, {1088, 1088}) == 1,
+          "10.2 rank K 17 x 64: every layout splits except w8a16 g128");
     Check(Throws([&] { PlanCols({Part::kW4a16Wsz, 64, 2176, 128, 0}, {0, 1088}); }) &&
               Throws([&] { PlanCols({Part::kW4a16Wsz, 64, 2176, 128, 0}, {1088, 1088}); }),
           "10.2: a 17 x 64 rank K cannot split a group-128 scale tensor");

@@ -78,11 +78,15 @@ enum class Part {
   // per pair row. Every range must be whole 128-blocks (both Hadamards work in 128-blocks), which
   // also makes it whole tile pairs. The trellis suh / svh scale vectors are kElem parts.
   kTrellisW,
+  // w8a16 (docs/w8a16.md 3.2, 6.2): wq = offset-binary codes in 512 B blocks per (16-row tile, 32-K block), so a row tile
+  // is one contiguous run of 16*K bytes; ws = u16 per (tile, group, row), 32 B per (tile, group).
+  kW8Wq,
+  kW8a16Ws,
 };
 struct PartShape {
   Part part = Part::kBf16;
   int64_t N = 0, K = 0;   // the FULL logical W[N, K] the part belongs to (kElem: N rows, K unused)
-  int group = 0;          // kW4a16Wsz: the w4a16 group the scales are cut at
+  int group = 0;          // kW4a16Wsz / kW8a16Ws: the group the scales are cut at
   int64_t row_bytes = 0;  // kElem only: bytes per row (8 for conv1d_weight, 4 for fp32 vectors)
   int rate = 0;           // kTrellisW only: trellis bits per weight (KB)
 };

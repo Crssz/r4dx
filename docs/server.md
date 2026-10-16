@@ -1320,7 +1320,7 @@ slot. See docs/batch-decode.md (including its validation status).
 `--tp 2` (default 1) and the `--tp-*` flags: tensor parallel across two ranks, the same flags,
 defaults, ranges and usage errors as `r4dx-cli`'s (docs/tp.md 9.1); see "Tensor parallel" below.
 
-`--layout w8a16` (symmetric int8 weights with f16 group scales, docs/w8a16.md) needs a container converted with `--layouts w8a16`; it is **TP=1 only** (`--tp 2` with it is refused) and a container without the `quant.w8a16` metadata block is refused before any upload. Measured on LFM2.5-24B-A2B: 88.7 tok/s decode on one GPU, `tools\server\smoke.ps1 -Layout w8a16 -Tp 1 -Dialect lfm2` 75 checks pass (docs/lfm2.md "8-bit (one GPU)").
+`--layout w8a16` (symmetric int8 weights with f16 group scales, docs/w8a16.md) needs a container converted with `--layouts w8a16`; it runs at TP=1 and, for LFM2, TP=2 (docs/w8a16.md "TP=2 outcome"; Qwen and Gemma still refuse `--tp 2` with it), and a container without the `quant.w8a16` metadata block is refused before any upload. Measured on LFM2.5-24B-A2B: 88.7 tok/s decode on one GPU, `tools\server\smoke.ps1 -Layout w8a16 -Tp 1 -Dialect lfm2` 75 checks pass (docs/lfm2.md "8-bit (one GPU)").
 
 `--pp 2` and the `--pp-*` flags (off by default; `R4DX_PP=1` when `--pp` is not given): prompt prefill as a two-stage pipeline
 across both GPUs with decode unchanged on the headless card -- needs both cards visible (`HIP_VISIBLE_DEVICES` unset), excludes

@@ -23,7 +23,7 @@ bool HasLayoutSuffix(const std::string& base) {
   const size_t begin = prev == std::string::npos ? 0 : prev + 1;
   const std::string layout = base.substr(begin, last - begin);
   return layout == "bf16" || layout == "w4a16" || layout == "w4a8" || layout == "mxfp4" ||
-         layout == "trellis";
+         layout == "trellis" || layout == "w8a16";
 }
 
 ShardRule Replicate() { return ShardRule{}; }
@@ -239,6 +239,8 @@ const char* PartName(Part p) {
     case Part::kW4a16Wsz: return "w4a16 wsz";
     case Part::kElem: return "elem";
     case Part::kTrellisW: return "trellis w";
+    case Part::kW8Wq: return "w8 wq";
+    case Part::kW8a16Ws: return "w8a16 ws";
   }
   return "?";
 }
@@ -250,7 +252,7 @@ constexpr int64_t kTrellisAlign = 128;
 int64_t TrellisBlockBytes(const PartShape& sh) { return 64 * static_cast<int64_t>(sh.rate); }
 
 bool IsTilePart(Part p) {
-  return p == Part::kW4Wq || p == Part::kW4a16Wsz;
+  return p == Part::kW4Wq || p == Part::kW4a16Wsz || p == Part::kW8Wq || p == Part::kW8a16Ws;
 }
 
 void RequireDiv(const char* fn, const PartShape& sh, const char* what, int64_t value,
@@ -276,6 +278,14 @@ void CheckShape(const char* fn, const PartShape& sh) {
       RequireDiv(fn, sh, "K", sh.K, 64);
       break;
     case Part::kW4a16Wsz:
+      RequireDiv(fn, sh, "N", sh.N, 16);
+      RequireDiv(fn, sh, "K", sh.K, sh.group);
+      break;
+    case Part::kW8Wq:
+      RequireDiv(fn, sh, "N", sh.N, 16);
+      RequireDiv(fn, sh, "K", sh.K, 32);
+      break;
+    case Part::kW8a16Ws:
       RequireDiv(fn, sh, "N", sh.N, 16);
       RequireDiv(fn, sh, "K", sh.K, sh.group);
       break;
@@ -455,6 +465,12 @@ std::vector<ByteRun> PlanRows(const PartShape& sh, const std::vector<Range>& row
       case Part::kW4a16Wsz:  // (t, g, r) dwords, K/g per row, tile-major
         Append(runs, a * (K / sh.group) * 4, n * (K / sh.group) * 4);
         break;
+      case Part::kW8Wq:  // 16*K bytes per row tile: rows [a, a+n) are one byte range
+        Append(runs, a * K, n * K);
+        break;
+      case Part::kW8a16Ws:  // 32 B per (tile, group): K/group * 2 bytes per row
+        Append(runs, a * (K / sh.group) * 2, n * (K / sh.group) * 2);
+        break;
       case Part::kElem:
         Append(runs, a * sh.row_bytes, n * sh.row_bytes);
         break;
@@ -476,6 +492,8 @@ std::vector<ByteRun> PlanCols(const PartShape& sh, Range cols) {
   switch (sh.part) {
     case Part::kW4Wq: align = 64; break;
     case Part::kW4a16Wsz: align = sh.group; break;
+    case Part::kW8Wq: align = sh.group > 0 ? sh.group : 32; break;
+    case Part::kW8a16Ws: align = sh.group; break;
     case Part::kTrellisW: align = kTrellisAlign; break;
     default: break;
   }
@@ -499,6 +517,18 @@ std::vector<ByteRun> PlanCols(const PartShape& sh, Range cols) {
       const int64_t g = sh.group;
       for (int64_t t = 0; t < N / 16; ++t) {
         Append(runs, (t * (K / g) + k0 / g) * 16 * 4, (k / g) * 16 * 4);
+      }
+      break;
+    }
+    case Part::kW8Wq:  // 512 B per (tile, 32-K block)
+      for (int64_t t = 0; t < N / 16; ++t) {
+        Append(runs, (t * (K / 32) + k0 / 32) * 512, (k / 32) * 512);
+      }
+      break;
+    case Part::kW8a16Ws: {  // 32 B per (tile, group)
+      const int64_t g = sh.group;
+      for (int64_t t = 0; t < N / 16; ++t) {
+        Append(runs, (t * (K / g) + k0 / g) * 32, (k / g) * 32);
       }
       break;
     }

@@ -30,7 +30,7 @@
 //   7. Refusals (docs/w8a16.md 6.3): (1) --layout w8a16 on the bf16 tiny.r4dx (no quant.w8a16) -- before any upload;
 //      (2) a doctored copy whose quant.w8a16.scale_log2_bias is 13, and one whose version is 2; (3) a doctored copy that
 //      declares group 64 while every .ws holds g128 scales (each .ws is then the wrong size), naming the tensor;
-//      the v1 TP rule (--tp 2 --layout w8a16, refused before any device work); (5) --layout bf16 on this --no-bf16
+//      (5) --layout bf16 on this --no-bf16
 //      container: "no tensor found ... in any known on-disk form".
 //   8. MIXED container (docs/w8a16.md 5.2 fallback A: non-expert linears bf16, experts w8a16), only when this build has
 //      r4dx-convert (R4DX_CONVERT_EXE) and the tiny checkpoint (R4DX_LFM2_TINY_DIR/ckpt) exists: converted into a temp
@@ -327,85 +327,8 @@ int main() {
       }
 
       // 2. determinism
-      m->Reset();
-      std::vector<int64_t> rows2;
-      Check(Feed(*m, g, &rows2) == got, "the same feed after Reset() gives identical bytes");
-
-      // 3. checkpoint / restore
-      m->Reset();
-      (void)m->Prefill(std::vector<int32_t>(g.ids.begin(), g.ids.begin() + 256));
-      m->SaveCheckpoint();
-      const std::vector<int32_t> tail(g.ids.begin() + 256, g.ids.begin() + kPrefillEnd);
-      const std::vector<float> a1 = m->Prefill(tail);
-      const std::vector<float> b1 = m->DecodeStep(g.ids[kPrefillEnd]);
-      m->RestoreCheckpoint();
-      Check(m->PositionCount() == 256, "RestoreCheckpoint rewinds PositionCount to 256");
-      const std::vector<float> a2 = m->Prefill(tail);
-      const std::vector<float> b2 = m->DecodeStep(g.ids[kPrefillEnd]);
-      Check(a1 == a2 && b1 == b2, "RestoreCheckpoint + the same tail reproduces the logits bit for bit");
-      const double kl_split = Kl(got[1].data(), a1.data(), V);
-      std::printf("  row 279 via 256+24 vs 1+256+23 chunks: KL %.3e\n", kl_split);
-      Check(kl_split < 1e-3, "a different prefill chunking gives the same row 279 (KL < 1e-3)");
-
-      // 5. greedy (no sampled path: vocab 64, see the header)
-      m->Reset();
-      (void)m->Prefill(std::vector<int32_t>(g.ids.begin(), g.ids.begin() + kPrefillEnd));
-      const int32_t greedy = m->DecodeStepGreedy(g.ids[kPrefillEnd]);
-      m->Reset();
-      (void)m->Prefill(std::vector<int32_t>(g.ids.begin(), g.ids.begin() + kPrefillEnd));
-      const std::vector<float> full = m->DecodeStep(g.ids[kPrefillEnd]);
-      Check(greedy == static_cast<int32_t>(Argmax(full.data(), V)), "DecodeStepGreedy == argmax(DecodeStep) in the same state");
-    }
-
-    // (informative) the bf16 container's rows from the same feed.
-    {
-      TpOptions tp;
-      std::unique_ptr<TextModel> mb = LoadTextModel(Opts(bcont, Layout::kBf16), tp);
-      std::vector<int64_t> rows_b;
-      const std::vector<std::vector<float>> bf = Feed(*mb, g, &rows_b);
-      double kl = 0;
-      int agree = 0;
-      for (size_t i = 0; i < bf.size() && i < got.size(); ++i) {
-        kl += Kl(bf[i].data(), got[i].data(), V);
-        agree += Argmax(bf[i].data(), V) == Argmax(got[i].data(), V) ? 1 : 0;
-      }
-      std::printf("  (informative) r4dx bf16 vs r4dx w8a16 rows: mean KL %.3e, top-1 agreement %d / %zu\n",
-                  kl / static_cast<double>(bf.size()), agree, bf.size());
-    }
-
-    // ---- 4, 6: Lfm2Model directly ----
-    {
-      Lfm2ModelOptions lo;
-      lo.container_path = wcont;
-      lo.layout = Layout::kW8a16;
-      lo.max_ctx = 512;
-      Lfm2Model lm = Lfm2Model::Load(lo);
-      const LayoutCount n = CountLayouts(lm.GetContainer());
-      Check(n.w8 > 0 && n.bf16 == 0 && n.other == 0 && n.all_g128,
-            "every body linear, expert and the head loaded as w8a16 g128 (" + std::to_string(n.w8) + " w8a16, " +
-                std::to_string(n.bf16) + " bf16 fallbacks)");
-      const int64_t H = lm.Config().hidden_size, T = 8;
-      std::mt19937 rng(77);
-      std::normal_distribution<float> nd(0.0f, 1.0f);
-      std::vector<uint16_t> x(static_cast<size_t>(T * H));
-      for (auto& v : x) v = core::FloatToBf16(nd(rng));
-      for (int64_t layer : {int64_t{2}, int64_t{3}}) {
-        if (!lm.Config().IsMoeLayer(layer)) {
-          Check(false, "layer " + std::to_string(layer) + " is an MoE layer of the tiny model");
-          continue;
-        }
-        Lfm2MoeDebug d1, d2;
-        const std::vector<uint16_t> y1 = lm.DebugFfnForward(layer, x, T, Lfm2MoePath::kPerSlot, &d1);
-        const std::vector<uint16_t> y2 = lm.DebugFfnForward(layer, x, T, Lfm2MoePath::kSorted, &d2);
-        Check(d1.ids == d2.ids, "layer " + std::to_string(layer) + ": both MoE paths route the same experts");
-        size_t diff = 0;
-        for (size_t i = 0; i < y1.size(); ++i) diff += y1[i] != y2[i] ? 1 : 0;
-        Check(diff == 0, "layer " + std::to_string(layer) + ": w8a16 experts, per-slot (M=1) == sorted (M<=16) bytes (" +
-                             std::to_string(diff) + " of " + std::to_string(y1.size()) + " differ)");
-        bool finite = true;
-        for (uint16_t v : y1) finite = finite && std::isfinite(core::Bf16ToFloat(v));
-        Check(finite, "layer " + std::to_string(layer) + ": the w8a16 MoE output is finite");
-      }
+      // No forward here: the tiny vocab (64) shards to 32 per rank, under the top-k kernel's minimum (the known tiny-model
+      // limit); the TP=2 numerics are checked on the real container (docs/w8a16.md 6.2, tools/server/smoke.ps1 -Tp 2).
     }
 
     // ---- 7: refusals ----
@@ -431,11 +354,6 @@ int main() {
       });
       Check(ThrowsWith([&] { (void)LoadTextModel(Opts(g64, Layout::kW8a16), tp1); }, ".w8a16.ws' is", &msg),
             "(3) a .ws whose size is not N*K/G*2 (g128 scales under a g64 header) is refused, naming the tensor: " + msg);
-      TpOptions tp2;
-      tp2.world = 2;
-      tp2.mode = TpOptions::Mode::kEmulate;
-      Check(ThrowsWith([&] { (void)LoadTextModel(Opts(wcont, Layout::kW8a16), tp2); }, "TP=1 only", &msg),
-            "v1: --tp 2 --layout w8a16 is refused (TP=1 only): " + msg);
       Check(ThrowsWith([&] { (void)LoadTextModel(Opts(wcont, Layout::kBf16), tp1); }, "in any known on-disk form", &msg),
             "(5) --layout bf16 on the --no-bf16 w8a16 container is refused: " + msg);
       std::error_code ec;

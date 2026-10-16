@@ -193,7 +193,7 @@ Increment of `KL(fp32 truth || r4dx)` over r4dx bf16 (gate: epsilon 0.005, incre
 - Teacher-forced **12.4 ms/row** on one GPU; **26.18 GiB** VRAM peak at 8192 context.
 - Server decode **88.7 tok/s** on one GPU, with the untuned fallback GEMM tuning (the w8a16 tuning table is still the empty
   placeholder). `tools\server\smoke.ps1 -Layout w8a16 -Tp 1 -Dialect lfm2`: 75 checks pass.
-- TP=1 only: w8a16 at TP=2 is refused.
+- TP=2 works (added 2026-10-16, docs/w8a16.md "TP=2 outcome").
 - Not done yet: tuning-table rows (`tool_w8a16_gemm_bench --inc-out`; the G128 MT 3/4 + NPW 4 tiles spill VGPRs), LDLQ for
   w8a16 (deferred), TP=2, the grouped MoE decode kernel, a check of the f16 activation range (values above 65504 saturate;
   not measured on LFM2), long-context and TTFT numbers.

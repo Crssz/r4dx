@@ -67,7 +67,6 @@ Lfm2Model Lfm2Model::Load(const Lfm2ModelOptions& opts) {
     throw std::invalid_argument("Lfm2Model::Load: tp_world > 1 needs a TpComm endpoint of the same world and rank");
   }
   if (is_tp) RefuseLfm2TrellisTp(opts.container_path, opts.layout, opts.layer_limit, "Lfm2Model::Load");
-  if (is_tp) RefuseLfm2W8a16Tp(opts.layout, "Lfm2Model::Load");
   if (opts.tp_submit_layers < 0 || opts.tp_submit_layers > 64 || opts.tp_max_inflight_units < 0 ||
       opts.tp_max_inflight_units > 64) {
     throw std::invalid_argument("Lfm2Model::Load: tp_submit_layers and tp_max_inflight_units must be in [0, 64]");

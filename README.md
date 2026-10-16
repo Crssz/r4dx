@@ -122,7 +122,7 @@ Which mode to use:
 | Model | Container | Modes | State |
 |---|---|---|---|
 | Qwen3.8-27B (Huihui) | trellis mix4.5m, about 17 GiB | one GPU, `--pp 2`, `--tp 2`, hybrid, MTP / DFlash2 | default, tables above |
-| LFM2.5-24B-A2B (`lfm2_moe`, 2.45 B active) | bf16, 48.5 GB | `--tp 2` only (about 25.8 GiB per card), about 60 tok/s decode; KL gate PASS vs HF-bf16 (ALL 0.00993 vs 0.01248, top-1 96.83 %) | bf16 works; **trellis hybrid on one card** (`--layout trellis`, 18.89 GB: K5 experts, bf16 non-expert and layers 2-5 experts; KL gate PASS, ALL +.0055 over bf16, about 61 tok/s decode); **w8a16 on one card** (`--layout w8a16`, 24.9 GB, TP=1 only; KL gate PASS, ALL +.0033 over bf16, 88.7 tok/s decode; [docs/w8a16.md](docs/w8a16.md)); MoE path not optimized yet; always thinks, Pythonic tool calls ([docs/lfm2.md](docs/lfm2.md)) |
+| LFM2.5-24B-A2B (`lfm2_moe`, 2.45 B active) | bf16, 48.5 GB | `--tp 2` only (about 25.8 GiB per card), about 60 tok/s decode; KL gate PASS vs HF-bf16 (ALL 0.00993 vs 0.01248, top-1 96.83 %) | bf16 works; **trellis hybrid on one card** (`--layout trellis`, 18.89 GB: K5 experts, bf16 non-expert and layers 2-5 experts; KL gate PASS, ALL +.0055 over bf16, about 61 tok/s decode); **w8a16 on one card or two** (`--layout w8a16`, 24.9 GB; KL gate PASS, ALL +.0033 over bf16, 88.7 tok/s decode at TP=1; `--tp 2` about 12.4 GiB per card, gate PASS ALL +.0025, 99 tok/s decode, prefill 2x; [docs/w8a16.md](docs/w8a16.md)); MoE path not optimized yet; always thinks, Pythonic tool calls ([docs/lfm2.md](docs/lfm2.md)) |
 
 ## Requirements
 

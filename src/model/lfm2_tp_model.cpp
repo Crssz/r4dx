@@ -149,7 +149,6 @@ std::unique_ptr<Lfm2TpModel> Lfm2TpModel::Load(const ModelOptions& opts, const T
   Lfm2ModelOptions g = MakeLfm2ModelOptions(opts);
   // docs/lfm2-plan.md L3-8: trellis is TP=1 only -- refused here, on the facade thread, before any device is touched.
   RefuseLfm2TrellisTp(g.container_path, g.layout, g.layer_limit, "Lfm2TpModel::Load");
-  RefuseLfm2W8a16Tp(g.layout, "Lfm2TpModel::Load");  // docs/w8a16.md 6.2: w8a16 is TP=1 only in v1
   const int64_t warmup_positions = Lfm2Model::WarmupPositions(g);
   if (g.max_ctx > 0 && g.max_ctx < warmup_positions) {
     throw std::invalid_argument("Lfm2TpModel::Load: --max-ctx must be at least " + std::to_string(warmup_positions) +

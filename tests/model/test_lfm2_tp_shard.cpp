@@ -279,9 +279,12 @@ void TestPhysicalPlans() {
                             {tp::Part::kW4Wq, 0, 0, static_cast<size_t>(l.N * l.K / 2)},
                             {tp::Part::kW4a16Wsz, 32, 0, static_cast<size_t>(l.N * (l.K / 32) * 4)},
                             {tp::Part::kW4a16Wsz, 64, 0, static_cast<size_t>(l.N * (l.K / 64) * 4)},
+                            {tp::Part::kW8Wq, 128, 0, static_cast<size_t>(l.N * l.K)},
+                            {tp::Part::kW8a16Ws, 128, 0, static_cast<size_t>(l.N * (l.K / 128) * 2)},
+                            {tp::Part::kW8a16Ws, 64, 0, static_cast<size_t>(l.N * (l.K / 64) * 2)},
                             {tp::Part::kTrellisW, 0, 4, static_cast<size_t>(l.N * l.K * 4 / 8)},
                             {tp::Part::kTrellisW, 0, 5, static_cast<size_t>(l.N * l.K * 5 / 8)}};
-    if (l.base == "lm_head") parts.resize(4);
+    if (l.base == "lm_head") parts.resize(7);
     for (const P& p : parts) {
       tp::PartShape sh;
       sh.part = p.part;
@@ -312,7 +315,7 @@ void TestPhysicalPlans() {
       ++plans;
     }
   }
-  Check(ok, "C: bf16 / w4a16 (g32, g64) / trellis (KB4, KB5) plans of every distinct LFM2 linear: the two ranks partition the part (" +
+  Check(ok, "C: bf16 / w4a16 (g32, g64) / w8a16 (wq, ws g128, g64) / trellis (KB4, KB5) plans of every distinct LFM2 linear: the two ranks partition the part (" +
                 std::to_string(plans) + " plans)");
 
   // conv.weight is a 1-D-per-channel elem part: 6 bytes per channel row (3 bf16 taps); the ranks' channel blocks partition it.

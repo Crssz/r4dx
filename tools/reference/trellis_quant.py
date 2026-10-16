@@ -1852,6 +1852,10 @@ def cmd_mix(args) -> int:
     elif args.ranking in ("gemma", "lfm2"):
         raise SystemExit(f"[trellis] --ranking {args.ranking} needs the K{lo:g} and K{hi:g} sources "
                          f"(arch {arch.name})")
+    if arch.is_lfm2:   # promotion may only reach a rate that has a finished source directory
+        import lfm2_mix
+
+        lfm2_mix.MAX_K = max(srcs)
     rates, report, ranking_used = allocate_ranked(linears, args.bpw, arch, gaps, args.ranking)
     need = sorted(set(rates.values()))
     lacking = [r for r in need if r not in srcs]

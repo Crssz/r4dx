@@ -193,7 +193,7 @@ struct ServerUsageError : std::runtime_error {
 
 inline std::string ServerUsageText(const char* argv0) {
   return std::string("usage: ") + argv0 +
-         " --model <container.r4dx> --layout {w4a16|bf16|trellis} "
+         " --model <container.r4dx> --layout {w4a16|bf16|trellis|w8a16} "
          "[--tokenizer-dir <dir>] [--dialect {auto|qwen35|gemma4|lfm2}] [--host <addr>] [--port N] "
          "[--max-ctx N] [--extended-ctx] "
          "[--max-tokens-default N] [--max-queue N] [--think {on|off}] [--layers N] "

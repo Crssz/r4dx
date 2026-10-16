@@ -269,7 +269,7 @@ struct CliUsageError : std::runtime_error {
 
 inline std::string CliUsageText(const char* argv0) {
   return std::string("usage: ") + argv0 +
-         " --model <container.r4dx> --layout {w4a16|bf16|trellis} "
+         " --model <container.r4dx> --layout {w4a16|bf16|trellis|w8a16} "
          "(--prompt \"...\" | --prompt-file <path> | --chat) [--tokenizer-dir <dir>] [--dialect {auto|qwen35|gemma4|lfm2}] [--system \"...\"] "
          "[--think {on|off}] [--max-tokens N] [--temperature F] [--top-k N] [--top-p F] "
          "[--min-p F] [--seed N] [--max-ctx N] [--extended-ctx] [--stats] [--profile] [--profile-token N] "

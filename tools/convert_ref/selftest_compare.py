@@ -80,8 +80,59 @@ def compare(label: str, got: bytes, want: bytes) -> bool:
     return False
 
 
+def main_w8a16(args) -> int:
+    """`--layouts w8a16`: the exe's int8 quantizer + kernel-order packer against w8_ref.py, byte for
+    byte, at G in {64, 128}, on a random weight with dead rows (amax 1e-25), a tiny-amax row, an
+    outlier row and ordinary rows. There is no --quant / --imatrix variant (w8a16 is RTN only)."""
+    import w8_ref
+
+    n = max(args.n, 16) // 16 * 16
+    k = max(args.k, 128) // 128 * 128
+    rng = np.random.default_rng(args.seed)
+    raw = rng.normal(0.0, 1.0, size=(n, k)).astype(np.float32)
+    raw *= (10.0 ** (-(np.arange(n) % 12) / 4.0)).astype(np.float32)[:, None]
+    raw[1] = 1e-25                      # dead row: every group flushes to a zero group
+    raw[2] = rng.normal(0.0, 5e-10, size=k).astype(np.float32)  # f16-subnormal biased scale
+    raw[3] = 0.0
+    raw[4, ::17] = 1500.0               # outliers (amax within the 2031 limit)
+    bf16_u16 = float_to_bf16_u16(raw).reshape(n, k)
+    w = bf16_u16_to_float(bf16_u16)
+
+    ok = True
+    with tempfile.TemporaryDirectory() as tmp:
+        in_path = str(pathlib.Path(tmp) / "selftest_input.safetensors")
+        write_bf16_safetensors(in_path, "w", bf16_u16, (n, k))
+        for g in (128, 64):
+            print(f"\n=== w8a16 g{g} ===")
+            out_path = str(pathlib.Path(tmp) / f"selftest_output_w8_g{g}.r4dx")
+            proc = subprocess.run(
+                [args.exe, "--selftest", "--selftest-input", in_path, "--selftest-output", out_path,
+                 "--layouts", "w8a16", "--no-bf16", "--w8a16-group", str(g), "--threads", "4"],
+                capture_output=True, text=True)
+            print(proc.stdout, end="")
+            if proc.returncode != 0:
+                print(proc.stderr, file=sys.stderr)
+                return 1
+            container = ContainerReader(out_path)
+            meta = container.metadata.get("quant", {}).get("w8a16", {})
+            print(f"metadata quant.w8a16: {meta}")
+            ok &= (meta.get("group") == g and meta.get("scale_log2_bias") == w8_ref.SCALE_LOG2_BIAS
+                   and meta.get("version") == 1)
+            q, s16, zero_groups = w8_ref.quantize_int8_symmetric(w, group=g)
+            ok &= compare(f"w8a16.wq g{g}", container["selftest.w8a16.wq"],
+                          w8_ref.pack_w8_bytes(q, n, k).tobytes())
+            ok &= compare(f"w8a16.ws g{g}", container["selftest.w8a16.ws"],
+                          w8_ref.pack_w8a16_scales(s16, n, k, group=g).astype("<u2").tobytes())
+            print(f"zero groups (python): {zero_groups}; exe log must say the same")
+            ok &= f"{zero_groups} zero groups" in proc.stdout
+    print("\nPASS" if ok else "\nFAIL")
+    return 0 if ok else 1
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
+    ap.add_argument("--layouts", default="w4a16", choices=("w4a16", "w8a16"),
+                    help="which layout's selftest to compare (default w4a16)")
     ap.add_argument("--exe", default=DEFAULT_EXE)
     ap.add_argument("--n", type=int, default=48)
     ap.add_argument("--k", type=int, default=384)
@@ -98,6 +149,9 @@ def main() -> int:
         print(f"selftest_compare: r4dx-convert.exe not found at {args.exe} -- build it first "
               f"(cmake --build --preset win-hip --target r4dx-convert)", file=sys.stderr)
         return 2
+
+    if args.layouts == "w8a16":
+        return main_w8a16(args)
 
     rng = np.random.default_rng(args.seed)
     raw = rng.normal(0.0, 1.0, size=(args.n, args.k)).astype(np.float32)

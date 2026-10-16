@@ -16,6 +16,7 @@
 
 #include "r4dx_convert/container_writer.hpp"
 #include "r4dx_convert/quant_int4.hpp"
+#include "r4dx_convert/quant_int8.hpp"
 #include "r4dx_convert/quant_ldlq.hpp"
 #include "r4dx_convert/quant_search.hpp"
 #include "r4dx_convert/tensor_codec.hpp"
@@ -33,6 +34,10 @@ struct LayoutSet {
   // scale tensor (W4a16WszName) and must be listed in __metadata__.quant.w4a16.groups. Ignored
   // when `w4a16` is false.
   int w4a16_group = kW4A16Group;
+  // The w8a16 layout (docs/w8a16.md): symmetric int8, f16 group scale, `<base>.w8a16.wq` / `.ws`.
+  // `w8a16_group` is run-wide (--w8a16-group), 64 or 128; ignored when `w8a16` is false.
+  bool w8a16 = false;
+  int w8a16_group = kW8A16Group;
   // The trellis layout (docs/trellis-kernel.md 2; r4dx-convert --trellis-from, trellis_import.hpp):
   // `<base>.trellis.w` / `.suh` / `.svh`, IMPORTED from an oracle directory, never quantized here.
   // Exclusive -- a trellis linear has no other layout (3.4: no `.bf16.w` may defeat the old-binary
@@ -96,6 +101,10 @@ inline std::vector<std::string> LinearLayoutTensorNames(const std::string& base,
     n.push_back(base + ".w4a16.wq");
     n.push_back(W4a16WszName(base, layouts.w4a16_group));
   }
+  if (layouts.w8a16) {
+    n.push_back(base + w8a16::kWqSuffix);
+    n.push_back(base + w8a16::kWsSuffix);
+  }
   if (layouts.trellis) {
     n.push_back(base + ".trellis.w");
     n.push_back(base + ".trellis.suh");
@@ -116,6 +125,7 @@ inline std::string LayoutSetId(const LayoutSet& ls) {
   auto add = [&](const std::string& t) { s += (s.empty() ? "" : "+") + t; };
   if (ls.bf16) add("bf16");
   if (ls.w4a16) add("w4a16.g" + std::to_string(ls.w4a16_group));
+  if (ls.w8a16) add(w8a16::kLayoutIdPrefix + std::to_string(ls.w8a16_group));
   if (ls.trellis) add("trellis.k" + std::to_string(ls.trellis_bits));
   return s.empty() ? std::string("none") : s;
 }
@@ -138,6 +148,12 @@ inline bool ParseLayoutSetId(const std::string& id, LayoutSet* out) {
         ls.w4a16 = true;
         ls.w4a16_group = std::stoi(t.substr(7));
         if (ls.w4a16_group != kW4A16Group && !IsW4A16GroupSupported(ls.w4a16_group)) return false;
+      } else if (t.compare(0, 7, w8a16::kLayoutIdPrefix) == 0 && t.size() > 7 && t.size() <= 10) {
+        for (size_t i = 7; i < t.size(); ++i)
+          if (t[i] < '0' || t[i] > '9') return false;
+        ls.w8a16 = true;
+        ls.w8a16_group = std::stoi(t.substr(7));
+        if (!IsW8A16GroupSupported(ls.w8a16_group)) return false;
       } else if (t == "trellis.k4" || t == "trellis.k5") {
         ls.trellis = true;
         ls.trellis_bits = t.back() - '0';
@@ -151,7 +167,7 @@ inline bool ParseLayoutSetId(const std::string& id, LayoutSet* out) {
   // Canonical only: the fixed order, each layout once, no empty token, no leading zeros.
   if (LayoutSetId(ls) != id) return false;
   // Trellis is exclusive (TrellisLayoutSet): "bf16+trellis.k4" is not a set this converter writes.
-  if (ls.trellis && (ls.bf16 || ls.w4a16)) return false;
+  if (ls.trellis && (ls.bf16 || ls.w4a16 || ls.w8a16)) return false;
   *out = ls;
   return true;
 }
@@ -166,6 +182,7 @@ inline uint64_t LinearLayoutBytes(int N, int K, const LayoutSet& layouts) {
   uint64_t bytes = 0;
   if (layouts.bf16) bytes += NK * 2;
   if (layouts.w4a16) bytes += NK / 2 + NK / layouts.w4a16_group * 4;
+  if (layouts.w8a16) bytes += NK + NK / layouts.w8a16_group * 2;
   if (layouts.trellis) {
     bytes += NK * static_cast<uint64_t>(layouts.trellis_bits) / 8 +
              static_cast<uint64_t>(TrellisPartCount(layouts)) * static_cast<uint64_t>(K) * 2 +
@@ -205,8 +222,9 @@ inline void CheckTrellisLayout(const std::string& base, int64_t N, int64_t K, co
     throw std::runtime_error("r4dx_convert: trellis linear " + base + " [" + std::to_string(N) +
                              "," + std::to_string(K) + "]: " + why);
   };
-  if (ls.bf16 || ls.w4a16)
-    fail("a trellis linear is written in the trellis layout only (docs/trellis-kernel.md 3.4)");
+  if (ls.bf16 || ls.w4a16 || ls.w8a16)
+    fail("a trellis linear is written in the trellis layout only (docs/trellis-kernel.md 3.4; "
+         "no w8a16 next to trellis, docs/w8a16.md 5.2)");
   if (ls.trellis_bits != 4 && ls.trellis_bits != 5)
     fail("KB=" + std::to_string(ls.trellis_bits) + " is not a rate the kernel instantiates (4, 5)");
   if (K % 128 != 0) fail("K is not a multiple of 128");
@@ -249,6 +267,15 @@ inline void PlanLinearLayouts(ContainerWriter& writer, const std::string& base, 
     // PackW4Nibbles' 64-K block: implied by the line above for any group >= 64, NOT for 32.
     RequireDivisible(K, 64, "K", base.c_str());
   }
+  if (layouts.w8a16) {
+    // docs/w8a16.md 3.3: N % 16, K % G (implies K % 32 for G in {64, 128}).
+    if (!IsW8A16GroupSupported(layouts.w8a16_group))
+      throw std::runtime_error("r4dx_convert: w8a16 group " + std::to_string(layouts.w8a16_group) +
+                               " for " + base + " is not 64 or 128");
+    RequireDivisible(N, w8a16::kTileRows, "N", base.c_str());
+    RequireDivisible(K, layouts.w8a16_group, "K", base.c_str());
+    RequireDivisible(K, w8a16::kKBlock, "K", base.c_str());
+  }
   if (layouts.bf16)
     writer.Plan(base + ".bf16.w", {N, K, 2}, static_cast<uint64_t>(N) * K * 2);
   if (layouts.w4a16) {
@@ -256,6 +283,12 @@ inline void PlanLinearLayouts(ContainerWriter& writer, const std::string& base, 
                 static_cast<uint64_t>(N) * K / 2);
     writer.Plan(W4a16WszName(base, g16), {static_cast<int64_t>(N) * K / g16, 4},
                 static_cast<uint64_t>(N) * K / g16 * 4);
+  }
+  if (layouts.w8a16) {
+    const int64_t NK = static_cast<int64_t>(N) * K;
+    writer.Plan(base + w8a16::kWqSuffix, {NK}, static_cast<uint64_t>(NK));
+    writer.Plan(base + w8a16::kWsSuffix, {NK / layouts.w8a16_group, 2},
+                static_cast<uint64_t>(NK / layouts.w8a16_group) * 2);
   }
 }
 
@@ -277,6 +310,12 @@ inline void EmitLinearLayouts(ContainerWriter& writer, const std::string& base,
     throw std::runtime_error("EmitLinearLayouts: '" + base + "' has K=" + std::to_string(K) +
                              " but its LDLQ factor was built for K=" + std::to_string(ldlq->K));
   }
+  // LDLQ for the int8 grid is deferred (docs/w8a16.md 5.3): never silently RTN a linear the run
+  // asked to round against a Hessian.
+  if (ldlq != nullptr && layouts.w8a16)
+    throw std::runtime_error("EmitLinearLayouts: '" + base +
+                             "' asks for LDLQ with w8a16, which is not implemented (RTN only, "
+                             "docs/w8a16.md 5.3)");
   if (layouts.bf16) {
     auto bytes = EncodeBf16(w);
     writer.WriteTensor(base + ".bf16.w", bytes.data(), bytes.size());
@@ -295,6 +334,16 @@ inline void EmitLinearLayouts(ContainerWriter& writer, const std::string& base,
     auto wsz = PackW4A16Scales(scale, zero, N, K, g16);
     writer.WriteTensor(base + ".w4a16.wq", wq.data(), wq.size() * 4);
     writer.WriteTensor(W4a16WszName(base, g16), wsz.data(), wsz.size() * 4);
+  }
+  if (layouts.w8a16) {
+    const int g8 = layouts.w8a16_group;
+    std::vector<uint8_t> q;
+    std::vector<uint16_t> scale16;
+    QuantizeInt8Symmetric(w.data(), N, K, g8, nthreads, q, scale16, nullptr, base.c_str());
+    auto wq = PackW8Bytes(q, N, K, nthreads);
+    auto ws = PackW8a16Scales(scale16, N, K, g8);
+    writer.WriteTensor(base + w8a16::kWqSuffix, wq.data(), wq.size());
+    writer.WriteTensor(base + w8a16::kWsSuffix, ws.data(), ws.size() * 2);
   }
 }
 

@@ -213,6 +213,29 @@ if(TARGET r4dx-convert)
 endif()
 add_test(NAME convert_w4a16_groups COMMAND convert_w4a16_groups)
 
+# w8a16 (docs/w8a16.md; quant_int8.hpp, linear_layouts.hpp): the symmetric-int8 quantizer and the
+# kernel-order packer byte-exact against tools/convert_ref/w8_ref.py fixtures (G 64 / 128), the RTN
+# error bounds on Gaussian / dead / tiny-amax rows, the CPU reference dequant (DequantW8a16).
+add_executable(convert_quant_int8 test_quant_int8.cpp)
+target_link_libraries(convert_quant_int8 PRIVATE r4dx_convert)
+target_compile_definitions(convert_quant_int8 PRIVATE
+  R4DX_CONVERT_FIXTURES_DIR="${CMAKE_CURRENT_SOURCE_DIR}/fixtures")
+add_test(NAME convert_quant_int8 COMMAND convert_quant_int8)
+
+# w8a16 layout plumbing: PlanLinearLayouts / LinearLayoutBytes / LayoutSetId, the shape refusals, keep-bf16
+# accounting and -- when r4dx-convert is built -- the exe's --selftest --layouts w8a16 (bytes, metadata
+# block, refusals). CPU-only.
+add_executable(convert_w8a16_layout test_w8a16_layout.cpp)
+target_link_libraries(convert_w8a16_layout PRIVATE r4dx_convert)
+target_compile_definitions(convert_w8a16_layout PRIVATE
+  R4DX_CONVERT_FIXTURES_DIR="${CMAKE_CURRENT_SOURCE_DIR}/fixtures")
+if(TARGET r4dx-convert)
+  target_compile_definitions(convert_w8a16_layout PRIVATE
+    R4DX_CONVERT_EXE="$<TARGET_FILE:r4dx-convert>")
+  add_dependencies(convert_w8a16_layout r4dx-convert)
+endif()
+add_test(NAME convert_w8a16_layout COMMAND convert_w8a16_layout)
+
 # DFlash2 task A1 item 1: minimal GGUF v3 reader (metadata KV of every type incl. arrays/strings,
 # tensor directory, F32/F16/BF16/Q8_0 dequant) against tests/convert/fixtures/tiny.gguf (generated
 # by tools/convert_ref/make_tiny_gguf.py, no gguf-py dependency either side).

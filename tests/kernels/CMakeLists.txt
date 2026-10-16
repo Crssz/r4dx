@@ -404,3 +404,27 @@ add_test(NAME test_lfm2_ref_cpu COMMAND test_lfm2_ref_cpu)
 add_executable(test_rep_penalty_cpu test_rep_penalty_cpu.cpp)
 target_include_directories(test_rep_penalty_cpu PRIVATE "${CMAKE_SOURCE_DIR}/src/kernels/include")
 add_test(NAME test_rep_penalty_cpu COMMAND test_rep_penalty_cpu)
+
+# ---- W8A16 GEMM (docs/w8a16.md 7.2) --------------------------------------------------------------------------
+# test_w8a16_ref_cpu: pure CPU (header-only w8a16_ref.hpp, no HIP call). Always runs.
+add_executable(test_w8a16_ref_cpu test_w8a16_ref_cpu.cpp)
+add_test(NAME test_w8a16_ref_cpu COMMAND test_w8a16_ref_cpu)
+# w8a16_ref.hpp static_asserts its local format constants against lane W1's r4dx_convert/w8a16_format.hpp
+# whenever that header is on this path (header-only, no library link).
+target_include_directories(test_w8a16_ref_cpu PRIVATE "${CMAKE_SOURCE_DIR}/src/convert/include")
+# test_w8a16_gemm: GPU (WRITTEN, NOT YET RUN by its author), r4dx_gemm_w8a16_nt_m64 against w8a16_ref.hpp at the
+# real LFM2 shapes. /EHc- because it checks precondition throws out of the extern "C" entry point.
+#   ctest --test-dir build\win-hip -R "^test_w8a16_gemm$" --output-on-failure
+add_executable(test_w8a16_gemm test_w8a16_gemm.cpp)
+target_link_libraries(test_w8a16_gemm PRIVATE r4dx_core r4dx_kernels r4d_core)
+target_include_directories(test_w8a16_gemm PRIVATE "${CMAKE_SOURCE_DIR}/src/convert/include")
+set_source_files_properties(test_w8a16_gemm.cpp PROPERTIES COMPILE_OPTIONS "/EHc-")
+add_test(NAME test_w8a16_gemm COMMAND test_w8a16_gemm)
+set_tests_properties(test_w8a16_gemm PROPERTIES ENVIRONMENT "HIP_VISIBLE_DEVICES=1")
+# tool_w8a16_gemm_bench: GPU bench (not a ctest), w8a16 vs r4d_gemm_bf16_nt_m64 / r4d_gemm_w4a16_nt_m64 over a
+# pooled working set, geometry sweep, writes gemm_tuning_table_w8a16.inc rows with --inc-out:
+#   $env:HIP_VISIBLE_DEVICES='1'; build\win-hip\tests\kernels\tool_w8a16_gemm_bench.exe --inc-out x.inc
+add_executable(tool_w8a16_gemm_bench tool_w8a16_gemm_bench.cpp)
+target_link_libraries(tool_w8a16_gemm_bench PRIVATE r4dx_core r4dx_kernels r4d_core)
+# /EHc-: the sweep skips illegal geometries by catching the launchers' throws.
+set_source_files_properties(tool_w8a16_gemm_bench.cpp PROPERTIES COMPILE_OPTIONS "/EHc-")

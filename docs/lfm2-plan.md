@@ -415,6 +415,8 @@ Gate per group g in {english, thai, code, tool, chat-ALL} (all must pass; thai k
 
 ## 7. Trellis pipeline
 
+Status 2026-10-16 (L3): **done**, with a changed outcome: the 4.5-bit mix fails the gate and the shipped format is the K5 hybrid; see the Outcome paragraph under L3 in section 9 and [lfm2.md](lfm2.md).
+
 Reuse list: `trellis_quant.py`, `hessian_capture.py`, `gemma_mix.py`/`sens_*.py` patterns, `rotation_oracle.py` (unused: unrotated),
 `trellis_import.hpp`, `tools/gemma/trellis_pipeline.ps1` (copied to `tools/lfm2/trellis_pipeline.ps1`, same stage names:
 `hessian | oracle-k4 | oracle-k5 | mix | convert | gate`, a stage without `-Run` only prints its command and refuses GPU work).
@@ -597,6 +599,10 @@ A, B, C, D, F can all start on day 1 (F's authoring needs only the arch table an
 - **L2-8 Docs.** `docs/status.md` / README row, `docs/server.md` LFM dialect section. Done when L2-7 passes.
 
 ### L3: trellis on one card
+
+Status 2026-10-16: L3-1..L3-9 **done**.
+
+**Outcome.** The 4.5-bit mix (4.5085 bpw, 13.4 GB) failed the KL gate (ALL +.0222 over bf16; english +.0245, thai +.0291), as did all-K5 (5.02 bpw, 14.8 GB, ALL +.0156) and K5 experts with bf16 non-expert (15.8 GB, ALL +.0100, english/thai fail). The shipped format is a hybrid: K5 experts, bf16 non-expert linears and bf16 experts of layers 2-5, 18.89 GB, which passes every group (ALL +.0055; top-1 96.13 %). K6 was not usable (only KB 4 and 5 are instantiated). Quantization damage is broad and concentrated in the early layers' experts, since HF bf16 itself keeps the same top-4 expert set for only 87 % of tokens. Numbers, layer sweep and reproduction commands: [lfm2.md](lfm2.md).
 
 - **L3-1 Arch table + Hessian capture port [CPU].** `arch_table.py` `lfm2_moe`, `hessian_capture.py --arch lfm2_moe` (per-expert routed Hessians + pooled Hessian + row counts, `--dry-run` lists
   tap groups, files and the size in GiB), `gen_samples.py`. Tests on the tiny checkpoint (`reference_arch_lfm2`, tiny pipeline). Lane F.

@@ -84,6 +84,16 @@ class Arena {
 
   void Reset() noexcept { offset_ = 0; }
 
+  // A partial Reset: Mark() returns the current offset, Rewind(mark) gives back everything allocated since. For a loop
+  // whose every iteration allocates scratch that the NEXT iteration may overwrite (stream-ordered work only: the earlier
+  // launches have consumed it by the time a later launch on the same stream writes it) -- e.g. one GEMM's scratch per MoE
+  // expert (Lfm2MoeFfn), so a layer's peak is one expert's scratch, not n_experts of them.
+  size_t Mark() const noexcept { return offset_; }
+  void Rewind(size_t mark) {
+    if (mark > offset_) throw std::logic_error("Arena::Rewind: mark is past the current offset");
+    offset_ = mark;
+  }
+
   size_t used_bytes() const noexcept { return offset_; }
   size_t capacity_bytes() const noexcept { return storage_.bytes(); }
 

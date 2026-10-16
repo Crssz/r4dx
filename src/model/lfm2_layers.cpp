@@ -106,8 +106,12 @@ void Lfm2MoeFfn::Forward(hipStream_t stream, core::Arena& arena, const uint16_t*
                                     hipMemcpyDeviceToHost, stream));
       R4DX_HIP_CHECK(hipStreamSynchronize(stream));
     });
+    // The experts' GEMM scratch (trellis: input transform + split-group partials) is given back after each pair: every
+    // launch is on `stream`, so the next pair's GEMMs only overwrite it after this pair's have read it.
+    const size_t mark = arena.Mark();
     for (int64_t t = 0; t < T; ++t) {
       for (int64_t j = 0; j < K; ++j) {
+        arena.Rewind(mark);
         const int32_t e = host_->ids.data()[t * K + j];
         if (e < 0 || e >= E) throw std::runtime_error("Lfm2MoeFfn: router returned expert id " + std::to_string(e));
         const size_t ue = static_cast<size_t>(e);
@@ -148,9 +152,12 @@ void Lfm2MoeFfn::Forward(hipStream_t stream, core::Arena& arena, const uint16_t*
       throw std::runtime_error("Lfm2MoeFfn: the expert sort covers " + std::to_string(off[E]) + " of " +
                                std::to_string(Pn) + " pairs (a router id out of range?)");
     }
+    // One expert's GEMM scratch at a time (see the per-slot path): the layer's arena peak does not grow with E.
+    const size_t mark = arena.Mark();
     for (int64_t e = 0; e < E; ++e) {
       const int64_t r0 = off[e], c = off[e + 1] - off[e];
       if (c == 0) continue;
+      arena.Rewind(mark);
       if (c < 0 || c > T) throw std::runtime_error("Lfm2MoeFfn: bad expert count " + std::to_string(c));
       const size_t ue = static_cast<size_t>(e);
       ProfiledCall(prof, stream, "gemm:moe.gate_up", [&] { ApplyLinear(stream, arena, w_.gate_up[ue], xs + r0 * H, gu, c); });

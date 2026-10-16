@@ -50,6 +50,46 @@ W4a16LoadGroups CheckQuantGroups(const nlohmann::json& metadata, const std::stri
   return w;
 }
 
+std::optional<W8a16Spec> CheckW8a16Choice(const nlohmann::json& metadata, const std::string& path,
+                                          Layout layout, Layout lm_head_layout, Layout mtp_head_layout,
+                                          int tp_world) {
+  const bool requested = layout == Layout::kW8a16 || lm_head_layout == Layout::kW8a16 ||
+                         mtp_head_layout == Layout::kW8a16;
+  if (!requested) return std::nullopt;
+  std::optional<W8a16Spec> spec = ParseW8a16Metadata(metadata, path);
+  RefuseW8a16Choice(spec, requested, tp_world, path);
+  CheckW8a16Meta(spec->group, spec->scale_log2_bias, path);
+  return spec;
+}
+
+void CheckW8a16Shape(const SafetensorsReader& r, const std::string& base, int64_t N, int64_t K, int group) {
+  const auto span = [&](const char* suffix) {
+    const auto& m = r.Meta(base + suffix);
+    return static_cast<uint64_t>(m.end - m.begin);
+  };
+  const std::string why = W8a16ShapeProblem(base, N, K, group, span(r4dx_convert::w8a16::kWqSuffix),
+                                            span(r4dx_convert::w8a16::kWsSuffix));
+  if (!why.empty()) throw W8a16FormatMismatch("r4dx::model::Container: " + why);
+}
+
+void LogW8a16(const W8a16Spec& spec, const std::string& path) {
+  std::fprintf(stderr, "r4dx: %s is a w8a16 container: int8 weights, f16 group scales (group %d, bias 2^%d)\n",
+               path.c_str(), spec.group, spec.scale_log2_bias);
+}
+
+bool TakeW8a16Bf16Head(const LinearLoadMeta& meta, const QuantLinear& head, int fallbacks_before, int* fallbacks) {
+  if (!meta.w8a16 || *fallbacks == fallbacks_before || head.layout != Layout::kBf16) return false;
+  --*fallbacks;
+  return true;
+}
+
+void LogW8a16Bf16Head(const std::string& path) {
+  std::fprintf(stderr,
+               "r4dx: %s stores lm_head as bf16 only (a w8a16 container converted with --lm-head bf16) -- loaded "
+               "as bf16\n",
+               path.c_str());
+}
+
 // docs/trellis-kernel.md 2.5, the refusals that need only the metadata and the requested body
 // layout -- run by both loaders right after the parse, before any upload.
 void CheckTrellisChoice(const std::optional<TrellisSpec>& trellis, bool rotated, Layout layout,
@@ -377,6 +417,20 @@ QuantLinear LoadQuantLinear(const SafetensorsReader& r, const LinearLoadMeta& me
       q.trellis_svh = UploadWidenedF16(r, base + ".trellis.svh");
       break;
     }
+    case Layout::kW8a16: {
+      // docs/w8a16.md 6.1: the codes and the biased f16 scales as stored (the kernel's fragment order),
+      // sized at the container's group before a byte is uploaded (6.3 rule 3).
+      if (!meta.w8a16) {
+        throw std::logic_error("r4dx::model::Container: '" + base + "' read as w8a16 without a checked "
+                               "__metadata__.quant.w8a16 (CheckW8a16Choice) for " + meta.path);
+      }
+      const int group = meta.w8a16->group;
+      CheckW8a16Shape(r, base, N, K, group);
+      q.w8a16_group = group;
+      q.w8_wq = UploadRawU8(r, base + r4dx_convert::w8a16::kWqSuffix);
+      q.w8_ws = UploadRawU16(r, base + r4dx_convert::w8a16::kWsSuffix);
+      break;
+    }
   }
   return q;
 }
@@ -393,6 +447,10 @@ bool HasLayout(const SafetensorsReader& r, const LinearLoadMeta& meta, const std
     case Layout::kTrellis:
       return meta.trellis && meta.trellis->Find(base) != nullptr && r.Has(base + ".trellis.w") &&
              r.Has(base + ".trellis.suh") && r.Has(base + ".trellis.svh");
+    case Layout::kW8a16:
+      // Both tensors (docs/w8a16.md 6.1); a base without them -- a `--keep-bf16` linear of a mixed
+      // container -- takes the bf16 fallback like any other layout's.
+      return r.Has(base + r4dx_convert::w8a16::kWqSuffix) && r.Has(base + r4dx_convert::w8a16::kWsSuffix);
   }
   return false;
 }

@@ -195,6 +195,8 @@ void TestFfnAlone(const Golden& g, Lfm2Model& m, const std::string& name) {
   Lfm2MoeDebug ds, dp;
   const std::vector<uint16_t> sorted = m.DebugFfnForward(layer, xn, T, Lfm2MoePath::kSorted, &ds);
   const std::vector<uint16_t> per_slot = m.DebugFfnForward(layer, xn, T, Lfm2MoePath::kPerSlot, &dp);
+  Lfm2MoeDebug dg;
+  const std::vector<uint16_t> grouped = m.DebugFfnForward(layer, xn, T, Lfm2MoePath::kGroupedDecode, &dg);
   const std::vector<int32_t> ids32 = Rows(ReadI32(r, "router_ids_fp32"), K, 0, T);
   const std::vector<int32_t> ids16 = Rows(ReadI32(r, "router_ids"), K, 0, T);
   const std::vector<float> w32 = Rows(r4dx_test::ReadGoldenAsFloat(r, "router_weights_fp32"), K, 0, T);
@@ -232,10 +234,15 @@ void TestFfnAlone(const Golden& g, Lfm2Model& m, const std::string& name) {
               per_slot == sorted ? "identical" : "differ");
   Check(dp.ids == ds.ids, name + ": the per-slot and the sorted path route identically");
   Check(e_ps < 1e-2, name + ": per-slot path output ~ sorted path output");
+  Check(dg.ids == dp.ids && grouped == per_slot,
+        name + ": grouped decode path (device-indexed) == staged per-slot path byte for byte over all " +
+            std::to_string(T) + " rows");
   const std::vector<uint16_t> one = Rows(xn, H, 0, 1);
   const std::vector<uint16_t> o_auto = m.DebugFfnForward(layer, one, 1, Lfm2MoePath::kAuto);
   const std::vector<uint16_t> o_sort = m.DebugFfnForward(layer, one, 1, Lfm2MoePath::kSorted);
   Check(o_auto == o_sort, name + ": one row (M = 1 everywhere): the decode path == the sorted path byte for byte");
+  const std::vector<uint16_t> o_ps = m.DebugFfnForward(layer, one, 1, Lfm2MoePath::kPerSlot);
+  Check(o_auto == o_ps, name + ": one row: kAuto (device-indexed grouped decode) == staged kPerSlot byte for byte");
 }
 
 // ---- 3. ShortConv state carry ------------------------------------------------------------------------------------

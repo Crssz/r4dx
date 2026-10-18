@@ -1,9 +1,9 @@
 # LFM2.5-24B-A2B in r4dx
 
-Status 2026-10-16: **bf16 TP=2 works end to end** (KL gate PASS, server smoke by hand: chat with the reasoning split, Thai,
+Status 2026-10-18: **bf16 TP=2 works end to end** (KL gate PASS, server smoke by hand: chat with the reasoning split, Thai,
 a tool call). **Trellis on one card works** as an 18.89 GB hybrid (K5 experts, bf16 non-expert and layers 2-5 experts;
-KL gate PASS, about 61 tok/s decode; see "Trellis (one GPU)"). **8-bit on one card works** (w8a16 g128, 24.9 GB, KL gate
-PASS with ALL +.0033 over bf16, 88.7 tok/s decode; see "8-bit (one GPU)"). This page is the
+KL gate PASS, **72.7 tok/s** decode; see "Trellis (one GPU)"). **8-bit on one card or two works** (w8a16 g128, 24.9 GB, KL gate
+PASS with ALL +.0033 over bf16, **171.2 tok/s** decode at TP=1 and **208.9 tok/s** at TP=2 with the L4-2 grouped MoE decode kernels; see "8-bit (one GPU)"). This page is the
 user-facing summary; the design and task list are [lfm2-plan.md](lfm2-plan.md), the verified model facts (each with a
 source line) are [lfm2-semantics.md](lfm2-semantics.md).
 
@@ -71,15 +71,23 @@ r4dx-server --model E:\models\r4dx\lfm2\lfm2-24b-a2b-bf16.r4dx --layout bf16 --t
 
 ## What is optimized and what is not
 
-bf16 correctness comes first; the MoE path is the **staged** one from lfm2-plan.md 3.5:
+The MoE decode path uses **device-indexed grouped kernels** (`L4-2`, `r4dx_lfm2_gemm_bf16_moe_decode` and
+`r4dx_gemm_w8a16_moe_decode`) plus a 32-wave dual-expert `r4dx_lfm2_router_f32` kernel:
 
-- Decode (one row): the fp32 router kernel, then one host readback of the 4 expert ids per MoE layer (38 syncs per token), then
-  per selected expert gate_up -> silu_mul -> down with the existing GEMMs, then a deterministic fp32 combine.
-- Prefill (chunks of up to 256 rows): router, a deterministic counting sort of the (token, slot) pairs by expert, one count
-  readback per layer, and one gate_up / silu_mul / down per non-empty expert.
-- Not done yet (plan phase L4): device-indexed grouped decode kernels (no host sync), a grouped prefill GEMM over the sorted
-  rows, larger MoE prefill chunks, any speculative decoding, the trellis kernels' indirect expert pointer. Only text exists: no
-  vision, no audio.
+- Decode (one row, bf16 and w8a16 experts): the fp32 router writes `ids[4]` and `wts[4]` on device, then one `gate_up`
+  grouped launch (`grid.z = 4`, reading expert base pointers from the layer's device pointer table), one `silu_mul` over all
+  4 slots, one `down` grouped launch (`grid.z = 4`), and the deterministic fp32 combine. **Zero host syncs** (down from 38
+  per token) and **519 launches/token** (down from 861), byte-for-bit identical to the staged per-slot path (`R4DX_LFM2_MOE_DECODE=staged`
+  is the kill switch). Trellis layers (layers 6-39 of the hybrid container) keep the staged per-slot path (L4-3: their 34
+  readbacks are ~8% of the step).
+- Prefill (chunks of up to 256 rows): router, a deterministic counting sort of the (token, slot) pairs by expert, then
+  device-indexed grouped GEMMs over the expert-sorted rows (L4-4: bf16 and w8a16, reading the device `expert_offsets`, no host
+  readback per layer).
+- Attention (10 layers): libr4d `h64_gqa4` bf16-KV kernels (L4-1): split-KV decode for up to 16 rows, tiled prefill, and split-KV
+  prefill from 2048 tokens of context. Per layer at 128k context decode takes 0.46 ms (the old reference kernel: 29.6 ms),
+  a 7239-token prompt prefills at 3847 tok/s. The reference kernel stays as the oracle and the fallback for other head sizes.
+- Not done yet (remaining L4 items): a chunk-size sweep for MoE prefill, any speculative decoding, the 128k long-context
+  needle run and long-context KL (L4-7). Only text exists: no vision, no audio.
 - Both TP ranks run the same router on identical bits; every expert is split across the ranks (two all-reduces per layer).
 
 ## Validated numbers (bf16 TP=2)
@@ -144,8 +152,7 @@ noise, not in outliers) and concentrated in the early layers' experts.
 
 - Container 18.89 GB; **20.29 GiB** VRAM peak (teacher-forced, 8192 context).
 - Top-1 **96.13 %** (bf16 TP=2 96.83 %, HF-bf16 96.53 %); all-chat test KL **.01545** (r4dx bf16 .00993, HF-bf16 noise .01248).
-- Teacher-forced **17.0 ms/row** on one GPU (bf16 TP=2: 25 ms/row). Server decode about **61 tok/s** on one GPU with the
-  untuned fallback GEMM tuning (bf16 TP=2: about 60-64 tok/s). Smoke suite: 75 checks pass.
+- Teacher-forced **17.0 ms/row** on one GPU (bf16 TP=2: 25 ms/row). Decode **72.7 tok/s** on one GPU (up from 61 tok/s before L4-2 grouped bf16 decode on layers 2-5 and the 32-wave router). Smoke suite: 75 checks pass.
 - Not done yet: tuning-table rows for the LFM2 trellis shapes, M = 256 / int8 prefill, grouped MoE kernels, a bf16 attention
   kernel for head_dim 64, a long-context / needle test, prefill TTFT numbers.
 
@@ -191,24 +198,21 @@ Increment of `KL(fp32 truth || r4dx)` over r4dx bf16 (gate: epsilon 0.005, incre
 
 - All-chat test KL **.01323** (r4dx bf16 .00993, HF-bf16 noise .01248); top-1 **96.41 %** (bf16 TP=2 96.83 %, HF-bf16 96.53 %).
 - Teacher-forced **12.4 ms/row** on one GPU; **26.18 GiB** VRAM peak at 8192 context.
-- Server decode **88.7 tok/s** on one GPU, with the untuned fallback GEMM tuning (the w8a16 tuning table is still the empty
-  placeholder). `tools\server\smoke.ps1 -Layout w8a16 -Tp 1 -Dialect lfm2`: 75 checks pass.
+- Decode **171.2 tok/s** on one GPU (up from 88.9 tok/s before L4-2 grouped MoE decode and the 32-wave router) and **208.9 tok/s** at `--tp 2` (up from 99.1 tok/s), byte-identical to the staged path. `tools\server\smoke.ps1 -Layout w8a16 -Tp 1 -Dialect lfm2`: 75 checks pass.
 - TP=2 works (added 2026-10-16, docs/w8a16.md "TP=2 outcome").
-- Not done yet: tuning-table rows (`tool_w8a16_gemm_bench --inc-out`; the G128 MT 3/4 + NPW 4 tiles spill VGPRs), LDLQ for
-  w8a16 (deferred), TP=2, the grouped MoE decode kernel, a check of the f16 activation range (values above 65504 saturate;
-  not measured on LFM2), long-context and TTFT numbers.
+- Tuning-table sweep (`tool_w8a16_gemm_bench --inc-out`, 2026-10-18): `W8a16FallbackTuning` (`NT=1` at `M=1`, `SK=8/4`) beat the isolated single-expert sweep rows in full-model decode (`171.2` vs `165.5 tok/s`) and preserves the KL-gated `SK` split orders, so `gemm_tuning_table_w8a16.inc` stays empty.
+- Not done yet: LDLQ for w8a16 (deferred), a check of the f16 activation range (values above 65504 saturate; not measured on LFM2), long-context and TTFT numbers.
 
 ### Three ways to run LFM2
 
-| | bf16, `--tp 2` | trellis hybrid, TP=1 | w8a16 g128, TP=1 |
-|---|--:|--:|--:|
-| container | 48.5 GB | 18.9 GB | 24.9 GB |
-| GPUs | 2 | 1 | 1 |
-| ALL increment over r4dx bf16 | +0 (reference) | +.0055 | +.0033 |
-| server decode | about 64 tok/s | about 61 tok/s | **88.7 tok/s** |
+| | bf16, `--tp 2` | trellis hybrid, TP=1 | w8a16 g128, TP=1 | w8a16 g128, `--tp 2` |
+|---|--:|--:|--:|--:|
+| container | 48.5 GB | 18.9 GB | 24.9 GB | 24.9 GB (12.2 GiB/card) |
+| GPUs | 2 | 1 | 1 | 2 |
+| ALL increment over r4dx bf16 | +0 (reference) | +.0055 | +.0033 | +.0025 |
+| decode | about 52-64 tok/s | **72.7 tok/s** | **171.2 tok/s** | **208.9 tok/s** |
 
-All three decode numbers use untuned GEMM settings. The trellis hybrid is K5 trellis experts with bf16 non-expert linears and
-bf16 experts of layers 2-5.
+The trellis hybrid is K5 trellis experts with bf16 non-expert linears and bf16 experts of layers 2-5.
 
 ## Pointers
 

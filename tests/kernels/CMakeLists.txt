@@ -197,6 +197,18 @@ target_link_libraries(test_attn_ref_gemma PRIVATE r4dx_model_attention r4dx_core
 add_test(NAME test_attn_ref_gemma COMMAND test_attn_ref_gemma)
 set_tests_properties(test_attn_ref_gemma PROPERTIES ENVIRONMENT "HIP_VISIBLE_DEVICES=1")
 
+# libr4d's head_dim 64 / gqa 4 bf16-KV attention (docs/lfm2-plan.md 3.4, task L4-1; `ctest -R attn_h64_gqa4`): decode,
+# prefill and split-KV prefill against the stage-0 reference kernel above on the same bf16 cache, plus the entry
+# points' negative return codes.
+add_executable(test_attn_h64_gqa4 test_attn_h64_gqa4.cpp)
+target_link_libraries(test_attn_h64_gqa4 PRIVATE r4dx_model_attention r4dx_core r4dx_kernels r4d_core)
+add_test(NAME test_attn_h64_gqa4 COMMAND test_attn_h64_gqa4)
+set_tests_properties(test_attn_h64_gqa4 PROPERTIES ENVIRONMENT "HIP_VISIBLE_DEVICES=1")
+# tool_attn_h64_bench: the same kernels vs the reference kernel, time and KV GB/s at 2k / 8k / 32k / 128k (not a ctest):
+# $env:HIP_VISIBLE_DEVICES='1'; build\win-hip\tests\kernels\tool_attn_h64_bench.exe
+add_executable(tool_attn_h64_bench tool_attn_h64_bench.cpp)
+target_link_libraries(tool_attn_h64_bench PRIVATE r4dx_model_attention r4dx_core r4dx_kernels r4d_core)
+
 # libr4d's sliding-window attention (docs/gemma4-plan.md 3.3, task M1-32; the GPU step is
 # `ctest -R "attn_.*gqa2"`): r4d_attn_{prefill,decode}_h256_gqa2_fp8kv against the stage-0 reference
 # kernel above, on the same fp8 ring bytes (gemma_attn_fixture.hpp). Window 1024 on the 1536-token
@@ -398,6 +410,8 @@ foreach(t test_lfm2_shortconv test_lfm2_router test_lfm2_moe test_lfm2_rope_norm
   add_test(NAME ${t} COMMAND ${t})
   set_tests_properties(${t} PROPERTIES ENVIRONMENT "HIP_VISIBLE_DEVICES=1")
 endforeach()
+target_include_directories(test_lfm2_rope_norm64 PRIVATE "${CMAKE_SOURCE_DIR}/src/model")
+target_link_libraries(test_lfm2_rope_norm64 PRIVATE r4dx_model_kernels)
 # test_lfm2_ref_cpu: pure CPU (no HIP call, no kernel library) -- lfm2_ref.hpp against hand cases and naive
 # implementations (whole-sequence causal conv1d, stable sort, HF rope / rmsnorm). Always runs.
 add_executable(test_lfm2_ref_cpu test_lfm2_ref_cpu.cpp)

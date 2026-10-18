@@ -21,6 +21,7 @@
 
 #include "lfm2_test_util.hpp"
 #include "r4dx/kernels/lfm2_kernels.h"
+#include "r4d.h"
 
 using namespace r4dx::core;
 using namespace lfm2_test;
@@ -166,6 +167,79 @@ void TestCombine(std::mt19937& rng, int T, int K, int hidden, bool inject_invali
   CheckF(FromBits(out_d.CopyToHost()) == got_sorted, nm + ": repeat launch gives the same bytes (determinism)");
 }
 
+void TestBf16MoeDecode(std::mt19937& rng, const std::string& tag, int T, int top_k, int E, int N, int K,
+                       int WV, int SK, int a_row_group) {
+  const int Pn = T * top_k;
+  const int a_rows = Pn / a_row_group;
+  const auto ids = RandomIds(rng, T, top_k, E);
+  const auto a_bits = ToBits(RandBf16(rng, static_cast<size_t>(a_rows) * K, 2.0f));
+  DeviceBuffer<uint16_t> a_d(a_bits.size());
+  a_d.CopyFromHost(a_bits);
+
+  std::vector<DeviceBuffer<uint16_t>> w_bufs;
+  w_bufs.reserve(static_cast<size_t>(E));
+  std::vector<uint64_t> ptrs_h(static_cast<size_t>(E));
+  for (int e = 0; e < E; ++e) {
+    w_bufs.emplace_back(static_cast<size_t>(N) * K);
+    w_bufs.back().CopyFromHost(ToBits(RandBf16(rng, static_cast<size_t>(N) * K, 0.5f)));
+    ptrs_h[static_cast<size_t>(e)] = reinterpret_cast<uint64_t>(w_bufs.back().data());
+  }
+  DeviceBuffer<uint64_t> ptrs_d(static_cast<size_t>(E));
+  ptrs_d.CopyFromHost(ptrs_h);
+  DeviceBuffer<int32_t> ids_d(static_cast<size_t>(Pn));
+  ids_d.CopyFromHost(ids);
+
+  DeviceBuffer<uint16_t> c_grouped(static_cast<size_t>(Pn) * N), c_staged(static_cast<size_t>(Pn) * N);
+  c_grouped.CopyFromHost(std::vector<uint16_t>(c_grouped.size(), 0x7F31));
+  c_staged.CopyFromHost(std::vector<uint16_t>(c_staged.size(), 0x7F31));
+
+  r4dx_lfm2_gemm_bf16_moe_decode(P(a_d.data()), P(ptrs_d.data()), P(ids_d.data()), P(c_grouped.data()), Pn,
+                                 a_row_group, E, K, N, WV, SK, 0);
+  for (int p = 0; p < Pn; ++p) {
+    const int e = ids[static_cast<size_t>(p)];
+    const uint16_t* ap = a_d.data() + static_cast<size_t>(p / a_row_group) * K;
+    uint16_t* cp = c_staged.data() + static_cast<size_t>(p) * N;
+    r4d_gemm_bf16_nt_m64(P(ap), P(w_bufs[static_cast<size_t>(e)].data()), P(cp), 1, K, N, WV, SK, 1, 0);
+  }
+  R4DX_HIP_CHECK(hipDeviceSynchronize());
+  const auto got = c_grouped.CopyToHost();
+  const auto want = c_staged.CopyToHost();
+  CheckF(got == want, tag + ": grouped bf16 MoE decode == per-pair r4d_gemm_bf16_nt_m64 (bitwise)");
+
+  r4dx_lfm2_gemm_bf16_moe_decode(P(a_d.data()), P(ptrs_d.data()), P(ids_d.data()), P(c_grouped.data()), Pn,
+                                 a_row_group, E, K, N, WV, SK, 0);
+  R4DX_HIP_CHECK(hipDeviceSynchronize());
+  CheckF(c_grouped.CopyToHost() == got, tag + ": repeat launch gives the same bytes");
+}
+
+void TestBf16MoeDecodeInvalidId(std::mt19937& rng) {
+  const int Pn = 4, E = 8, N = 64, K = 256;
+  std::vector<int32_t> ids = {2, -1, 8, 5};
+  DeviceBuffer<uint16_t> a_d(static_cast<size_t>(Pn) * K), c_d(static_cast<size_t>(Pn) * N);
+  a_d.CopyFromHost(ToBits(RandBf16(rng, a_d.size(), 1.0f)));
+  std::vector<DeviceBuffer<uint16_t>> w_bufs;
+  std::vector<uint64_t> ptrs_h(E);
+  for (int e = 0; e < E; ++e) {
+    w_bufs.emplace_back(static_cast<size_t>(N) * K);
+    w_bufs.back().CopyFromHost(ToBits(RandBf16(rng, static_cast<size_t>(N) * K, 0.5f)));
+    ptrs_h[e] = reinterpret_cast<uint64_t>(w_bufs.back().data());
+  }
+  DeviceBuffer<uint64_t> ptrs_d(E);
+  ptrs_d.CopyFromHost(ptrs_h);
+  DeviceBuffer<int32_t> ids_d(Pn);
+  ids_d.CopyFromHost(ids);
+  c_d.CopyFromHost(std::vector<uint16_t>(c_d.size(), 0x7F31));
+  r4dx_lfm2_gemm_bf16_moe_decode(P(a_d.data()), P(ptrs_d.data()), P(ids_d.data()), P(c_d.data()), Pn, 1, E, K, N, 1, 4, 0);
+  R4DX_HIP_CHECK(hipDeviceSynchronize());
+  const auto got = c_d.CopyToHost();
+  bool invalid_untouched = true, valid_written = true;
+  for (int n = 0; n < N; ++n) {
+    invalid_untouched &= got[1 * N + n] == 0x7F31 && got[2 * N + n] == 0x7F31;
+    valid_written &= got[0 * N + n] != 0x7F31 && got[3 * N + n] != 0x7F31;
+  }
+  Check(invalid_untouched && valid_written, "bf16 moe decode: invalid expert ids leave their C rows untouched");
+}
+
 void TestThrows() {
   DeviceBuffer<int32_t> a(64);
   auto throws = [&](int T, int K, int E) {
@@ -179,6 +253,24 @@ void TestThrows() {
   Check(throws(1, 4, 257), "sort: n_experts 257 throws");
   Check(throws(5000, 4, 64), "sort: T * top_k > 16384 throws");
   Check(throws(1, 4, 0), "sort: n_experts 0 throws");
+  DeviceBuffer<uint16_t> x(256);
+  DeviceBuffer<uint64_t> p(8);
+  auto throws_bf16 = [&](int Pn, int grp, int E, int K, int N, int WV, int SK, bool null_p = false) {
+    try {
+      r4dx_lfm2_gemm_bf16_moe_decode(null_p ? 0 : P(x.data()), P(p.data()), P(a.data()), P(x.data()), Pn, grp, E, K, N,
+                                     WV, SK, 0);
+    } catch (const std::runtime_error&) {
+      return true;
+    }
+    return false;
+  };
+  Check(throws_bf16(0, 1, 8, 256, 64, 1, 4), "bf16 moe decode: n_pairs 0 throws");
+  Check(throws_bf16(4, 3, 8, 256, 64, 1, 4), "bf16 moe decode: n_pairs % a_row_group != 0 throws");
+  Check(throws_bf16(4, 1, 257, 256, 64, 1, 4), "bf16 moe decode: n_experts > 256 throws");
+  Check(throws_bf16(4, 1, 8, 256, 24, 1, 4), "bf16 moe decode: N % 16 != 0 throws");
+  Check(throws_bf16(4, 1, 8, 240, 64, 1, 4), "bf16 moe decode: K % (SK*16) != 0 throws");
+  Check(throws_bf16(4, 1, 8, 256, 64, 9, 4), "bf16 moe decode: WV*SK*32 > 1024 throws");
+  Check(throws_bf16(4, 1, 8, 256, 64, 1, 4, true), "bf16 moe decode: null pointer throws");
 }
 
 }  // namespace
@@ -219,6 +311,11 @@ int main() {
   TestCombine(rng, 256, 4, 2048, false);
   TestCombine(rng, 17, 4, 1000, false);  // hidden not a multiple of the block
   TestCombine(rng, 8, 4, 2048, true);
+  TestBf16MoeDecode(rng, "bf16 moe decode gate_up [3072x2048] T=1 top-4", 1, 4, 16, 3072, 2048, 4, 4, 4);
+  TestBf16MoeDecode(rng, "bf16 moe decode down [2048x1536] T=1 top-4", 1, 4, 16, 2048, 1536, 4, 4, 1);
+  TestBf16MoeDecode(rng, "bf16 moe decode TP2 gate_up [1536x2048] T=1 top-4", 1, 4, 16, 1536, 2048, 4, 4, 4);
+  TestBf16MoeDecode(rng, "bf16 moe decode TP2 down [2048x768] T=8 top-4", 8, 4, 16, 2048, 768, 4, 4, 1);
+  TestBf16MoeDecodeInvalidId(rng);
   TestThrows();
   std::printf(g_ok ? "PASS\n" : "FAIL\n");
   return g_ok ? 0 : 1;

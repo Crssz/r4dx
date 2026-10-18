@@ -105,6 +105,23 @@ inline int64_t AttnDecodeWindowScratchBytes(const ArgsW& a) {
   return r4d_attn_decode_h256_gqa2_scratch_bytes(&a);
 }
 
+// ---- attention: head_dim 64, gqa 4, bf16 KV (LFM2's full-attention layers; r4d_attn_paged_h64_gqa4.hip) ----
+// Plain Args; k_descale / v_descale may be null. Decode needs Args::scratch (AttnDecodeH64ScratchBytes);
+// split-KV prefill needs it when Args::splits > 1 (AttnPrefillSplitKvH64ScratchBytes).
+inline void AttnPrefillH64Bf16Kv(const Args& a, hipStream_t stream) {
+  R4DX_R4D_CHECK("attn_prefill_h64_gqa4_bf16kv", r4d_attn_prefill_h64_gqa4_bf16kv(&a, stream));
+}
+inline void AttnPrefillSplitKvH64Bf16Kv(const Args& a, hipStream_t stream) {
+  R4DX_R4D_CHECK("attn_prefill_splitkv_h64_gqa4_bf16kv", r4d_attn_prefill_splitkv_h64_gqa4_bf16kv(&a, stream));
+}
+inline int64_t AttnPrefillSplitKvH64ScratchBytes(const Args& a) {
+  return r4d_attn_prefill_splitkv_h64_gqa4_scratch_bytes(&a);
+}
+inline void AttnDecodeH64Bf16Kv(const Args& a, hipStream_t stream) {
+  R4DX_R4D_CHECK("attn_decode_h64_gqa4_bf16kv", r4d_attn_decode_h64_gqa4_bf16kv(&a, stream));
+}
+inline int64_t AttnDecodeH64ScratchBytes(const Args& a) { return r4d_attn_decode_h64_gqa4_scratch_bytes(&a); }
+
 // Every attention geometry the build serves (r4d_attn_dims reports the gqa6 one only), for validating
 // a model's layer types against all of them at load.
 inline std::vector<R4DAttnGeom> GetAttnGeoms() {

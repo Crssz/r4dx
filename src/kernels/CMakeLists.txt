@@ -99,12 +99,15 @@ add_custom_command(
           "${R4DX_HIPCC}" ${R4DX_KERNELS_FLAGS} -c "${R4DX_TRELLIS_SRC}" -o "${R4DX_TRELLIS_OBJ}"
   DEPENDS "${R4DX_TRELLIS_SRC}"
           "${CMAKE_CURRENT_SOURCE_DIR}/include/r4dx/kernels/kernels.h"
+          "${CMAKE_CURRENT_SOURCE_DIR}/include/r4dx/kernels/lfm2_kernels.h"
           "${CMAKE_CURRENT_SOURCE_DIR}/include/r4dx/kernels/gemma_kernels.h"
           "${CMAKE_CURRENT_SOURCE_DIR}/include/r4dx/kernels/gemma_device.h"
           "${CMAKE_CURRENT_SOURCE_DIR}/include/r4dx/kernels/hadamard_device.h"
           "${CMAKE_CURRENT_SOURCE_DIR}/../core/include/r4dx/core/dtype.hpp"
           "${CMAKE_CURRENT_SOURCE_DIR}/../core/include/r4dx/core/error.hpp"
           "${CMAKE_CURRENT_SOURCE_DIR}/../../third_party/libr4d/r4d_fwht128.h"
+          "${CMAKE_CURRENT_SOURCE_DIR}/../../third_party/libr4d/r4d_gdn_wmma.h"
+          "${CMAKE_CURRENT_SOURCE_DIR}/../../third_party/libr4d/r4d_trellis_dq.h"
           "${CMAKE_CURRENT_SOURCE_DIR}/../../third_party/libr4d/r4d_trellis_i8_fused.h"
           "${CMAKE_CURRENT_SOURCE_DIR}/../../third_party/libr4d/r4d_trellis_i8_layout.h"
   COMMENT "hipcc (${R4D_GFX_ARCH}) trellis_transform.obj"
@@ -147,6 +150,7 @@ add_custom_command(
           "${CMAKE_CURRENT_SOURCE_DIR}/include/r4dx/kernels/lfm2_kernels.h"
           "${CMAKE_CURRENT_SOURCE_DIR}/include/r4dx/kernels/kernels.h"
           "${CMAKE_CURRENT_SOURCE_DIR}/../core/include/r4dx/core/error.hpp"
+          "${CMAKE_CURRENT_SOURCE_DIR}/../../third_party/libr4d/r4d_gdn_wmma.h"
   COMMENT "hipcc (${R4D_GFX_ARCH}) lfm2_kernels.obj"
   VERBATIM
 )

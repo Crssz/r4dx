@@ -1,15 +1,63 @@
 # Status
 
+## LFM2.5-24B-A2B L4-1: libr4d `h64_gqa4` attention (decode, prefill, split-KV prefill), 2026-10-18
+
+New `third_party/libr4d/r4d_attn_paged_h64_gqa4.hip` (`R4D_VERSION` 0.7.0): the gqa6 prefill / decode kernel templates
+instantiated at head_dim 64, GQA 4, bf16 KV (entry points `r4d_attn_{prefill,prefill_splitkv,decode}_h64_gqa4_bf16kv`,
+registry rows, `r4dx::core::r4d` wrappers). `Lfm2AttnLayer` calls it (decode for T <= 16, prefill otherwise, split-KV prefill
+from 2048 tokens of context by `Lfm2PrefillSplits`); the stage-0 reference kernel stays as fallback and oracle.
+`Lfm2Model::seqused_dev_` carries the device context length. The Qwen attention ISA guard still passes.
+
+- **Correctness:** `test_attn_h64_gqa4` against the reference kernel on the same bf16 cache: rel L2 1e-3 to 2.3e-3, two
+  launches give the same bytes, split-KV with 1 segment equals the plain launch, refusals return -1/-2/-4/-5.
+  `ctest -R "lfm2|w8a16"` all pass; real-weights `test_lfm2_layers` passes with the layer-2 mixer error unchanged (6.9e-3).
+  Greedy text can differ from the reference-kernel path after a few tokens (f16 P operands: rounding class).
+- **Per layer, device 1 (`tool_attn_h64_bench`), reference -> h64_gqa4:** decode q_len 1 at 2k/8k/32k/128k: 403 -> 20 us,
+  2.0 ms -> 28 us, 7.9 ms -> 69 us, 29.6 ms -> 464 us. 64-row prefill chunk: 4.1 ms -> 34 us, 15.8 ms -> 80 us, 59 ms ->
+  245 us, 258 ms -> 820 us.
+- **End to end** (`w8a16` TP=1): decode 176 tok/s at short context; a 7239-token prompt prefills in 1.88 s (3847 tok/s)
+  and decodes at 164 tok/s.
+- **Follow-ups:** KL gate on the real model (`w8a16` TP=1, new attention): PASS, ALL +.00333 over r4dx bf16 (unchanged from
+  +.0033; chat segments < 600 tokens, so split-KV prefill is not in the gate). `smoke.ps1 -Tp 2 -Dialect lfm2`: all checks
+  pass, TP=2 decode about 249 tok/s. The bench's HIP 719 fault was a bug in `attn_ref.hip` (PV loop read past the cache end
+  for head_dim < 256), fixed with a column guard. The decode split law was swept and left unchanged (within about 15 % of the
+  best fixed count; the 8192 slowdown was run-to-run variation).
+- **Needle (L4-7 part, `w8a16` TP=1, greedy, one passcode hidden mid-prompt in repetitive filler notes):** 32,113 tokens:
+  correct, prefill 3736 tok/s, decode 149 tok/s; 101,783 tokens (`--max-ctx 131072 --extended-ctx`): correct, prefill 3344
+  tok/s (30.4 s), decode 110 tok/s, 28.5 GiB VRAM. Both exercise split-KV prefill. Still open: a long-context KL against an
+  fp32 truth, the 60-minute soak and `Lfm2TpModel` fault injection.
+
+## LFM2.5-24B-A2B Phase L4 (L4-2 / L4-3 / L4-6): device-indexed grouped MoE decode, 171.2 tok/s (TP=1) and 208.9 tok/s (TP=2), 2026-10-18
+
+Implemented `r4dx_lfm2_gemm_bf16_moe_decode` (`src/kernels/src/lfm2_kernels.hip`), `r4dx_gemm_w8a16_moe_decode`
+(`src/kernels/src/w8a16_gemm.hip`), per-layer device pointer tables in `Lfm2Container` (bf16 and w8a16, including bf16-kept
+layers of hybrid containers), `Lfm2MoePath::kGroupedDecode` in `Lfm2MoeFfn` (default at `T = 1` whenever device pointer
+tables exist; kill switch `R4DX_LFM2_MOE_DECODE=staged`), and widened `r4dx_lfm2_router_f32` to 32 waves with dual-expert
+accumulation.
+
+- **Bit-exactness:** `kGroupedDecode` is byte-for-bit identical to the staged `kPerSlot` path across all unit, layer-golden
+  and model tests (`test_lfm2_moe`, `test_w8a16_gemm`, `lfm2_layer_golden`, `lfm2_tiny_w8a16`, `lfm2_tiny_e2e`). Also fixed
+  `Lfm2Model::DecodeStepSampled` to fall back to `SampleCanonical` when `vocab_local <= 64`, so `lfm2_tiny_e2e` (TP=1 and
+  TP=2 emulate) and `lfm2_tiny_trellis` pass all checks.
+- **Decode speed (LFM2.5-24B-A2B, 128 tokens, greedy, 8192 ctx):**
+  - `w8a16` g128 TP=1 (one R9700): **88.9 -> 171.2 tok/s** (5.84 ms/tok, **1.93x**; 134.1 tok/s from grouped MoE decode alone
+    + 171.2 tok/s with the 32-wave router; 0 host syncs/token, 861 -> 519 launches/token).
+  - `w8a16` g128 TP=2 (two R9700s): **99.1 -> 208.9 tok/s** (4.79 ms/tok, **2.11x**).
+  - `trellis` hybrid TP=1 (layers 2-5 bf16 experts on grouped decode, layers 6-39 trellis on staged): **61 -> 72.7 tok/s**
+    (**1.19x**). Remaining 34 trellis readbacks are 7.9% of `gpu_sum` (< 15% L4-3 threshold -> staged path kept for trellis,
+    `libr4d` untouched).
+- **W8A16 tuning sweep (`tool_w8a16_gemm_bench.exe`):** swept all 16 TP=1 and TP=2 shapes (490-642 GB/s at M=1);
+  `W8a16FallbackTuning` (`NT=1` at `M=1`, `SK=8/4`) beats the isolated single-linear sweep rows in full-model decode
+  (`171.2` vs `165.5 tok/s`), so `gemm_tuning_table_w8a16.inc` stays empty.
+
 ## LFM2.5-24B-A2B: w8a16 (8-bit, one card) validated, 2026-10-16
 
 New `--layout w8a16` (symmetric int8 weights, f16 group scales at g128, bf16 activations, TP=1, and TP=2 on LFM2 since the follow-up), merged to `main` from
 branch `w8a16`. LFM2 container `lfm2-w8a16-g128.r4dx`, 24.88 GB (converted in 108 s with `--layouts w8a16 --no-bf16`), 26.18
 GiB VRAM peak at 8192 ctx on one GPU. KL gate (epsilon 0.005, increment over r4dx bf16) **PASS**: code +.0033, english +.0028,
 thai +.0047, tool +.0005, ALL +.0033; all-chat test KL .01323 (bf16 .00993, HF-bf16 .01248), top-1 96.41 %. Server decode
-**88.7 tok/s** on one GPU (bf16 TP=2 about 64, trellis hybrid about 61; all untuned), teacher-forced 12.4 ms/row; smoke
-`-Layout w8a16 -Tp 1 -Dialect lfm2` 75 checks pass. Qwen TP=1 identity rows 1, 3, 6, 9 are byte-identical to `main`. Not done:
-tuning-table rows (the w8a16 table is the empty placeholder), LDLQ, grouped MoE decode kernel, f16 activation
-range check, long-context / TTFT numbers. Pages: [w8a16.md](w8a16.md) (design and outcome), [lfm2.md](lfm2.md) "8-bit (one
+**88.7 tok/s** on one GPU at initial merge (**171.2 tok/s** after L4-2 above), teacher-forced 12.4 ms/row; smoke
+`-Layout w8a16 -Tp 1 -Dialect lfm2` 75 checks pass. Qwen TP=1 identity rows 1, 3, 6, 9 are byte-identical to `main`. Pages: [w8a16.md](w8a16.md) (design and outcome), [lfm2.md](lfm2.md) "8-bit (one
 GPU)", [container-format.md](container-format.md) "w8a16 body layout".
 
 ## LFM2.5-24B-A2B: bf16 TP=2 and trellis hybrid (one card) work, 2026-10-16

@@ -327,8 +327,71 @@ int main() {
       }
 
       // 2. determinism
-      // No forward here: the tiny vocab (64) shards to 32 per rank, under the top-k kernel's minimum (the known tiny-model
-      // limit); the TP=2 numerics are checked on the real container (docs/w8a16.md 6.2, tools/server/smoke.ps1 -Tp 2).
+      m->Reset();
+      std::vector<int64_t> rows2;
+      Check(Feed(*m, g, &rows2) == got, "2: the same feed after Reset() gives identical bytes");
+
+      // 3. checkpoint / restore of the ShortConv state
+      m->Reset();
+      (void)m->Prefill(std::vector<int32_t>(g.ids.begin(), g.ids.begin() + 256));
+      m->SaveCheckpoint();
+      const std::vector<int32_t> tail(g.ids.begin() + 256, g.ids.begin() + kPrefillEnd);
+      const std::vector<float> a1 = m->Prefill(tail);
+      const std::vector<float> b1 = m->DecodeStep(g.ids[kPrefillEnd]);
+      m->RestoreCheckpoint();
+      const std::vector<float> a2 = m->Prefill(tail);
+      const std::vector<float> b2 = m->DecodeStep(g.ids[kPrefillEnd]);
+      Check(a1 == a2 && b1 == b2, "3: RestoreCheckpoint + the same tail reproduces the logits bit for bit");
+      const double kl_split = Kl(got[1].data(), a1.data(), V);
+      std::printf("  row 279 via 256+24 vs 1+256+23 chunks: KL %.3e\n", kl_split);
+      Check(kl_split < 1e-3, "3: a different prefill chunking gives the same row 279 (KL < 1e-3)");
+
+      // 5. DecodeStepGreedy == argmax(DecodeStep) in the same state
+      m->Reset();
+      (void)m->Prefill(std::vector<int32_t>(g.ids.begin(), g.ids.begin() + kPrefillEnd));
+      const int32_t greedy = m->DecodeStepGreedy(g.ids[kPrefillEnd]);
+      m->Reset();
+      (void)m->Prefill(std::vector<int32_t>(g.ids.begin(), g.ids.begin() + kPrefillEnd));
+      const std::vector<float> full = m->DecodeStep(g.ids[kPrefillEnd]);
+      Check(greedy == static_cast<int32_t>(Argmax(full.data(), V)),
+            "5: DecodeStepGreedy == argmax(DecodeStep) in the same state");
+    }
+
+    // ---- 4 & 6: the MoE paths (kGroupedDecode == kPerSlot == kSorted) and layout counts on w8a16 experts ----
+    {
+      Lfm2ModelOptions lo;
+      lo.container_path = wcont;
+      lo.layout = Layout::kW8a16;
+      lo.max_ctx = 512;
+      Lfm2Model lm = Lfm2Model::Load(lo);
+      const LayoutCount n = CountLayouts(lm.GetContainer());
+      Check(n.w8 > 0 && n.bf16 == 0 && n.other == 0 && n.all_g128,
+            "6: every body linear, expert and the head loaded as kW8a16 at group 128 (" + std::to_string(n.w8) +
+                " linears, 0 fallbacks)");
+      const int64_t H = lm.Config().hidden_size, T = 8;
+      std::mt19937 rng(77);
+      std::normal_distribution<float> nd(0.0f, 1.0f);
+      std::vector<uint16_t> x(static_cast<size_t>(T * H));
+      for (auto& v : x) v = core::FloatToBf16(nd(rng));
+      for (int64_t layer : {int64_t{2}, int64_t{3}}) {
+        Check(lm.GetContainer().Layer(layer).moe.HasW8a16Ptrs(),
+              "4: layer " + std::to_string(layer) + " has w8a16 device expert pointer tables");
+        Lfm2MoeDebug d_grp, d_ps, d_sort;
+        const std::vector<uint16_t> y_grp = lm.DebugFfnForward(layer, x, T, Lfm2MoePath::kGroupedDecode, &d_grp);
+        const std::vector<uint16_t> y_ps = lm.DebugFfnForward(layer, x, T, Lfm2MoePath::kPerSlot, &d_ps);
+        const std::vector<uint16_t> y_sort = lm.DebugFfnForward(layer, x, T, Lfm2MoePath::kSorted, &d_sort);
+        Check(d_grp.ids == d_ps.ids && d_ps.ids == d_sort.ids,
+              "4: layer " + std::to_string(layer) + ": kGroupedDecode, kPerSlot and kSorted route the same experts");
+        Check(y_grp == y_ps,
+              "4: layer " + std::to_string(layer) + ": w8a16 kGroupedDecode == staged kPerSlot byte for byte");
+        Check(y_ps == y_sort,
+              "4: layer " + std::to_string(layer) + ": w8a16 kPerSlot (M=1) == kSorted (M<=16) byte for byte");
+        const std::vector<uint16_t> x1(x.begin(), x.begin() + H);
+        const std::vector<uint16_t> o_auto = lm.DebugFfnForward(layer, x1, 1, Lfm2MoePath::kAuto);
+        const std::vector<uint16_t> o_ps = lm.DebugFfnForward(layer, x1, 1, Lfm2MoePath::kPerSlot);
+        Check(o_auto == o_ps,
+              "4: layer " + std::to_string(layer) + ": T=1 kAuto (grouped decode) == staged kPerSlot byte for byte");
+      }
     }
 
     // ---- 7: refusals ----

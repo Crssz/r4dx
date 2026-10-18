@@ -78,7 +78,8 @@ int main() {
                   tag + " resolves to the M = 1 row (" + Str(t1) + ")");
             Check(t.NT == (M == 1 ? t1.NT : 0), tag + ": NT 0 for M = 2..16 (w4a16's rule)");
           }
-          // The fallback's documented shape (the table is the empty placeholder).
+          // Bit-identical SK rule (docs/w8a16.md 4.5): SK always equals the fallback's SK, and shapes not in
+          // gemm_tuning_table_w8a16.inc (g == 64 or the tiny K == 512 shapes) resolve to the exact fallback.
           const int wv = (s.N / 16 < 512) ? 1 : 4;
           const int npw = M > 16 ? 4 : 1;
           int sk = 1;
@@ -88,10 +89,13 @@ int main() {
               break;
             }
           }
-          const int mb = M > 16 ? static_cast<int>(std::min<int64_t>(4, (M + 15) / 16)) : 1;
-          Check(t.WV == wv && t.SK == sk && t.MB == mb && t.NPW == npw && t.NT == (M == 1 ? 1 : 0),
-                tag + " is docs/w8a16.md 4.5's fallback (WV " + std::to_string(wv) + " SK " + std::to_string(sk) + " MB " +
-                    std::to_string(mb) + " NPW " + std::to_string(npw) + ")");
+          Check(t.SK == sk, tag + ": SK matches the bit-identical fallback SK " + std::to_string(sk));
+          if (g == 64 || s.K == 512) {
+            const int mb = M > 16 ? static_cast<int>(std::min<int64_t>(4, (M + 15) / 16)) : 1;
+            Check(t.WV == wv && t.SK == sk && t.MB == mb && t.NPW == npw && t.NT == (M == 1 ? 1 : 0),
+                  tag + " is docs/w8a16.md 4.5's fallback (WV " + std::to_string(wv) + " SK " + std::to_string(sk) +
+                      " MB " + std::to_string(mb) + " NPW " + std::to_string(npw) + ")");
+          }
         }
       }
     }
@@ -101,8 +105,8 @@ int main() {
     Check(PickTuning(Layout::kW8a16, 3072, 2048, 1, 128).SK == 8, "expert gate_up K 2048 g128 (16 groups): SK 8 at M = 1");
     Check(PickTuning(Layout::kW8a16, 2048, 1536, 1, 128).SK == 4, "expert down K 1536 g128 (12 groups): SK 4 at M = 1");
     Check(PickTuning(Layout::kW8a16, 2048, 11776, 1, 128).SK == 4, "dense down K 11776 g128 (92 groups): SK 4 at M = 1");
-    Check(PickTuning(Layout::kW8a16, 3072, 2048, 1, 128).WV == 1, "expert gate_up (192 row tiles): WV 1");
-    Check(PickTuning(Layout::kW8a16, 23552, 2048, 1, 128).WV == 4, "dense gate_up (1472 row tiles): WV 4");
+    Check(PickTuning(Layout::kW8a16, 3072, 2048, 1, 128).WV == 2, "expert gate_up (grid.z=4 tuned row): WV 2");
+    Check(PickTuning(Layout::kW8a16, 2048, 1536, 1, 128).WV == 4, "expert down (grid.z=4 tuned row): WV 4");
     Check(PickTuning(Layout::kW8a16, 23552, 2048, 64, 128).SK == 4,
           "dense gate_up M = 64: SK 4 (WV 4 x NPW 4 x SK 4 = 64 KiB of LDS, the cap)");
 
@@ -115,8 +119,8 @@ int main() {
       // would hand one of them the other's pick.
       const LinearTuning c = PickTuning(Layout::kBf16, 2048, 2048, 1, 0);
       const LinearTuning d = PickTuning(Layout::kW8a16, 2048, 2048, 1, 128);
-      Check(d.SK == 8 && d.WV == 1, "w8a16 [2048, 2048] g128 after a bf16 pick at the same shape is its own: " + Str(d) +
-                                        " (bf16: " + Str(c) + ")");
+      Check(d.SK == 8, "w8a16 [2048, 2048] g128 after a bf16 pick at the same shape is its own: " + Str(d) +
+                           " (bf16: " + Str(c) + ")");
       Check(PickTuning(Layout::kBf16, 2048, 2048, 1, 0).SK == c.SK, "and the bf16 pick is unchanged after it");
     }
 

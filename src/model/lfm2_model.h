@@ -181,6 +181,7 @@ class Lfm2Model {
 
   core::PinnedBuffer<int32_t> ids_host_;
   core::DeviceBuffer<int32_t> ids_dev_, positions_dev_;
+  core::DeviceBuffer<int32_t> seqused_dev_;  // [1] == start_pos + T of the call (the h64_gqa4 attention reads it on device)
   core::DeviceBuffer<uint16_t> buf_h_;  // bf16 residual [max_chunk, hidden]
   core::DeviceBuffer<float> logits_dev_;
   core::DeviceBuffer<int32_t> argmax_dev_, summary_ids_dev_;

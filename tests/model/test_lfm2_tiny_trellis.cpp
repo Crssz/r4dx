@@ -275,14 +275,22 @@ int main() {
           Check(false, "layer " + std::to_string(layer) + " is an MoE layer of the tiny model");
           continue;
         }
-        Lfm2MoeDebug d1, d2;
+        Check(lm.GetContainer().Layer(layer).moe.HasTrellisPtrs(),
+              "layer " + std::to_string(layer) + ": trellis experts have device pointer tables");
+        Lfm2MoeDebug d_grp, d1, d2;
+        const std::vector<uint16_t> y_grp = lm.DebugFfnForward(layer, x, T, Lfm2MoePath::kGroupedDecode, &d_grp);
         const std::vector<uint16_t> y1 = lm.DebugFfnForward(layer, x, T, Lfm2MoePath::kPerSlot, &d1);
         const std::vector<uint16_t> y2 = lm.DebugFfnForward(layer, x, T, Lfm2MoePath::kSorted, &d2);
-        Check(d1.ids == d2.ids, "layer " + std::to_string(layer) + ": both MoE paths route the same experts");
+        Check(d_grp.ids == d1.ids && d1.ids == d2.ids, "layer " + std::to_string(layer) + ": all MoE paths route the same experts");
+        Check(y_grp == y1, "layer " + std::to_string(layer) + ": trellis kGroupedDecode == staged kPerSlot byte for byte");
         size_t diff = 0;
         for (size_t i = 0; i < y1.size(); ++i) diff += y1[i] != y2[i] ? 1 : 0;
         Check(diff == 0, "layer " + std::to_string(layer) + ": trellis experts, per-slot (M=1) == sorted (M<=16) bytes (" +
                              std::to_string(diff) + " of " + std::to_string(y1.size()) + " differ)");
+        const std::vector<uint16_t> x1(x.begin(), x.begin() + H);
+        const std::vector<uint16_t> o_auto = lm.DebugFfnForward(layer, x1, 1, Lfm2MoePath::kAuto);
+        const std::vector<uint16_t> o_ps = lm.DebugFfnForward(layer, x1, 1, Lfm2MoePath::kPerSlot);
+        Check(o_auto == o_ps, "layer " + std::to_string(layer) + ": T=1 kAuto (grouped decode) == staged kPerSlot byte for byte");
         bool finite = true;
         for (uint16_t v : y1) finite = finite && std::isfinite(core::Bf16ToFloat(v));
         Check(finite, "layer " + std::to_string(layer) + ": the trellis MoE output is finite");

@@ -18,6 +18,7 @@
 #include "profile_span.h"
 #include "r4dx/core/error.hpp"
 #include "r4dx/kernels/kernels.h"
+#include "r4dx/kernels/lfm2_kernels.h"
 
 namespace r4dx::model {
 
@@ -109,6 +110,7 @@ Lfm2Model Lfm2Model::Load(const Lfm2ModelOptions& opts) {
   m.ids_host_ = core::PinnedBuffer<int32_t>(static_cast<size_t>(rows));
   m.ids_dev_ = core::DeviceBuffer<int32_t>(static_cast<size_t>(rows));
   m.positions_dev_ = core::DeviceBuffer<int32_t>(static_cast<size_t>(moe_rows));
+  m.seqused_dev_ = core::DeviceBuffer<int32_t>(1);
   m.buf_h_ = core::DeviceBuffer<uint16_t>(static_cast<size_t>(moe_rows * hidden));
   m.logits_dev_ = core::DeviceBuffer<float>(static_cast<size_t>(m.vocab_local_));
   m.argmax_dev_ = core::DeviceBuffer<int32_t>(1);
@@ -163,7 +165,7 @@ Lfm2Model Lfm2Model::Load(const Lfm2ModelOptions& opts) {
   m.stream_.Synchronize();
   std::cerr << "[r4dx::model::Lfm2Model] " << layers << " layers (" << m.n_conv_ << " conv), max_ctx " << m.max_ctx_
             << ", KV bf16 = " << (static_cast<double>(m.kv_bytes_) / (1024.0 * 1024.0 * 1024.0))
-            << " GiB, attention reference, residual bf16, MoE staged (host-sync)"
+            << " GiB, attention r4d h64_gqa4, residual bf16, MoE staged (host-sync)"
             << (m.container_.HasTrellis() ? ", trellis body" : "") << ", logit mask "
             << (m.real_vocab_ > 0 ? ">= " + std::to_string(m.real_vocab_) : std::string("off"));
   if (is_tp) std::cerr << ", TP rank " << opts.tp_rank << "/" << opts.tp_world << " (vocab shard " << m.vocab_local_ << ")";
@@ -214,6 +216,8 @@ void Lfm2Model::UploadPositions(int64_t start_pos, int64_t T) {
   std::vector<int32_t> h(static_cast<size_t>(T));
   for (int64_t t = 0; t < T; ++t) h[static_cast<size_t>(t)] = static_cast<int32_t>(start_pos + t);
   positions_dev_.CopyFromHost(h.data(), h.size());
+  const int32_t seqused = static_cast<int32_t>(start_pos + T);
+  seqused_dev_.CopyFromHost(&seqused, 1);
 }
 
 void Lfm2Model::MaskPaddingLogits(float* logits_local, int64_t rows, int64_t row_stride) {
@@ -273,17 +277,23 @@ void Lfm2Model::RunLayer(int64_t i, uint16_t* h, int64_t T, int64_t start_pos, S
     aw.q_norm = lw.attn.q_norm.data();
     aw.k_norm = lw.attn.k_norm.data();
     attn_[static_cast<size_t>(i)]->Forward(arena_, x, sub, aw, *kv_[static_cast<size_t>(i)], static_cast<int>(T),
-                                           static_cast<int>(start_pos), positions_dev_.data(), s_raw, prof, comm_);
+                                           static_cast<int>(start_pos), positions_dev_.data(), seqused_dev_.data(), s_raw,
+                                           prof, comm_);
   } else {
     Lfm2ConvLayer(cfg, lw.conv, comm_).Forward(s_raw, arena_, x, sub, ConvState(i), T, prof);
   }
   take(dbg ? &dbg->mixer_out : nullptr, sub);
-  ProfiledCall(prof, s_raw, "layer.residual_add", [&] { r4dx_residual_add_bf16(P(h), P(sub), P(h), T * hidden, s); });
-  take(dbg ? &dbg->mid_residual : nullptr, h);
-  // ---- FFN half ----
-  ProfiledCall(prof, s_raw, "layer.ffn_norm",
-               [&] { r4dx_rmsnorm_plain_bf16(P(h), P(lw.ffn_norm.data()), P(x), T, hidden, eps, 0, s); });
-  take(dbg ? &dbg->ffn_norm_out : nullptr, x);
+  if (dbg == nullptr) {
+    ProfiledCall(prof, s_raw, "layer.ffn_norm", [&] {
+      r4dx_lfm2_residual_rmsnorm_plain_bf16(P(h), P(sub), P(lw.ffn_norm.data()), P(x), T, hidden, eps, s);
+    });
+  } else {
+    ProfiledCall(prof, s_raw, "layer.residual_add", [&] { r4dx_residual_add_bf16(P(h), P(sub), P(h), T * hidden, s); });
+    take(&dbg->mid_residual, h);
+    ProfiledCall(prof, s_raw, "layer.ffn_norm",
+                 [&] { r4dx_rmsnorm_plain_bf16(P(h), P(lw.ffn_norm.data()), P(x), T, hidden, eps, 0, s); });
+    take(&dbg->ffn_norm_out, x);
+  }
   RunFfn(i, x, sub, T, prof, moe_path, dbg ? &dbg->moe : nullptr);
   take(dbg ? &dbg->ffn_out : nullptr, sub);
   ProfiledCall(prof, s_raw, "layer.residual_add", [&] { r4dx_residual_add_bf16(P(h), P(sub), P(h), T * hidden, s); });
@@ -481,7 +491,7 @@ int32_t Lfm2Model::DecodeStepSampled(int32_t token_id, const kernels::SamplePara
   const float inv_t = SummaryInvTemperature(params);
   if (params.temperature <= 0.0f) return DecodeStepGreedy(token_id);
   const int64_t vocab = container_.Config().vocab_size;
-  if (inv_t == 0.0f) {
+  if (inv_t == 0.0f || vocab_local_ <= R4DX_TOPK_LSE_K) {
     const std::vector<float> logits = DecodeStep(token_id);
     return kernels::SampleCanonical(logits.data(), vocab, params, kernels::DrawUniform01(rng));
   }

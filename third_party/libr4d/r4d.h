@@ -36,7 +36,7 @@
 // Library version. The module exposes it as r4d.__version__, and the git tag it was built from is
 // expected to match -- which is what lets a consumer assert it linked the sources it pinned rather
 // than whatever a stale clone happened to hold.
-#define R4D_VERSION "0.6.0"
+#define R4D_VERSION "0.7.0"
 
 struct R4DArgs {
     const void*  q;             // (num_seqs*q_len, q_heads, head_dim)  bf16
@@ -118,6 +118,20 @@ void r4d_attn_dims(int* head_dim, int* gqa, int* block_size, int* max_decode_row
 int  r4d_attn_prefill_h256_gqa2_fp8kv (const R4DArgsW* a, hipStream_t stream);
 int  r4d_attn_decode_h256_gqa2_fp8kv  (const R4DArgsW* a, hipStream_t stream);
 int64_t r4d_attn_decode_h256_gqa2_scratch_bytes(const R4DArgsW* a);
+// ---- attention: head_dim 64, gqa 4, bf16 KV (r4d_attn_paged_h64_gqa4.hip) ---------------------------
+// The same kernels as the gqa6 family, compiled for head_dim 64 with 4 queries per KV head and a bf16
+// paged cache (LFM2's full-attention layers). Everything else is the family's contract: paged block 16,
+// bf16 query, causal, varlen; k_descale / v_descale may be null (1.0). Prefill: 32 query rows per
+// workgroup (8 warps x 16 rows / gqa 4), 64-key tiles. Split-KV prefill: the gqa6 contract (caller's
+// count clamped to 64, <= 1 is the plain launch, fp32 partials in a->scratch). Decode: split-KV, at most
+// 64 query rows (q_len <= 16), a->splits 0 = the unit's split law; needs a->scratch. Return 0 on
+// success, negative on a shape this instantiation does not serve (-1 head_dim / block_size, -2 gqa,
+// -4 query rows, -5 scratch missing).
+int  r4d_attn_prefill_h64_gqa4_bf16kv        (const R4DArgs* a, hipStream_t stream);
+int  r4d_attn_prefill_splitkv_h64_gqa4_bf16kv(const R4DArgs* a, hipStream_t stream);
+int64_t r4d_attn_prefill_splitkv_h64_gqa4_scratch_bytes(const R4DArgs* a);
+int  r4d_attn_decode_h64_gqa4_bf16kv         (const R4DArgs* a, hipStream_t stream);
+int64_t r4d_attn_decode_h64_gqa4_scratch_bytes(const R4DArgs* a);
 // Every attention geometry this build serves, so a model can be validated against all of them at
 // load (r4d_attn_dims reports the gqa6 one only).
 struct R4DAttnGeom {

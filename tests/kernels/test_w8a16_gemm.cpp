@@ -284,6 +284,57 @@ void TestHandActivations(int G) {
   Check(Bf16ToFloat(c[6]) == 0.0f, "hand G" + std::to_string(G) + ": 1e-9 -> 0");
 }
 
+void TestMoeDecode(std::mt19937& rng, const std::string& tag, int T, int top_k, int E, int N, int K, int G,
+                   const Geo& g, int a_row_group) {
+  const int Pn = T * top_k;
+  const int a_rows = Pn / a_row_group;
+  const auto a = MakeA(rng, K);
+  DeviceBuffer<uint16_t> a_d(static_cast<size_t>(a_rows) * K);
+  a_d.CopyFromHost(a.data(), a_d.size());
+
+  std::vector<Problem> experts(static_cast<size_t>(E));
+  std::vector<uint64_t> wq_ptrs_h(static_cast<size_t>(E)), ws_ptrs_h(static_cast<size_t>(E));
+  for (int e = 0; e < E; ++e) {
+    experts[e].N = N, experts[e].K = K, experts[e].G = G;
+    experts[e].cols = {0};
+    MakeWeight(rng, experts[e]);
+    wq_ptrs_h[e] = reinterpret_cast<uint64_t>(experts[e].wq.data());
+    ws_ptrs_h[e] = reinterpret_cast<uint64_t>(experts[e].ws.data());
+  }
+  DeviceBuffer<uint64_t> wq_ptrs_d(static_cast<size_t>(E)), ws_ptrs_d(static_cast<size_t>(E));
+  wq_ptrs_d.CopyFromHost(wq_ptrs_h);
+  ws_ptrs_d.CopyFromHost(ws_ptrs_h);
+
+  std::uniform_int_distribution<int> de(0, E - 1);
+  std::vector<int32_t> ids(static_cast<size_t>(Pn));
+  for (auto& id : ids) id = de(rng);
+  DeviceBuffer<int32_t> ids_d(static_cast<size_t>(Pn));
+  ids_d.CopyFromHost(ids);
+
+  DeviceBuffer<uint16_t> c_grouped(static_cast<size_t>(Pn) * N), c_staged(static_cast<size_t>(Pn) * N);
+  R4DX_HIP_CHECK(hipMemset(c_grouped.data(), 0xff, c_grouped.bytes()));
+  R4DX_HIP_CHECK(hipMemset(c_staged.data(), 0xff, c_staged.bytes()));
+
+  r4dx_gemm_w8a16_moe_decode(P(a_d.data()), P(wq_ptrs_d.data()), P(ws_ptrs_d.data()), P(ids_d.data()),
+                             P(c_grouped.data()), Pn, a_row_group, E, K, N, G, g.WV, g.SK, g.NPW, g.NT, 0);
+  for (int p = 0; p < Pn; ++p) {
+    const int e = ids[static_cast<size_t>(p)];
+    const int64_t ap = P(a_d.data()) + static_cast<int64_t>((p / a_row_group) * K * sizeof(uint16_t));
+    const int64_t cp = P(c_staged.data()) + static_cast<int64_t>(static_cast<size_t>(p) * N * sizeof(uint16_t));
+    r4dx_gemm_w8a16_nt_m64(ap, P(experts[e].wq.data()), P(experts[e].ws.data()), cp, 1, K, N, G, g.WV, g.SK, 1, g.NPW,
+                           g.NT, 0);
+  }
+  R4DX_HIP_CHECK(hipDeviceSynchronize());
+  const auto got = c_grouped.CopyToHost();
+  const auto want = c_staged.CopyToHost();
+  Check(got == want, tag + " " + GeoStr(g) + ": r4dx_gemm_w8a16_moe_decode == per-pair r4dx_gemm_w8a16_nt_m64 (bitwise)");
+
+  r4dx_gemm_w8a16_moe_decode(P(a_d.data()), P(wq_ptrs_d.data()), P(ws_ptrs_d.data()), P(ids_d.data()),
+                             P(c_grouped.data()), Pn, a_row_group, E, K, N, G, g.WV, g.SK, g.NPW, g.NT, 0);
+  R4DX_HIP_CHECK(hipDeviceSynchronize());
+  Check(c_grouped.CopyToHost() == got, tag + " " + GeoStr(g) + ": two runs identical");
+}
+
 void TestIllegal() {
   DeviceBuffer<uint16_t> a(64 * 256), ws(64 * 4), c(64 * 64);
   DeviceBuffer<uint8_t> wq(64 * 256);
@@ -318,6 +369,23 @@ void TestIllegal() {
         "exports: has_group 64/128 only");
   Check(r4dx_gemm_w8a16_scale_log2_bias() == kScaleLog2Bias && r4dx_gemm_w8a16_max_m() == kMaxM,
         "exports: scale_log2_bias 12, max_m 64");
+  DeviceBuffer<uint64_t> ptrs(8);
+  DeviceBuffer<int32_t> ids(16);
+  auto throws_moe = [&](int Pn, int grp, int E, int K, int N, int G, int WV, int SK, int NPW, int NT,
+                        bool null_a = false) {
+    try {
+      r4dx_gemm_w8a16_moe_decode(null_a ? 0 : P(a.data()), P(ptrs.data()), P(ptrs.data()), P(ids.data()), P(c.data()),
+                                 Pn, grp, E, K, N, G, WV, SK, NPW, NT, 0);
+    } catch (const std::exception&) {
+      return true;
+    }
+    return false;
+  };
+  Check(throws_moe(0, 1, 8, 256, 64, 128, 1, 1, 1, 1), "moe illegal: n_pairs = 0 throws");
+  Check(throws_moe(4, 3, 8, 256, 64, 128, 1, 1, 1, 1), "moe illegal: n_pairs % a_row_group != 0 throws");
+  Check(throws_moe(4, 1, 257, 256, 64, 128, 1, 1, 1, 1), "moe illegal: n_experts > 256 throws");
+  Check(throws_moe(4, 1, 8, 256, 64, 128, 1, 1, 2, 1), "moe illegal: NPW = 2 throws");
+  Check(throws_moe(4, 1, 8, 256, 64, 128, 1, 1, 1, 1, true), "moe illegal: null pointer throws");
 }
 
 }  // namespace
@@ -350,6 +418,13 @@ int main(int argc, char** argv) {
         if (quick && s.big) continue;
         TestProblem(rng, s.name, s.N, s.K, G, Ms);
       }
+    }
+    TestMoeDecode(rng, "moe.gate_up [3072x2048] G128 T=1", 1, 4, 8, 3072, 2048, 128, Fallback(1, 3072, 8), 4);
+    TestMoeDecode(rng, "moe.down [2048x1536] G128 T=1", 1, 4, 8, 2048, 1536, 128, Fallback(1, 2048, 4), 1);
+    TestMoeDecode(rng, "moe.tp2.down [2048x768] G128 T=8", 8, 4, 8, 2048, 768, 128, Fallback(1, 2048, 2), 1);
+    if (!quick) {
+      TestMoeDecode(rng, "moe.gate_up [3072x2048] G64 T=1", 1, 4, 8, 3072, 2048, 64, {4, 4, 1, 4, 0}, 4);
+      TestMoeDecode(rng, "moe.down [2048x1536] G64 T=1", 1, 4, 8, 2048, 1536, 64, {1, 8, 1, 1, 1}, 1);
     }
   } catch (const std::exception& e) {
     std::printf("EXCEPTION: %s\n", e.what());

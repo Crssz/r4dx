@@ -29,6 +29,7 @@
 #include <vector>
 
 #include "model.h"  // ModelOptions
+#include "lfm2_model.h"
 #include "r4dx/models_root.h"
 #include "r4dx_convert/safetensors_reader.hpp"
 #include "test_common.h"
@@ -207,12 +208,40 @@ int main() {
       tp1 = RunMode(*m, g, "TP=1");
     }
     const auto cross = [&](const std::vector<std::vector<float>>& tp2, const std::string& tag) {
-      double kl = 0;
-      for (size_t i = 0; i < tp1.size(); ++i) kl += Kl(tp1[i].data(), tp2[i].data(), g.V);
+      double kl = 0, kl_noise = 0;
+      std::vector<int64_t> rows;
+      rows.push_back(0);
+      rows.push_back(kPrefillEnd - 1);
+      for (int64_t p = kPrefillEnd; p < g.N; ++p) rows.push_back(p);
+      for (size_t i = 0; i < tp1.size(); ++i) {
+        kl += Kl(tp1[i].data(), tp2[i].data(), g.V);
+        kl_noise += Kl(g.Truth(rows[i]), g.Hf(rows[i]), g.V);
+      }
       kl /= static_cast<double>(tp1.size());
-      std::printf("  %s vs TP=1: mean KL %.3e\n", tag.c_str(), kl);
-      Check(kl < 2e-3, tag + " rows agree with the TP=1 rows (mean KL < 2e-3)");
+      kl_noise /= static_cast<double>(tp1.size());
+      std::printf("  %s vs TP=1: mean KL %.3e (3x noise %.3e)\n", tag.c_str(), kl, 3.0 * kl_noise);
+      Check(kl <= 3.0 * kl_noise, tag + " rows agree with the TP=1 rows (mean KL <= 3 x noise)");
     };
+    {
+      Lfm2ModelOptions lo;
+      lo.container_path = container;
+      lo.max_ctx = 512;
+      Lfm2Model lm = Lfm2Model::Load(lo);
+      const int64_t H = lm.Config().hidden_size, T = 8;
+      std::mt19937 rng(77);
+      std::normal_distribution<float> nd(0.0f, 1.0f);
+      std::vector<uint16_t> x(static_cast<size_t>(T * H));
+      for (auto& v : x) v = core::FloatToBf16(nd(rng));
+      for (int64_t layer : {int64_t{2}, int64_t{3}}) {
+        Check(lm.GetContainer().Layer(layer).moe.HasBf16Ptrs(),
+              "bf16 layer " + std::to_string(layer) + " has device expert pointer tables");
+        Lfm2MoeDebug d_grp, d_ps;
+        const std::vector<uint16_t> y_grp = lm.DebugFfnForward(layer, x, T, Lfm2MoePath::kGroupedDecode, &d_grp);
+        const std::vector<uint16_t> y_ps = lm.DebugFfnForward(layer, x, T, Lfm2MoePath::kPerSlot, &d_ps);
+        Check(d_grp.ids == d_ps.ids && y_grp == y_ps,
+              "bf16 layer " + std::to_string(layer) + ": kGroupedDecode == staged kPerSlot byte for byte");
+      }
+    }
     {
       TpOptions tp;
       tp.world = 2;

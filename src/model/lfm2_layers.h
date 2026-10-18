@@ -76,9 +76,10 @@ struct Lfm2MoeHost {
 };
 
 enum class Lfm2MoePath {
-  kAuto,      // T == 1: per-slot (decode); T > 1: sorted
-  kPerSlot,   // every row's top_k experts one by one, M = 1 GEMMs (the decode path, also for T > 1: test / A-B only)
-  kSorted,    // the counting-sort path, also for T == 1
+  kAuto,           // T == 1: kGroupedDecode when the layer has device pointer tables (bf16 / w8a16), else kPerSlot; T > 1: kSorted
+  kGroupedDecode,  // device-indexed grouped decode (no host readback; grid.z = T * top_k; needs bf16 or w8a16 pointer tables)
+  kPerSlot,        // staged host-readback path: every row's top_k experts one by one, M = 1 ApplyLinear GEMMs
+  kSorted,         // the counting-sort path, also for T == 1
 };
 
 // What a debug caller wants back from Lfm2MoeFfn::Forward (host copies, taken after a stream synchronize).

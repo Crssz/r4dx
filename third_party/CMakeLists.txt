@@ -1,6 +1,6 @@
 # third_party/CMakeLists.txt
 #
-# r4d_core: a static library built from the 17 HIP translation units of the vendored libr4d
+# r4d_core: a static library built from the 19 HIP translation units of the vendored libr4d
 # (third_party/libr4d: attention, GDN, the bf16 / w4a16 / trellis GEMMs, the DFlash conv, the kernel
 # registry).
 #
@@ -46,7 +46,7 @@ if(EXISTS "${R4D_DEVICE_LIB_PATH}")
   list(APPEND R4D_BASE_FLAGS --rocm-device-lib-path=${R4D_DEVICE_LIB_PATH})
 endif()
 
-# unit -> extra per-unit flags, for the 18 units r4dx links (the two `_wq` units are R4DX_FAKEQ_W's,
+# unit -> extra per-unit flags, for the 19 units r4dx links (the two `_wq` units are R4DX_FAKEQ_W's,
 # docs/int8-prefill.md: the trellis GEMMs with the decoded weights rounded to int8, a unit of their own so
 # the shipped trellis units compile exactly as before; r4d_gemm_trellis_nt_i8 is R4DX_PREFILL_INT8's int8 x int8
 # GEMM, a unit of its own for the same reason; r4d_gdn_chunk_scan_stable_* is the span-safe GDN chunk scan, the
@@ -54,6 +54,7 @@ endif()
 set(R4D_UNITS
   r4d_attn_paged_h256_gqa6
   r4d_attn_paged_h256_gqa2
+  r4d_attn_paged_h64_gqa4
   r4d_attn_vit_h72_bf16
   r4d_gdn_chunk_scan_k128_v128_c64_bf16
   r4d_gdn_chunk_scan_stable_k128_v128_c64_bf16
@@ -90,6 +91,8 @@ set(R4D_DEPS_r4d_gemm_trellis_nt_m64_wq "${LIBR4D_DIR}/r4d_gemm_trellis_nt_m64.h
 set(R4D_DEPS_r4d_gemm_trellis_nt_m256_wq "${LIBR4D_DIR}/r4d_gemm_trellis_nt_m256.hip")
 # The sliding-window unit instantiates the same two kernel files (WIN = 1).
 set(R4D_DEPS_r4d_attn_paged_h256_gqa2 ${R4D_DEPS_r4d_attn_paged_h256_gqa6})
+# The head_dim 64 / gqa 4 unit instantiates the same two kernel files (bf16 KV).
+set(R4D_DEPS_r4d_attn_paged_h64_gqa4 ${R4D_DEPS_r4d_attn_paged_h256_gqa6})
 # The span-safe chunk scan #includes the shipped scan's source with R4D_GDN_SCAN_STABLE defined (a unit of its own, like the `_wq`s).
 set(R4D_DEPS_r4d_gdn_chunk_scan_stable_k128_v128_c64_bf16 "${LIBR4D_DIR}/r4d_gdn_chunk_scan_k128_v128_c64_bf16.hip")
 

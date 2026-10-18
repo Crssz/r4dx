@@ -85,4 +85,81 @@ void r4dx_lfm2_moe_gather_bf16(int64_t x, int64_t sorted_pairs, int64_t out, int
 void r4dx_lfm2_moe_combine_bf16(int64_t y, int64_t pos_of_pair, int64_t w, int64_t out, int T,
                                  int top_k, int hidden, int64_t stream);
 
+// ---- grouped MoE decode GEMM (bf16; docs/lfm2-plan.md 3.5 / L4-2) ---------------------------------------
+// Device-indexed M = 1 GEMM across n_pairs = T * top_k routed (token, slot) pairs in one launch
+// (grid.z = p in 0..n_pairs-1). For pair p:
+//   expert e = ids[p] (int32 on device; a pair with e outside [0, n_experts) returns without writing C);
+//   weight W = (const bf16*)w_ptrs[e] ([N, K] row-major bf16, from the layer's device uint64 pointer table);
+//   input  A = a_bf16 + (p / a_row_group) * K (a_row_group = top_k for gate_up, which shares token row
+//              t = p / top_k across its top_k slots; a_row_group = 1 for down, where each pair p has its
+//              own [1, K] row);
+//   output C = c_bf16 + p * N ([1, N] bf16).
+// Each pair p executes the exact M = 1, MT = 1 WMMA loop and fixed-order LDS split-K reduction of
+// r4d_gemm_bf16_nt_m64, so C[p, :] is bit-for-bit identical to calling r4d_gemm_bf16_nt_m64(A_p, W_e, C_p,
+// 1, K, N, WV, SK, 1, stream) at the same (WV, SK). Counts 1 launch in r4dx_kernel_launch_counter.
+// Preconditions (throw): 1 <= n_pairs <= 16384, 1 <= a_row_group <= n_pairs, n_pairs % a_row_group == 0,
+// 1 <= n_experts <= 256, N >= 16, N % 16 == 0, WV >= 1, SK >= 1, K >= 16, K % (SK * 16) == 0,
+// WV * SK * 32 <= 1024, WV * SK * 256 * sizeof(float) <= 64 * 1024, non-null pointers.
+void r4dx_lfm2_gemm_bf16_moe_decode(int64_t a_bf16, int64_t w_ptrs, int64_t ids, int64_t c_bf16,
+                                    int n_pairs, int a_row_group, int n_experts, int K, int N,
+                                    int WV, int SK, int64_t stream);
+
+// ---- grouped MoE decode input transform + GEMM (trellis; docs/lfm2-plan.md 3.5 / L4-3) ------------------
+// Device-indexed input transform across n_pairs = T * top_k routed (token, slot) pairs (grid.y = p):
+//   expert e = ids[p] (int32 on device; a pair with e outside [0, n_experts) returns without writing);
+//   suh_e    = (const float*)suh_ptrs[e] (float [parts * K]);
+//   x_p      = x_bf16 + (p / a_row_group) * K;
+//   a0_p     = a0_f16 + p * K; a1_p = a1_f16 + p * K (when parts == 2).
+// Bit-for-bit identical to calling r4dx_trellis_input_bf16(x_p, 1, K, parts, {suh_e, suh_e + K},
+// {a0_p, a1_p}, prescale_log2, stream) per pair. Counts 1 launch in r4dx_kernel_launch_counter.
+void r4dx_lfm2_trellis_moe_input_bf16(int64_t x_bf16, int64_t suh_ptrs, int64_t ids, int64_t a0_f16,
+                                      int64_t a1_f16, int n_pairs, int a_row_group, int n_experts,
+                                      int64_t K, int parts, int prescale_log2, int64_t stream);
+
+// Device-indexed M = 1 trellis GEMM across n_pairs = T * top_k routed (token, slot) pairs (grid.z = p):
+//   expert e = ids[p] (int32 on device; a pair with e outside [0, n_experts) returns without writing C);
+//   W_e      = (const uint32_t*)w_ptrs[e], svh_e = (const float*)svh_ptrs[e];
+//   A0_p     = a0_f16 + p * K, A1_p = a1_f16 ? a1_f16 + p * K : 0;
+//   C_p      = c_bf16 + p * N;
+//   ws_p     = ws_f32 ? ws_f32 + p * SKG * N : 0;
+//   tickets_p = tickets_u32 ? tickets_u32 + p * (N / 128) : 0 (disjoint per pair, self-resetting).
+// Bit-for-bit identical to calling r4d_gemm_trellis_nt_m64(A0_p, A1_p, n_split, W_e, svh_e, C_p, ws_p,
+// tickets_p, 1, K, N, bits, WV, SK, 1, NP, SKG, U, NT, out_scale, stream) per pair.
+// Instantiated for bits in {4, 5}, NP = 1, U in {1, 2, 4}, NT in {0, 1}. Counts 1 launch.
+void r4dx_lfm2_gemm_trellis_moe_decode(int64_t a0_f16, int64_t a1_f16, int n_split, int64_t w_ptrs,
+                                       int64_t svh_ptrs, int64_t ids, int64_t c_bf16, int64_t ws_f32,
+                                       int64_t tickets_u32, int n_pairs, int n_experts, int K, int N,
+                                       int bits, int WV, int SK, int NP, int SKG, int U, int NT,
+                                       float out_scale, int64_t stream);
+
+// ---- grouped MoE prefill GEMM (bf16; docs/lfm2-plan.md 3.5 / L4-4) --------------------------------------
+// Device-indexed grouped GEMM over the expert-sorted rows A[n_pairs, K] -> C[n_pairs, N], driven by
+// device `expert_offsets[n_experts + 1]` (from r4dx_lfm2_moe_sort) with zero host readback.
+// Grid.y enumerates 16-row tiles across all non-empty experts (at most min(n_pairs, (n_pairs+15)/16 + n_experts)
+// tiles); each active tile (expert e, row_start = offsets[e] + 16*mt, m_rows = min(16, offsets[e+1] - row_start))
+// runs the exact MT = 1 WMMA + LDS split-K reduction of r4d_gemm_bf16_nt_m64 on W = w_ptrs[e], producing
+// output bytes identical to calling r4d_gemm_bf16_nt_m64 per non-empty expert at the same SK.
+void r4dx_lfm2_gemm_bf16_moe_prefill(int64_t a_bf16, int64_t w_ptrs, int64_t expert_offsets,
+                                     int64_t c_bf16, int n_pairs, int n_experts, int K, int N,
+                                     int WV, int SK, int64_t stream);
+
+// ---- L4-5 fusions (docs/lfm2-plan.md L4-5) ---------------------------------------------------------------
+// Fused in-place residual add + plain RMSNorm:
+//   h[r, i] = bf16(h[r, i] + sub[r, i])
+//   x_out[r, i] = bf16(float(h[r, i]) * rsqrt(mean(float(h[r, :])**2) + eps) * float(weight[i]))
+// Bit-for-bit identical to calling r4dx_residual_add_bf16(h, sub, h, rows * hidden, stream) followed by
+// r4dx_rmsnorm_plain_bf16(h, weight, x_out, rows, hidden, eps, 0, stream). Counts 1 launch.
+void r4dx_lfm2_residual_rmsnorm_plain_bf16(int64_t h, int64_t sub, int64_t weight, int64_t x_out,
+                                           int64_t rows, int64_t hidden, float eps, int64_t stream);
+
+// Fused attention pre-core (head_dim == 64): per-head plain RMSNorm on q[T, heads_q, 64] and
+// k[T, heads_k, 64], NeoX rotate_half RoPE on q and k at positions pos_ids[T], and paged bf16 KV cache
+// write of (roped k, raw v) at slots pos_ids[T] -- all in one launch of (T, heads_q + heads_k) workgroups.
+// Bit-for-bit identical to the 4-launch chain (q_norm, k_norm, rope_neox, kv_write_paged_bf16_hnd).
+// Counts 1 launch. Preconditions (throw): head_dim == 64, heads_q >= 1, heads_k >= 1, block_size >= 1.
+void r4dx_lfm2_attn_precore_bf16(int64_t q, int64_t k, int64_t v, int64_t q_norm, int64_t k_norm,
+                                 int64_t pos_ids, int64_t kv_cache, int T, int heads_q, int heads_k,
+                                 int head_dim, float rms_eps, float rope_theta, int block_size,
+                                 int64_t kv_block_stride, int64_t kv_head_stride, int64_t stream);
+
 }  // extern "C"

@@ -51,11 +51,14 @@ struct Geo {
   int WV, SK, MB, NPW, NT;
 };
 
-// LFM2.5-24B-A2B at TP = 1 (docs/w8a16.md 3.3, docs/lfm2-semantics.md).
+// LFM2.5-24B-A2B at TP = 1 and the distinct TP = 2 rank shapes (docs/w8a16.md 3.3, 4.5, docs/lfm2-semantics.md).
 std::vector<Shape> DefaultShapes() {
-  return {{"expert.gate_up", 3072, 2048}, {"expert.down", 2048, 1536},  {"conv.in_proj", 6144, 2048},
-          {"conv.out_proj", 2048, 2048},  {"attn.kv", 512, 2048},       {"dense.gate_up", 23552, 2048},
-          {"dense.down", 2048, 11776},    {"lm_head", 128000, 2048}};
+  return {{"expert.gate_up", 3072, 2048},     {"expert.down", 2048, 1536},      {"conv.in_proj", 6144, 2048},
+          {"conv.out_proj", 2048, 2048},      {"attn.kv", 512, 2048},           {"dense.gate_up", 23552, 2048},
+          {"dense.down", 2048, 11776},        {"lm_head", 128000, 2048},        {"tp2.expert.gate_up", 1536, 2048},
+          {"tp2.expert.down", 2048, 768},     {"tp2.out_proj", 2048, 1024},     {"tp2.attn.q", 1024, 2048},
+          {"tp2.attn.kv", 256, 2048},         {"tp2.dense.gate_up", 11776, 2048}, {"tp2.dense.down", 2048, 5888},
+          {"tp2.lm_head", 64000, 2048}};
 }
 
 std::vector<int> ParseInts(const std::string& s) {
@@ -115,6 +118,16 @@ bool LegalW8(const Geo& g, int M, int K, int G) {
          g.WV * g.NPW * g.SK <= 64;
 }
 
+// FallbackSk: the SK of linear.cpp's W8a16FallbackTuning (preserving SK keeps every output bit-identical).
+int FallbackSk(int N, int K, int M, int G) {
+  const int wv = (N / 16 < 512) ? 1 : 4;
+  const int npw = (M > 16) ? 4 : 1;
+  for (int sk : {8, 4, 2, 1}) {
+    if (K % (sk * G) == 0 && wv * sk * 32 <= 1024 && wv * npw * sk <= 64) return sk;
+  }
+  return 1;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -125,6 +138,7 @@ int main(int argc, char** argv) {
   int reps = 20;
   size_t pool_mib = 512;
   bool baselines = true;
+  bool bit_identical = false;
   for (int i = 1; i < argc; ++i) {
     const std::string a = argv[i];
     auto next = [&]() -> std::string {
@@ -137,6 +151,7 @@ int main(int argc, char** argv) {
     else if (a == "--reps") reps = std::stoi(next());
     else if (a == "--pool-mib") pool_mib = static_cast<size_t>(std::stoul(next()));
     else if (a == "--no-baselines") baselines = false;
+    else if (a == "--bit-identical") bit_identical = true;
     else if (a == "--shapes") {
       shapes.clear();
       std::stringstream ss(next());
@@ -177,23 +192,60 @@ int main(int argc, char** argv) {
         }
         Pool wq(static_cast<size_t>(N) * K, pool_bytes, 0x93), ws(static_cast<size_t>(N) * (K / G) * 2,
                                                                      pool_bytes / 32, 0x3c);
+        const bool is_expert = s.name.find("expert.") != std::string::npos;
+        const int n_moe_sets = static_cast<int>(std::max<size_t>(1, wq.bufs.size() / 4));
+        std::vector<DeviceBuffer<uint64_t>> wq_ptrs_sets, ws_ptrs_sets;
+        DeviceBuffer<int32_t> moe_ids(4);
+        DeviceBuffer<uint16_t> moe_c(static_cast<size_t>(4) * N);
+        if (bit_identical && is_expert) {
+          moe_ids.CopyFromHost(std::vector<int32_t>{0, 1, 2, 3});
+          for (int si = 0; si < n_moe_sets; ++si) {
+            std::vector<uint64_t> qh(4), sh(4);
+            for (int j = 0; j < 4; ++j) {
+              qh[j] = static_cast<uint64_t>(wq.at(static_cast<size_t>(si * 4 + j)));
+              sh[j] = static_cast<uint64_t>(ws.at(static_cast<size_t>(si * 4 + j)));
+            }
+            wq_ptrs_sets.emplace_back(4);
+            wq_ptrs_sets.back().CopyFromHost(qh);
+            ws_ptrs_sets.emplace_back(4);
+            ws_ptrs_sets.back().CopyFromHost(sh);
+          }
+        }
         for (int M : Ms) {
           // w8a16 sweep
           double best = 1e30;
           Geo bg{};
+          const int pinned_sk = FallbackSk(N, K, M, G);
           for (int WV : {1, 2, 4, 8})
             for (int SK : {1, 2, 4, 8, 16})
               for (int MB = 1; MB <= 4; ++MB)
                 for (int NPW : {1, 4})
                   for (int NT : {0, 1}) {
+                    if (bit_identical) {
+                      if (SK != pinned_sk) continue;
+                      if (M == 1 && (MB != 1 || NT != 1)) continue;
+                    }
                     const Geo g{WV, SK, MB, NPW, NT};
                     if (!LegalW8(g, M, K, G)) continue;
-                    const double us = TimeUs(
-                        [&](size_t i) {
-                          r4dx_gemm_w8a16_nt_m64(P(a.data()), wq.at(i), ws.at(i), P(c.data()), M, K, N, G, WV, SK,
-                                                 MB, NPW, NT, 0);
-                        },
-                        reps);
+                    double us = -1.0;
+                    if (bit_identical && is_expert && M == 1) {
+                      us = TimeUs(
+                          [&](size_t i) {
+                            const size_t si = i % static_cast<size_t>(n_moe_sets);
+                            r4dx_gemm_w8a16_moe_decode(P(a.data()), P(wq_ptrs_sets[si].data()),
+                                                       P(ws_ptrs_sets[si].data()), P(moe_ids.data()), P(moe_c.data()),
+                                                       4, 1, 4, K, N, G, WV, SK, NPW, NT, 0);
+                          },
+                          reps);
+                      if (us > 0) us /= 4.0;  // per expert
+                    } else {
+                      us = TimeUs(
+                          [&](size_t i) {
+                            r4dx_gemm_w8a16_nt_m64(P(a.data()), wq.at(i), ws.at(i), P(c.data()), M, K, N, G, WV, SK,
+                                                   MB, NPW, NT, 0);
+                          },
+                          reps);
+                    }
                     if (us > 0 && us < best) best = us, bg = g;
                   }
           double best_bf = -1, best_w4 = -1;

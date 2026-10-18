@@ -44,4 +44,28 @@ int r4dx_gemm_w8a16_has_group(int group);   // 1 for 64 and 128, else 0
 int r4dx_gemm_w8a16_scale_log2_bias(void);  // 12 (the converter and the loader assert it)
 int r4dx_gemm_w8a16_max_m(void);            // 64
 
+// Device-indexed grouped MoE decode GEMM (docs/w8a16.md 4.4): runs M = 1, MB = 1 across n_pairs = T * top_k
+// routed (token, slot) pairs in one launch (grid.z = p in 0..n_pairs-1). For pair p:
+//   expert e = ids[p] (int32 on device; a pair with e outside [0, n_experts) returns without writing C);
+//   weights  = wq_ptrs[e], ws_ptrs[e] (uint64 device pointer tables of length n_experts);
+//   input  A = a_bf16 + (p / a_row_group) * K (a_row_group = top_k for gate_up, 1 for down);
+//   output C = c + p * N ([1, N] bf16).
+// Bit-for-bit identical to calling r4dx_gemm_w8a16_nt_m64(A_p, wq_e, ws_e, C_p, 1, K, N, group, WV, SK, 1,
+// NPW, NT, stream) per pair. Counts 1 launch in r4dx_kernel_launch_counter.
+// Preconditions (throw): 1 <= n_pairs <= 16384, 1 <= a_row_group <= n_pairs, n_pairs % a_row_group == 0,
+// 1 <= n_experts <= 256, and r4dx_gemm_w8a16_nt_m64's rules at M = 1, MB = 1.
+void r4dx_gemm_w8a16_moe_decode(int64_t a_bf16, int64_t wq_ptrs, int64_t ws_ptrs, int64_t ids,
+                                int64_t c, int n_pairs, int a_row_group, int n_experts, int K, int N,
+                                int group, int WV, int SK, int NPW, int NT, int64_t stream);
+
+// Device-indexed grouped MoE prefill GEMM (docs/lfm2-plan.md 3.5 / L4-4): runs over the expert-sorted
+// rows A[n_pairs, K] -> C[n_pairs, N], driven by device `expert_offsets[n_experts + 1]` with zero host
+// readback. Each 16-row tile of each non-empty expert e runs the exact MT = 1 WMMA + LDS split-K reduction
+// of r4dx_gemm_w8a16_nt_m64 on wq_ptrs[e], ws_ptrs[e], producing output bytes identical to calling
+// r4dx_gemm_w8a16_nt_m64 per non-empty expert at the same SK. Counts 1 launch in r4dx_kernel_launch_counter.
+void r4dx_gemm_w8a16_moe_prefill(int64_t a_bf16, int64_t wq_ptrs, int64_t ws_ptrs,
+                                 int64_t expert_offsets, int64_t c, int n_pairs, int n_experts,
+                                 int K, int N, int group, int WV, int SK, int NPW, int NT,
+                                 int64_t stream);
+
 }  // extern "C"

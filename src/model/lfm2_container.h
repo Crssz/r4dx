@@ -59,9 +59,28 @@ struct Lfm2MoeWeights {
   core::DeviceBuffer<float> expert_bias;   // fp32 [num_experts], replicated
   std::vector<QuantLinear> gate_up;        // [e]: [2 * moe_intermediate, hidden]  (gate rows first; the rank's halves under TP)
   std::vector<QuantLinear> down;           // [e]: [hidden, moe_intermediate]       (the rank's K slice under TP)
-  // layout kBf16 only (empty otherwise; the trellis / w4a16 table is an L4 decision): the experts' bf16 weight base
-  // pointers as uint64, indexed by expert id.
+  // Per-layer device pointer tables (uint64 [num_experts]), indexed by the router's expert id:
+  //   bf16  : populated whenever every expert of this layer loaded as kBf16 (incl. bf16-kept layers of a hybrid container;
+  //           docs/lfm2-plan.md 3.5 / L4-2)
+  //   w8a16 : populated whenever every expert of this layer loaded as kW8a16 at a uniform group (docs/w8a16.md 4.4)
   core::DeviceBuffer<uint64_t> gate_up_bf16_ptrs, down_bf16_ptrs;
+  core::DeviceBuffer<uint64_t> gate_up_w8_wq_ptrs, gate_up_w8_ws_ptrs;
+  core::DeviceBuffer<uint64_t> down_w8_wq_ptrs, down_w8_ws_ptrs;
+  core::DeviceBuffer<uint64_t> gate_up_trellis_w_ptrs, gate_up_trellis_suh_ptrs, gate_up_trellis_svh_ptrs;
+  core::DeviceBuffer<uint64_t> down_trellis_w_ptrs, down_trellis_suh_ptrs, down_trellis_svh_ptrs;
+  uint32_t* moe_trellis_tickets = nullptr;  // borrowed from Lfm2Container::moe_trellis_tickets_
+
+  bool HasBf16Ptrs() const { return !gate_up_bf16_ptrs.empty() && !down_bf16_ptrs.empty(); }
+  bool HasW8a16Ptrs() const {
+    return !gate_up_w8_wq_ptrs.empty() && !gate_up_w8_ws_ptrs.empty() && !down_w8_wq_ptrs.empty() &&
+           !down_w8_ws_ptrs.empty();
+  }
+  bool HasTrellisPtrs() const {
+    return !gate_up_trellis_w_ptrs.empty() && !gate_up_trellis_suh_ptrs.empty() && !gate_up_trellis_svh_ptrs.empty() &&
+           !down_trellis_w_ptrs.empty() && !down_trellis_suh_ptrs.empty() && !down_trellis_svh_ptrs.empty() &&
+           moe_trellis_tickets != nullptr;
+  }
+  bool HasDeviceDecodePtrs() const { return HasBf16Ptrs() || HasW8a16Ptrs() || HasTrellisPtrs(); }
 };
 
 struct Lfm2LayerWeights {
@@ -126,7 +145,7 @@ class Lfm2Container {
   QuantLinear lm_head_;
   std::vector<Lfm2LayerWeights> layers_;
   std::optional<TrellisSpec> trellis_;
-  core::DeviceBuffer<uint32_t> trellis_tickets_;
+  core::DeviceBuffer<uint32_t> trellis_tickets_, moe_trellis_tickets_;
 };
 
 // docs/lfm2-plan.md L3-8: the trellis body (the shipping format) runs at TP=1 only -- the TP=2 shard rules of the

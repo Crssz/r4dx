@@ -718,7 +718,8 @@ add_test(NAME test_tp_rank_worker COMMAND test_tp_rank_worker)
 # calls r4d_gemm_w4a16_nt_m64_group() through quant_linear.h's CheckW4a16Group, which is a host
 # function -- no device required.)
 add_executable(test_dflash_draft_weights test_dflash_draft_weights.cpp)
-target_include_directories(test_dflash_draft_weights PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../../src/model)
+target_include_directories(test_dflash_draft_weights PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../../src/model
+                                                             ${CMAKE_SOURCE_DIR}/src/kernels/include)
 target_link_libraries(test_dflash_draft_weights PRIVATE r4dx_convert r4dx_core)
 target_compile_definitions(test_dflash_draft_weights PRIVATE
   R4DX_CONVERT_FIXTURES_DIR="${CMAKE_CURRENT_SOURCE_DIR}/../convert/fixtures")
@@ -727,7 +728,8 @@ add_test(NAME test_dflash_draft_weights COMMAND test_dflash_draft_weights)
 # test_dflash_hf_weights (docs/gemma4-plan.md D-3 / D-5): the loader reads a `r4dx-convert --dflash-hf` container --
 # block 16, 6 target layers, softcap / embed_scale / variant, per-layer pattern -- and defaults when they are absent. CPU-only.
 add_executable(test_dflash_hf_weights test_dflash_hf_weights.cpp)
-target_include_directories(test_dflash_hf_weights PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../../src/model)
+target_include_directories(test_dflash_hf_weights PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../../src/model
+                                                          ${CMAKE_SOURCE_DIR}/src/kernels/include)
 target_link_libraries(test_dflash_hf_weights PRIVATE r4dx_convert r4dx_core)
 add_test(NAME test_dflash_hf_weights COMMAND test_dflash_hf_weights)
 

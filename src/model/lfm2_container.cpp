@@ -66,10 +66,45 @@ Lfm2Container Lfm2Container::Load(const std::string& path, const Lfm2LoadOptions
   const auto raw_f32 = [&](const std::string& name) {
     return shard ? shard->Raw<float>(name) : UploadRawF32(reader, name);
   };
-  // uint64 base pointers of a vector of bf16 QuantLinears (the L4 grouped kernels' expert table).
-  const auto ptr_table = [](const std::vector<QuantLinear>& v) {
+  // uint64 base pointers of a vector of QuantLinears (the L4 grouped kernels' expert tables).
+  const auto ptr_table_bf16 = [](const std::vector<QuantLinear>& v) {
     std::vector<uint64_t> host(v.size());
     for (size_t e = 0; e < v.size(); ++e) host[e] = reinterpret_cast<uint64_t>(v[e].bf16_w.data());
+    core::DeviceBuffer<uint64_t> dev(host.size());
+    dev.CopyFromHost(host.data(), host.size());
+    return dev;
+  };
+  const auto ptr_table_w8_wq = [](const std::vector<QuantLinear>& v) {
+    std::vector<uint64_t> host(v.size());
+    for (size_t e = 0; e < v.size(); ++e) host[e] = reinterpret_cast<uint64_t>(v[e].w8_wq.data());
+    core::DeviceBuffer<uint64_t> dev(host.size());
+    dev.CopyFromHost(host.data(), host.size());
+    return dev;
+  };
+  const auto ptr_table_w8_ws = [](const std::vector<QuantLinear>& v) {
+    std::vector<uint64_t> host(v.size());
+    for (size_t e = 0; e < v.size(); ++e) host[e] = reinterpret_cast<uint64_t>(v[e].w8_ws.data());
+    core::DeviceBuffer<uint64_t> dev(host.size());
+    dev.CopyFromHost(host.data(), host.size());
+    return dev;
+  };
+  const auto ptr_table_trellis_w = [](const std::vector<QuantLinear>& v) {
+    std::vector<uint64_t> host(v.size());
+    for (size_t e = 0; e < v.size(); ++e) host[e] = reinterpret_cast<uint64_t>(v[e].trellis_w.data());
+    core::DeviceBuffer<uint64_t> dev(host.size());
+    dev.CopyFromHost(host.data(), host.size());
+    return dev;
+  };
+  const auto ptr_table_trellis_suh = [](const std::vector<QuantLinear>& v) {
+    std::vector<uint64_t> host(v.size());
+    for (size_t e = 0; e < v.size(); ++e) host[e] = reinterpret_cast<uint64_t>(v[e].trellis_suh.data());
+    core::DeviceBuffer<uint64_t> dev(host.size());
+    dev.CopyFromHost(host.data(), host.size());
+    return dev;
+  };
+  const auto ptr_table_trellis_svh = [](const std::vector<QuantLinear>& v) {
+    std::vector<uint64_t> host(v.size());
+    for (size_t e = 0; e < v.size(); ++e) host[e] = reinterpret_cast<uint64_t>(v[e].trellis_svh.data());
     core::DeviceBuffer<uint64_t> dev(host.size());
     dev.CopyFromHost(host.data(), host.size());
     return dev;
@@ -118,10 +153,40 @@ Lfm2Container Lfm2Container::Load(const std::string& path, const Lfm2LoadOptions
         m.gate_up.push_back(linear(Lfm2ExpertBase(i, e, "gate_up"), o.layout, cfg.ExpertGateUpRows(), hidden));
         m.down.push_back(linear(Lfm2ExpertBase(i, e, "down"), o.layout, hidden, cfg.moe_intermediate_size));
       }
-      if (o.layout == Layout::kBf16 && !m.gate_up.empty() && m.gate_up[0].layout == Layout::kBf16 &&
-          m.down[0].layout == Layout::kBf16) {
-        m.gate_up_bf16_ptrs = ptr_table(m.gate_up);
-        m.down_bf16_ptrs = ptr_table(m.down);
+      bool all_bf16 = !m.gate_up.empty();
+      bool all_w8 = !m.gate_up.empty() && m.gate_up[0].w8a16_group > 0 && m.down[0].w8a16_group > 0;
+      bool all_trellis = !m.gate_up.empty() &&
+                         (m.gate_up[0].trellis_bits == 4 || m.gate_up[0].trellis_bits == 5) &&
+                         (m.down[0].trellis_bits == 4 || m.down[0].trellis_bits == 5);
+      for (size_t e = 0; e < m.gate_up.size(); ++e) {
+        all_bf16 = all_bf16 && m.gate_up[e].layout == Layout::kBf16 && m.down[e].layout == Layout::kBf16;
+        all_w8 = all_w8 && m.gate_up[e].layout == Layout::kW8a16 && m.down[e].layout == Layout::kW8a16 &&
+                 m.gate_up[e].w8a16_group == m.gate_up[0].w8a16_group &&
+                 m.down[e].w8a16_group == m.down[0].w8a16_group;
+        all_trellis = all_trellis && m.gate_up[e].layout == Layout::kTrellis && m.down[e].layout == Layout::kTrellis &&
+                      m.gate_up[e].trellis_bits == m.gate_up[0].trellis_bits &&
+                      m.down[e].trellis_bits == m.down[0].trellis_bits &&
+                      m.gate_up[e].trellis_prescale_log2 == m.gate_up[0].trellis_prescale_log2 &&
+                      m.down[e].trellis_prescale_log2 == m.down[0].trellis_prescale_log2 &&
+                      m.gate_up[e].trellis_parts == m.gate_up[0].trellis_parts &&
+                      m.down[e].trellis_parts == m.down[0].trellis_parts &&
+                      m.gate_up[e].trellis_part_n[0] == m.gate_up[0].trellis_part_n[0];
+      }
+      if (all_bf16) {
+        m.gate_up_bf16_ptrs = ptr_table_bf16(m.gate_up);
+        m.down_bf16_ptrs = ptr_table_bf16(m.down);
+      } else if (all_w8) {
+        m.gate_up_w8_wq_ptrs = ptr_table_w8_wq(m.gate_up);
+        m.gate_up_w8_ws_ptrs = ptr_table_w8_ws(m.gate_up);
+        m.down_w8_wq_ptrs = ptr_table_w8_wq(m.down);
+        m.down_w8_ws_ptrs = ptr_table_w8_ws(m.down);
+      } else if (all_trellis) {
+        m.gate_up_trellis_w_ptrs = ptr_table_trellis_w(m.gate_up);
+        m.gate_up_trellis_suh_ptrs = ptr_table_trellis_suh(m.gate_up);
+        m.gate_up_trellis_svh_ptrs = ptr_table_trellis_svh(m.gate_up);
+        m.down_trellis_w_ptrs = ptr_table_trellis_w(m.down);
+        m.down_trellis_suh_ptrs = ptr_table_trellis_suh(m.down);
+        m.down_trellis_svh_ptrs = ptr_table_trellis_svh(m.down);
       }
     }
     c.layers_.push_back(std::move(lw));
@@ -189,9 +254,11 @@ void Lfm2Container::ForEachLinear(Fn&& fn) {
 
 void Lfm2Container::AssignTrellisTickets() {
   size_t total = 0;
+  int64_t max_moe_n = 0;
   ForEachLinear([&](QuantLinear& q) {
     if (q.layout == Layout::kTrellis) {
       total += core::r4d::GemmTrellisTicketsBytes(static_cast<int>(q.N)) / sizeof(uint32_t);
+      max_moe_n = std::max(max_moe_n, q.N);
     }
   });
   trellis_tickets_ = core::DeviceBuffer<uint32_t>(total);
@@ -202,11 +269,26 @@ void Lfm2Container::AssignTrellisTickets() {
     q.trellis_tickets = trellis_tickets_.data() + off;
     off += core::r4d::GemmTrellisTicketsBytes(static_cast<int>(q.N)) / sizeof(uint32_t);
   });
+  if (max_moe_n >= 128) {
+    // Per-pair self-resetting tickets for r4dx_lfm2_gemm_trellis_moe_decode (up to 256 tokens * top_k = 1024 pairs).
+    const size_t moe_tk = static_cast<size_t>(1024) * static_cast<size_t>(max_moe_n / 128);
+    moe_trellis_tickets_ = core::DeviceBuffer<uint32_t>(moe_tk);
+    moe_trellis_tickets_.Zero();
+    for (Lfm2LayerWeights& lw : layers_) {
+      if (!lw.dense && !lw.moe.gate_up_trellis_w_ptrs.empty()) {
+        lw.moe.moe_trellis_tickets = moe_trellis_tickets_.data();
+      }
+    }
+  }
 }
 
 void Lfm2Container::ZeroTrellisTickets(hipStream_t stream) {
-  if (trellis_tickets_.empty()) return;
-  core::r4d::GemmTrellisZeroTickets(trellis_tickets_.data(), trellis_tickets_.bytes(), stream);
+  if (!trellis_tickets_.empty()) {
+    core::r4d::GemmTrellisZeroTickets(trellis_tickets_.data(), trellis_tickets_.bytes(), stream);
+  }
+  if (!moe_trellis_tickets_.empty()) {
+    core::r4d::GemmTrellisZeroTickets(moe_trellis_tickets_.data(), moe_trellis_tickets_.bytes(), stream);
+  }
 }
 
 }  // namespace r4dx::model

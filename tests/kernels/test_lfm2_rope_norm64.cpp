@@ -18,6 +18,8 @@
 
 #include "lfm2_test_util.hpp"
 #include "r4dx/kernels/kernels.h"
+#include "kernels/model_kernels.h"
+#include "r4dx/kernels/lfm2_kernels.h"
 
 using namespace r4dx::core;
 using namespace lfm2_test;
@@ -158,6 +160,69 @@ void TestPreCoreOrder(std::mt19937& rng) {
   Check(Close(got, want, 3.0 / 128, 0.02), "qk-norm then rope chain (q [40, 32, 64]) == reference chain");
 }
 
+void TestFusions(std::mt19937& rng) {
+  // 1. r4dx_lfm2_residual_rmsnorm_plain_bf16 == r4dx_residual_add_bf16 + r4dx_rmsnorm_plain_bf16 (bitwise)
+  {
+    const int64_t rows = 16, hidden = 2048;
+    const auto h0 = ToBits(RandBf16(rng, rows * hidden, 2.0f));
+    const auto sub = ToBits(RandBf16(rng, rows * hidden, 1.5f));
+    const auto w = ToBits(RandBf16(rng, hidden, 1.0f));
+    DeviceBuffer<uint16_t> h_a(h0.size()), h_b(h0.size()), sub_d(sub.size()), w_d(w.size());
+    DeviceBuffer<uint16_t> x_a(h0.size()), x_b(h0.size());
+    h_a.CopyFromHost(h0);
+    h_b.CopyFromHost(h0);
+    sub_d.CopyFromHost(sub);
+    w_d.CopyFromHost(w);
+    r4dx_residual_add_bf16(P(h_a.data()), P(sub_d.data()), P(h_a.data()), rows * hidden, 0);
+    r4dx_rmsnorm_plain_bf16(P(h_a.data()), P(w_d.data()), P(x_a.data()), rows, hidden, 1e-5f, 0, 0);
+    r4dx_lfm2_residual_rmsnorm_plain_bf16(P(h_b.data()), P(sub_d.data()), P(w_d.data()), P(x_b.data()), rows, hidden,
+                                          1e-5f, 0);
+    R4DX_HIP_CHECK(hipDeviceSynchronize());
+    Check(h_a.CopyToHost() == h_b.CopyToHost() && x_a.CopyToHost() == x_b.CopyToHost(),
+          "r4dx_lfm2_residual_rmsnorm_plain_bf16 == residual_add + rmsnorm_plain (bitwise on h and x_out)");
+  }
+  // 2. r4dx_lfm2_attn_precore_bf16 == q_norm + k_norm + rope_neox + kv_write_paged_bf16_hnd (bitwise)
+  {
+    const int T = 16, hq = 32, hk = 8, block_size = 16, max_blocks = 8;
+    const int64_t head_stride = static_cast<int64_t>(block_size) * 2 * kHd;
+    const int64_t block_stride = static_cast<int64_t>(hk) * head_stride;
+    const auto q0 = ToBits(RandBf16(rng, static_cast<size_t>(T) * hq * kHd, 2.0f));
+    const auto k0 = ToBits(RandBf16(rng, static_cast<size_t>(T) * hk * kHd, 2.0f));
+    const auto v0 = ToBits(RandBf16(rng, static_cast<size_t>(T) * hk * kHd, 2.0f));
+    const auto qn = ToBits(RandBf16(rng, kHd, 1.0f));
+    const auto kn = ToBits(RandBf16(rng, kHd, 1.0f));
+    std::vector<int32_t> pos(T);
+    for (int t = 0; t < T; ++t) pos[t] = t * 5 + 3;
+    DeviceBuffer<uint16_t> qa(q0.size()), qb(q0.size()), ka(k0.size()), kb(k0.size()), vd(v0.size());
+    DeviceBuffer<uint16_t> qnd(kHd), knd(kHd);
+    DeviceBuffer<int32_t> pd(T);
+    DeviceBuffer<uint16_t> kva(static_cast<size_t>(max_blocks * block_stride)), kvb(kva.size());
+    qa.CopyFromHost(q0);
+    qb.CopyFromHost(q0);
+    ka.CopyFromHost(k0);
+    kb.CopyFromHost(k0);
+    vd.CopyFromHost(v0);
+    qnd.CopyFromHost(qn);
+    knd.CopyFromHost(kn);
+    pd.CopyFromHost(pos);
+    R4DX_HIP_CHECK(hipMemset(kva.data(), 0x5a, kva.bytes()));
+    R4DX_HIP_CHECK(hipMemset(kvb.data(), 0x5a, kvb.bytes()));
+
+    r4dx_rmsnorm_plain_bf16(P(qa.data()), P(qnd.data()), P(qa.data()), static_cast<int64_t>(T) * hq, kHd, 1e-5f, 0, 0);
+    r4dx_rmsnorm_plain_bf16(P(ka.data()), P(knd.data()), P(ka.data()), static_cast<int64_t>(T) * hk, kHd, 1e-5f, 0, 0);
+    r4dx_rope_neox_bf16(P(qa.data()), P(ka.data()), P(pd.data()), T, hq, hk, kHd, kTheta, 0);
+    r4dx_model_kv_write_paged_bf16_hnd(P(ka.data()), P(vd.data()), P(pd.data()), P(kva.data()), T, hk, kHd, block_size,
+                                       block_stride, head_stride, 0);
+
+    r4dx_lfm2_attn_precore_bf16(P(qb.data()), P(kb.data()), P(vd.data()), P(qnd.data()), P(knd.data()), P(pd.data()),
+                                P(kvb.data()), T, hq, hk, kHd, 1e-5f, kTheta, block_size, block_stride, head_stride, 0);
+    R4DX_HIP_CHECK(hipDeviceSynchronize());
+    Check(qa.CopyToHost() == qb.CopyToHost() && ka.CopyToHost() == kb.CopyToHost() &&
+              kva.CopyToHost() == kvb.CopyToHost(),
+          "r4dx_lfm2_attn_precore_bf16 == q_norm + k_norm + rope_neox + kv_write (bitwise on q, k and kv_cache)");
+  }
+}
+
 }  // namespace
 
 int main() {
@@ -167,6 +232,7 @@ int main() {
   TestRope(rng);
   TestNorm(rng);
   TestPreCoreOrder(rng);
+  TestFusions(rng);
   std::printf(g_ok ? "PASS\n" : "FAIL\n");
   return g_ok ? 0 : 1;
 }

@@ -2,12 +2,15 @@
 
 #include <stdexcept>
 #include <string>
+#include <algorithm>
+#include <cmath>
 
 #include "linear.h"
 #include "profile_span.h"
 #include "r4dx/core/error.hpp"
 #include "r4dx/kernels/kernels.h"
 #include "r4dx/kernels/lfm2_kernels.h"
+#include "r4dx/kernels/w8a16_gemm.h"
 
 namespace r4dx::model {
 
@@ -94,13 +97,104 @@ void Lfm2MoeFfn::Forward(hipStream_t stream, core::Arena& arena, const uint16_t*
     R4DX_HIP_CHECK(hipStreamSynchronize(stream));  // pageable sources
   }
 
-  const bool per_slot = path == Lfm2MoePath::kPerSlot || (path == Lfm2MoePath::kAuto && T == 1);
-  uint16_t* gu = arena.Alloc<uint16_t>(static_cast<size_t>(T * 2 * I), 16);  // an expert holds at most T rows
-  uint16_t* act = arena.Alloc<uint16_t>(static_cast<size_t>(T * I), 16);
-  uint16_t* ys = arena.Alloc<uint16_t>(static_cast<size_t>(Pn * H), 16);      // one output row per pair
+  const bool have_dev_ptrs = w_.HasDeviceDecodePtrs();
+  // R4DX_LFM2_MOE_DECODE=staged (or host / 0): kill switch forcing the staged host-readback kPerSlot path at decode.
+  static const bool kForceStagedDecode = [] {
+    const char* e = std::getenv("R4DX_LFM2_MOE_DECODE");
+    return e != nullptr && (std::string(e) == "staged" || std::string(e) == "host" || std::string(e) == "0");
+  }();
+  if (path == Lfm2MoePath::kGroupedDecode && !have_dev_ptrs) {
+    throw std::logic_error("Lfm2MoeFfn: kGroupedDecode requested on a layer without device expert pointer tables");
+  }
+  const bool grouped_decode =
+      path == Lfm2MoePath::kGroupedDecode ||
+      (path == Lfm2MoePath::kAuto && T == 1 && have_dev_ptrs && !kForceStagedDecode);
+  const bool per_slot = path == Lfm2MoePath::kPerSlot || (path == Lfm2MoePath::kAuto && T == 1 && !grouped_decode);
+  uint16_t* ys = arena.Alloc<uint16_t>(static_cast<size_t>(Pn * H), 16);  // one output row per pair
 
-  if (per_slot) {
-    // ---- decode path: read the T * top_k ids back (one sync), then M = 1 expert GEMMs per pair, slot layout ----
+  if (grouped_decode) {
+    // ---- device-indexed grouped decode (docs/lfm2-plan.md 3.5 / L4-2 / L4-3, docs/w8a16.md 4.4): zero host syncs ----
+    uint16_t* gu = arena.Alloc<uint16_t>(static_cast<size_t>(Pn * 2 * I), 16);
+    uint16_t* act = arena.Alloc<uint16_t>(static_cast<size_t>(Pn * I), 16);
+    const QuantLinear& gu0 = w_.gate_up[0];
+    const QuantLinear& dn0 = w_.down[0];
+    const int var_gu = gu0.layout == Layout::kW8a16     ? gu0.w8a16_group
+                       : gu0.layout == Layout::kTrellis ? gu0.trellis_bits
+                                                        : gu0.w4a16_group;
+    const int var_dn = dn0.layout == Layout::kW8a16     ? dn0.w8a16_group
+                       : dn0.layout == Layout::kTrellis ? dn0.trellis_bits
+                                                        : dn0.w4a16_group;
+    const LinearTuning t_gu = PickTuning(gu0.layout, gu0.N, gu0.K, 1, var_gu);
+    const LinearTuning t_dn = PickTuning(dn0.layout, dn0.N, dn0.K, 1, var_dn);
+    uint16_t* tq_a0 = nullptr;
+    uint16_t* tq_a1 = nullptr;
+    float* tq_ws = nullptr;
+    if (w_.HasTrellisPtrs()) {
+      const int64_t max_k = std::max(gu0.K, dn0.K);
+      tq_a0 = arena.Alloc<uint16_t>(static_cast<size_t>(Pn * max_k), 16);
+      if (gu0.trellis_parts > 1 || dn0.trellis_parts > 1) {
+        tq_a1 = arena.Alloc<uint16_t>(static_cast<size_t>(Pn * max_k), 16);
+      }
+      const int64_t ws_elems =
+          std::max((t_gu.SKG > 1 || t_gu.WV * t_gu.NPW * 32 < 128) ? Pn * t_gu.SKG * gu0.N : int64_t{0},
+                   (t_dn.SKG > 1 || t_dn.WV * t_dn.NPW * 32 < 128) ? Pn * t_dn.SKG * dn0.N : int64_t{0});
+      if (ws_elems > 0) tq_ws = arena.Alloc<float>(static_cast<size_t>(ws_elems), 16);
+    }
+    ProfiledCall(prof, stream, "gemm:moe.gate_up", [&] {
+      if (w_.HasBf16Ptrs()) {
+        r4dx_lfm2_gemm_bf16_moe_decode(P(x_normed), P(w_.gate_up_bf16_ptrs.data()), P(ids), P(gu),
+                                       static_cast<int>(Pn), static_cast<int>(K), static_cast<int>(E),
+                                       static_cast<int>(gu0.K), static_cast<int>(gu0.N), t_gu.WV, t_gu.SK, s);
+      } else if (w_.HasW8a16Ptrs()) {
+        r4dx_gemm_w8a16_moe_decode(P(x_normed), P(w_.gate_up_w8_wq_ptrs.data()), P(w_.gate_up_w8_ws_ptrs.data()),
+                                   P(ids), P(gu), static_cast<int>(Pn), static_cast<int>(K), static_cast<int>(E),
+                                   static_cast<int>(gu0.K), static_cast<int>(gu0.N), gu0.w8a16_group, t_gu.WV,
+                                   t_gu.SK, t_gu.NPW, t_gu.NT, s);
+      } else {
+        const float out_scale = static_cast<float>(std::ldexp(1.0, -gu0.trellis_prescale_log2) / std::sqrt(128.0));
+        const int n_split = static_cast<int>(gu0.trellis_parts > 1 ? gu0.trellis_part_n[0] : gu0.N);
+        r4dx_lfm2_trellis_moe_input_bf16(P(x_normed), P(w_.gate_up_trellis_suh_ptrs.data()), P(ids), P(tq_a0),
+                                         P(tq_a1), static_cast<int>(Pn), static_cast<int>(K), static_cast<int>(E),
+                                         gu0.K, gu0.trellis_parts, gu0.trellis_prescale_log2, s);
+        r4dx_lfm2_gemm_trellis_moe_decode(P(tq_a0), P(tq_a1), n_split, P(w_.gate_up_trellis_w_ptrs.data()),
+                                          P(w_.gate_up_trellis_svh_ptrs.data()), P(ids), P(gu), P(tq_ws),
+                                          P(w_.moe_trellis_tickets), static_cast<int>(Pn), static_cast<int>(E),
+                                          static_cast<int>(gu0.K), static_cast<int>(gu0.N), gu0.trellis_bits,
+                                          t_gu.WV, t_gu.SK, t_gu.NPW, t_gu.SKG, t_gu.U, t_gu.NT, out_scale, s);
+      }
+    });
+    ProfiledCall(prof, stream, "moe.silu_mul", [&] { r4dx_silu_mul_bf16(P(gu), P(act), Pn, I, 2 * I, s); });
+    ProfiledCall(prof, stream, "gemm:moe.down", [&] {
+      if (w_.HasBf16Ptrs()) {
+        r4dx_lfm2_gemm_bf16_moe_decode(P(act), P(w_.down_bf16_ptrs.data()), P(ids), P(ys),
+                                       static_cast<int>(Pn), /*a_row_group=*/1, static_cast<int>(E),
+                                       static_cast<int>(dn0.K), static_cast<int>(dn0.N), t_dn.WV, t_dn.SK, s);
+      } else if (w_.HasW8a16Ptrs()) {
+        r4dx_gemm_w8a16_moe_decode(P(act), P(w_.down_w8_wq_ptrs.data()), P(w_.down_w8_ws_ptrs.data()), P(ids), P(ys),
+                                   static_cast<int>(Pn), /*a_row_group=*/1, static_cast<int>(E),
+                                   static_cast<int>(dn0.K), static_cast<int>(dn0.N), dn0.w8a16_group, t_dn.WV,
+                                   t_dn.SK, t_dn.NPW, t_dn.NT, s);
+      } else {
+        const float out_scale = static_cast<float>(std::ldexp(1.0, -dn0.trellis_prescale_log2) / std::sqrt(128.0));
+        const int n_split = static_cast<int>(dn0.trellis_parts > 1 ? dn0.trellis_part_n[0] : dn0.N);
+        r4dx_lfm2_trellis_moe_input_bf16(P(act), P(w_.down_trellis_suh_ptrs.data()), P(ids), P(tq_a0), P(tq_a1),
+                                         static_cast<int>(Pn), /*a_row_group=*/1, static_cast<int>(E), dn0.K,
+                                         dn0.trellis_parts, dn0.trellis_prescale_log2, s);
+        r4dx_lfm2_gemm_trellis_moe_decode(P(tq_a0), P(tq_a1), n_split, P(w_.down_trellis_w_ptrs.data()),
+                                          P(w_.down_trellis_svh_ptrs.data()), P(ids), P(ys), P(tq_ws),
+                                          P(w_.moe_trellis_tickets), static_cast<int>(Pn), static_cast<int>(E),
+                                          static_cast<int>(dn0.K), static_cast<int>(dn0.N), dn0.trellis_bits,
+                                          t_dn.WV, t_dn.SK, t_dn.NPW, t_dn.SKG, t_dn.U, t_dn.NT, out_scale, s);
+      }
+    });
+    ProfiledCall(prof, stream, "moe.combine", [&] {
+      r4dx_lfm2_moe_combine_bf16(P(ys), 0, P(wts), P(out), static_cast<int>(T), static_cast<int>(K),
+                                 static_cast<int>(H), s);
+    });
+  } else if (per_slot) {
+    // ---- staged decode path: read the T * top_k ids back (one sync), then M = 1 expert GEMMs per pair, slot layout ----
+    uint16_t* gu = arena.Alloc<uint16_t>(static_cast<size_t>(2 * I), 16);
+    uint16_t* act = arena.Alloc<uint16_t>(static_cast<size_t>(I), 16);
     ProfiledCall(prof, stream, "moe.readback", [&] {
       R4DX_HIP_CHECK(hipMemcpyAsync(host_->ids.data(), ids, static_cast<size_t>(Pn) * sizeof(int32_t),
                                     hipMemcpyDeviceToHost, stream));
@@ -128,7 +222,13 @@ void Lfm2MoeFfn::Forward(hipStream_t stream, core::Arena& arena, const uint16_t*
       r4dx_lfm2_moe_combine_bf16(P(ys), 0, P(wts), P(out), static_cast<int>(T), static_cast<int>(K), static_cast<int>(H), s);
     });
   } else {
-    // ---- sorted path: deterministic counting sort, one readback of the offsets, per-expert GEMMs over its rows ----
+    // ---- sorted path: deterministic counting sort, then either device-indexed grouped prefill GEMMs (bf16 / w8a16,
+    //      docs/lfm2-plan.md L4-4: zero host syncs) or the staged per-expert loop (trellis or R4DX_LFM2_MOE_PREFILL=staged) ----
+    static const bool kForceStagedPrefill = [] {
+      const char* e = std::getenv("R4DX_LFM2_MOE_PREFILL");
+      return e != nullptr && (std::string(e) == "staged" || std::string(e) == "host" || std::string(e) == "0");
+    }();
+    const bool grouped_prefill = (w_.HasBf16Ptrs() || w_.HasW8a16Ptrs()) && !kForceStagedPrefill;
     int32_t* counts = arena.Alloc<int32_t>(static_cast<size_t>(E), 16);
     int32_t* offsets = arena.Alloc<int32_t>(static_cast<size_t>(E + 1), 16);
     int32_t* sorted = arena.Alloc<int32_t>(static_cast<size_t>(Pn), 16);
@@ -142,27 +242,64 @@ void Lfm2MoeFfn::Forward(hipStream_t stream, core::Arena& arena, const uint16_t*
       r4dx_lfm2_moe_gather_bf16(P(x_normed), P(sorted), P(xs), static_cast<int>(Pn), static_cast<int>(K),
                                 static_cast<int>(H), H, P(offsets + E), s);
     });
-    ProfiledCall(prof, stream, "moe.readback", [&] {
-      R4DX_HIP_CHECK(hipMemcpyAsync(host_->offsets.data(), offsets, static_cast<size_t>(E + 1) * sizeof(int32_t),
-                                    hipMemcpyDeviceToHost, stream));
-      R4DX_HIP_CHECK(hipStreamSynchronize(stream));
-    });
-    const int32_t* off = host_->offsets.data();
-    if (off[0] != 0 || off[E] != Pn) {
-      throw std::runtime_error("Lfm2MoeFfn: the expert sort covers " + std::to_string(off[E]) + " of " +
-                               std::to_string(Pn) + " pairs (a router id out of range?)");
-    }
-    // One expert's GEMM scratch at a time (see the per-slot path): the layer's arena peak does not grow with E.
-    const size_t mark = arena.Mark();
-    for (int64_t e = 0; e < E; ++e) {
-      const int64_t r0 = off[e], c = off[e + 1] - off[e];
-      if (c == 0) continue;
-      arena.Rewind(mark);
-      if (c < 0 || c > T) throw std::runtime_error("Lfm2MoeFfn: bad expert count " + std::to_string(c));
-      const size_t ue = static_cast<size_t>(e);
-      ProfiledCall(prof, stream, "gemm:moe.gate_up", [&] { ApplyLinear(stream, arena, w_.gate_up[ue], xs + r0 * H, gu, c); });
-      ProfiledCall(prof, stream, "moe.silu_mul", [&] { r4dx_silu_mul_bf16(P(gu), P(act), c, I, 2 * I, s); });
-      ProfiledCall(prof, stream, "gemm:moe.down", [&] { ApplyLinear(stream, arena, w_.down[ue], act, ys + r0 * H, c); });
+    if (grouped_prefill) {
+      uint16_t* gu = arena.Alloc<uint16_t>(static_cast<size_t>(Pn * 2 * I), 16);
+      uint16_t* act = arena.Alloc<uint16_t>(static_cast<size_t>(Pn * I), 16);
+      const QuantLinear& gu0 = w_.gate_up[0];
+      const QuantLinear& dn0 = w_.down[0];
+      const LinearTuning t_gu = PickTuning(gu0.layout, gu0.N, gu0.K, 16,
+                                           gu0.layout == Layout::kW8a16 ? gu0.w8a16_group : gu0.w4a16_group);
+      const LinearTuning t_dn = PickTuning(dn0.layout, dn0.N, dn0.K, 16,
+                                           dn0.layout == Layout::kW8a16 ? dn0.w8a16_group : dn0.w4a16_group);
+      ProfiledCall(prof, stream, "gemm:moe.gate_up", [&] {
+        if (w_.HasBf16Ptrs()) {
+          r4dx_lfm2_gemm_bf16_moe_prefill(P(xs), P(w_.gate_up_bf16_ptrs.data()), P(offsets), P(gu),
+                                          static_cast<int>(Pn), static_cast<int>(E), static_cast<int>(gu0.K),
+                                          static_cast<int>(gu0.N), t_gu.WV, t_gu.SK, s);
+        } else {
+          r4dx_gemm_w8a16_moe_prefill(P(xs), P(w_.gate_up_w8_wq_ptrs.data()), P(w_.gate_up_w8_ws_ptrs.data()),
+                                      P(offsets), P(gu), static_cast<int>(Pn), static_cast<int>(E),
+                                      static_cast<int>(gu0.K), static_cast<int>(gu0.N), gu0.w8a16_group, t_gu.WV,
+                                      t_gu.SK, t_gu.NPW, t_gu.NT, s);
+        }
+      });
+      ProfiledCall(prof, stream, "moe.silu_mul", [&] { r4dx_silu_mul_bf16(P(gu), P(act), Pn, I, 2 * I, s); });
+      ProfiledCall(prof, stream, "gemm:moe.down", [&] {
+        if (w_.HasBf16Ptrs()) {
+          r4dx_lfm2_gemm_bf16_moe_prefill(P(act), P(w_.down_bf16_ptrs.data()), P(offsets), P(ys),
+                                          static_cast<int>(Pn), static_cast<int>(E), static_cast<int>(dn0.K),
+                                          static_cast<int>(dn0.N), t_dn.WV, t_dn.SK, s);
+        } else {
+          r4dx_gemm_w8a16_moe_prefill(P(act), P(w_.down_w8_wq_ptrs.data()), P(w_.down_w8_ws_ptrs.data()), P(offsets),
+                                      P(ys), static_cast<int>(Pn), static_cast<int>(E), static_cast<int>(dn0.K),
+                                      static_cast<int>(dn0.N), dn0.w8a16_group, t_dn.WV, t_dn.SK, t_dn.NPW, t_dn.NT, s);
+        }
+      });
+    } else {
+      uint16_t* gu = arena.Alloc<uint16_t>(static_cast<size_t>(T * 2 * I), 16);  // an expert holds at most T rows
+      uint16_t* act = arena.Alloc<uint16_t>(static_cast<size_t>(T * I), 16);
+      ProfiledCall(prof, stream, "moe.readback", [&] {
+        R4DX_HIP_CHECK(hipMemcpyAsync(host_->offsets.data(), offsets, static_cast<size_t>(E + 1) * sizeof(int32_t),
+                                      hipMemcpyDeviceToHost, stream));
+        R4DX_HIP_CHECK(hipStreamSynchronize(stream));
+      });
+      const int32_t* off = host_->offsets.data();
+      if (off[0] != 0 || off[E] != Pn) {
+        throw std::runtime_error("Lfm2MoeFfn: the expert sort covers " + std::to_string(off[E]) + " of " +
+                                 std::to_string(Pn) + " pairs (a router id out of range?)");
+      }
+      // One expert's GEMM scratch at a time (see the per-slot path): the layer's arena peak does not grow with E.
+      const size_t mark = arena.Mark();
+      for (int64_t e = 0; e < E; ++e) {
+        const int64_t r0 = off[e], c = off[e + 1] - off[e];
+        if (c == 0) continue;
+        arena.Rewind(mark);
+        if (c < 0 || c > T) throw std::runtime_error("Lfm2MoeFfn: bad expert count " + std::to_string(c));
+        const size_t ue = static_cast<size_t>(e);
+        ProfiledCall(prof, stream, "gemm:moe.gate_up", [&] { ApplyLinear(stream, arena, w_.gate_up[ue], xs + r0 * H, gu, c); });
+        ProfiledCall(prof, stream, "moe.silu_mul", [&] { r4dx_silu_mul_bf16(P(gu), P(act), c, I, 2 * I, s); });
+        ProfiledCall(prof, stream, "gemm:moe.down", [&] { ApplyLinear(stream, arena, w_.down[ue], act, ys + r0 * H, c); });
+      }
     }
     ProfiledCall(prof, stream, "moe.combine", [&] {
       r4dx_lfm2_moe_combine_bf16(P(ys), P(pos_of_pair), P(wts), P(out), static_cast<int>(T), static_cast<int>(K),

@@ -239,6 +239,296 @@ void Launch(int64_t a, int64_t wq, int64_t ws, int64_t c, int M, int K, int N, i
   if (err != hipSuccess) Fail(std::string("launch failed: ") + hipGetErrorString(err));
 }
 
+constexpr int kMaxMoePairs = 16384;
+constexpr int kMaxMoeExperts = 256;
+
+template <int G, int NPW, bool NT>
+__global__ __launch_bounds__(1024) void w8a16_gemm_moe_decode_kernel(
+    const unsigned short* __restrict__ A, const uint64_t* __restrict__ wq_ptrs,
+    const uint64_t* __restrict__ ws_ptrs, const int32_t* __restrict__ ids,
+    __hip_bfloat16* __restrict__ C, int a_row_group, int n_experts, int K, int N, int WV, int SK) {
+  static_assert(G % kKPB == 0, "a group is a whole number of 32-K packed blocks");
+  constexpr int bpg = G / kKPB;
+  extern __shared__ float red[];  // WV*NPW*SK*256 floats
+  const int p = blockIdx.z;
+  const int e = ids[p];
+  if (e < 0 || e >= n_experts) return;
+  const unsigned char* Wq = reinterpret_cast<const unsigned char*>(wq_ptrs[e]);
+  const unsigned short* Ws = reinterpret_cast<const unsigned short*>(ws_ptrs[e]);
+  if (!Wq || !Ws) return;
+  const unsigned short* Ap = A + (size_t)(p / a_row_group) * (size_t)K;
+  __hip_bfloat16* Cp = C + (size_t)p * (size_t)N;
+
+  const int tid = threadIdx.x, wave = tid / kWave, lane = tid % kWave;
+  const int col_local = wave / SK, ksplit = wave % SK;
+  const int nt0 = (blockIdx.x * WV + col_local) * NPW;
+  const int n0 = nt0 * 16;
+  const int Ks = K / SK;
+  const int groups = Ks / G;
+  const int kbase = ksplit * Ks;
+
+  v8f acc[NPW];
+#pragma unroll
+  for (int j = 0; j < NPW; j++) acc[j] = (v8f)(0.f);
+
+  if (n0 < N) {
+    const unsigned off = rowGo((unsigned)K, 0, 0, lane) + (unsigned)kbase;
+    gu2 pa = (gu2)(const unsigned long long*)(Ap + off);
+
+    const int kpb = K / kKPB;
+    const int nsc = K / G;
+    gw4 pw[NPW];
+    gus ps[NPW];
+    const int ntlast = N / 16 - 1;
+#pragma unroll
+    for (int j = 0; j < NPW; j++) {
+      const int t = (nt0 + j) < ntlast ? (nt0 + j) : ntlast;
+      pw[j] = (gw4)(const uint4v*)(Wq) + (size_t)(t * (size_t)kpb + kbase / kKPB) * kWave + lane;
+      ps[j] = (gus)(Ws) + (size_t)(t * (size_t)nsc + kbase / G) * 16 + (lane & 15);
+    }
+
+    for (int g = 0; g < groups; g++) {
+      float sc[NPW];
+#pragma unroll
+      for (int j = 0; j < NPW; j++) sc[j] = __half2float(__ushort_as_half(ps[j][(size_t)g * 16]));
+
+      v8f g_acc[NPW];
+#pragma unroll
+      for (int b = 0; b < bpg; b++) {
+        uint4v wv[NPW];
+#pragma unroll
+        for (int j = 0; j < NPW; j++) {
+          const size_t o = (size_t)(g * bpg + b) * kWave;
+          wv[j] = NT ? __builtin_nontemporal_load(&pw[j][o]) : pw[j][o];
+        }
+#pragma unroll
+        for (int s = 0; s < 2; s++) {
+          const int u = b * 2 + s;
+          const v8h afrag = fragA_bf16(pa, u);
+#pragma unroll
+          for (int j = 0; j < NPW; j++) {
+            const v8h bfrag = dequant8(wv[j][2 * s], wv[j][2 * s + 1]);
+            g_acc[j] = u == 0 ? mmah(afrag, bfrag, (v8f)(0.f)) : mmah(afrag, bfrag, g_acc[j]);
+          }
+        }
+      }
+#pragma unroll
+      for (int j = 0; j < NPW; j++)
+#pragma unroll
+        for (int el = 0; el < 8; el++) acc[j][el] = fmaf(g_acc[j][el], sc[j], acc[j][el]);
+      pa += (G / 16) * 4;
+    }
+  }
+
+  const float unbias = 1.0f / (float)(1 << kScaleLog2Bias);
+  const int ncols = WV * NPW;
+  const int nthreads = WV * SK * kWave;
+  __syncthreads();
+#pragma unroll
+  for (int j = 0; j < NPW; j++) {
+    const int slot = ((col_local * NPW + j) * SK + ksplit) * 256;
+#pragma unroll
+    for (int el = 0; el < 8; el++) red[slot + el * kWave + lane] = acc[j][el];
+  }
+  __syncthreads();
+  for (int idx = tid; idx < ncols * 256; idx += nthreads) {
+    const int col = idx >> 8, off = idx & 255;
+    float v = 0.f;
+    for (int s = 0; s < SK; s++) v += red[(col * SK + s) * 256 + off];
+    v = v * unbias;
+    const int l = off & 31;
+    const int n = (blockIdx.x * ncols + col) * 16 + (l & 15);
+    const int m = 8 * (l >> 4) + (off >> 5);
+    if (n < N && m < 1) Cp[n] = __float2bfloat16(v);
+  }
+}
+
+[[noreturn]] void FailMoe(const std::string& what) {
+  throw std::runtime_error("r4dx_gemm_w8a16_moe_decode: " + what);
+}
+
+template <int G>
+void LaunchMoeDecode(int64_t a, int64_t wq_ptrs, int64_t ws_ptrs, int64_t ids, int64_t c, int n_pairs,
+                     int a_row_group, int n_experts, int K, int N, int WV, int SK, int NPW, int NT,
+                     int64_t stream) {
+  const int ntiles = N / 16;
+  const int ncols = WV * NPW;
+  dim3 grid((ntiles + ncols - 1) / ncols, 1, n_pairs), block(WV * SK * kWave);
+  const size_t smem = (size_t)ncols * SK * 256 * sizeof(float);
+  auto Ap = (const unsigned short*)a;
+  auto Wqp = (const uint64_t*)wq_ptrs;
+  auto Wsp = (const uint64_t*)ws_ptrs;
+  auto Idp = (const int32_t*)ids;
+  auto Cp = (__hip_bfloat16*)c;
+  hipStream_t st = (hipStream_t)stream;
+#define W8_MOE_LAUNCH(NP, TT)                                                                          \
+  hipLaunchKernelGGL((w8a16_gemm_moe_decode_kernel<G, NP, TT>), grid, block, smem, st, Ap, Wqp, Wsp,    \
+                     Idp, Cp, a_row_group, n_experts, K, N, WV, SK)
+  if (NPW == 1) {
+    if (NT) { W8_MOE_LAUNCH(1, true); } else { W8_MOE_LAUNCH(1, false); }
+  } else {
+    if (NT) { W8_MOE_LAUNCH(4, true); } else { W8_MOE_LAUNCH(4, false); }
+  }
+#undef W8_MOE_LAUNCH
+  const hipError_t err = hipGetLastError();
+  if (err != hipSuccess) FailMoe(std::string("launch failed: ") + hipGetErrorString(err));
+}
+
+__device__ __forceinline__ bool ResolveW8MoePrefillTile(const int32_t* __restrict__ offsets, int n_experts,
+                                                        int n_pairs, int tile_idx, int& out_e,
+                                                        int& out_row_start, int& out_m_rows) {
+  int rem = tile_idx;
+  for (int e = 0; e < n_experts; ++e) {
+    const int r0 = offsets[e];
+    const int r1 = offsets[e + 1];
+    const int c = r1 - r0;
+    if (c <= 0) continue;
+    const int nt = (c + 15) >> 4;
+    if (rem < nt) {
+      out_e = e;
+      out_row_start = r0 + (rem << 4);
+      out_m_rows = (r1 - out_row_start) < 16 ? (r1 - out_row_start) : 16;
+      return out_row_start >= 0 && out_row_start + out_m_rows <= n_pairs;
+    }
+    rem -= nt;
+  }
+  return false;
+}
+
+template <int G, int NPW, bool NT>
+__global__ __launch_bounds__(1024) void w8a16_gemm_moe_prefill_kernel(
+    const unsigned short* __restrict__ A, const uint64_t* __restrict__ wq_ptrs,
+    const uint64_t* __restrict__ ws_ptrs, const int32_t* __restrict__ offsets,
+    __hip_bfloat16* __restrict__ C, int n_pairs, int n_experts, int K, int N, int WV, int SK) {
+  static_assert(G % kKPB == 0, "a group is a whole number of 32-K packed blocks");
+  constexpr int bpg = G / kKPB;
+  extern __shared__ float red[];  // WV*NPW*SK*256 floats
+  int e = -1, row_start = 0, m_rows = 0;
+  if (!ResolveW8MoePrefillTile(offsets, n_experts, n_pairs, static_cast<int>(blockIdx.y), e, row_start,
+                               m_rows)) {
+    return;
+  }
+  const unsigned char* Wq = reinterpret_cast<const unsigned char*>(wq_ptrs[e]);
+  const unsigned short* Ws = reinterpret_cast<const unsigned short*>(ws_ptrs[e]);
+  if (!Wq || !Ws) return;
+  const unsigned short* Ap = A + (size_t)row_start * (size_t)K;
+  __hip_bfloat16* Cp = C + (size_t)row_start * (size_t)N;
+
+  const int tid = threadIdx.x, wave = tid / kWave, lane = tid % kWave;
+  const int col_local = wave / SK, ksplit = wave % SK;
+  const int nt0 = (blockIdx.x * WV + col_local) * NPW;
+  const int n0 = nt0 * 16;
+  const int Ks = K / SK;
+  const int groups = Ks / G;
+  const int kbase = ksplit * Ks;
+
+  v8f acc[NPW];
+#pragma unroll
+  for (int j = 0; j < NPW; j++) acc[j] = (v8f)(0.f);
+
+  if (n0 < N) {
+    const unsigned off = rowGo((unsigned)K, 0, m_rows - 1, lane) + (unsigned)kbase;
+    gu2 pa = (gu2)(const unsigned long long*)(Ap + off);
+
+    const int kpb = K / kKPB;
+    const int nsc = K / G;
+    gw4 pw[NPW];
+    gus ps[NPW];
+    const int ntlast = N / 16 - 1;
+#pragma unroll
+    for (int j = 0; j < NPW; j++) {
+      const int t = (nt0 + j) < ntlast ? (nt0 + j) : ntlast;
+      pw[j] = (gw4)(const uint4v*)(Wq) + (size_t)(t * (size_t)kpb + kbase / kKPB) * kWave + lane;
+      ps[j] = (gus)(Ws) + (size_t)(t * (size_t)nsc + kbase / G) * 16 + (lane & 15);
+    }
+
+    for (int g = 0; g < groups; g++) {
+      float sc[NPW];
+#pragma unroll
+      for (int j = 0; j < NPW; j++) sc[j] = __half2float(__ushort_as_half(ps[j][(size_t)g * 16]));
+
+      v8f g_acc[NPW];
+#pragma unroll
+      for (int b = 0; b < bpg; b++) {
+        uint4v wv[NPW];
+#pragma unroll
+        for (int j = 0; j < NPW; j++) {
+          const size_t o = (size_t)(g * bpg + b) * kWave;
+          wv[j] = NT ? __builtin_nontemporal_load(&pw[j][o]) : pw[j][o];
+        }
+#pragma unroll
+        for (int s = 0; s < 2; s++) {
+          const int u = b * 2 + s;
+          const v8h afrag = fragA_bf16(pa, u);
+#pragma unroll
+          for (int j = 0; j < NPW; j++) {
+            const v8h bfrag = dequant8(wv[j][2 * s], wv[j][2 * s + 1]);
+            g_acc[j] = u == 0 ? mmah(afrag, bfrag, (v8f)(0.f)) : mmah(afrag, bfrag, g_acc[j]);
+          }
+        }
+      }
+#pragma unroll
+      for (int j = 0; j < NPW; j++)
+#pragma unroll
+        for (int el = 0; el < 8; el++) acc[j][el] = fmaf(g_acc[j][el], sc[j], acc[j][el]);
+      pa += (G / 16) * 4;
+    }
+  }
+
+  const float unbias = 1.0f / (float)(1 << kScaleLog2Bias);
+  const int ncols = WV * NPW;
+  const int nthreads = WV * SK * kWave;
+  __syncthreads();
+#pragma unroll
+  for (int j = 0; j < NPW; j++) {
+    const int slot = ((col_local * NPW + j) * SK + ksplit) * 256;
+#pragma unroll
+    for (int el = 0; el < 8; el++) red[slot + el * kWave + lane] = acc[j][el];
+  }
+  __syncthreads();
+  for (int idx = tid; idx < ncols * 256; idx += nthreads) {
+    const int col = idx >> 8, off = idx & 255;
+    float v = 0.f;
+    for (int s = 0; s < SK; s++) v += red[(col * SK + s) * 256 + off];
+    v = v * unbias;
+    const int l = off & 31;
+    const int n = (blockIdx.x * ncols + col) * 16 + (l & 15);
+    const int m = 8 * (l >> 4) + (off >> 5);
+    if (n < N && m < m_rows) Cp[(size_t)m * N + n] = __float2bfloat16(v);
+  }
+}
+
+[[noreturn]] void FailMoePrefill(const std::string& what) {
+  throw std::runtime_error("r4dx_gemm_w8a16_moe_prefill: " + what);
+}
+
+template <int G>
+void LaunchMoePrefill(int64_t a, int64_t wq_ptrs, int64_t ws_ptrs, int64_t offsets, int64_t c, int n_pairs,
+                      int n_experts, int K, int N, int WV, int SK, int NPW, int NT, int64_t stream) {
+  const int ntiles = N / 16;
+  const int ncols = WV * NPW;
+  const int max_tiles = n_pairs < ((n_pairs + 15) / 16 + n_experts) ? n_pairs : ((n_pairs + 15) / 16 + n_experts);
+  dim3 grid((ntiles + ncols - 1) / ncols, max_tiles), block(WV * SK * kWave);
+  const size_t smem = (size_t)ncols * SK * 256 * sizeof(float);
+  auto Ap = (const unsigned short*)a;
+  auto Wqp = (const uint64_t*)wq_ptrs;
+  auto Wsp = (const uint64_t*)ws_ptrs;
+  auto Ofp = (const int32_t*)offsets;
+  auto Cp = (__hip_bfloat16*)c;
+  hipStream_t st = (hipStream_t)stream;
+#define W8_MOE_PF_LAUNCH(NP, TT)                                                                          \
+  hipLaunchKernelGGL((w8a16_gemm_moe_prefill_kernel<G, NP, TT>), grid, block, smem, st, Ap, Wqp, Wsp,     \
+                     Ofp, Cp, n_pairs, n_experts, K, N, WV, SK)
+  if (NPW == 1) {
+    if (NT) { W8_MOE_PF_LAUNCH(1, true); } else { W8_MOE_PF_LAUNCH(1, false); }
+  } else {
+    if (NT) { W8_MOE_PF_LAUNCH(4, true); } else { W8_MOE_PF_LAUNCH(4, false); }
+  }
+#undef W8_MOE_PF_LAUNCH
+  const hipError_t err = hipGetLastError();
+  if (err != hipSuccess) FailMoePrefill(std::string("launch failed: ") + hipGetErrorString(err));
+}
+
 }  // namespace
 
 extern "C" {
@@ -267,5 +557,64 @@ void r4dx_gemm_w8a16_nt_m64(int64_t a_bf16, int64_t wq, int64_t ws, int64_t c, i
 int r4dx_gemm_w8a16_has_group(int group) { return group == 64 || group == 128; }
 int r4dx_gemm_w8a16_scale_log2_bias(void) { return kScaleLog2Bias; }
 int r4dx_gemm_w8a16_max_m(void) { return kMaxM; }
+
+void r4dx_gemm_w8a16_moe_decode(int64_t a_bf16, int64_t wq_ptrs, int64_t ws_ptrs, int64_t ids, int64_t c,
+                                int n_pairs, int a_row_group, int n_experts, int K, int N, int group,
+                                int WV, int SK, int NPW, int NT, int64_t stream) {
+  if (n_pairs < 1 || n_pairs > kMaxMoePairs) {
+    FailMoe("n_pairs must be 1.." + std::to_string(kMaxMoePairs) + " (got " + std::to_string(n_pairs) + ")");
+  }
+  if (a_row_group < 1 || a_row_group > n_pairs || n_pairs % a_row_group != 0) {
+    FailMoe("a_row_group must divide n_pairs in 1..n_pairs (a_row_group " + std::to_string(a_row_group) +
+            ", n_pairs " + std::to_string(n_pairs) + ")");
+  }
+  if (n_experts < 1 || n_experts > kMaxMoeExperts) {
+    FailMoe("n_experts must be 1.." + std::to_string(kMaxMoeExperts) + " (got " + std::to_string(n_experts) + ")");
+  }
+  if (group != 64 && group != 128) FailMoe("group " + std::to_string(group) + " is not instantiated (64, 128)");
+  if (N < 16 || N % 16) FailMoe("N must be a positive multiple of 16 (got " + std::to_string(N) + ")");
+  if (WV < 1 || SK < 1) FailMoe("WV and SK must be >= 1");
+  if (K < 1 || K % (SK * group)) {
+    FailMoe("K must be a positive multiple of SK*group (K " + std::to_string(K) + ", SK " + std::to_string(SK) +
+            ", group " + std::to_string(group) + ")");
+  }
+  if (WV * SK * kWave > 1024) FailMoe("WV*SK*32 > 1024 threads per block");
+  if (NPW != 1 && NPW != 4) FailMoe("NPW must be 1 or 4");
+  if ((size_t)WV * NPW * SK * 256 * sizeof(float) > 64 * 1024) FailMoe("LDS WV*NPW*SK KiB > 64");
+  if (!a_bf16 || !wq_ptrs || !ws_ptrs || !ids || !c) FailMoe("null pointer");
+  if (group == 128)
+    LaunchMoeDecode<128>(a_bf16, wq_ptrs, ws_ptrs, ids, c, n_pairs, a_row_group, n_experts, K, N, WV, SK, NPW, NT, stream);
+  else
+    LaunchMoeDecode<64>(a_bf16, wq_ptrs, ws_ptrs, ids, c, n_pairs, a_row_group, n_experts, K, N, WV, SK, NPW, NT, stream);
+  r4dx_kernel_launch_counter_add(1);
+}
+
+void r4dx_gemm_w8a16_moe_prefill(int64_t a_bf16, int64_t wq_ptrs, int64_t ws_ptrs,
+                                 int64_t expert_offsets, int64_t c, int n_pairs, int n_experts,
+                                 int K, int N, int group, int WV, int SK, int NPW, int NT,
+                                 int64_t stream) {
+  if (n_pairs < 1 || n_pairs > kMaxMoePairs) {
+    FailMoePrefill("n_pairs must be 1.." + std::to_string(kMaxMoePairs) + " (got " + std::to_string(n_pairs) + ")");
+  }
+  if (n_experts < 1 || n_experts > kMaxMoeExperts) {
+    FailMoePrefill("n_experts must be 1.." + std::to_string(kMaxMoeExperts) + " (got " + std::to_string(n_experts) + ")");
+  }
+  if (group != 64 && group != 128) FailMoePrefill("group " + std::to_string(group) + " is not instantiated (64, 128)");
+  if (N < 16 || N % 16) FailMoePrefill("N must be a positive multiple of 16 (got " + std::to_string(N) + ")");
+  if (WV < 1 || SK < 1) FailMoePrefill("WV and SK must be >= 1");
+  if (K < 1 || K % (SK * group)) {
+    FailMoePrefill("K must be a positive multiple of SK*group (K " + std::to_string(K) + ", SK " + std::to_string(SK) +
+                   ", group " + std::to_string(group) + ")");
+  }
+  if (WV * SK * kWave > 1024) FailMoePrefill("WV*SK*32 > 1024 threads per block");
+  if (NPW != 1 && NPW != 4) FailMoePrefill("NPW must be 1 or 4");
+  if ((size_t)WV * NPW * SK * 256 * sizeof(float) > 64 * 1024) FailMoePrefill("LDS WV*NPW*SK KiB > 64");
+  if (!a_bf16 || !wq_ptrs || !ws_ptrs || !expert_offsets || !c) FailMoePrefill("null pointer");
+  if (group == 128)
+    LaunchMoePrefill<128>(a_bf16, wq_ptrs, ws_ptrs, expert_offsets, c, n_pairs, n_experts, K, N, WV, SK, NPW, NT, stream);
+  else
+    LaunchMoePrefill<64>(a_bf16, wq_ptrs, ws_ptrs, expert_offsets, c, n_pairs, n_experts, K, N, WV, SK, NPW, NT, stream);
+  r4dx_kernel_launch_counter_add(1);
+}
 
 }  // extern "C"

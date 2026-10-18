@@ -103,7 +103,7 @@ __global__ __launch_bounds__(kThreads) void GemmaAttnRefKernel(const R4dxGemmaAt
     for (int j = 0; j < n; ++j) {
       const int64_t vb = key_base(k0 + j) + hd;
       const float pj = sp[j];
-      acc0 += pj * LoadKv<KVP>(kv, vb + d0);
+      if (d0 < hd) acc0 += pj * LoadKv<KVP>(kv, vb + d0);  // d0 >= hd (head_dim < 256) would read past the cache end
       if (d1 < hd) acc1 += pj * LoadKv<KVP>(kv, vb + d1);
     }
     __syncthreads();

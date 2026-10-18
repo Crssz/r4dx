@@ -34,6 +34,7 @@ GemmaContainerInfo GemmaContainer::Inspect(const std::string& path, int64_t laye
 }
 
 GemmaContainer GemmaContainer::Load(const std::string& path, const GemmaLoadOptions& o_in) {
+  const core::DirectLoadScope direct_load;  // docs/direct-storage.md
   GemmaLoadOptions o = o_in;
   if (o.lm_head_layout == Layout::kTrellis) o.lm_head_layout = Layout::kW4a16;  // heads are never trellis
   if (o.tp_world < 1 || o.tp_world > 2 || o.tp_rank < 0 || o.tp_rank >= o.tp_world) {

@@ -11,3 +11,10 @@ set_tests_properties(test_core PROPERTIES ENVIRONMENT "HIP_VISIBLE_DEVICES=1")
 add_executable(test_tp_host_exchange test_tp_host_exchange.cpp)
 target_link_libraries(test_tp_host_exchange PRIVATE r4dx_core)
 add_test(NAME test_tp_host_exchange COMMAND test_tp_host_exchange)
+
+# DirectStorage file -> VRAM loading (src/core/direct_storage.cpp, docs/direct-storage.md). Device 1 like
+# test_core; SKIP 77 without a HIP device or where DirectStorage cannot start.
+add_executable(test_direct_storage test_direct_storage.cpp)
+target_link_libraries(test_direct_storage PRIVATE r4dx_core)
+add_test(NAME test_direct_storage COMMAND test_direct_storage)
+set_tests_properties(test_direct_storage PROPERTIES ENVIRONMENT "HIP_VISIBLE_DEVICES=1" SKIP_RETURN_CODE 77)

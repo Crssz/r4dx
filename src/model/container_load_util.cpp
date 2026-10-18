@@ -7,6 +7,7 @@
 #include <fstream>
 #include <map>
 
+#include "r4dx/core/direct_storage.hpp"
 #include "r4dx/core/error.hpp"
 #include "r4dx/core/r4d.hpp"
 
@@ -250,39 +251,37 @@ int64_t ElemCountBySize(const SafetensorsReader& r, const std::string& name, int
   return static_cast<int64_t>(span / static_cast<uint64_t>(elem_bytes));
 }
 
-core::DeviceBuffer<uint16_t> UploadRawU16(const SafetensorsReader& r, const std::string& name) {
-  const int64_t n = ElemCountBySize(r, name, 2);
-  core::DeviceBuffer<uint16_t> buf(static_cast<size_t>(n));
-  buf.CopyFromHost(reinterpret_cast<const uint16_t*>(r.Data(name)), static_cast<size_t>(n));
+// The tensor's bytes into a fresh device buffer: straight from the file through DirectStorage when a
+// DirectLoadScope is active and the tensor is big enough to be worth it, else from the mapping.
+template <class T>
+core::DeviceBuffer<T> UploadRawT(const SafetensorsReader& r, const std::string& name) {
+  const int64_t n = ElemCountBySize(r, name, static_cast<int64_t>(sizeof(T)));
+  core::DeviceBuffer<T> buf(static_cast<size_t>(n));
+  const uint64_t bytes = static_cast<uint64_t>(n) * sizeof(T);
+  if (!core::DirectLoadScope::TryRead(r.Path(), r.FileOffset(name), bytes, buf.data())) {
+    buf.CopyFromHost(reinterpret_cast<const T*>(r.Data(name)), static_cast<size_t>(n));
+  }
   return buf;
+}
+
+core::DeviceBuffer<uint16_t> UploadRawU16(const SafetensorsReader& r, const std::string& name) {
+  return UploadRawT<uint16_t>(r, name);
 }
 
 core::DeviceBuffer<float> UploadRawF32(const SafetensorsReader& r, const std::string& name) {
-  const int64_t n = ElemCountBySize(r, name, 4);
-  core::DeviceBuffer<float> buf(static_cast<size_t>(n));
-  buf.CopyFromHost(reinterpret_cast<const float*>(r.Data(name)), static_cast<size_t>(n));
-  return buf;
+  return UploadRawT<float>(r, name);
 }
 
 core::DeviceBuffer<uint8_t> UploadRawU8(const SafetensorsReader& r, const std::string& name) {
-  const int64_t n = ElemCountBySize(r, name, 1);
-  core::DeviceBuffer<uint8_t> buf(static_cast<size_t>(n));
-  buf.CopyFromHost(reinterpret_cast<const uint8_t*>(r.Data(name)), static_cast<size_t>(n));
-  return buf;
+  return UploadRawT<uint8_t>(r, name);
 }
 
 core::DeviceBuffer<uint32_t> UploadRawU32(const SafetensorsReader& r, const std::string& name) {
-  const int64_t n = ElemCountBySize(r, name, 4);
-  core::DeviceBuffer<uint32_t> buf(static_cast<size_t>(n));
-  buf.CopyFromHost(reinterpret_cast<const uint32_t*>(r.Data(name)), static_cast<size_t>(n));
-  return buf;
+  return UploadRawT<uint32_t>(r, name);
 }
 
 core::DeviceBuffer<int32_t> UploadRawI32(const SafetensorsReader& r, const std::string& name) {
-  const int64_t n = ElemCountBySize(r, name, 4);
-  core::DeviceBuffer<int32_t> buf(static_cast<size_t>(n));
-  buf.CopyFromHost(reinterpret_cast<const int32_t*>(r.Data(name)), static_cast<size_t>(n));
-  return buf;
+  return UploadRawT<int32_t>(r, name);
 }
 
 // gdn.norm_weight is stored bf16 (docs/container-format.md), but both consumers

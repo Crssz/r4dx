@@ -103,6 +103,7 @@ Container Container::Load(const std::string& path, Layout layout, Layout lm_head
 }
 
 Container Container::Load(const std::string& path, const ContainerLoadOptions& o_in) {
+  const core::DirectLoadScope direct_load;  // docs/direct-storage.md: weights file -> VRAM, no page cache
   // docs/trellis-kernel.md 5.1: the heads of a trellis container are w4a16 (or bf16) -- mapped
   // here, at the top, so the TP=1 path and LoadShard both see it.
   const ContainerLoadOptions o = MapTrellisHeads(o_in);
@@ -488,6 +489,7 @@ using container_util::ShardLoadStats;
 }  // namespace
 
 Container Container::LoadShard(const std::string& path, const ContainerLoadOptions& o) {
+  const core::DirectLoadScope direct_load;  // a no-op when Load() (the usual caller) already opened one
   if (o.load_vision && o.tp_rank != 0) {
     throw std::invalid_argument(
         "r4dx::model::Container::Load: the vision tower's weights live on tensor-parallel rank 0 "

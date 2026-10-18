@@ -14,6 +14,7 @@
 #include <vector>
 
 #include "container_load_util.h"
+#include "r4dx/core/direct_storage.hpp"
 #include "tp/tp_shard.h"
 #include "trellis_meta.h"
 
@@ -345,7 +346,9 @@ class ShardLoader {
     }
     const size_t count = total / sizeof(T);
     core::DeviceBuffer<T> buf(count);
-    if (runs.size() == 1) {
+    if (ReadRunsDirect(name, runs, buf.data())) {
+      // The bytes went file -> VRAM through DirectStorage: no mapping read, no staging copy.
+    } else if (runs.size() == 1) {
       // One contiguous range: straight from the mmap, no staging copy.
       buf.CopyFromHost(reinterpret_cast<const T*>(src + runs[0].src_off), count);
     } else {
@@ -361,6 +364,26 @@ class ShardLoader {
     ++(sharded ? stats_.sharded : stats_.replicated);
     stats_.uploaded_bytes += total;
     return buf;
+  }
+
+  // Every run of `name` straight from the file into `dst` (the runs back to back), when a
+  // DirectLoadScope is active and every run is big enough for DirectStorage to pay off. false:
+  // nothing was written and the caller copies from the mapping.
+  bool ReadRunsDirect(const std::string& name, const std::vector<tp::ByteRun>& runs, void* dst) const {
+    for (const tp::ByteRun& run : runs) {
+      if (run.bytes < core::DirectLoadScope::kMinBytes) return false;
+    }
+    const uint64_t base = r_.FileOffset(name);
+    char* out = static_cast<char*>(dst);
+    for (size_t i = 0; i < runs.size(); ++i) {
+      if (!core::DirectLoadScope::TryRead(r_.Path(), base + runs[i].src_off, runs[i].bytes, out)) {
+        // One file, one answer: only the first run can be refused (no scope, or an unsupported volume).
+        if (i != 0) throw std::logic_error("ShardLoader: DirectStorage refused a later run of an accepted tensor");
+        return false;
+      }
+      out += runs[i].bytes;
+    }
+    return true;
   }
 
   const SafetensorsReader& r_;

@@ -198,6 +198,7 @@ docs/           design notes and measurements
 | Architecture and module map | [docs/architecture.md](docs/architecture.md) |
 | Container format | [docs/container-format.md](docs/container-format.md) |
 | Building on Windows | [docs/build-windows.md](docs/build-windows.md) |
+| Weights SSD to VRAM (DirectStorage) | [docs/direct-storage.md](docs/direct-storage.md) |
 | Trellis quantization and kernel | [docs/quant2.md](docs/quant2.md), [docs/trellis-kernel.md](docs/trellis-kernel.md) |
 | Default model and baselines | [docs/huihui.md](docs/huihui.md) |
 | LFM2.5-24B-A2B (MoE, bf16 TP=2, trellis hybrid and w8a16 one card) | [docs/lfm2.md](docs/lfm2.md), [docs/w8a16.md](docs/w8a16.md), [docs/lfm2-plan.md](docs/lfm2-plan.md), [docs/lfm2-semantics.md](docs/lfm2-semantics.md) |

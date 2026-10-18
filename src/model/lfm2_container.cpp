@@ -15,6 +15,7 @@ namespace r4dx::model {
 using namespace container_util;
 
 Lfm2Container Lfm2Container::Load(const std::string& path, const Lfm2LoadOptions& o_in) {
+  const core::DirectLoadScope direct_load;  // docs/direct-storage.md
   Lfm2LoadOptions o = o_in;
   if (o.lm_head_layout == Layout::kTrellis) o.lm_head_layout = Layout::kW4a16;  // heads are never trellis
   if (o.tp_world < 1 || o.tp_world > 2 || o.tp_rank < 0 || o.tp_rank >= o.tp_world) {

@@ -10,6 +10,7 @@ where the upstream cuts one, else by commit SHA of the default branch at fetch t
 | cpp-httplib | `third_party/httplib/httplib.h` | github.com/yhirose/cpp-httplib | `v0.18.3` |
 | minja | `third_party/minja/minja.hpp`, `chat-template.hpp` | github.com/google/minja | `021c2293c187789ef13d56c6cfd89c9b134fd80f` |
 | stb_image | `third_party/stb/stb_image.h` | github.com/nothings/stb | `2c980bb59875b0d32144a71867fbdebb2f77cd20` |
+| DirectStorage (headers + x64 `dstorage.dll`, `dstoragecore.dll`, LICENSE, NOTICES) | `third_party/directstorage/` | nuget.org `Microsoft.Direct3D.DirectStorage` | `1.3.0` |
 
 libr4d (the GPU kernels) is not header-only: it is vendored as plain sources under
 `third_party/libr4d` (tree of upstream libr4d commit `f47a8bce908b062c7af77f8dbd18b760c1d199e6`,

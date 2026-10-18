@@ -63,7 +63,7 @@ inline std::string WideToUtf8(const std::wstring& w) {
 // One memory-mapped .safetensors file.
 class SafetensorsReader {
  public:
-  explicit SafetensorsReader(const std::wstring& path) : path_display_(WideToUtf8(path)) {
+  explicit SafetensorsReader(const std::wstring& path) : path_(path), path_display_(WideToUtf8(path)) {
     try {
       Open(path);
     } catch (...) {
@@ -164,6 +164,10 @@ class SafetensorsReader {
     const auto& m = tensors_.at(name);
     return view_ + data_start_ + m.begin;
   }
+  // The shard's path and a tensor's absolute byte offset in it (header included): what a loader
+  // that reads the file itself (DirectStorage, docs/direct-storage.md) needs instead of Data().
+  const std::wstring& Path() const { return path_; }
+  uint64_t FileOffset(const std::string& name) const { return data_start_ + tensors_.at(name).begin; }
   // The JSON header's bytes exactly as in the file (from the mapping, so the same bytes the tensor
   // directory was parsed from).
   std::string HeaderJson() const {
@@ -178,6 +182,7 @@ class SafetensorsReader {
   }
 
  private:
+  std::wstring path_;
   std::string path_display_;
   HANDLE file_ = INVALID_HANDLE_VALUE;
   HANDLE mapping_ = nullptr;

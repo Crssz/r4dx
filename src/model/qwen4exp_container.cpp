@@ -7,6 +7,7 @@
 #include <stdexcept>
 
 #include "container_load_util.h"
+#include "r4dx/core/direct_storage.hpp"
 #include "r4dx/core/error.hpp"
 #include "r4dx/core/r4d.hpp"  // GemmTrellisTicketsBytes / GemmTrellisZeroTickets
 
@@ -572,6 +573,7 @@ void LoadExpertClass(const SafetensorsReader& r, const LinearLoadMeta& meta, Lay
 }  // namespace
 
 Qwen4ExpContainer Qwen4ExpContainer::Load(const std::string& path, const Qwen4ExpLoadOptions& o) {
+  const core::DirectLoadScope direct_load;  // docs/direct-storage.md
   Qwen4ExpContainer c;
   c.info_ = Inspect(path, o.layout, o.lm_head_layout);
   const Qwen4ExpConfig& cfg = c.info_.config;

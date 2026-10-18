@@ -4,7 +4,8 @@
 
 ```
 src/core/       device/stream/buffer plumbing: HIP device/stream lifetime, device buffer RAII,
-                the paged KV cache allocator, the GDN state allocator.
+                the paged KV cache allocator, the GDN state allocator, and DirectStorage file -> VRAM
+                loading (docs/direct-storage.md).
 src/kernels/    r4dx-owned HIP kernels -- the glue r4d does not provide (see "Own kernels" below).
 src/model/      the layer graph: embedding -> N decoder layers -> final norm -> lm_head, built
                 from a parsed r4dx container + config_model.

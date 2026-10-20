@@ -19,7 +19,7 @@ Each source is OPTIONAL and skipped, with a line in the meta file, when its inpu
 calib.txt + kv_calib_corpus + the repo code windows, but no WikiText-2, no corpus-v2 generated samples and no SFT parquet):
 `--wikitext`, `--gen-file`, `--sft` name them; `--require-all` turns a missing one into an error. A corpus without the generated /
 SFT part has no agent or thinking-mode traces: for the real run fetch the SFT parquet and, ideally, generate thinking-mode
-samples with the Ornith checkpoint (plan 5.1: the DFlash2 drafter is judged on thinking traces).
+samples with the Ornith checkpoint (the model is meant to be used with thinking on).
 
 Output `tokens_calib.json` in the shared segments format of make_tokens_json.py:
     {"tokenizer": ..., "tokenizer_mode": "canonical", "tokenizer_provenance": {...}, "add_special_tokens": false,

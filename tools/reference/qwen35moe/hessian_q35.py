@@ -411,7 +411,10 @@ def fallback_diag(m: torch.Tensor) -> torch.Tensor:
 
 
 def write_hess(path: Path, h: torch.Tensor, rows: int) -> dict:
-    return hc.write_hess_file(path, h.detach().cpu().numpy(), rows)
+    dead = int((torch.diagonal(h) <= 0).sum())          # channels whose second moment is exactly zero (see finalize_layer)
+    st = hc.write_hess_file(path, h.detach().cpu().numpy(), rows)
+    st["dead_channels"] = dead
+    return st
 
 
 def finalize_layer(root: Path, layer: int, taps: LayerTaps, ref: Qwen35MoeStreamingReference, corpus: dict,
@@ -463,9 +466,15 @@ def finalize_layer(root: Path, layer: int, taps: LayerTaps, ref: Qwen35MoeStream
 
     if not np.array_equal(taps.n_gu, taps.routed) or not np.array_equal(taps.n_dn, taps.routed):
         raise RuntimeError("routed counts disagree with the captured expert rows")
-    bad = {f: s for f, s in files.items() if not (s["finite"] and s["min_diag"] > 0.0)}
+    # Dead channels. Ornith-1.5-122B has many intermediate channels that never fire: weights down to ~1e-36 make silu(gate) * up (the
+    # down_proj input) and some GDN out_proj input channels exactly 0 in fp32 over the whole corpus (layer 0: ~880 of the 1024
+    # channels of an expert, 45 of the 8192 GDN output channels). Their Hessian rows / columns are zero, which is the truth, not a
+    # capture defect: the oracle adds trellis' 0.025 mean(diag) damping and nothing in the loss depends on those weights. They are
+    # RECORDED (capture.json dead_channels); only a non-finite file or one with no live channel at all is refused.
+    bad = {f: s for f, s in files.items() if not (s["finite"] and s["dead_channels"] < s["K"])}
     fb_set = {expert_file(layer, e, "gu") for e in fallback["gate_up"]} | {expert_file(layer, e, "down") for e in fallback["down"]}
     nonpos = {f: s["nonpos_channels"][:8] for f, s in bad.items() if f not in fb_set}
+    dead_ch = {f: s["dead_channels"] for f, s in files.items() if s["dead_channels"] > 0 and f not in fb_set}
     share = {"gate_up": len(fallback["gate_up"]) / E, "down": len(fallback["down"]) / E}
     routing = {"layer": layer, "tokens": taps.t_in, "top_k": taps.top_k, "pairs": taps.pairs,
                "threshold": {"gate_up": taps.gu_k, "down": taps.down_k},
@@ -494,13 +503,17 @@ def finalize_layer(root: Path, layer: int, taps: LayerTaps, ref: Qwen35MoeStream
     timing["finalize_s"] = time.perf_counter() - t0
     cap = {"layer": layer, "layer_type": lt, "tokens": taps.t_in, "files": len(files), "bytes": sum(s["bytes"] for s in files.values()),
            "fallback_share": share, "fallback_count": {k: len(v) for k, v in fallback.items()},
-           "nonpositive_diag_nonfallback": nonpos, "asymmetry": asym,
+           "nonpositive_diag_nonfallback": nonpos,
+           "dead_channels": {"files_with_dead_channels": len(dead_ch), "total": sum(dead_ch.values()),
+                             "worst_fraction": max((n / files[f]["K"] for f, n in dead_ch.items()), default=0.0),
+                             "by_file": dict(sorted(dead_ch.items())) if len(dead_ch) <= 600 else "see the .hess diagonals"},
+           "asymmetry": asym,
            "shared_input_gate": taps.shared, "timing": timing,
            "peak_rss_gib": peak_rss_gib(),
            "peak_vram_gib": (torch.cuda.max_memory_allocated() / 2**30 if torch.cuda.is_available() else None)}
     atomic_json(out / "capture.json", cap)
     if nonpos:
-        raise RuntimeError(f"layer {layer}: non-finite or non-positive diagonals outside the fallback: {nonpos}")
+        raise RuntimeError(f"layer {layer}: non-finite Hessians, or Hessians without a live channel, outside the fallback: {nonpos}")
     if not taps.shared["equal"]:
         raise RuntimeError(f"layer {layer}: a companion linear did not read its representative's input")
     done = {"layer": layer, "files": {f.name: sha256_file(f) for f in sorted(out.glob("*")) if f.name != "DONE.json"}}
@@ -699,8 +712,8 @@ def cmd_check(args) -> int:
             problems.append(f"{name}: non-finite")
         if not np.array_equal(h, h.T):
             problems.append(f"{name}: not symmetric after expansion")
-        if h.diagonal().min() <= 0:
-            problems.append(f"{name}: min diag {h.diagonal().min()}")
+        if h.diagonal().max() <= 0:
+            problems.append(f"{name}: no live channel (max diag {h.diagonal().max()})")
         if h.shape[0] != meta["K"] or rows != meta["rows"]:
             problems.append(f"{name}: K/rows differ from hessian.json")
         if ".e" in name and name not in fb and rows < h.shape[0]:

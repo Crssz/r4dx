@@ -4,9 +4,8 @@
     python tools\\quant2\\qwen35moe\\disk_budget.py [--root E:\\models\\r4dx\\q35moe] [--model-dir ...Ornith-1.5-122B] [--layers 0..47]
         [--ks 3,4] [--cap-gib 26] [--tokens 1000000 | --tokens-file tokens_calib.json]
 
-Everything is derived from the config (shapes) and the byte model of alloc_q35.py; the GPU-time figures are ESTIMATES from the
-qwen4_exp runs (Viterbi encoder ~24k tiles/s on an R9700, 1.7 tiles of work per raw tile: LDLQ + the global-scale search) and
-say so: measure one layer (`-Stage hessian|oracle -Layers 0`) before believing them.
+Everything is derived from the config (shapes) and the byte model of alloc_q35.py; the GPU-time figures are ESTIMATES scaled from the
+one measured layer (below) and say so: they move with the GPU (device 0 also drives the display) and with the lock holders.
 """
 
 from __future__ import annotations
@@ -23,9 +22,11 @@ from qwen35moe import alloc_q35 as A  # noqa: E402
 from qwen35moe.arch import Qwen35MoeArch  # noqa: E402
 
 GIB = 2**30
-TILES_PER_S = 24_000.0       # Viterbi encoder throughput measured on the qwen4_exp runs (R9700, KB 3; 26-28k at KB 4)
-WORK_PER_TILE = 1.7          # LDLQ pass + global-scale search, relative to the raw tile count (qwen4_exp: 32.7k vs 19.2k per expert)
-
+TILES_PER_S = 12_800.0       # END-TO-END rate, MEASURED 2026-10-21 on layer 0 of the real 4-layer slice (HIP device 0, the display GPU, cohort 32,
+                             # KB 3): 13.98 M encoder tiles in 18.3 min with one 840 s slice restart (a 32-expert chunk: 1.70 M tiles in ~125 s;
+                             # the encoder alone ran 19 k tiles/s). The qwen4_exp runs on device 1 had 23.7 k (KB 3) - 28 k (KB 4) tiles/s.
+WORK_PER_TILE = 1.44         # encoder tiles (LDLQ pass + global-scale search) per raw tile: 53 k per expert vs 36.9 k raw
+HESS_S_PER_MTOK = 380.0      # Hessian pass of one layer, MEASURED: 105,694 tokens in 40 s forward + 5 s finalize (device 0, peak VRAM 18.3 GiB, RSS 5.4 GiB)
 
 def parse_layers(spec: str) -> list[int]:
     out: list[int] = []
@@ -98,8 +99,9 @@ def main() -> int:
     print(f"[budget] GPU time (ESTIMATE, one GPU, one process under the lock):")
     print(f"           oracle encoder: {tiles_raw / 1e6:.0f} M raw tiles per K x {WORK_PER_TILE} / {TILES_PER_S:.0f} tiles/s"
           f" = {secs / 3600:.1f} h per K, {len(ks) * secs / 3600:.1f} h for K {','.join(map(str, ks))}")
-    print(f"           hessian passes: {len(layers)} layers x (forward of {T:,} tokens + fp32 Hessian GEMMs): not measured at this size;"
-          f" the tiny model does a 20k-token layer in a few seconds -- time layer 0 first")
+    hs = len(layers) * (T / 1e6 * HESS_S_PER_MTOK + 10)
+    print(f"           hessian passes: {len(layers)} layers x ({T:,} tokens at {HESS_S_PER_MTOK:.0f} s per 1M tokens, measured on a 105k-token pilot)"
+          f" = {hs / 3600:.1f} h; total ~{(hs + len(ks) * secs) / 3600:.0f} h")
     print("           slices of --BudgetSeconds (840 s) release the GPU lock in between, so other jobs interleave")
     return 0 if ok else 1
 

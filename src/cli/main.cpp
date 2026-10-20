@@ -416,11 +416,11 @@ int RunMain(int argc, char** argv) {
 
   r4dx::model::ModelOptions opts;
   opts.container_path = args.model_path;
-  // qwen4_exp (docs/qwen4exp.md): a container with a trellis payload and no explicit --layout runs the trellis
-  // layout; every other arch and every explicit --layout keeps exactly what was asked for.
+  // qwen4_exp (docs/qwen4exp.md) and qwen3_5_moe (docs/qwen35moe-plan.md): a container with a trellis payload and no
+  // explicit --layout runs the trellis layout; every other arch and every explicit --layout keeps exactly what was asked for.
   if (!args.layout_given && r4dx::model::Qwen4ExpDefaultsToTrellis(args.model_path)) {
     args.layout = "trellis";
-    std::fprintf(stderr, "[r4dx-cli] qwen4_exp container with a trellis payload: --layout defaults to trellis\n");
+    std::fprintf(stderr, "[r4dx-cli] MoE container with a trellis payload: --layout defaults to trellis\n");
   }
   try {
     opts.layout = r4dx::model::LayoutFromName(args.layout);
@@ -727,7 +727,7 @@ int RunMain(int argc, char** argv) {
       // is built, i.e. 2 x ~26 GB on a 32 GB card, which Windows pages out (decode fell from ~90 to ~18 tok/s).
       // Reset() drops the per-sequence state (conv state, positions) and keeps the weights.
       if (args.tp == 1 && dynamic_cast<r4dx::model::PpModel*>(model.get()) == nullptr && !container_is_lfm2 &&
-          container_arch != r4dx::model::Arch::kQwen4Exp) {
+          container_arch != r4dx::model::Arch::kQwen4Exp && container_arch != r4dx::model::Arch::kQwen35Moe) {
         model = r4dx::model::LoadTextModel(opts, tpo, ppo);
       } else {
         // docs/tp.md 2.8: a second full TP load would need twice the VRAM; Reset() drops the same

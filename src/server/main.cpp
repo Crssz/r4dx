@@ -61,7 +61,7 @@ int main(int argc, char** argv) {
   // layout; every other arch and every explicit --layout keeps exactly what was asked for.
   if (!args.layout_given && r4dx::model::Qwen4ExpDefaultsToTrellis(args.model_path)) {
     args.layout = "trellis";
-    std::fprintf(stderr, "[r4dx-server] qwen4_exp container with a trellis payload: --layout defaults to trellis\n");
+    std::fprintf(stderr, "[r4dx-server] MoE container with a trellis payload: --layout defaults to trellis\n");
   }
   try {
     opts.model_opts.layout = r4dx::model::LayoutFromName(args.layout);

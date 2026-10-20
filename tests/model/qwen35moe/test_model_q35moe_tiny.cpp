@@ -50,7 +50,12 @@ Tol GoldenTol(const std::string& name) {
 // One layer alone over the golden's own residual input: bf16 noise of that layer, not the amplified noise of those before it.
 Tol IsolatedTol(const std::string& name) {
   const auto has = [&](const char* s) { return name.find(s) != std::string::npos; };
-  if (has("moe_out")) return {0.06, 0.08, 0.05, 0.01};
+  // Measured on the real Ornith layers 0-3 (T = 7/70/300) against the fp32 isolated golden, next to HF's own bf16 layer (iso_golden.py
+  // --bf16): the MoE output sums nine bf16 contributions with cancellations, so HF itself sits at mean/rms 0.008-0.034 and 1-8.5% of
+  // its elements outside 0.08 rms + 5% of the fp32 value; r4dx (fp32 combine, one rounding) measures 0.014-0.027 and 3-8%. The
+  // bounds are that noise with margin; the mixers sit at 0.001-0.004 and need no allowance.
+  if (has("moe_out")) return {0.05, 0.08, 0.05, 0.12};
+  if (has("residual_out")) return {0.03, 0.05, 0.03, 0.025};
   return {0.03, 0.05, 0.03, 0.004};
 }
 
@@ -249,6 +254,7 @@ int RunTest() {
   std::printf("\n%s (%d failure(s))\n", g_failures == 0 ? "PASS" : "FAIL", g_failures);
   return g_failures == 0 ? 0 : 1;
 }
+
 
 
 

@@ -29,24 +29,24 @@ from qwen35moe import tiny_golden  # noqa: E402
 PROMPTS = (7, 70, 300)
 
 
-def build_layer(hf_dir: Path, text_cfg, layer: int):
+def build_layer(hf_dir: Path, text_cfg, layer: int, dtype=torch.float32):
     from transformers.models.qwen3_5_moe.modeling_qwen3_5_moe import Qwen3_5MoeDecoderLayer
 
-    mod = Qwen3_5MoeDecoderLayer(text_cfg, layer).float()
+    mod = Qwen3_5MoeDecoderLayer(text_cfg, layer).to(dtype)
     prefix = f"model.language_model.layers.{layer}."
     sd = {}
     with safe_open(str(hf_dir / "model-00001-of-00001.safetensors"), framework="pt") as f:
         for name in f.keys():
             if name.startswith(prefix):
-                sd[name[len(prefix):]] = f.get_tensor(name).float()
+                sd[name[len(prefix):]] = f.get_tensor(name).to(dtype)
     missing, unexpected = mod.load_state_dict(sd, strict=True), None
     mod.eval()
     return mod
 
 
-def run_layer(mod, text_cfg, rotary, x_bf16: torch.Tensor, capture: dict, p: str):
+def run_layer(mod, text_cfg, rotary, x_bf16: torch.Tensor, capture: dict, p: str, dtype=torch.float32):
     T = x_bf16.shape[0]
-    x = x_bf16.float().unsqueeze(0)
+    x = x_bf16.to(dtype).unsqueeze(0)
     pos = torch.arange(T).view(1, 1, T).expand(3, 1, T)
     cos, sin = rotary(x, pos)
     handles = []
@@ -87,27 +87,31 @@ def main(argv=None) -> int:
     ap.add_argument("--dir", required=True)
     ap.add_argument("--golden", default="golden_fp8")
     ap.add_argument("--out", default="golden_iso_f32")
+    ap.add_argument("--bf16", action="store_true", help="run the layers in bfloat16 (HF's own bf16 noise, for comparison); default out golden_iso_bf16")
     ap.add_argument("--prompts", type=int, nargs="*", default=list(PROMPTS))
     args = ap.parse_args(argv)
+    dtype = torch.bfloat16 if args.bf16 else torch.float32
+    if args.bf16 and args.out == "golden_iso_f32":
+        args.out = "golden_iso_bf16"
     root = Path(args.dir)
     hf = root / "hf"
     cfg = Qwen3_5MoeConfig.from_pretrained(str(hf))
     text_cfg = cfg.text_config
     text_cfg._attn_implementation = tiny_golden.install_fp8_kv_attention()
-    rotary = Qwen3_5MoeTextRotaryEmbedding(text_cfg)
+    rotary = Qwen3_5MoeTextRotaryEmbedding(text_cfg)  # fp32 cos / sin; rotary(x, pos) casts them to x.dtype
     out_dir = root / args.out
     out_dir.mkdir(parents=True, exist_ok=True)
     goldens = {t: load_file(str(root / args.golden / f"T{t}.safetensors")) for t in args.prompts}
     results = {t: {"input_ids": goldens[t]["input_ids"]} for t in args.prompts}
     for layer in range(text_cfg.num_hidden_layers):
-        mod = build_layer(hf, text_cfg, layer)
+        mod = build_layer(hf, text_cfg, layer, dtype)
         print(f"[iso] layer {layer} ({mod.block_type}) built", flush=True)
         for t in args.prompts:
             p = f"layer{layer}."
             x = goldens[t][p + "residual_in"]
             results[t][p + "residual_in"] = x.clone()
             cap: dict[str, torch.Tensor] = {}
-            run_layer(mod, text_cfg, rotary, x, cap, p)
+            run_layer(mod, text_cfg, rotary, x, cap, p, dtype)
             for k, v in cap.items():
                 results[t][k] = v
             print(f"[iso]   T={t}: {len(cap)} tensors", flush=True)
@@ -126,3 +130,4 @@ def main(argv=None) -> int:
 
 if __name__ == "__main__":
     sys.exit(main())
+

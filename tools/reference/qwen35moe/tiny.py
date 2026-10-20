@@ -177,21 +177,18 @@ def load_hf_model(hf_dir: str | Path):
             sub.experts_implementation = "eager"
         except Exception:
             pass
-    with torch.device("meta"):
-        model = Qwen3_5MoeForConditionalGeneration(cfg)
+    # Built for real (not on the meta device + to_empty): to_empty() leaves the non-persistent buffers -- the rotary inv_freq --
+    # uninitialised, which silently turned RoPE off in the first goldens (the position-dependent attention layer disagreed with
+    # r4dx while every GDN layer matched). dtype goes through the constructor so inv_freq stays fp32, as in from_pretrained.
+    model = Qwen3_5MoeForConditionalGeneration._from_config(cfg, dtype=torch.bfloat16)
     sd = load_file(str(hf_dir / "model-00001-of-00001.safetensors"))
-    model = model.to_empty(device="cpu").to(torch.bfloat16)
     missing, unexpected = model.load_state_dict(sd, strict=False)
     bad = [k for k in missing if not k.startswith("model.visual.")]
     if bad or unexpected:
         raise RuntimeError(f"tiny-q35moe load: missing {bad[:5]} unexpected {list(unexpected)[:5]}")
-    # buffers that to_empty() left uninitialised (rotary inv_freq)
-    for mod in model.modules():
-        if hasattr(mod, "inv_freq") and hasattr(mod, "rope_init_fn"):
-            inv, scale = mod.rope_init_fn(mod.config, "cpu")
-            mod.inv_freq = inv
-            mod.original_inv_freq = inv
-            mod.attention_scaling = scale
+    inv = model.model.language_model.rotary_emb.inv_freq
+    if not (inv.dtype == torch.float32 and abs(float(inv[0]) - 1.0) < 1e-6 and float(inv[-1]) < 1e-2 and float(inv[-1]) > 0):
+        raise RuntimeError(f"tiny-q35moe load: rotary inv_freq looks uninitialised: dtype {inv.dtype}, {inv[:2].tolist()} ... {inv[-1].item()}")
     model.eval()
     return model
 

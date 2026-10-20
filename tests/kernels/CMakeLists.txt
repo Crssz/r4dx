@@ -204,6 +204,13 @@ add_executable(test_attn_h64_gqa4 test_attn_h64_gqa4.cpp)
 target_link_libraries(test_attn_h64_gqa4 PRIVATE r4dx_model_attention r4dx_core r4dx_kernels r4d_core)
 add_test(NAME test_attn_h64_gqa4 COMMAND test_attn_h64_gqa4)
 set_tests_properties(test_attn_h64_gqa4 PROPERTIES ENVIRONMENT "HIP_VISIBLE_DEVICES=1")
+# libr4d's head_dim 256 / gqa 16 fp8-KV attention (docs/qwen35moe-plan.md M3, the Qwen3.5 MoE family; `ctest -R attn_h256_gqa16`):
+# decode, prefill and split-KV prefill against the stage-0 reference kernel on the same fp8 cache, the core wrappers' gqa
+# dispatch and the entry points' negative return codes.
+add_executable(test_attn_h256_gqa16 test_attn_h256_gqa16.cpp)
+target_link_libraries(test_attn_h256_gqa16 PRIVATE r4dx_model_attention r4dx_core r4dx_kernels r4d_core)
+add_test(NAME test_attn_h256_gqa16 COMMAND test_attn_h256_gqa16)
+set_tests_properties(test_attn_h256_gqa16 PROPERTIES ENVIRONMENT "HIP_VISIBLE_DEVICES=1")
 # tool_attn_h64_bench: the same kernels vs the reference kernel, time and KV GB/s at 2k / 8k / 32k / 128k (not a ctest):
 # $env:HIP_VISIBLE_DEVICES='1'; build\win-hip\tests\kernels\tool_attn_h64_bench.exe
 add_executable(tool_attn_h64_bench tool_attn_h64_bench.cpp)

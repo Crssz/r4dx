@@ -40,19 +40,36 @@ int64_t SliceRows(int64_t T) { return (T <= kScanChunk || T % kScanChunk == 0) ?
 
 }  // namespace
 
-Qwen4ExpGdn::Qwen4ExpGdn(const Qwen4ExpConfig& cfg, const Qwen4ExpGdnRefs& w)
+namespace {
+GdnGeometry GeometryOf(const Qwen4ExpConfig& cfg) {
+  GdnGeometry g;
+  g.hidden = cfg.hidden_size;
+  g.key_heads = cfg.linear_num_key_heads;
+  g.value_heads = cfg.linear_num_value_heads;
+  g.key_dim = cfg.linear_key_head_dim;
+  g.value_dim = cfg.linear_value_head_dim;
+  g.conv_kernel = cfg.linear_conv_kernel_dim;
+  g.rms_eps = cfg.rms_norm_eps;
+  g.sigmoid_gate = cfg.output_gate_type == Qwen4ExpConfig::OutputGate::kSigmoid;
+  return g;
+}
+}  // namespace
+
+Qwen4ExpGdn::Qwen4ExpGdn(const Qwen4ExpConfig& cfg, const Qwen4ExpGdnRefs& w) : Qwen4ExpGdn(GeometryOf(cfg), w) {}
+
+Qwen4ExpGdn::Qwen4ExpGdn(const GdnGeometry& geo, const Qwen4ExpGdnRefs& w)
     : w_(w),
-      hidden_(cfg.hidden_size),
-      Hg_(cfg.linear_num_key_heads),
-      H_(cfg.linear_num_value_heads),
-      K_(cfg.linear_key_head_dim),
-      V_(cfg.linear_value_head_dim),
-      width_(cfg.linear_conv_kernel_dim),
-      key_dim_(cfg.linear_num_key_heads * cfg.linear_key_head_dim),
-      value_dim_(cfg.linear_num_value_heads * cfg.linear_value_head_dim),
+      hidden_(geo.hidden),
+      Hg_(geo.key_heads),
+      H_(geo.value_heads),
+      K_(geo.key_dim),
+      V_(geo.value_dim),
+      width_(geo.conv_kernel),
+      key_dim_(geo.key_heads * geo.key_dim),
+      value_dim_(geo.value_heads * geo.value_dim),
       conv_dim_(2 * key_dim_ + value_dim_),
-      eps_(static_cast<float>(cfg.rms_norm_eps)),
-      sigmoid_gate_(cfg.output_gate_type == Qwen4ExpConfig::OutputGate::kSigmoid) {
+      eps_(static_cast<float>(geo.rms_eps)),
+      sigmoid_gate_(geo.sigmoid_gate) {
   if (K_ != 128 || V_ != 128) Fail("libr4d's GDN kernels are written for key / value head dim 128");
   if (width_ != 4) Fail("libr4d's GDN conv kernels are written for a conv kernel of 4");
   if (H_ % Hg_ != 0) Fail("value heads are not a multiple of key heads");

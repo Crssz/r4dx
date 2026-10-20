@@ -59,11 +59,23 @@ struct Qwen4ExpGdnCall {
   bool prefill_recurrent = false;
 };
 
+// The Gated DeltaNet geometry of one mixer, for architectures that are not qwen4_exp (qwen3_5_moe, docs/qwen35moe-plan.md):
+// the plain fields Qwen4ExpGdn reads off Qwen4ExpConfig. `sigmoid_gate` is the gated norm's gate activation (sigmoid for
+// qwen4_exp, silu for the Qwen3.5 hybrid).
+struct GdnGeometry {
+  int64_t hidden = 0;
+  int64_t key_heads = 0, value_heads = 0, key_dim = 0, value_dim = 0;
+  int64_t conv_kernel = 4;
+  double rms_eps = 1e-6;
+  bool sigmoid_gate = false;
+};
+
 class Qwen4ExpGdn {
  public:
   // Throws std::runtime_error for a geometry libr4d's GDN kernels do not serve (key / value head dim 128, conv width 4,
   // 16 | 48 head grouping is whatever the kernels check) or a missing / mis-shaped weight.
   Qwen4ExpGdn(const Qwen4ExpConfig& cfg, const Qwen4ExpGdnRefs& w);
+  Qwen4ExpGdn(const GdnGeometry& geo, const Qwen4ExpGdnRefs& w);
 
   // Arena bytes one Forward(T) allocates (ApplyLinear's own scratch comes on top, as for any caller).
   size_t ArenaBytes(int64_t T) const;

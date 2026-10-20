@@ -1,0 +1,22 @@
+# tests/model/qwen35moe: one executable + one ctest per file, registered explicitly below (like tests/model/qwen4exp).
+#   q35moe_add_test(<name>)   links r4dx_model (Container / Model / TextModel of the arch)
+#   SINGLE_DEVICE             runs on device 1 (HIP_VISIBLE_DEVICES=1)
+#   TWO_DEVICES               removes HIP_VISIBLE_DEVICES from the test's environment: both cards visible
+# Every test gets the labels q35moe and q35moe_gpu and SKIP_RETURN_CODE 77 (a missing fixture / device is a SKIP, never a PASS).
+# Fixtures (tools/reference/qwen35moe/tiny.py + tiny_golden.py + r4dx-convert) are found through R4DX_Q35MOE_TINY_DIR.
+
+function(q35moe_add_test name)
+  cmake_parse_arguments(ARG "SINGLE_DEVICE;TWO_DEVICES" "" "" ${ARGN})
+  add_executable(${name} "${CMAKE_CURRENT_SOURCE_DIR}/${name}.cpp")
+  target_link_libraries(${name} PRIVATE r4dx_model r4dx_model_qwen4exp_kernels r4dx_core r4d_core)
+  target_include_directories(${name} PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
+  add_test(NAME ${name} COMMAND ${name})
+  set_tests_properties(${name} PROPERTIES LABELS "q35moe;q35moe_gpu" SKIP_RETURN_CODE 77)
+  if(ARG_SINGLE_DEVICE)
+    set_tests_properties(${name} PROPERTIES ENVIRONMENT "HIP_VISIBLE_DEVICES=1")
+  elseif(ARG_TWO_DEVICES)
+    set_tests_properties(${name} PROPERTIES ENVIRONMENT_MODIFICATION "HIP_VISIBLE_DEVICES=unset:")
+  endif()
+endfunction()
+
+q35moe_add_test(test_model_q35moe_tiny SINGLE_DEVICE)

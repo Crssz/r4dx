@@ -256,4 +256,9 @@ std::unique_ptr<TextModel> LoadLfm2TextModel(const ModelOptions& opts, const TpO
 // R4DX_Q4_DEVICES / R4DX_Q4_SPLIT choose them). TextModel::Config().arch is Arch::kQwen4Exp for what it returns.
 std::unique_ptr<TextModel> LoadQwen4ExpTextModel(const ModelOptions& opts, const TpOptions& tp);
 
+// The qwen3_5_moe branch of LoadTextModel (arch.h: DetectArch(opts.container_path) == kQwen35Moe). Defined in
+// qwen35moe_local_text_model.cpp: tp.world must be 1 (the two cards are the model's own layer split; R4DX_Q35_DEVICES /
+// R4DX_Q35_SPLIT choose them). TextModel::Config().arch is Arch::kQwen35Moe for what it returns.
+std::unique_ptr<TextModel> LoadQwen35MoeTextModel(const ModelOptions& opts, const TpOptions& tp);
+
 }  // namespace r4dx::model

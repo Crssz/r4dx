@@ -164,6 +164,13 @@ set(R4DX_MODEL_SOURCES
   qwen4exp_stage.cpp
   qwen4exp_model.cpp
   qwen4exp_local_text_model.cpp
+  # qwen3_5_moe (Ornith-1.5-122B, docs/qwen35moe-plan.md M3): the layer-range weight loader.
+  qwen35moe_container.cpp
+  # ... and its per-device stage (kernel side: it must not see qwen4exp_weights.h), the two-stage model (container side) and
+  # the TextModel wrapper + LoadQwen35MoeTextModel.
+  qwen35moe_stage.cpp
+  qwen35moe_model.cpp
+  qwen35moe_local_text_model.cpp
 )
 # r4dx_model_tptest: the SAME sources compiled with R4DX_TP_TESTING, which adds the tensor-parallel
 # test hooks (Model::DflashDebugLastTop16 and friends, docs/tp.md 10.1 "P5 additions") -- linked only

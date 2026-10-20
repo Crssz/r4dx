@@ -95,7 +95,9 @@ Arch DetectArch(const std::string& container_path) {
 
 bool Qwen4ExpDefaultsToTrellis(const std::string& container_path) {
   const nlohmann::json meta = ReadContainerMetadata(container_path);
-  if (meta.is_null() || DetectArchFromMetadata(meta) != Arch::kQwen4Exp) return false;
+  if (meta.is_null()) return false;
+  const Arch arch = DetectArchFromMetadata(meta);
+  if (arch != Arch::kQwen4Exp && arch != Arch::kQwen35Moe) return false;  // qwen3_5_moe follows the same rule
   return meta.is_object() && meta.contains("quant") && meta.at("quant").is_object() &&
          meta.at("quant").contains("trellis");
 }

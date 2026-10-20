@@ -132,6 +132,20 @@ int  r4d_attn_prefill_splitkv_h64_gqa4_bf16kv(const R4DArgs* a, hipStream_t stre
 int64_t r4d_attn_prefill_splitkv_h64_gqa4_scratch_bytes(const R4DArgs* a);
 int  r4d_attn_decode_h64_gqa4_bf16kv         (const R4DArgs* a, hipStream_t stream);
 int64_t r4d_attn_decode_h64_gqa4_scratch_bytes(const R4DArgs* a);
+// ---- attention: head_dim 256, gqa 16, fp8 KV (r4d_attn_paged_h256_gqa16.hip) -------------------------
+// The same kernels as the gqa6 family, compiled for head_dim 256 with 16 queries per KV head (the full-attention
+// layers of the Qwen3.5 MoE family: 32 q heads / 2 KV heads). Everything else is the gqa6 contract: paged block 16,
+// bf16 query, fp8-e4m3 KV with per-(seq, head) descales, causal, varlen. Prefill: 24 query positions per workgroup
+// (24 warps x 16 rows / gqa 16), 48-key tiles; split-KV prefill: the gqa6 contract (the caller's count clamped to 64,
+// <= 1 is the plain launch, fp32 partials in a->scratch); there is no exact-wide variant (callers use the plain launch,
+// which is the same bits). Decode: split-KV, at most 64 query rows (q_len <= 4), a->splits 0 = the unit's split law;
+// needs a->scratch. Return 0 on success, negative on a shape this instantiation does not serve (-1 head_dim / block_size,
+// -2 gqa, -4 query rows, -5 scratch missing).
+int  r4d_attn_prefill_h256_gqa16_fp8kv        (const R4DArgs* a, hipStream_t stream);
+int  r4d_attn_prefill_splitkv_h256_gqa16_fp8kv(const R4DArgs* a, hipStream_t stream);
+int64_t r4d_attn_prefill_splitkv_h256_gqa16_scratch_bytes(const R4DArgs* a);
+int  r4d_attn_decode_h256_gqa16_fp8kv         (const R4DArgs* a, hipStream_t stream);
+int64_t r4d_attn_decode_h256_gqa16_scratch_bytes(const R4DArgs* a);
 // Every attention geometry this build serves, so a model can be validated against all of them at
 // load (r4d_attn_dims reports the gqa6 one only).
 struct R4DAttnGeom {

@@ -55,6 +55,7 @@ set(R4D_UNITS
   r4d_attn_paged_h256_gqa6
   r4d_attn_paged_h256_gqa2
   r4d_attn_paged_h64_gqa4
+  r4d_attn_paged_h256_gqa16
   r4d_attn_vit_h72_bf16
   r4d_gdn_chunk_scan_k128_v128_c64_bf16
   r4d_gdn_chunk_scan_stable_k128_v128_c64_bf16
@@ -93,6 +94,8 @@ set(R4D_DEPS_r4d_gemm_trellis_nt_m256_wq "${LIBR4D_DIR}/r4d_gemm_trellis_nt_m256
 set(R4D_DEPS_r4d_attn_paged_h256_gqa2 ${R4D_DEPS_r4d_attn_paged_h256_gqa6})
 # The head_dim 64 / gqa 4 unit instantiates the same two kernel files (bf16 KV).
 set(R4D_DEPS_r4d_attn_paged_h64_gqa4 ${R4D_DEPS_r4d_attn_paged_h256_gqa6})
+# The head_dim 256 / gqa 16 unit instantiates the same two kernel files (fp8 KV, the Qwen3.5 MoE family).
+set(R4D_DEPS_r4d_attn_paged_h256_gqa16 ${R4D_DEPS_r4d_attn_paged_h256_gqa6})
 # The span-safe chunk scan #includes the shipped scan's source with R4D_GDN_SCAN_STABLE defined (a unit of its own, like the `_wq`s).
 set(R4D_DEPS_r4d_gdn_chunk_scan_stable_k128_v128_c64_bf16 "${LIBR4D_DIR}/r4d_gdn_chunk_scan_k128_v128_c64_bf16.hip")
 

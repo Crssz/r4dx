@@ -766,3 +766,4 @@ endif()
 
 # tests/model/qwen4exp/: glob-registered tests of the qwen4_exp arch (docs/qwen4exp-plan.md).
 add_subdirectory(qwen4exp)
+add_subdirectory(qwen35moe)

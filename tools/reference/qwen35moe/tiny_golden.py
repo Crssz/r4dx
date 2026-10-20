@@ -50,6 +50,22 @@ DEFAULT_MODEL = tiny.DEFAULT_OUT / "hf"
 DEFAULT_OUT = tiny.DEFAULT_OUT / "golden"
 
 
+def install_fp8_kv_attention() -> str:
+    """Registers an attention implementation that rounds K and V (post q/k-norm and rope, as r4dx writes them to its cache) to
+    fp8 e4m3 and back before the sdpa call -- the noise of r4dx's fp8 paged KV cache with a descale of 1.0 (the tiny container
+    has no --kv-calib). Returns its name for `model.config._attn_implementation`."""
+    from transformers import AttentionInterface
+    from transformers.integrations.sdpa_attention import sdpa_attention_forward
+
+    def fp8_sdpa(module, query, key, value, attention_mask, **kwargs):
+        key = key.to(torch.float8_e4m3fn).to(key.dtype)
+        value = value.to(torch.float8_e4m3fn).to(value.dtype)
+        return sdpa_attention_forward(module, query, key, value, attention_mask, **kwargs)
+
+    AttentionInterface.register("fp8kv_sdpa", fp8_sdpa)
+    return "fp8kv_sdpa"
+
+
 def golden_prompts() -> dict[int, list[int]]:
     gen = torch.Generator().manual_seed(PROMPT_SEED)
     out = {}
@@ -140,15 +156,33 @@ def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--model", default=str(DEFAULT_MODEL))
     ap.add_argument("--out", default=str(DEFAULT_OUT))
+    ap.add_argument("--kv-fp8", action="store_true",
+                    help="round K / V to fp8 e4m3 inside the attention layers (r4dx's cache noise); the default out dir "
+                         "becomes <tiny>/golden_fp8")
+    ap.add_argument("--fp32", action="store_true",
+                    help="run the HF model in float32 (activations rounded to bf16 only when stored): the near-exact reference "
+                         "the bf16 run's own noise can be judged against; the default out dir becomes <tiny>/golden_f32[_fp8]")
     args = ap.parse_args(argv)
+    if args.out == str(DEFAULT_OUT) and (args.kv_fp8 or args.fp32):
+        args.out = str(tiny.DEFAULT_OUT / ("golden_f32" if args.fp32 else "golden") ) + ("_fp8" if args.kv_fp8 else "")
     torch.manual_seed(0)
     model = tiny.load_hf_model(args.model)
+    if args.fp32:
+        model = model.float()
+    if args.kv_fp8:
+        impl = install_fp8_kv_attention()
+        model.config._attn_implementation = impl
+        model.config.text_config._attn_implementation = impl
+        for layer in model.model.language_model.layers:
+            if hasattr(layer, "self_attn"):
+                layer.self_attn.config._attn_implementation = impl
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
     meta = {"prompts": {}, "free_steps": FREE_STEPS}
     for t, ids in golden_prompts().items():
         tensors = run(model, ids)
-        save_file({k: v.contiguous() for k, v in tensors.items()}, str(out / f"T{t}.safetensors"))
+        save_file({k: (v.to(torch.bfloat16) if v.is_floating_point() else v).contiguous() for k, v in tensors.items()},
+                  str(out / f"T{t}.safetensors"))
         free = free_run(model, ids, FREE_STEPS)
         (out / f"free_T{t}.json").write_text(json.dumps({"prompt": ids, "continuation": free}))
         meta["prompts"][str(t)] = {

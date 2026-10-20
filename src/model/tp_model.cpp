@@ -1291,10 +1291,15 @@ std::unique_ptr<TextModel> LoadTextModel(const ModelOptions& opts, const TpOptio
     return LoadQwen4ExpTextModel(opts, tp);
   }
   if (arch == Arch::kQwen35Moe) {
-    // docs/qwen35moe-plan.md M3: the model is not written yet. Refuse here rather than let the Qwen3.5 dense loader
-    // misread a MoE container.
-    throw std::invalid_argument("LoadTextModel: qwen3_5_moe (Ornith-1.5-122B) containers are recognised but the model "
-                                "is not implemented yet (docs/qwen35moe-plan.md)");
+    if (pp_on) {
+      throw std::invalid_argument("LoadTextModel: --pp 2 does not support qwen3_5_moe (it splits its layers over the two "
+                                  "cards itself; R4DX_Q35_DEVICES / R4DX_Q35_SPLIT)");
+    }
+    if (tp.world != 1) {
+      throw std::invalid_argument("LoadTextModel: --tp " + std::to_string(tp.world) +
+                                  " does not support qwen3_5_moe yet (it splits its layers over the two cards itself)");
+    }
+    return LoadQwen35MoeTextModel(opts, tp);
   }
   if (arch == Arch::kGemma4) {
     if (pp_on) throw std::invalid_argument("LoadTextModel: --pp 2 does not support Gemma 4 (it has its own RunChunk)");

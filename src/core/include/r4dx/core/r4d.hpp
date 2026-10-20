@@ -60,31 +60,55 @@ inline AttnVitDims GetAttnVitDims() {
 // shapes coincide) reads out-of-bounds/garbage descales for sequences 1..num_seqs-1.
 using Args = R4DArgs;
 
+// The full-attention entry points below serve two geometries, told apart by the call's own head counts: 6 queries per KV
+// head (the Qwen3.5 27B, `*_gqa6_*`) and 16 (the Qwen3.5 MoE family, `*_gqa16_*`, r4d_attn_paged_h256_gqa16.hip). Every
+// other ratio goes to the gqa6 kernels, which reject it with their own "-2" (the check is theirs, not duplicated here).
+inline bool IsGqa16(const Args& a) { return a.kv_heads > 0 && a.q_heads / a.kv_heads == 16; }
+
 inline void AttnPrefillFp8Kv(const Args& a, hipStream_t stream) {
+  if (IsGqa16(a)) {
+    R4DX_R4D_CHECK("attn_prefill_h256_gqa16_fp8kv", r4d_attn_prefill_h256_gqa16_fp8kv(&a, stream));
+    return;
+  }
   R4DX_R4D_CHECK("attn_prefill_h256_gqa6_fp8kv", r4d_attn_prefill_h256_gqa6_fp8kv(&a, stream));
 }
 // Split-KV prefill (prefill M1): Args::splits segments of the KV range, fp32 partials in
 // Args::scratch (AttnPrefillSplitKvScratchBytes), fixed-order merge. splits <= 1 is exactly
 // AttnPrefill*Kv above (same kernel, same bits, no scratch).
 inline void AttnPrefillSplitKvFp8Kv(const Args& a, hipStream_t stream) {
+  if (IsGqa16(a)) {
+    R4DX_R4D_CHECK("attn_prefill_splitkv_h256_gqa16_fp8kv",
+                   r4d_attn_prefill_splitkv_h256_gqa16_fp8kv(&a, stream));
+    return;
+  }
   R4DX_R4D_CHECK("attn_prefill_splitkv_h256_gqa6_fp8kv",
                  r4d_attn_prefill_splitkv_h256_gqa6_fp8kv(&a, stream));
 }
 inline int64_t AttnPrefillSplitKvScratchBytes(const Args& a) {
+  if (IsGqa16(a)) return r4d_attn_prefill_splitkv_h256_gqa16_scratch_bytes(&a);
   return r4d_attn_prefill_splitkv_h256_gqa6_scratch_bytes(&a);
 }
 // Exact-wide prefill (prefill M1 lossless mode): AttnPrefillFp8Kv's bits over more workgroups.
-// Args::splits 0 = the default geometry (see r4d.h).
+// Args::splits 0 = the default geometry (see r4d.h). At gqa 16 there is no wider geometry: it IS the plain launch.
 inline void AttnPrefillExactFp8Kv(const Args& a, hipStream_t stream) {
+  if (IsGqa16(a)) {
+    R4DX_R4D_CHECK("attn_prefill_h256_gqa16_fp8kv", r4d_attn_prefill_h256_gqa16_fp8kv(&a, stream));
+    return;
+  }
   R4DX_R4D_CHECK("attn_prefill_exact_h256_gqa6_fp8kv",
                  r4d_attn_prefill_exact_h256_gqa6_fp8kv(&a, stream));
 }
 inline void AttnDecodeFp8Kv(const Args& a, hipStream_t stream) {
+  if (IsGqa16(a)) {
+    R4DX_R4D_CHECK("attn_decode_h256_gqa16_fp8kv", r4d_attn_decode_h256_gqa16_fp8kv(&a, stream));
+    return;
+  }
   R4DX_R4D_CHECK("attn_decode_h256_gqa6_fp8kv", r4d_attn_decode_h256_gqa6_fp8kv(&a, stream));
 }
 // Bytes of split-KV decode scratch this shape needs; allocate and set Args::scratch before
 // calling AttnDecode*.
 inline int64_t AttnDecodeScratchBytes(const Args& a) {
+  if (IsGqa16(a)) return r4d_attn_decode_h256_gqa16_scratch_bytes(&a);
   return r4d_attn_decode_h256_gqa6_scratch_bytes(&a);
 }
 

@@ -70,7 +70,7 @@ Reuse, do not copy:
 - **M3 model (done on the tiny checkpoint, 2026-10-21)** `Qwen35MoeContainer` / `Qwen35MoeStage` / `Qwen35MoeModel` / `Qwen35MoeLocalTextModel` (two-device layer split, host-routed MoE, `R4DX_Q35_DEVICES` / `R4DX_Q35_SPLIT`), `r4dx-convert` branch, `LoadTextModel` dispatch, CLI/server trellis default. New libr4d unit `r4d_attn_paged_h256_gqa16.hip` (head_dim 256, 32 q / 2 kv heads, fp8 KV: prefill, split-KV prefill, decode), tested against the stage-0 reference attention (`tests/kernels/test_attn_h256_gqa16.cpp`, error ~2e-3 relative). `tests/model/qwen35moe/test_model_q35moe_tiny.cpp` PASSES against the HF golden (both GDN prefill paths): every layer in isolation from the golden's residual (GDN layers, attention layer, router, experts, shared expert), the whole model, and 24-token greedy free runs (24 of 24 agree at T = 70). **Real weights (2026-10-21):** the same test PASSES on a 4-layer prefix of the real checkpoint (`tools/reference/qwen35moe/real_prefix.py subset` + `r4dx-convert`, 21.6 GiB bf16, three GDN layers and the first attention layer; `R4DX_Q35MOE_TINY_DIR=E:\models\r4dx\q35moe-real4`), whole model and layer by layer, against HF bf16 and against the fp32 layer-isolated reference (`iso_golden.py`): GDN and attention outputs at mean/rms 0.001-0.004 of the fp32 value; the MoE output at 0.014-0.027, i.e. at parity with HF's own bf16 layer (0.008-0.034, same method); 24 of 24 greedy tokens agree at T = 70. `r4dx-cli` runs the prefix end to end (load, chat template, prefill, decode). Lessons: real activations carry outlier channels ~100x the rms, so the test judges the fraction of elements outside an absolute + relative band, not max/rms; HF's bf16 MoE is a noisy reference. Not done: the two-device split test (physical GPU 1 is faulted, see below), trellis/w4a16 containers (needs M4), long-context behaviour, speed (the MoE is host-routed: one sync per layer, one GEMM per expert).
 - **M4 converter + quantization** Hessians per layer from an HF reference forward (layer-streaming, 250 GB does not fit RAM), trellis oracle at KB 3 and KB 4, allocation, `r4dx-convert` branch. This is the long, GPU-hours stage; reuse `tools/quant2/qwen4exp/` scripts with the Qwen3.5 layer builder.
 - **M5 end to end** CLI/server chat on the real container, KL gate vs HF bf16 (mean KL <= 0.02, top-1 >= 93%, the qwen4_exp bar), thinking + tool calls through the Qwen3.5 template.
-- **M6 parity features** vision tower for the new sizes (reuse `src/vision`), `--tp 2` MoE sharding, MTP head, grouped GPU MoE decode, prefill int8 path, DFlash2 speculative decoding (section 6; after the quantized container and the grouped decode kernel).
+- **M6 parity features** vision tower for the new sizes (reuse `src/vision`), `--tp 2` MoE sharding, MTP head, grouped GPU MoE decode, prefill int8 path, DFlash2 speculative decoding (section 6; after the quantized container and the grouped decode kernel), grouped MoE prefill speed (section 8). Performance estimates: section 7.
 
 ## 5. Out of scope / decisions
 
@@ -83,8 +83,10 @@ Reuse, do not copy:
 ## 6. DFlash2 speculative decoding (planned, not started)
 
 Source: `incoai/Ornith-1.5-122B-DFlash2` (Apache-2.0, `qwen3` architecture, 0.9 B parameters, BF16, ~1.8 GB). A block-diffusion drafter for
-`ornith-ai/Ornith-1.5-122B`: block of 16 (15 drafted tokens per verification step), lossless (greedy output equals the target's). Not downloaded yet
-(needs the user's yes). Numbers below are from its model card (SGLang 0.5.21, two NVIDIA GB300, TP 2, Ornith default sampling, thinking on,
+`ornith-ai/Ornith-1.5-122B`: block of 16 (15 drafted tokens per verification step), lossless (greedy output equals the target's). Downloaded 2026-10-21 to
+`E:\models\r4dx\Ornith-1.5-122B-DFlash2` (6 layers, hidden 3072, 32 q / 8 kv heads x 128, sliding window 2048, target taps at layers
+1, 7, 14, 20, 26, 32, 39, 45, two-tap conv group 16, selector rank 256 / top-k 16, mask token 248077; not yet checked against r4dx's
+DFlash2 driver). Numbers below are from its model card (SGLang 0.5.21, two NVIDIA GB300, TP 2, Ornith default sampling, thinking on,
 4096 new tokens), NOT measured on r4dx / R9700.
 
 | Task | Acceptance length | Speedup at concurrency 1 |
@@ -112,3 +114,44 @@ confidence: it assumes the 16-row grouped expert GEMM runs at decent efficiency.
 5. Driver wiring in `Qwen35MoeLocalTextModel`, server/CLI flags (`--dflash`), then a greedy-equality test against plain decode and an acceptance-length
    measurement on code / math / chat prompts.
 6. Measure on r4dx; only then decide whether the MTP head (M6) is still worth building.
+
+## 7. Performance expectations (estimates, NOT measured on Ornith; written 2026-10-21)
+
+Method: bytes read per token from the config (active ~9.0 B parameters, ~4.9 GB at ~3.5-bit experts / ~4.5-bit rest, shared experts assumed
+quantized) at the qwen4exp-measured ~290 GB/s kernel bandwidth, plus ~4 ms fixed host-sync / card hand-off per pipeline step
+(`docs/qwen4exp.md`, "Decode performance"); `--tp 2` factors from the 27B (`docs/tp.md`: 0.63-0.7x kernel time per rank, ~1.65x measured
+on plain decode, all-reduce 7.5 us / 10 KiB); fusion and tuning +5-15% (the doc's measured fusion gains were small, 2.4% for HC + QSA).
+P2P between the two R9700s is unavailable on Windows and would add only ~5%.
+
+| Decode, single request (tok/s) | Range | Planning |
+|---|---:|---:|
+| today, host-routed MoE | 15-18 | 16 |
+| pipeline split, grouped kernel + fusion | 36-54 | 46 |
+| + MTP (k = 1-2, accepted 70-85% assumed) | 50-75 | 62 |
+| + DFlash2: chat / code / math / MATH-500-like | 40-75 / 47-89 / 61-115 / 68-128 | 58 / 70 / 88 / 98 |
+| `--tp 2`, plain | 55-75 | 65 |
+| `--tp 2` + MTP | 70-100 | 85 |
+| `--tp 2` + DFlash2: chat / code / math / MATH-500-like | 56-100 / 66-120 / 85-150 / 95-170 | 85 / 100 / 125 / 140 |
+
+Caveats: if the shared experts stay bf16 (as in qwen4exp) subtract ~8% from every row; run-to-run spread is ~10%; decode slows with context;
+DFlash2 and MTP gains are workload dependent (chat ~1.3x, code and math 1.5-2.2x) and need the new verify-row kernels.
+
+## 8. Prefill speed (planned, not started)
+
+Expected today: ~150-300 tok/s (pipeline split), ~200-400 with `--tp 2`; an 8k prompt takes ~27-55 s to the first token, 32k ~2-2.5 min.
+Scaled from the qwen4exp measurements (230-450 tok/s, ~5 TFLOPS useful, against the dense 27B's ~1000 tok/s / ~54 TFLOPS on the same cards).
+Nothing was profiled; the causes are inferred:
+
+1. Host-routed MoE: a router-id D2H copy and host sync per layer, then per-expert GEMMs, ~25,000 launches per 256-row chunk (~0.25-0.5 s of the
+   observed ~0.57 s per chunk).
+2. Skinny expert GEMMs: ~8 rows per expert in a 256-row chunk against 64-row tiles (`r4d_gemm_trellis_nt_m64`).
+3. The trellis decode to fp16 is not amortised over few rows.
+4. Nearly all 256 experts are read in every layer, so each chunk streams ~52 GB (floor ~0.11 s, ~2000 tok/s).
+5. The pipeline split keeps one card idle at a time; the chunk cap is 256 rows.
+
+Work items (after the quantized container; guess: 500-900 tok/s afterwards, practical ceiling ~1500):
+a. Grouped prefill MoE GEMM: sort rows by expert, one launch per layer, dense tiles (probably the biggest gain).
+b. Larger chunks (512-1024 rows) so each expert sees more rows and weights are streamed less often; check the activation VRAM.
+c. fp8 / int8 MoE prefill path (already the M6 "prefill int8 path").
+d. Overlap chunks across both cards (`docs/pp-prefill.md`, not ported to this model) and/or `--tp 2`.
+e. Profile first: add an `R4DX_Q35_PROFILE` timing breakdown for prefill (per-layer MoE / GDN / attention) before changing kernels.

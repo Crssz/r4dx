@@ -283,6 +283,8 @@
 #include "gemma_layout.hpp"
 #include "lfm2_layout.hpp"
 #include "awq_source.hpp"
+#include "fused_experts_source.hpp"
+#include "qwen35moe_layout.hpp"
 #include "qwen4exp_layout.hpp"
 
 namespace {
@@ -1853,10 +1855,27 @@ int RunConvert(const AppArgs& args) {
   // follows is reached only when this is false, so a Qwen run is exactly what it was.
   const bool is_gemma = config.value("model_type", std::string()) == r4dx_convert::gemma::kModelArch;
   const bool is_qwen4 = config.value("model_type", std::string()) == r4dx_convert::qwen4exp::kModelArch;
+  // qwen3_5_moe (Ornith-1.5-122B, qwen35moe_layout.hpp): text only, HF's fused experts read through the virtual source.
+  const bool is_q35moe = config.value("model_type", std::string()) == r4dx_convert::qwen35moe::kModelArch;
   if (!is_qwen4 && !args.ngram_sidecar.empty())
     throw std::runtime_error("--ngram-sidecar applies to qwen4_exp checkpoints only (this one is not qwen4_exp)");
-  if (!is_qwen4 && args.plan_only)
-    throw std::runtime_error("--plan-only applies to qwen4_exp checkpoints only (this one is not qwen4_exp)");
+  if (!is_qwen4 && !is_q35moe && args.plan_only)
+    throw std::runtime_error("--plan-only applies to qwen4_exp and qwen3_5_moe checkpoints only");
+  r4dx_convert::qwen35moe::TextShape mshape;
+  if (is_q35moe) {
+    if (args.vision == 1 || args.mtp == 1)
+      throw std::runtime_error("--vision on / --mtp on: the qwen3_5_moe branch converts the text model only "
+                               "(model.visual.* and mtp.* are skipped; docs/qwen35moe-plan.md M6)");
+    if (!args.draft_vocab_ids.empty())
+      throw std::runtime_error("--draft-vocab-ids needs the MTP head, which the qwen3_5_moe branch does not convert");
+    if (r4dx_convert::ParseRotationKind(args.rotate) != r4dx_convert::RotationKind::kNone)
+      throw std::runtime_error("--rotate " + args.rotate + ": not supported for qwen3_5_moe");
+    if (args.record_reuse_guard || !args.reuse_from.empty())
+      throw std::runtime_error("--record-reuse-guard / --reuse-tensors-from are not supported for qwen3_5_moe yet");
+    if (config.contains("quantization_config") && config.at("quantization_config").is_object())
+      throw std::runtime_error("qwen3_5_moe: quantization_config is present; only a bf16 checkpoint is converted");
+    mshape = r4dx_convert::qwen35moe::ParseTextConfig(config);
+  }
   // qwen4_exp: text only in milestone 1, one scheme, one layout path. Refused before any shard is opened.
   r4dx_convert::qwen4exp::TextShape qshape;
   r4dx_convert::qwen4exp::NgramSidecar ngram;
@@ -1914,10 +1933,10 @@ int RunConvert(const AppArgs& args) {
     if (refused != nullptr) throw std::runtime_error(std::string("r4dx-convert (lfm2_moe): ") + refused + " is not supported");
   }
   const bool do_audio = is_gemma && args.audio == 1;
-  const bool do_vision = is_lfm2                ? false
+  const bool do_vision = (is_lfm2 || is_q35moe)  ? false
                          : (is_gemma || is_qwen4) ? (args.vision == 1)
                                                   : (args.vision >= 0 ? (args.vision == 1) : full_run);
-  const bool do_mtp = (is_gemma || is_lfm2 || is_qwen4) ? false : (args.mtp >= 0 ? (args.mtp == 1) : full_run);
+  const bool do_mtp = (is_gemma || is_lfm2 || is_qwen4 || is_q35moe) ? false : (args.mtp >= 0 ? (args.mtp == 1) : full_run);
 
   LayoutSet layouts = ParseLayoutList(args.layouts_spec, /*bf16_default_on=*/true);
   // The head follows the body's quantized layout by default (docs/w8a16.md 5.2: "the head is w8a16 by
@@ -1953,6 +1972,7 @@ int RunConvert(const AppArgs& args) {
     std::cout << "[r4dx-convert] arch=" << r4dx_convert::gemma::kModelArch
               << " audio=" << (do_audio ? "on" : "off") << "\n";
   if (is_lfm2) std::cout << "[r4dx-convert] arch=" << r4dx_convert::lfm2::kModelArch << "\n";
+  if (is_q35moe) std::cout << "[r4dx-convert] arch=" << r4dx_convert::qwen35moe::kModelArch << "\n";
   if (is_qwen4)
     std::cout << "[r4dx-convert] arch=" << r4dx_convert::qwen4exp::kModelArch << " ngram-sidecar=" << ngram.path
               << " (" << ngram.rows << " rows x " << ngram.row_bytes << " B, body sha256 " << ngram.sha256 << ")\n";
@@ -2078,6 +2098,15 @@ int RunConvert(const AppArgs& args) {
       awq_linears == 0)
     throw std::runtime_error("qwen4_exp: config.json says pack-quantized but the checkpoint has no "
                              "*.weight_packed tensors");
+  // qwen3_5_moe: HF's fused 3-D expert tensors appear as per-expert 2-D bf16 tensors (zero-copy views of the shard mapping).
+  size_t fused_expert_tensors = 0;
+  if (is_q35moe) {
+    fused_expert_tensors = r4dx_convert::fused_experts::InstallFusedExpertsSource(model);
+    if (fused_expert_tensors == 0)
+      throw std::runtime_error("qwen3_5_moe: the checkpoint has no fused mlp.experts.gate_up_proj / down_proj tensors");
+    std::cout << "[r4dx-convert] fused experts source: " << fused_expert_tensors
+              << " virtual per-expert tensor(s) over the fused gate_up_proj / down_proj\n";
+  }
   const auto t_reg0 = std::chrono::steady_clock::now();
   ContainerWriter writer;
 
@@ -2281,7 +2310,8 @@ int RunConvert(const AppArgs& args) {
       imported = trellis.Resolve(container_base, hf_names, kept, &tls, std::cout);
       if (tls.trellis) requested = tls;
     }
-    if (is_qwen4 && trellis.Enabled() && trellis_eligible && container_base.find(".moe.experts.") != std::string::npos)
+    if ((is_qwen4 || is_q35moe) && trellis.Enabled() && trellis_eligible &&
+        container_base.find(".moe.experts.") != std::string::npos)
       trellis_kb[container_base] = imported ? requested.trellis_bits : 0;
     // A rotated trellis import (Gemma): the oracle quantized fold(W), so the reconstruction check
     // must compare against the same fold of the checkpoint weight (the fold and its norm, per HF
@@ -2515,7 +2545,45 @@ int RunConvert(const AppArgs& args) {
     if (trellis.Enabled()) qw::CheckExpertKbUniform(trellis_kb);
   }
 
-  for (int i = 0; i < ((is_gemma || is_lfm2 || is_qwen4) ? 0 : layers); ++i) {
+  // ---- qwen3_5_moe branch (qwen35moe_layout.cpp): the Qwen3.5 hybrid with a MoE FFN, same closures and Kit -----------
+  if (is_q35moe) {
+    namespace qm = r4dx_convert::qwen35moe;
+    qm::Kit kit;
+    kit.all_names = [&model]() { return model.AllNames(); };
+    kit.has = [&model](const std::string& n) { return model.Has(n); };
+    kit.shape = [&model](const std::string& n) { return model.Meta(n).shape; };
+    kit.add_bf16 = add_bf16;
+    kit.add_fp32_widen = add_fp32_widen;
+    kit.add_descale = [&](const std::string& container_name, int n_kv, int layer_idx, const char* kind) {
+      add_descale(container_name, n_kv, layer_idx, kind, /*calib_applicable=*/true);
+    };
+    kit.add_linear = [&](const std::vector<std::string>& hf_names, const std::string& base, qm::LinearRole role) {
+      switch (role) {
+        case qm::LinearRole::kHead:
+          add_linear(hf_names, base, lm_head_layouts);
+          break;
+        case qm::LinearRole::kBf16Only:  // shared experts: `.bf16.w` only, never a trellis body linear
+          add_linear(hf_names, base, r4dx_convert::KeptBf16LayoutSet(), LinearFold{}, /*trellis_eligible=*/false);
+          break;
+        default:
+          add_linear(hf_names, base, layouts);
+          break;
+      }
+    };
+    const std::unordered_set<std::string> consumed = qm::AddTextStack(kit, mshape, layers);
+    const std::vector<std::string> unconsumed = qm::UnconsumedTensors(model.AllNames(), consumed, layers);
+    if (!unconsumed.empty()) {
+      std::string msg = "r4dx-convert (qwen3_5_moe): " + std::to_string(unconsumed.size()) +
+                        " checkpoint tensor(s) are not converted and not skipped on purpose (a mis-guessed "
+                        "tensor name, or a tensor this converter does not know):";
+      for (size_t k = 0; k < unconsumed.size() && k < 20; ++k) msg += "\n  " + unconsumed[k];
+      if (unconsumed.size() > 20) msg += "\n  ... and " + std::to_string(unconsumed.size() - 20) + " more";
+      throw std::runtime_error(msg);
+    }
+    if (trellis.Enabled()) r4dx_convert::qwen4exp::CheckExpertKbUniform(trellis_kb);
+  }
+
+  for (int i = 0; i < ((is_gemma || is_lfm2 || is_qwen4 || is_q35moe) ? 0 : layers); ++i) {
     const std::string hf = "model.language_model.layers." + std::to_string(i) + ".";
     const std::string base = "text.layers." + std::to_string(i) + ".";
     // --rotate folds (all kNone without it): input_layernorm's (1 + w) goes into this layer's token
@@ -2572,7 +2640,7 @@ int RunConvert(const AppArgs& args) {
   // Everything from here on is outside the rotated stack and is never folded: the runtime applies
   // x Q after the embedding gather and x Q^T before final_norm (docs/quant2.md section 3).
   // (the Gemma / LFM2 / qwen4_exp branches above registered these; LFM2's head comes from the tied embedding)
-  if (!is_gemma && !is_lfm2 && !is_qwen4) {
+  if (!is_gemma && !is_lfm2 && !is_qwen4 && !is_q35moe) {
     add_bf16("model.language_model.embed_tokens.weight", "text.embed_tokens");
     add_bf16("model.language_model.norm.weight", "text.final_norm");
     add_linear({"lm_head.weight"}, "lm_head", lm_head_layouts);
@@ -2915,6 +2983,30 @@ int RunConvert(const AppArgs& args) {
         {"n-gram table", "not in this container: __metadata__.ngram_sidecar names the sidecar file"},
     };
   }
+  // qwen3_5_moe: model_arch is what the loader dispatches on (arch.h DetectArch); the summary says what the body is.
+  if (is_q35moe) {
+    namespace fs = std::filesystem;
+    fs::path in = fs::u8path(args.input).lexically_normal();
+    if (!in.has_filename()) in = in.parent_path();
+    metadata["model_id"] = in.filename().u8string();
+    metadata["model_arch"] = r4dx_convert::qwen35moe::kModelArch;
+    if (layers < num_layers_total) metadata["layers_present"] = layers;
+    const std::string body = trellis.Enabled()
+                                 ? "trellis (--trellis-from, one KB per layer and expert class; __metadata__.quant.trellis)"
+                                 : "w4a16|bf16 (as requested by --layouts; pick at load time)";
+    metadata["quant_summary"] = {
+        {"text.layers.*.attn.qg|k|v|o, gdn.in_proj_qkv|z|out_proj, moe.experts.*.gate_up|down", body},
+        {"text.layers.*.moe.shared.gate|up|down", "bf16 (<base>.bf16.w; never quantized)"},
+        {"text.layers.*.moe.router|shared_gate, gdn.in_proj_a|b", "bf16 (never quantized)"},
+        {"text.layers.*.input_layernorm|post_attention_layernorm, attn.q_norm|k_norm, gdn.norm_weight, gdn.conv1d_weight, "
+         "text.final_norm, text.embed_tokens",
+         "bf16 raw weights (norm kernels apply 1 + w)"},
+        {"text.layers.*.gdn.A_log|dt_bias", "fp32 (bf16 checkpoint tensors widened)"},
+        {"text.layers.*.attn.k_descale|v_descale", "fp32 [kv_heads] (--kv-calib or 1.0)"},
+        {"lm_head", "w4a16|bf16 (as requested by --layouts / --lm-head), untied"},
+        {"vision.*, mtp.*", "not converted (text only)"},
+    };
+  }
   // w8a16 (docs/w8a16.md 3.1): the metadata block and the "w4a16|bf16" summary rows are touched only
   // when some linear is ACTUALLY written w8a16 (after --keep-bf16), so every other container keeps its
   // header byte for byte.
@@ -2972,6 +3064,11 @@ int RunConvert(const AppArgs& args) {
     metadata["r4dx_convert_run"]["audio"] = do_audio;
   }
   if (is_lfm2) metadata["r4dx_convert_run"]["arch"] = r4dx_convert::lfm2::kModelArch;
+  if (is_q35moe) {
+    metadata["r4dx_convert_run"]["arch"] = r4dx_convert::qwen35moe::kModelArch;
+    metadata["r4dx_convert_run"]["fused_experts_source"] = fused_expert_tensors;
+    metadata["r4dx_convert_run"]["skipped"] = {"vision.* (model.visual.*): text only", "mtp.*: not converted yet"};
+  }
   if (is_qwen4) {
     metadata["r4dx_convert_run"]["arch"] = r4dx_convert::qwen4exp::kModelArch;
     metadata["r4dx_convert_run"]["awq_source"] =

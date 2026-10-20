@@ -31,7 +31,14 @@ add_library(r4dx_convert_qwen4exp STATIC qwen4exp_layout.cpp awq_source.cpp)
 target_include_directories(r4dx_convert_qwen4exp PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(r4dx_convert_qwen4exp PUBLIC r4dx_convert)
 
+# r4dx_convert_qwen35moe: the qwen3_5_moe branch (Ornith-1.5-122B, docs/qwen35moe-plan.md) -- its tensor layout and coverage
+# audit (qwen35moe_layout.hpp, built on qwen4_exp's Kit) and the virtual per-expert source over HF's fused expert tensors
+# (fused_experts_source.hpp). Plain C++, no HIP, no weights.
+add_library(r4dx_convert_qwen35moe STATIC qwen35moe_layout.cpp fused_experts_source.cpp)
+target_include_directories(r4dx_convert_qwen35moe PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
+target_link_libraries(r4dx_convert_qwen35moe PUBLIC r4dx_convert r4dx_convert_qwen4exp)
+
 if(R4DX_BUILD_CONVERT)
   add_executable(r4dx-convert main.cpp)
-  target_link_libraries(r4dx-convert PRIVATE r4dx_convert r4dx_convert_gemma r4dx_convert_lfm2 r4dx_convert_qwen4exp)
+  target_link_libraries(r4dx-convert PRIVATE r4dx_convert r4dx_convert_gemma r4dx_convert_lfm2 r4dx_convert_qwen4exp r4dx_convert_qwen35moe)
 endif()

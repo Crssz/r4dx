@@ -33,7 +33,7 @@ Prefix `model.language_model.` for the text tower, `model.visual.` for vision, `
 - Full-attention layer: `self_attn.{q,k,v,o}_proj.weight`, `self_attn.{q,k}_norm.weight`.
 - Both: `input_layernorm.weight`, `post_attention_layernorm.weight`, `mlp.gate.weight` (router), `mlp.shared_expert.{gate,up,down}_proj.weight`, `mlp.shared_expert_gate.weight`.
 - **Routed experts of the main model are FUSED 3-D tensors** (HF 5.x layout): `mlp.experts.gate_up_proj` and `mlp.experts.down_proj`, not per-expert linears. The converter must slice them per expert; gate-then-up order inside `gate_up_proj` is **VERIFY** against the golden (M2).
-- **The MTP head ships with the checkpoint**: `mtp.layers.0.*` (a full-attention block with an MoE FFN whose experts are PER-EXPERT `experts.{E}.{gate,up,down}_proj.weight`, unlike the main model), `mtp.pre_fc_norm_embedding`, `mtp.pre_fc_norm_hidden`, `mtp.fc`, `mtp.norm`. MTP is therefore possible (M6); only DFlash is out, for want of a drafter.
+- **The MTP head ships with the checkpoint**: `mtp.layers.0.*` (a full-attention block with an MoE FFN whose experts are PER-EXPERT `experts.{E}.{gate,up,down}_proj.weight`, unlike the main model), `mtp.pre_fc_norm_embedding`, `mtp.pre_fc_norm_hidden`, `mtp.fc`, `mtp.norm`. MTP is therefore possible (M6). A DFlash 2 drafter for this model also exists (`incoai/Ornith-1.5-122B-DFlash2`, section 6), so DFlash2 is in scope too.
 - Vision: `model.visual.patch_embed.proj`, `pos_embed`, `blocks.{0..26}.{norm1,norm2,attn.qkv,attn.proj,mlp.linear_fc1,mlp.linear_fc2}`, `merger.{norm,linear_fc1,linear_fc2}`.
 
 ## 2. Fit on two R9700 (32 GB each)
@@ -70,12 +70,45 @@ Reuse, do not copy:
 - **M3 model (done on the tiny checkpoint, 2026-10-21)** `Qwen35MoeContainer` / `Qwen35MoeStage` / `Qwen35MoeModel` / `Qwen35MoeLocalTextModel` (two-device layer split, host-routed MoE, `R4DX_Q35_DEVICES` / `R4DX_Q35_SPLIT`), `r4dx-convert` branch, `LoadTextModel` dispatch, CLI/server trellis default. New libr4d unit `r4d_attn_paged_h256_gqa16.hip` (head_dim 256, 32 q / 2 kv heads, fp8 KV: prefill, split-KV prefill, decode), tested against the stage-0 reference attention (`tests/kernels/test_attn_h256_gqa16.cpp`, error ~2e-3 relative). `tests/model/qwen35moe/test_model_q35moe_tiny.cpp` PASSES against the HF golden (both GDN prefill paths): every layer in isolation from the golden's residual (GDN layers, attention layer, router, experts, shared expert), the whole model, and 24-token greedy free runs (24 of 24 agree at T = 70). **Real weights (2026-10-21):** the same test PASSES on a 4-layer prefix of the real checkpoint (`tools/reference/qwen35moe/real_prefix.py subset` + `r4dx-convert`, 21.6 GiB bf16, three GDN layers and the first attention layer; `R4DX_Q35MOE_TINY_DIR=E:\models\r4dx\q35moe-real4`), whole model and layer by layer, against HF bf16 and against the fp32 layer-isolated reference (`iso_golden.py`): GDN and attention outputs at mean/rms 0.001-0.004 of the fp32 value; the MoE output at 0.014-0.027, i.e. at parity with HF's own bf16 layer (0.008-0.034, same method); 24 of 24 greedy tokens agree at T = 70. `r4dx-cli` runs the prefix end to end (load, chat template, prefill, decode). Lessons: real activations carry outlier channels ~100x the rms, so the test judges the fraction of elements outside an absolute + relative band, not max/rms; HF's bf16 MoE is a noisy reference. Not done: the two-device split test (physical GPU 1 is faulted, see below), trellis/w4a16 containers (needs M4), long-context behaviour, speed (the MoE is host-routed: one sync per layer, one GEMM per expert).
 - **M4 converter + quantization** Hessians per layer from an HF reference forward (layer-streaming, 250 GB does not fit RAM), trellis oracle at KB 3 and KB 4, allocation, `r4dx-convert` branch. This is the long, GPU-hours stage; reuse `tools/quant2/qwen4exp/` scripts with the Qwen3.5 layer builder.
 - **M5 end to end** CLI/server chat on the real container, KL gate vs HF bf16 (mean KL <= 0.02, top-1 >= 93%, the qwen4_exp bar), thinking + tool calls through the Qwen3.5 template.
-- **M6 parity features** vision tower for the new sizes (reuse `src/vision`), `--tp 2` MoE sharding, MTP head, grouped GPU MoE decode, prefill int8 path.
+- **M6 parity features** vision tower for the new sizes (reuse `src/vision`), `--tp 2` MoE sharding, MTP head, grouped GPU MoE decode, prefill int8 path, DFlash2 speculative decoding (section 6; after the quantized container and the grouped decode kernel).
 
 ## 5. Out of scope / decisions
 
-- **DFlash**: needs a trained drafter for this model. None exists, so it is skipped.
-- **MTP**: the weights ship (section 1.1). Deferred to M6, not dropped.
+- **DFlash2**: NOT out of scope. An earlier version of this plan said no drafter exists; that was wrong, `incoai/Ornith-1.5-122B-DFlash2` exists (section 6). Original DFlash (v1) has no Ornith drafter and stays out.
+- **MTP**: the weights ship (section 1.1). Deferred to M6, not dropped. DFlash2's acceptance length is far above a single MTP head's, so MTP may be dropped if DFlash2 works (decide after the DFlash2 measurement).
 - **KV / long context**: fp8 paged KV as for the 27B; validated contexts are decided at M5.
 - Every GPU job runs through `tools\with_lock.ps1 -Name gpu` and one at a time (dual-GPU sustained load has reset the display on this machine).
 
+
+## 6. DFlash2 speculative decoding (planned, not started)
+
+Source: `incoai/Ornith-1.5-122B-DFlash2` (Apache-2.0, `qwen3` architecture, 0.9 B parameters, BF16, ~1.8 GB). A block-diffusion drafter for
+`ornith-ai/Ornith-1.5-122B`: block of 16 (15 drafted tokens per verification step), lossless (greedy output equals the target's). Not downloaded yet
+(needs the user's yes). Numbers below are from its model card (SGLang 0.5.21, two NVIDIA GB300, TP 2, Ornith default sampling, thinking on,
+4096 new tokens), NOT measured on r4dx / R9700.
+
+| Task | Acceptance length | Speedup at concurrency 1 |
+|---|---:|---:|
+| GSM8K | 8.33 | 2.27x |
+| MATH-500 | 9.20 | 2.65x |
+| HumanEval | 8.64 | 2.53x |
+| MBPP | 6.37 | 1.98x |
+| MT-Bench | 5.41 | 1.34x |
+
+### 6.1 Expected value on r4dx (estimate, unmeasured)
+
+A 16-row verify step in the MoE touches about 100 of 256 experts per layer (256 x (1 - (1 - 8/256)^16)), i.e. ~40% of the expert weights: roughly
+20 GB read per step against ~5 GB for a single-token decode step. At the qwen4exp-measured efficiency that is ~70-80 ms per verify step against ~20 ms
+for plain decode; with 5-9 accepted tokens per step the estimate is 70-120 tok/s, about 1.5-2.5x over a ~45 tok/s pipeline-split baseline. Low
+confidence: it assumes the 16-row grouped expert GEMM runs at decent efficiency.
+
+### 6.2 Work items (after M4 quantized container and the grouped M=1 decode kernel)
+
+1. Download the drafter; convert to the r4dx DFlash2 container with the existing tooling (`docs/dflash2.md`); check its config against the driver
+   (r4dx's current drafter is ~1.9 B and was trained for the Qwen3.8 27B: tap layers, hidden size, head layout, vocab).
+2. Tap target hidden features from the Ornith layers the drafter was trained on (`Qwen35MoeStage` capture hook already exists).
+3. Partial-accept rollback for the 36 GDN layers (the stage's GDN checkpoint exists but is untested for this use).
+4. Grouped MoE kernel for M = 16 verify rows at 3072 / 1024 (new; the M=1 decode kernel does not cover it).
+5. Driver wiring in `Qwen35MoeLocalTextModel`, server/CLI flags (`--dflash`), then a greedy-equality test against plain decode and an acceptance-length
+   measurement on code / math / chat prompts.
+6. Measure on r4dx; only then decide whether the MTP head (M6) is still worth building.

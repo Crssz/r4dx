@@ -23,6 +23,7 @@ enum class Arch {
   kGemma4,    // gemma4_unified: sliding + full attention, sandwich norms, GeGLU, tied head
   kLfm2Moe,   // lfm2_moe (LFM2.5-24B-A2B): ShortConv + attention, dense then 64-expert MoE FFN, tied head
   kQwen4Exp,  // qwen4_exp (Qwen3.8-Flash-Next): GDN + QSA, 512-expert MoE, hyper-connections, PLE
+  kQwen35Moe, // qwen3_5_moe (Ornith-1.5-122B): the Qwen3.5 GDN + full-attention hybrid with a 256-expert top-8 MoE FFN
 };
 
 // Stable on-disk / log spelling: `__metadata__.model_arch` for Gemma, LFM2 and qwen4_exp, "qwen3_5"
@@ -38,6 +39,8 @@ inline const char* ArchName(Arch a) {
       return "lfm2_moe";
     case Arch::kQwen4Exp:
       return "qwen4_exp";
+    case Arch::kQwen35Moe:
+      return "qwen3_5_moe";
   }
   return "qwen3_5";  // unreachable: every enumerator is handled above
 }

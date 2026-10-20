@@ -375,8 +375,8 @@ void TestDetectArch() {
         "metadata: a Qwen3.5 model_config is kQwen35");
   Check(DetectArchFromMetadata(json{{"model_config", {{"model_type", "qwen3_5_moe"},
                                                       {"architectures", {"Qwen3_5MoeForConditionalGeneration"}}}}}) ==
-            Arch::kQwen35,
-        "metadata: a Qwen3.5-MoE model_config is kQwen35");
+            Arch::kQwen35Moe,
+        "metadata: a Qwen3.5-MoE model_config is kQwen35Moe (docs/qwen35moe-plan.md M1; was kQwen35 before the arch existed)");
   Check(DetectArchFromMetadata(json::object()) == Arch::kQwen35, "metadata: empty (selftest container) is kQwen35");
   Check(DetectArchFromMetadata(json::array()) == Arch::kQwen35, "metadata: non-object is kQwen35");
 

@@ -502,6 +502,12 @@ add_executable(test_qwen4exp_config test_qwen4exp_config.cpp)
 target_link_libraries(test_qwen4exp_config PRIVATE r4dx_model_arch)
 add_test(NAME test_qwen4exp_config COMMAND test_qwen4exp_config)
 
+# test_qwen35moe_config (docs/qwen35moe-plan.md M1): Qwen35MoeConfig::FromJson on the Ornith-1.5-122B config
+# (layer pattern, MoE geometry, every refusal) and DetectArch for qwen3_5_moe. CPU-only.
+add_executable(test_qwen35moe_config test_qwen35moe_config.cpp)
+target_link_libraries(test_qwen35moe_config PRIVATE r4dx_model_arch)
+add_test(NAME test_qwen35moe_config COMMAND test_qwen35moe_config)
+
 # test_gemma_container (docs/gemma4-plan.md M1-19): GemmaContainer::Inspect (the CPU half of the Gemma loader --
 # `__metadata__` + the tensor directory, no HIP call) on a tiny 6-layer fixture converted by the real r4dx-convert
 # (when built), the real Huihui bf16.r4dx header (SKIP when absent), and option-A rotation metadata. CPU only:

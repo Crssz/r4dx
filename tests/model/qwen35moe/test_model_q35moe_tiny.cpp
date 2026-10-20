@@ -31,7 +31,8 @@ void Check(bool cond, const std::string& what) {
 }
 
 struct Tol {
-  double max_norm, mean_norm;
+  double mean_norm;   // mean|err| / rms(ref)
+  double atol_rel, rtol, max_bad;  // at most `max_bad` of the elements may exceed atol_rel * rms(ref) + rtol * |ref|
 };
 
 // The bound of one capture point against the HF golden, as max|err| / rms(ref) and mean|err| / rms(ref) over all rows of the
@@ -42,15 +43,15 @@ Tol GoldenTol(const std::string& name) {
   // Whole model against the fp32 golden: the noise of four layers of a noise-amplifying random network (the tiny net's HF bf16 run
   // is itself at mean/rms 0.045-0.09 from its fp32 run at layer 3), so these bounds only exclude garbage; the per-layer check is
   // the layer-isolated one below.
-  if (has("moe_out")) return {2.5, 0.25};
-  return {1.2, 0.15};
+  if (has("moe_out")) return {0.25, 0.25, 0.15, 0.05};
+  return {0.15, 0.25, 0.10, 0.02};
 }
 
 // One layer alone over the golden's own residual input: bf16 noise of that layer, not the amplified noise of those before it.
 Tol IsolatedTol(const std::string& name) {
   const auto has = [&](const char* s) { return name.find(s) != std::string::npos; };
-  if (has("moe_out")) return {0.5, 0.06};
-  return {0.25, 0.03};
+  if (has("moe_out")) return {0.06, 0.08, 0.05, 0.01};
+  return {0.03, 0.05, 0.03, 0.004};
 }
 
 // Compares every capture the golden also has.
@@ -128,9 +129,13 @@ void CompareToGolden(const CaptureStore& store, const Golden& g, const std::stri
     PrintStats(name, s);
     const Tol t = tol(name);
     Check(!s.nan, tag + " " + name + ": NaN / Inf");
-    Check(s.max_norm <= t.max_norm && s.mean_norm <= t.mean_norm,
-          tag + " " + name + ": error above its bound (max/rms " + std::to_string(s.max_norm) + " > " +
-              std::to_string(t.max_norm) + " or mean/rms " + std::to_string(s.mean_norm) + " > " + std::to_string(t.mean_norm) + ")");
+    const double bad = BadFraction(cap.bf16.data(), ref, n, t.atol_rel, t.rtol);
+    std::printf("      %-26s mean/rms %.5f (<= %.3f), elements outside %.2f rms + %.0f%%: %.4f%% (<= %.2f%%)\n", name.c_str(), s.mean_norm,
+                t.mean_norm, t.atol_rel, 100.0 * t.rtol, 100.0 * bad, 100.0 * t.max_bad);
+    Check(s.mean_norm <= t.mean_norm && bad <= t.max_bad,
+          tag + " " + name + ": error above its bound (mean/rms " + std::to_string(s.mean_norm) + " > " + std::to_string(t.mean_norm) +
+              " or " + std::to_string(100.0 * bad) + "% of the elements outside " + std::to_string(t.atol_rel) + " rms + " +
+              std::to_string(100.0 * t.rtol) + "% (allowed " + std::to_string(100.0 * t.max_bad) + "%))");
   }
 }
 
@@ -228,6 +233,7 @@ int RunTest() {
     auto model = LoadTiny("bf16", false, {}, 0, 4096, /*gdn_recurrent=*/false);
     for (int T : {7, 70, 300}) {
       const Golden g(T, GoldenPath(T));
+      const Golden giso(T, IsoGoldenPath(T));  // the reference the isolated outputs are judged against
       for (int layer = 0; layer < 4; ++layer) {
         const std::string pfx = "layer" + std::to_string(layer) + ".";
         CaptureStore store;
@@ -235,7 +241,7 @@ int RunTest() {
         model->RunLayerIsolated(g.ids(), layer, g.Bf16(pfx + "residual_in"));
         model->SetCapture(nullptr);
         std::printf("\n-- isolated layer %d, T=%d\n", layer, T);
-        CompareToGolden(store, g, "iso L" + std::to_string(layer) + " T" + std::to_string(T), IsolatedTol, pfx, /*strict_experts=*/true);
+        CompareToGolden(store, giso, "iso L" + std::to_string(layer) + " T" + std::to_string(T), IsolatedTol, pfx, /*strict_experts=*/true);
       }
     }
   }
@@ -243,5 +249,7 @@ int RunTest() {
   std::printf("\n%s (%d failure(s))\n", g_failures == 0 ? "PASS" : "FAIL", g_failures);
   return g_failures == 0 ? 0 : 1;
 }
+
+
 
 

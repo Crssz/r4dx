@@ -54,6 +54,13 @@ inline std::string GoldenDir() {
   const char* e = std::getenv("R4DX_Q35MOE_GOLDEN");
   return TinyDir() + "\\" + (e != nullptr && e[0] != 0 ? e : "golden_fp8");
 }
+// The layer-isolated reference: `golden_iso_f32` (tools/reference/qwen35moe/iso_golden.py: each layer alone in float32 over the bf16
+// golden's residual input) when it exists, else the whole-model golden itself. R4DX_Q35MOE_ISO_GOLDEN names another subdirectory.
+inline std::string IsoGoldenPath(int T) {
+  const char* e = std::getenv("R4DX_Q35MOE_ISO_GOLDEN");
+  const std::string iso = TinyDir() + "\\" + (e != nullptr && e[0] != 0 ? e : "golden_iso_f32") + "\\T" + std::to_string(T) + ".safetensors";
+  return std::filesystem::exists(iso) ? iso : GoldenDir() + "\\T" + std::to_string(T) + ".safetensors";
+}
 inline std::string GoldenPath(int T) { return GoldenDir() + "\\T" + std::to_string(T) + ".safetensors"; }
 inline std::string FreePath(int T) { return GoldenDir() + "\\free_T" + std::to_string(T) + ".json"; }
 inline bool Exists(const std::string& p) { return std::filesystem::exists(p); }
@@ -215,6 +222,20 @@ inline Stats CompareBf16(const uint16_t* got, const uint16_t* ref, int64_t n) {
   return s;
 }
 
+// Fraction of elements whose error exceeds atol_rel * rms(ref) + rtol * |ref|. A robust companion of max/rms: real activations carry
+// outlier channels ~100x the rms, where a few elements dominate max|err| / rms(ref) at bf16-level relative error.
+inline double BadFraction(const uint16_t* got, const uint16_t* ref, int64_t n, double atol_rel, double rtol) {
+  double sq = 0;
+  for (int64_t i = 0; i < n; ++i) sq += static_cast<double>(Bf(ref[i])) * Bf(ref[i]);
+  const double rms = n > 0 ? std::sqrt(sq / static_cast<double>(n)) : 0.0;
+  int64_t bad = 0;
+  for (int64_t i = 0; i < n; ++i) {
+    const double g = Bf(got[i]), r = Bf(ref[i]);
+    if (!(std::fabs(g - r) <= atol_rel * rms + rtol * std::fabs(r))) ++bad;  // NaN counts as bad
+  }
+  return n > 0 ? static_cast<double>(bad) / static_cast<double>(n) : 0.0;
+}
+
 inline void PrintStatsHeader() {
   std::printf("  %-26s %9s %10s %10s %10s %9s %9s %6s %7s %7s\n", "tensor", "n", "max|err|", "mean|err|", "rms(ref)",
               "max/rms", "mean/rms", "maxulp", "ulp>=1", "ulp>=2");
@@ -280,3 +301,5 @@ inline std::unique_ptr<Qwen35MoeModel> LoadTiny(const std::string& layout, bool 
 }
 
 }  // namespace q35m
+
+

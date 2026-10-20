@@ -43,6 +43,18 @@ at KB 4 ~58 GB; the non-expert part at ~4.5 bits is ~5 GB. With the qwen4_exp bu
 per card plus KV, the target is a **KB 3 / KB 4 mix by (layer, class)** of about 3.3-3.6 bits for experts, split by
 layer over both cards. Expect ~50-52 GiB total. One card cannot hold it.
 
+### 2.1 Quantization pipeline numbers and the host-RAM option (2026-10-21)
+
+The pipeline (`tools/quant2/qwen35moe/`, README there) budgets weights at 26 GiB per card. Its byte model (matching
+`Qwen35MoeContainer::Inspect`): all-KB3 experts + KB4 projections = 44.4 GiB (k = 24), all KB4 = 57.9 GiB, which does NOT fit
+2 x 26 GiB; the allocator spends the ~7.6 GiB between them on the best loss-per-GiB promotions. Oracle time scaled from the one-layer pilot is ~14.6 h per K
+(~29 h for K 3 + 4, ~34 h with the Hessians; README in that directory) on one GPU; kept data ~99 GiB (oracle dirs) + ~53 GiB (container).
+
+Open option: a **host-RAM expert tier** (coldest experts in pinned RAM, CPU computes them at decode, PCIe stream at prefill; the
+dropped Qwen3.8 port budgeted 11.5 GiB of a 64 GB machine). It would lift the budget to ~52 + ~10 GiB and make an all-KB4 mix fit. Quantization
+side: an allocator `--host-gib` option and a placement list from the per-expert routed counts the Hessian pass already records. Runtime
+side (CPU expert path, pinned buffers) belongs to the runtime owner. Not decided.
+
 ## 3. Integration
 
 New `Arch::kQwen35Moe` (on-disk `model_arch` `"qwen3_5_moe"`), dispatched in `src/model/arch.{h,cpp}` BEFORE the

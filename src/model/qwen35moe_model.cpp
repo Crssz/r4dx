@@ -113,6 +113,17 @@ Qwen35MoeLayerRefs LayerRefs(const Qwen35MoeContainer& c, int64_t i) {
     r.moe.expert_gate_up.push_back(&e.gate_up);
     r.moe.expert_down.push_back(&e.down);
   }
+  if (mw.gate_up_store.layout == Layout::kTrellis && mw.down_store.layout == Layout::kTrellis) {
+    Qwen35MoeTrellisPtrs& tp = r.moe.trellis;
+    tp.gate_up_w = mw.gate_up_store.trellis_w.data();
+    tp.gate_up_suh = mw.gate_up_store.trellis_suh.data();
+    tp.gate_up_svh = mw.gate_up_store.trellis_svh.data();
+    tp.gate_up_bits = mw.gate_up_store.bits;
+    tp.down_w = mw.down_store.trellis_w.data();
+    tp.down_suh = mw.down_store.trellis_suh.data();
+    tp.down_svh = mw.down_store.trellis_svh.data();
+    tp.down_bits = mw.down_store.bits;
+  }
   return r;
 }
 
@@ -257,6 +268,7 @@ std::unique_ptr<Qwen35MoeModel> Qwen35MoeModel::Load(const Qwen35MoeModelOptions
     so.max_ctx = options.max_ctx;
     so.max_rows = kChunkRows;
     so.prompt_checkpoint = options.prompt_checkpoint;
+    so.grouped_decode = options.grouped_decode;
     m.stages_.push_back(std::make_unique<Qwen35MoeStage>(so, std::move(layers), std::move(head)));
     {
       Qwen35MoeDeviceScope dev(r.device);
@@ -484,6 +496,16 @@ void Qwen35MoeModel::RestoreCheckpoint() {
 void Qwen35MoeModel::SetCapture(Qwen35MoeCaptureFn fn) {
   capture_active_ = static_cast<bool>(fn);
   for (auto& st : stages_) st->SetCapture(fn);
+}
+
+void Qwen35MoeModel::SetGroupedDecode(bool on, bool with_capture) {
+  for (auto& st : stages_) st->SetGroupedDecode(on, with_capture);
+}
+
+int64_t Qwen35MoeModel::GroupedDecodeLayers() const {
+  int64_t n = 0;
+  for (const auto& st : stages_) n += st->GroupedDecodeLayers();
+  return n;
 }
 
 std::vector<VramReport> Qwen35MoeModel::Vram() const {

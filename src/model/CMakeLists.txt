@@ -169,6 +169,7 @@ set(R4DX_MODEL_SOURCES
   # ... and its per-device stage (kernel side: it must not see qwen4exp_weights.h), the two-stage model (container side) and
   # the TextModel wrapper + LoadQwen35MoeTextModel.
   qwen35moe_stage.cpp
+  qwen35moe_grouped_decode.cpp
   qwen35moe_model.cpp
   qwen35moe_local_text_model.cpp
 )

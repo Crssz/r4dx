@@ -25,6 +25,7 @@
 #include <vector>
 
 #include "qwen35moe_config.h"
+#include "qwen35moe_grouped_decode.h"
 #include "qwen4exp_gdn.h"
 #include "quant_linear.h"
 #include "r4dx/kernels/summary_sampler.hpp"
@@ -64,6 +65,8 @@ struct Qwen35MoeMoeRefs {
   const uint16_t* shared_gate = nullptr;          // bf16 [1, hidden]
   std::vector<const QuantLinear*> expert_gate_up; // [experts]: [2 * inter, hidden]
   std::vector<const QuantLinear*> expert_down;    // [experts]: [hidden, inter]
+  // The same experts as stacked trellis buffers (the grouped decode path); all null when the experts are not trellis.
+  Qwen35MoeTrellisPtrs trellis;
 };
 
 struct Qwen35MoeLayerRefs {
@@ -87,6 +90,9 @@ struct Qwen35MoeStageOptions {
   int64_t max_ctx = 0;       // KV capacity in tokens
   int64_t max_rows = 256;    // rows per chunk (<= 256)
   bool prompt_checkpoint = false;
+  // Decode (one row, no capture) runs the MoE on the device without a host sync per layer (qwen35moe_grouped_decode.h) when the
+  // layer's geometry and trellis experts allow it. -1 = R4DX_Q35_GROUPED (default on; 0 = the host-routed MoE), 0 / 1 force it.
+  int grouped_decode = -1;
 };
 
 // Test hook: a named intermediate of the forward pass, handed to the callback with a DEVICE pointer that is valid on
@@ -174,6 +180,12 @@ class Qwen35MoeStage {
   // Test hook (see Qwen35MoeCapture). Setting it also makes Head() compute the norm and the lm_head over EVERY row of the
   // chunk so `norm_out` / `logits` carry all rows; requires vocab * max_rows * 2 bytes of extra device memory.
   void SetCapture(Qwen35MoeCaptureFn fn);
+
+  // Test hook: switches the grouped decode MoE on / off at run time (no effect on layers that do not qualify).
+  // with_capture: a capture installed does NOT send the one-row MoE back to the host-routed path (it records moe_out, not topk_ids).
+  void SetGroupedDecode(bool on, bool with_capture = false);
+  // How many of this stage's layers take the grouped decode MoE (0 when it is off).
+  int64_t GroupedDecodeLayers() const;
 
   // Wall milliseconds of the stage's last RunLayers / Head call (host clock).
   double LastRunMs() const;

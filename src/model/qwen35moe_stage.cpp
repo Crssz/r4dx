@@ -4,6 +4,8 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cstdlib>
+#include <cstring>
 #include <deque>
 #include <stdexcept>
 #include <string>
@@ -86,7 +88,9 @@ struct LayerRt {
 
   // MoE
   qwen4exp::MoeWeights moe_w;
+  Qwen35GroupedMoeWeights gmoe_w;              // the same router / shared-expert pointers for the grouped decode MoE
   const Qwen35MoeMoeRefs* moe_refs = nullptr;  // points into Impl::layer_refs
+  bool grouped = false;                        // decode MoE takes Qwen35GroupedMoeDecode (geometry + trellis experts qualify)
 };
 
 }  // namespace
@@ -113,6 +117,9 @@ struct Qwen35MoeStage::Impl {
 
   GdnControlCache control;
   std::unique_ptr<qwen4exp::MoeBlockBase> moe;
+  std::unique_ptr<Qwen35GroupedMoeDecode> gmoe;  // the M = 1 on-device MoE (null when no layer qualifies)
+  bool grouped_on = false;                      // gmoe is used by the layers that qualify
+  bool grouped_capture = false;                 // ... also while a capture is installed (tests)
   std::vector<Qwen35MoeLayerRefs> layer_refs;
   std::vector<std::unique_ptr<LayerRt>> layers;
   // head
@@ -307,8 +314,27 @@ Qwen35MoeStage::Qwen35MoeStage(const Qwen35MoeStageOptions& options, std::vector
     L->moe_w.shared_gate_proj = e.shared_gate_proj;
     L->moe_w.shared_up_proj = e.shared_up_proj;
     L->moe_w.shared_down_proj = e.shared_down_proj;
+    L->gmoe_w = {L->moe_w.router, L->moe_w.shared_gate_proj, L->moe_w.shared_up_proj, L->moe_w.shared_down_proj,
+                 L->moe_w.shared_gate};
     L->moe_refs = &e;
+    // The grouped kernels fix the input / output scale at 1/sqrt(128): a container with a trellis prescale keeps the host-routed MoE.
+    L->grouped = Qwen35GroupedMoeDecode::Supported(cfg.hidden_size, cfg.moe_intermediate_size, cfg.shared_expert_intermediate_size,
+                                                   cfg.num_experts, cfg.num_experts_per_tok, e.trellis) &&
+                 e.expert_gate_up[0]->layout == Layout::kTrellis && e.expert_gate_up[0]->trellis_prescale_log2 == 0 &&
+                 e.expert_down[0]->layout == Layout::kTrellis && e.expert_down[0]->trellis_prescale_log2 == 0;
     m.layers.push_back(std::move(L));
+  }
+
+  // The grouped decode MoE: one scratch set for the stage (its layers run one after another on the stream).
+  if (std::any_of(m.layers.begin(), m.layers.end(), [](const auto& lp) { return lp->grouped; })) {
+    m.gmoe = std::make_unique<Qwen35GroupedMoeDecode>(static_cast<int>(cfg.num_experts), static_cast<int>(cfg.num_experts_per_tok),
+                                                      cfg.norm_topk_prob);
+    int mode = options.grouped_decode;
+    if (mode < 0) {
+      const char* env = std::getenv("R4DX_Q35_GROUPED");
+      mode = (env != nullptr && std::strcmp(env, "0") == 0) ? 0 : 1;
+    }
+    m.grouped_on = mode != 0;
   }
 
   // ---- head ---------------------------------------------------------------------------------------------------------
@@ -366,6 +392,18 @@ int64_t Qwen35MoeStage::EndLayer() const { return impl_->end; }
 bool Qwen35MoeStage::HasHead() const { return impl_->head_refs.has_value(); }
 double Qwen35MoeStage::LastRunMs() const { return impl_->last_run_ms; }
 double Qwen35MoeStage::LastHeadMs() const { return impl_->last_head_ms; }
+
+void Qwen35MoeStage::SetGroupedDecode(bool on, bool with_capture) {
+  Impl& m = *impl_;
+  m.grouped_on = on && m.gmoe != nullptr;
+  m.grouped_capture = with_capture;
+}
+
+int64_t Qwen35MoeStage::GroupedDecodeLayers() const {
+  const Impl& m = *impl_;
+  if (!m.grouped_on) return 0;
+  return std::count_if(m.layers.begin(), m.layers.end(), [](const auto& lp) { return lp->grouped; });
+}
 
 void Qwen35MoeStage::SetCapture(Qwen35MoeCaptureFn fn) {
   Impl& m = *impl_;
@@ -447,6 +485,13 @@ void Qwen35MoeStage::Impl::RunMoe(LayerRt& L, const Qwen35MoeChunk& c) {
   const Qwen35MoeMoeRefs& e = *L.moe_refs;
   Norm(hmid.data(), L.post_ln, x.data(), c.rows);
   CapBf16(L.index, "mlp_in", x.data(), c.rows, hidden, c.first_pos);
+  if (c.rows == 1 && grouped_on && L.grouped && (!capture || grouped_capture)) {
+    gmoe->Run(s, arena, L.gmoe_w, e.trellis, x.data(), blk.data());
+    arena.Reset();
+    CapBf16(L.index, "moe_out", blk.data(), 1, hidden, c.first_pos);
+    ResidualAdd(hmid.data(), blk.data(), h.data(), 1);
+    return;
+  }
   // One expert GEMM's ApplyLinear scratch comes from its own small arena, reset before each call: the experts' calls (up to
   // 2 per expert, hundreds per prefill chunk) would otherwise pile their scratch up in the block arena. Stream order makes
   // the reuse safe (every GEMM of the layer runs on `stream`, one after another).

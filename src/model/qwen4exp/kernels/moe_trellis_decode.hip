@@ -88,13 +88,14 @@ __global__ void GroupedMoeDecodeSortKernel(
     const float* __restrict__ weights_in,
     int32_t* __restrict__ ids_sorted_out,
     float* __restrict__ weights_sorted_out,
+    int32_t* __restrict__ rank_out,  // nullable: rank_out[j] = where input j landed in the sorted order
     int k) {
   __shared__ int32_t s_ids[16];
   __shared__ float s_w[16];
   const int lane = static_cast<int>(threadIdx.x);
   if (lane < k) {
     s_ids[lane] = ids_in[lane];
-    s_w[lane] = weights_in[lane];
+    s_w[lane] = weights_in != nullptr ? weights_in[lane] : 0.0f;
   }
   __syncthreads();
   if (lane < k) {
@@ -110,13 +111,15 @@ __global__ void GroupedMoeDecodeSortKernel(
       }
     }
     ids_sorted_out[rank] = my_id;
-    weights_sorted_out[rank] = my_w;
+    if (weights_sorted_out != nullptr) weights_sorted_out[rank] = my_w;
+    if (rank_out != nullptr) rank_out[lane] = rank;
   }
 }
 
 // ------------------------------------------------------------------------------------------------
 // 2. Grouped Trellis Input Transform for gate_up (K=2560, parts=2)
 // ------------------------------------------------------------------------------------------------
+template <int K>
 __global__ __launch_bounds__(32) void GroupedTrellisInputGateUpKernel(
     const uint16_t* __restrict__ x,
     const int32_t* __restrict__ ids_sorted,
@@ -125,7 +128,7 @@ __global__ __launch_bounds__(32) void GroupedTrellisInputGateUpKernel(
     uint16_t* __restrict__ out_a1,
     float scale) {
   const int lane = static_cast<int>(threadIdx.x);
-  const int k_blk = static_cast<int>(blockIdx.x);  // 0..19 (20 blocks of 128 = 2560)
+  const int k_blk = static_cast<int>(blockIdx.x);  // 0..K/128-1
   const int slot = static_cast<int>(blockIdx.y);   // 0..top_k-1
   const int expert = ids_sorted[slot];
 
@@ -136,11 +139,11 @@ __global__ __launch_bounds__(32) void GroupedTrellisInputGateUpKernel(
 #pragma unroll
   for (int r = 0; r < 4; ++r) xv[r] = Bf16BitsToFloat(x_blk[32 * r]);
 
-  const float* suh0 = all_suh + ((size_t)expert * 5120 + k_off);
-  const float* suh1 = suh0 + 2560;
+  const float* suh0 = all_suh + ((size_t)expert * (2 * K) + k_off);
+  const float* suh1 = suh0 + K;
 
-  uint16_t* dst0 = out_a0 + ((size_t)slot * 2560 + k_off);
-  uint16_t* dst1 = out_a1 + ((size_t)slot * 2560 + k_off);
+  uint16_t* dst0 = out_a0 + ((size_t)slot * K + k_off);
+  uint16_t* dst1 = out_a1 + ((size_t)slot * K + k_off);
 
   float v0[4], v1[4];
 #pragma unroll
@@ -164,6 +167,9 @@ __global__ __launch_bounds__(32) void GroupedTrellisInputGateUpKernel(
 // ------------------------------------------------------------------------------------------------
 // 3. Fused silu_mul + Trellis Input Transform for down (K=640, parts=1)
 // ------------------------------------------------------------------------------------------------
+// ROUND_SILU: silu(gate) is rounded to bf16 before the multiply by up (HF and the host-routed path: two roundings); false
+// keeps qwen4_exp's single rounding of gate * sigmoid(gate) * up.
+template <int INTER, bool ROUND_SILU>
 __global__ __launch_bounds__(32) void GroupedSiluMulTrellisInputDownKernel(
     const uint16_t* __restrict__ gu,
     const int32_t* __restrict__ ids_sorted,
@@ -171,24 +177,25 @@ __global__ __launch_bounds__(32) void GroupedSiluMulTrellisInputDownKernel(
     uint16_t* __restrict__ out_a0,
     float scale) {
   const int lane = static_cast<int>(threadIdx.x);
-  const int k_blk = static_cast<int>(blockIdx.x);  // 0..4 (5 blocks of 128 = 640)
+  const int k_blk = static_cast<int>(blockIdx.x);  // 0..INTER/128-1
   const int slot = static_cast<int>(blockIdx.y);   // 0..top_k-1
   const int expert = ids_sorted[slot];
 
   const int64_t k_off = static_cast<int64_t>(k_blk) * 128 + lane;
-  const uint16_t* gu_expert = gu + ((size_t)slot * 1280 + k_off);
+  const uint16_t* gu_expert = gu + ((size_t)slot * (2 * INTER) + k_off);
 
   float xv[4];
 #pragma unroll
   for (int r = 0; r < 4; ++r) {
     const float g = Bf16BitsToFloat(gu_expert[32 * r]);
-    const float u = Bf16BitsToFloat(gu_expert[640 + 32 * r]);
-    const float h = Bf16BitsToFloat(r4d_tq_bf16_rn(g * TqSigmoid(g) * u));
+    const float u = Bf16BitsToFloat(gu_expert[INTER + 32 * r]);
+    const float h = ROUND_SILU ? Bf16BitsToFloat(r4d_tq_bf16_rn(Bf16BitsToFloat(r4d_tq_bf16_rn(g / (1.0f + expf(-g)))) * u))
+                               : Bf16BitsToFloat(r4d_tq_bf16_rn(g * TqSigmoid(g) * u));
     xv[r] = h;
   }
 
-  const float* suh = all_suh_down + ((size_t)expert * 640 + k_off);
-  uint16_t* dst = out_a0 + ((size_t)slot * 640 + k_off);
+  const float* suh = all_suh_down + ((size_t)expert * INTER + k_off);
+  uint16_t* dst = out_a0 + ((size_t)slot * INTER + k_off);
 
   float v[4];
 #pragma unroll
@@ -403,6 +410,28 @@ __global__ __launch_bounds__(256) void GroupedMoeDecodeCombineKernel(
   out[d] = r4d_tq_bf16_rn(acc);
 }
 
+// Router-order combine (qwen3_5_moe): sums the experts in the order the router ranked them (j = 0 the highest score), exactly like the
+// host-routed q4x_moe_combine_bf16, so the fp32 sum -- and its single bf16 rounding -- is bit-identical to that path. yp rows are in
+// SORTED-expert order; rank[j] says where router slot j sits there.
+__global__ __launch_bounds__(256) void GroupedMoeDecodeCombineRouterOrderKernel(
+    const uint16_t* __restrict__ yp, const float* __restrict__ weights, const int32_t* __restrict__ rank,
+    const uint16_t* __restrict__ shared_y, const uint16_t* __restrict__ shared_gate_logit, uint16_t* __restrict__ out, int top_k,
+    int hidden) {
+  const int d = blockIdx.x * blockDim.x + threadIdx.x;
+  if (d >= hidden) return;
+  float acc = 0.0f;
+#pragma unroll
+  for (int j = 0; j < 16; ++j) {
+    if (j >= top_k) break;
+    acc += Bf16BitsToFloat(yp[(size_t)rank[j] * hidden + d]) * weights[j];
+  }
+  if (shared_y != nullptr) {
+    const float gate = Bf16BitsToFloat(r4d_tq_bf16_rn(TqSigmoid(Bf16BitsToFloat(shared_gate_logit[0]))));
+    acc += Bf16BitsToFloat(r4d_tq_bf16_rn(gate * Bf16BitsToFloat(shared_y[d])));
+  }
+  out[d] = r4d_tq_bf16_rn(acc);
+}
+
 }  // namespace
 
 namespace r4dx {
@@ -415,7 +444,7 @@ hipError_t GroupedMoeDecodeSort(const int32_t* ids_in, const float* weights_in,
   if (top_k <= 0) return hipSuccess;
   if (top_k > 16) return hipErrorInvalidValue;  // s_ids[16] / one lane per selected expert
   hipLaunchKernelGGL(GroupedMoeDecodeSortKernel, dim3(1), dim3(32), 0, static_cast<hipStream_t>(stream),
-                     ids_in, weights_in, ids_sorted_out, weights_sorted_out, top_k);
+                     ids_in, weights_in, ids_sorted_out, weights_sorted_out, static_cast<int32_t*>(nullptr), top_k);
   return hipGetLastError();
 }
 
@@ -424,7 +453,7 @@ hipError_t GroupedTrellisInputGateUp(const uint16_t* x, const int32_t* ids_sorte
                                      int top_k, void* stream) {
   if (top_k <= 0) return hipSuccess;
   const float scale = static_cast<float>(1.0 / std::sqrt(128.0));
-  hipLaunchKernelGGL(GroupedTrellisInputGateUpKernel, dim3(20, static_cast<unsigned>(top_k)), dim3(32), 0,
+  hipLaunchKernelGGL(GroupedTrellisInputGateUpKernel<2560>, dim3(20, static_cast<unsigned>(top_k)), dim3(32), 0,
                      static_cast<hipStream_t>(stream), x, ids_sorted, all_suh, out_a0, out_a1, scale);
   return hipGetLastError();
 }
@@ -470,7 +499,7 @@ hipError_t GroupedSiluMulTrellisInputDown(const uint16_t* gu, const int32_t* ids
                                           int top_k, void* stream) {
   if (top_k <= 0) return hipSuccess;
   const float scale = static_cast<float>(1.0 / std::sqrt(128.0));
-  hipLaunchKernelGGL(GroupedSiluMulTrellisInputDownKernel, dim3(5, static_cast<unsigned>(top_k)), dim3(32), 0,
+  hipLaunchKernelGGL((GroupedSiluMulTrellisInputDownKernel<640, false>), dim3(5, static_cast<unsigned>(top_k)), dim3(32), 0,
                      static_cast<hipStream_t>(stream), gu, ids_sorted, all_suh_down, out_a0, scale);
   return hipGetLastError();
 }
@@ -508,6 +537,142 @@ hipError_t GroupedTrellisGemvDown(int kb, const uint16_t* in_a0,
   } else {
     return hipErrorInvalidValue;  // only 3 / 4 bit trellis is instantiated
   }
+  return hipGetLastError();
+}
+
+// ------------------------------------------------------------------------------------------------
+// qwen3_5_moe geometry: hidden 3072, expert intermediate 1024 (gate_up N 2048, two parts of 1024), the same kernels.
+//   gate_up: K 3072 = 192 k-tiles over SK 2 waves x kQ35GuSkg split groups; down: K 1024 = 64 k-tiles over SK 2 x kQ35DownSkg.
+// ------------------------------------------------------------------------------------------------
+namespace {
+constexpr int kQ35Hidden = 3072;
+constexpr int kQ35Inter = 1024;
+constexpr int kQ35GuSkg = kGroupedQ35GuSkg;
+constexpr int kQ35DownSkg = kGroupedQ35DownSkg;
+}  // namespace
+
+hipError_t GroupedTrellisInputGateUpQ35(const uint16_t* x, const int32_t* ids_sorted, const float* all_suh,
+                                        uint16_t* out_a0, uint16_t* out_a1, int top_k, void* stream) {
+  if (top_k <= 0) return hipSuccess;
+  const float scale = static_cast<float>(1.0 / std::sqrt(128.0));
+  hipLaunchKernelGGL(GroupedTrellisInputGateUpKernel<kQ35Hidden>, dim3(kQ35Hidden / 128, static_cast<unsigned>(top_k)),
+                     dim3(32), 0, static_cast<hipStream_t>(stream), x, ids_sorted, all_suh, out_a0, out_a1, scale);
+  return hipGetLastError();
+}
+
+namespace {
+int g_q35_gu_skg = kQ35GuSkg;
+int g_q35_down_skg = kQ35DownSkg;
+
+template <int KB, int SKG>
+hipError_t LaunchGuQ35(const uint16_t* in_a0, const uint16_t* in_a1, const int32_t* ids_sorted, const uint32_t* all_w,
+                       const float* all_svh, uint16_t* out_c, float* ws, unsigned* all_tickets, int top_k, hipStream_t st) {
+  constexpr int N = 2 * kQ35Inter;
+  const float out_scale = static_cast<float>(1.0 / std::sqrt(128.0));
+  const size_t smem = 2 * 128 * 8 * sizeof(float);
+  constexpr size_t w_per = static_cast<size_t>(N) * kQ35Hidden * KB / 32;
+  constexpr size_t svh_per = N, ws_per = SKG * N, tickets_per = N / 128;
+  hipLaunchKernelGGL((GroupedGemmTrellisM1Kernel<KB, kQ35Hidden, N, kQ35Inter, 2, SKG, 2, w_per, svh_per, ws_per, tickets_per>),
+                     dim3(N / 128, SKG, static_cast<unsigned>(top_k)), dim3(256), smem, st, (const unsigned short*)in_a0,
+                     (const unsigned short*)in_a1, all_w, all_svh, ids_sorted, out_c, ws, all_tickets, out_scale);
+  return hipGetLastError();
+}
+
+template <int KB>
+hipError_t DispatchGuQ35(int skg, const uint16_t* in_a0, const uint16_t* in_a1, const int32_t* ids_sorted, const uint32_t* all_w,
+                         const float* all_svh, uint16_t* out_c, float* ws, unsigned* all_tickets, int top_k, hipStream_t st) {
+  switch (skg) {
+    case 2: return LaunchGuQ35<KB, 2>(in_a0, in_a1, ids_sorted, all_w, all_svh, out_c, ws, all_tickets, top_k, st);
+    case 3: return LaunchGuQ35<KB, 3>(in_a0, in_a1, ids_sorted, all_w, all_svh, out_c, ws, all_tickets, top_k, st);
+    case 4: return LaunchGuQ35<KB, 4>(in_a0, in_a1, ids_sorted, all_w, all_svh, out_c, ws, all_tickets, top_k, st);
+    case 6: return LaunchGuQ35<KB, 6>(in_a0, in_a1, ids_sorted, all_w, all_svh, out_c, ws, all_tickets, top_k, st);
+    case 8: return LaunchGuQ35<KB, 8>(in_a0, in_a1, ids_sorted, all_w, all_svh, out_c, ws, all_tickets, top_k, st);
+    case 12: return LaunchGuQ35<KB, 12>(in_a0, in_a1, ids_sorted, all_w, all_svh, out_c, ws, all_tickets, top_k, st);
+    default: return hipErrorInvalidValue;
+  }
+}
+
+template <int KB, int SKG>
+hipError_t LaunchDownQ35(const uint16_t* in_a0, const int32_t* ids_sorted, const uint32_t* all_w_down, const float* all_svh_down,
+                         uint16_t* out_yp, float* ws, unsigned* all_tickets_down, int top_k, hipStream_t st) {
+  constexpr int N = kQ35Hidden;
+  const float out_scale = static_cast<float>(1.0 / std::sqrt(128.0));
+  const size_t smem = 2 * 128 * 8 * sizeof(float);
+  constexpr size_t w_per = static_cast<size_t>(N) * kQ35Inter * KB / 32;
+  constexpr size_t svh_per = N, ws_per = SKG * N, tickets_per = N / 128;
+  hipLaunchKernelGGL((GroupedGemmTrellisM1Kernel<KB, kQ35Inter, N, N, 2, SKG, 2, w_per, svh_per, ws_per, tickets_per>),
+                     dim3(N / 128, SKG, static_cast<unsigned>(top_k)), dim3(256), smem, st, (const unsigned short*)in_a0, nullptr,
+                     all_w_down, all_svh_down, ids_sorted, out_yp, ws, all_tickets_down, out_scale);
+  return hipGetLastError();
+}
+
+template <int KB>
+hipError_t DispatchDownQ35(int skg, const uint16_t* in_a0, const int32_t* ids_sorted, const uint32_t* all_w_down,
+                           const float* all_svh_down, uint16_t* out_yp, float* ws, unsigned* all_tickets_down, int top_k,
+                           hipStream_t st) {
+  switch (skg) {
+    case 1: return LaunchDownQ35<KB, 1>(in_a0, ids_sorted, all_w_down, all_svh_down, out_yp, ws, all_tickets_down, top_k, st);
+    case 2: return LaunchDownQ35<KB, 2>(in_a0, ids_sorted, all_w_down, all_svh_down, out_yp, ws, all_tickets_down, top_k, st);
+    case 4: return LaunchDownQ35<KB, 4>(in_a0, ids_sorted, all_w_down, all_svh_down, out_yp, ws, all_tickets_down, top_k, st);
+    case 8: return LaunchDownQ35<KB, 8>(in_a0, ids_sorted, all_w_down, all_svh_down, out_yp, ws, all_tickets_down, top_k, st);
+    default: return hipErrorInvalidValue;
+  }
+}
+}  // namespace
+
+hipError_t GroupedQ35SetSplits(int gate_up_skg, int down_skg) {
+  const bool gu_ok = gate_up_skg == 2 || gate_up_skg == 3 || gate_up_skg == 4 || gate_up_skg == 6 || gate_up_skg == 8 || gate_up_skg == 12;
+  const bool dn_ok = down_skg == 1 || down_skg == 2 || down_skg == 4 || down_skg == 8;
+  if (!gu_ok || !dn_ok) return hipErrorInvalidValue;
+  g_q35_gu_skg = gate_up_skg;
+  g_q35_down_skg = down_skg;
+  return hipSuccess;
+}
+
+hipError_t GroupedTrellisGemvGateUpQ35(int kb, const uint16_t* in_a0, const uint16_t* in_a1, const int32_t* ids_sorted,
+                                       const uint32_t* all_w, const float* all_svh, uint16_t* out_c, float* ws,
+                                       unsigned* all_tickets, int top_k, void* stream) {
+  if (top_k <= 0) return hipSuccess;
+  const auto st = static_cast<hipStream_t>(stream);
+  if (kb == 3) return DispatchGuQ35<3>(g_q35_gu_skg, in_a0, in_a1, ids_sorted, all_w, all_svh, out_c, ws, all_tickets, top_k, st);
+  if (kb == 4) return DispatchGuQ35<4>(g_q35_gu_skg, in_a0, in_a1, ids_sorted, all_w, all_svh, out_c, ws, all_tickets, top_k, st);
+  return hipErrorInvalidValue;
+}
+hipError_t GroupedSiluMulTrellisInputDownQ35(const uint16_t* gu, const int32_t* ids_sorted, const float* all_suh_down,
+                                             uint16_t* out_a0, int top_k, void* stream) {
+  if (top_k <= 0) return hipSuccess;
+  const float scale = static_cast<float>(1.0 / std::sqrt(128.0));
+  hipLaunchKernelGGL((GroupedSiluMulTrellisInputDownKernel<kQ35Inter, true>), dim3(kQ35Inter / 128, static_cast<unsigned>(top_k)),
+                     dim3(32), 0, static_cast<hipStream_t>(stream), gu, ids_sorted, all_suh_down, out_a0, scale);
+  return hipGetLastError();
+}
+
+hipError_t GroupedTrellisGemvDownQ35(int kb, const uint16_t* in_a0, const int32_t* ids_sorted, const uint32_t* all_w_down,
+                                     const float* all_svh_down, uint16_t* out_yp, float* ws, unsigned* all_tickets_down,
+                                     int top_k, void* stream) {
+  if (top_k <= 0) return hipSuccess;
+  const auto st = static_cast<hipStream_t>(stream);
+  if (kb == 3) return DispatchDownQ35<3>(g_q35_down_skg, in_a0, ids_sorted, all_w_down, all_svh_down, out_yp, ws, all_tickets_down, top_k, st);
+  if (kb == 4) return DispatchDownQ35<4>(g_q35_down_skg, in_a0, ids_sorted, all_w_down, all_svh_down, out_yp, ws, all_tickets_down, top_k, st);
+  return hipErrorInvalidValue;
+}
+hipError_t GroupedMoeDecodeSortRanked(const int32_t* ids_in, int32_t* ids_sorted_out, int32_t* rank_out, int top_k, void* stream) {
+  if (top_k <= 0) return hipSuccess;
+  if (top_k > 16) return hipErrorInvalidValue;
+  hipLaunchKernelGGL(GroupedMoeDecodeSortKernel, dim3(1), dim3(32), 0, static_cast<hipStream_t>(stream), ids_in,
+                     static_cast<const float*>(nullptr)  /* weights are not reordered */, ids_sorted_out,
+                     static_cast<float*>(nullptr), rank_out, top_k);
+  return hipGetLastError();
+}
+
+hipError_t GroupedMoeDecodeCombineRouterOrder(const uint16_t* yp, const float* weights, const int32_t* rank, const uint16_t* shared_y,
+                                              const uint16_t* shared_gate_logit, uint16_t* out, int top_k, int hidden,
+                                              void* stream) {
+  if (top_k <= 0 || hidden <= 0) return hipSuccess;
+  if (top_k > 16) return hipErrorInvalidValue;
+  const unsigned blocks = static_cast<unsigned>((hidden + 255) / 256);
+  hipLaunchKernelGGL(GroupedMoeDecodeCombineRouterOrderKernel, dim3(blocks), dim3(256), 0, static_cast<hipStream_t>(stream), yp,
+                     weights, rank, shared_y, shared_gate_logit, out, top_k, hidden);
   return hipGetLastError();
 }
 

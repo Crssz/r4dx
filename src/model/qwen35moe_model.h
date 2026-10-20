@@ -55,6 +55,8 @@ struct Qwen35MoeModelOptions {
   // GDN layers prefill through the recurrent decode kernels, one token at a time, instead of the chunked scan (the slow
   // reference path). Also on when R4DX_Q35_GDN_PREFILL=recurrent.
   bool gdn_prefill_recurrent = false;
+  // The on-device M = 1 MoE of a decode step (Qwen35GroupedMoeDecode): -1 = R4DX_Q35_GROUPED (default on, 0 = the host-routed MoE), 0 / 1 force.
+  int grouped_decode = -1;
 };
 
 class Qwen35MoeModel {
@@ -99,6 +101,9 @@ class Qwen35MoeModel {
   // Installs `fn` on every stage (see Qwen35MoeCapture). With a capture installed every chunk of a Prefill also runs the
   // head so `norm_out` / `logits` cover all rows. An empty function removes it.
   void SetCapture(Qwen35MoeCaptureFn fn);
+  // Test hook: the grouped decode MoE on / off at run time; GroupedDecodeLayers() = how many layers (all stages) take it right now.
+  void SetGroupedDecode(bool on, bool with_capture = false);
+  int64_t GroupedDecodeLayers() const;
 
   // Layer-isolated forward (tests): Reset()s the sequence, then feeds `token_ids` in chunks through ONLY layer `layer`
   // (global index): each chunk's residual input is the caller's `residual_in` rows [T, hidden] bf16 (HOST; e.g. the HF

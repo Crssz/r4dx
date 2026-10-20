@@ -55,7 +55,7 @@ Tol IsolatedTol(const std::string& name) {
 
 // Compares every capture the golden also has.
 void CompareToGolden(const CaptureStore& store, const Golden& g, const std::string& tag, Tol (*tol)(const std::string&) = GoldenTol,
-                     const std::string& prefix = "") {
+                     const std::string& prefix = "", bool strict_experts = false) {
   PrintStatsHeader();
   for (const auto& [name, cap] : store.all()) {
     if (!g.Has(name) || name.rfind(prefix, 0) != 0) continue;
@@ -110,7 +110,9 @@ void CompareToGolden(const CaptureStore& store, const Golden& g, const std::stri
       }
       std::printf("  %-26s rows %d: order differs in %d rows, expert SET differs in %d rows (%d not explained by a router near-tie; worst %.4f of the row's logit rms from the cut)\n",
                   name.c_str(), rows, order_rows, set_rows, unexplained, worst);
-      Check(unexplained == 0, tag + " " + name + ": expert sets differ from the golden beyond router near-ties");
+      // Whole-model runs only REPORT the expert-set differences (upstream noise moves a router logit across the cut anywhere in a
+      // noise-amplifying network); the layer-isolated runs, which start from the golden's own residual, enforce them.
+      if (strict_experts) Check(unexplained == 0, tag + " " + name + ": expert sets differ from the golden beyond router near-ties");
       continue;
     }
     int64_t n = 0;
@@ -233,7 +235,7 @@ int RunTest() {
         model->RunLayerIsolated(g.ids(), layer, g.Bf16(pfx + "residual_in"));
         model->SetCapture(nullptr);
         std::printf("\n-- isolated layer %d, T=%d\n", layer, T);
-        CompareToGolden(store, g, "iso L" + std::to_string(layer) + " T" + std::to_string(T), IsolatedTol, pfx);
+        CompareToGolden(store, g, "iso L" + std::to_string(layer) + " T" + std::to_string(T), IsolatedTol, pfx, /*strict_experts=*/true);
       }
     }
   }
@@ -241,4 +243,5 @@ int RunTest() {
   std::printf("\n%s (%d failure(s))\n", g_failures == 0 ? "PASS" : "FAIL", g_failures);
   return g_failures == 0 ? 0 : 1;
 }
+
 

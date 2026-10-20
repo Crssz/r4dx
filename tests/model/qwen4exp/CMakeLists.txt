@@ -56,3 +56,4 @@ q4exp_add_test(test_model_q4exp_tiny MODEL GPU SINGLE_DEVICE)
 
 # The two-card split: stage 0 / stage 1 on ordinals 0 / 1, so both cards must be visible (with one it exits 77).
 q4exp_add_test(test_model_q4exp_split MODEL GPU TWO_DEVICES)
+q4exp_add_test(test_q4exp_grouped_synth MODEL GPU SINGLE_DEVICE)

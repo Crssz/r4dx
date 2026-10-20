@@ -69,7 +69,7 @@ Reuse, do not copy:
 | GDN mixer | `Qwen4ExpGdn` (`qwen4exp_gdn.h`, silu gate selectable) or `GdnLayer` | config adapter; check libr4d GDN kernels accept 16 key / 64 value heads (ratio 4) **VERIFY** |
 | full attention + paged fp8 KV | `Model` path in `model.cpp`, `attention/` | none expected; head_dim 256, 32/2 heads like the 27B's 24/4 -> check GQA 16 **VERIFY** |
 | MoE block | `qwen4exp::MoeBlockBase` (host-routed, `MoeConfig` already parametric) | instantiate for hidden 3072, inter 1024, k 8, E 256 |
-| grouped on-GPU decode MoE | `moe_trellis_decode.hip` | instantiated only for hidden 2560 / inter 640 / <=16 experts / bits 3-4: add 3072 / 1024 instantiation (speed work, milestone 2) |
+| grouped on-GPU decode MoE | `moe_trellis_decode.hip` | **done 2026-10-21 (section 7.1):** 3072 / 1024 / top-8 / any expert count <= 1024 / bits 3-4 instantiated, `Qwen35GroupedMoeDecode` (`src/model/qwen35moe_grouped_decode.*`) wired into `Qwen35MoeStage::RunMoe` for one-row steps; `R4DX_Q35_GROUPED=0` keeps the host-routed MoE |
 | layer-split pipeline | `Qwen4ExpModel` / `Qwen4ExpStage` pattern, `ChooseSplit` | new `Qwen35MoeStage` without HC/PLE/QSA; no sidecar |
 | container, trellis GEMM, tokenizer, server | shared | dialect `qwen3_5` (same Qwen3.5 template family) **VERIFY** the chat template hash against the 27B's |
 | converter | `r4dx-convert` qwen4_exp branch | new branch for `model_type: qwen3_5_moe`; checkpoint has per-expert or fused 3D expert tensors **VERIFY** from `model.safetensors.index.json` |
@@ -138,7 +138,7 @@ P2P between the two R9700s is unavailable on Windows and would add only ~5%.
 | Decode, single request (tok/s) | Range | Planning |
 |---|---:|---:|
 | today, host-routed MoE | 15-18 | 16 |
-| pipeline split, grouped kernel + fusion | 36-54 | 46 |
+| pipeline split, grouped kernel + fusion (kernel measured: 0.12-0.135 ms per MoE layer, section 7.1) | 36-54 | 46 |
 | + MTP (k = 1-2, accepted 70-85% assumed) | 50-75 | 62 |
 | + DFlash2: chat / code / math / MATH-500-like | 40-75 / 47-89 / 61-115 / 68-128 | 58 / 70 / 88 / 98 |
 | `--tp 2`, plain | 55-75 | 65 |
@@ -148,6 +148,39 @@ P2P between the two R9700s is unavailable on Windows and would add only ~5%.
 Caveats: if the shared experts stay bf16 (as in qwen4exp) subtract ~8% from every row; run-to-run spread is ~10%; decode slows with context;
 DFlash2 and MTP gains are workload dependent (chat ~1.3x, code and math 1.5-2.2x) and need the new verify-row kernels.
 
+### 7.1 Grouped on-device decode MoE (measured 2026-10-21)
+
+`Qwen35GroupedMoeDecode` runs the one-token MoE of a layer with no host sync: router GEMM, route, shared expert (5 bf16 kernels), sort,
+gate_up input transform, grouped trellis GEMV, silu * up fused with the down input transform, grouped GEMV, combine -- 12 launches. It
+applies to layers with hidden 3072, expert width 1024 (routed and shared), top_k <= 16, <= 1024 experts, trellis KB 3 or 4 on both expert
+projections and a container prescale of 0; everything else, every prefill chunk and every captured run keeps the host-routed path.
+`R4DX_Q35_GROUPED=0` (or `Qwen35MoeModelOptions::grouped_decode = 0`) switches it off.
+
+Design choices that matter: the split-group counts are 4 (gate_up) and 4 (down), the counts the host-routed `ApplyLinear` picks at M = 1
+for these shapes, the silu is rounded to bf16 before the multiply by up (as HF and the host path do), and the combine sums the experts in
+router order -- so the bf16 outputs match the host-routed MoE almost bit for bit. The shared expert is NOT folded in as an extra expert:
+its weights are bf16, the routed ones trellis, so it could not be bit-exact. A side stream for the shared expert was 1.5x slower (cross-stream
+waits cost more than the overlap saves) and was removed.
+
+Per layer-call at 256 experts, top-8 (synthetic weights, 6 layers cycled so the 64 MB Infinity cache cannot hold the working set; device 1;
+`test_q35moe_grouped_moe_kernel`, 1000 calls, host wall):
+
+| gate_up / down bits | grouped | host-routed | bytes per call | achieved |
+|---|---:|---:|---:|---:|
+| 4 / 4 | 0.131-0.135 ms | 0.43-0.51 ms | 58.6 MB (38.1 routed + 20.4 router / bf16 shared) | 435-446 GB/s |
+| 3 / 4 | 0.124 ms | 0.44 ms | 52.3 MB | 423 GB/s |
+| 3 / 3 | 0.120 ms | 0.43 ms | 49.2 MB | 410 GB/s |
+
+About 3.3x over the host-routed layer. Phases (event bracketed, so they sum to more than the wall time): shared expert 0.045 ms, gate_up GEMV 0.06,
+down GEMV 0.057, route 0.015-0.02, gate_up transform 0.025. The qwen4exp reference is 0.085 ms at 10 experts of 640 (less than half the bytes).
+Split-group counts 2-12 (gate_up) and 1-8 (down) are within 3% of each other; 8 / 8 is 1-2% faster but rounds differently. The 20 MB of bf16
+router + shared expert is a third of the bytes; quantizing the shared expert would cut ~0.03 ms per layer.
+
+Equivalence (`test_model_q35moe_grouped`, trellis tiny container `q35moe-tiny\tiny-mix.r4dx`, prompts T = 1 / 7 / 70 / 300): the 48-step greedy
+continuations are identical token for token (49 of 49) with zero teacher-forced argmax flips, logits identical bar one prompt at mean/rms 0.0002;
+layer-level `moe_out` over 280 real single-row calls differs in 8 of 860k elements (largest 0.5% of the row rms). 256-expert synthetic layer:
+grouped vs host-routed max|err|/rms 0.0005 (4-bit), 0.0000 (3-bit gate_up). Decode of the 4-layer tiny model: 2.5-3.9 ms -> 1.3-1.7 ms per token.
+Not covered: no real-dimension trellis container exists yet (`q35moe-real4` is bf16, so the grouped path does not apply to it).
 ## 8. Prefill speed (planned, not started)
 
 Expected today: ~150-300 tok/s (pipeline split), ~200-400 with `--tp 2`; an 8k prompt takes ~27-55 s to the first token, 32k ~2-2.5 min.

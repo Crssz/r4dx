@@ -99,10 +99,13 @@ def class_of(base_module: str) -> str:
 
 
 def make_job(model_dir: Path, K: float) -> dict:
-    return {"model_dir": str(model_dir), "config_sha256": sha256_path(model_dir / "config.json"), "K": float(K),
-            "hessian_basis": "matched", "codebook": "mul1",
-            "recipe": dict(tq.RECIPE, qwen35moe="one shared-Hessian group per distinct input; experts: {gate, up} + {down}"),
-            "code_sha256": tq.code_sha256()}
+    job = {"model_dir": str(model_dir), "config_sha256": sha256_path(model_dir / "config.json"), "K": float(K),
+           "hessian_basis": "matched", "codebook": "mul1",
+           "recipe": dict(tq.RECIPE, qwen35moe="one shared-Hessian group per distinct input; experts: {gate, up} + {down}"),
+           "code_sha256": tq.code_sha256()}
+    if CLEAN_BELOW > 0:   # absent when 0 = the oracle as it was before the cleaning: chunks written then match a --clean-below 0 run only
+        job["clean_channels_below"] = CLEAN_BELOW
+    return job
 
 
 def chunk_ids(arch: Qwen35MoeArch, classes: str, chunk_experts: int) -> list[str]:
@@ -309,6 +312,67 @@ def probe_errors(arch, reader, layer: int, g: dict, res: dict, weights: dict, en
     return {"rows": n, "out_err": float(((yh - y) ** 2).sum(1).mean()), "out_energy": float((y ** 2).sum(1).mean())}
 
 
+NULL_WEIGHT_MAX = 1e-12   # a group whose largest |weight| is below this is a null group (see null_group_result)
+POOR_PROXY, POOR_G = 0.3, 0.05   # a group above / below these is reported as POOR (warning line; alloc_q35.py counts them)
+CLEAN_BELOW = 1e-8        # weight rows / columns whose largest |w| is below this are zeroed before quantizing (clean_negligible_channels)
+
+
+def clean_negligible_channels(w: torch.Tensor, below: float) -> tuple[torch.Tensor, int, int]:
+    """(w with every output row and input column of max |w| < `below` set to exactly 0, rows changed, columns changed); w is the HF
+    [out, in] weight.
+
+    Why (found on the real layers 0-3, 2026-10-21): Ornith's pruned experts keep channels whose weights are 1e-12 .. 1e-30 instead of 0.
+    trellis_quant.regularize normalizes every column of W^T by `c * sign + 1e-10` and every row by `r * sign / -scale + 1e-10`; when a
+    channel's scale lands within a factor ~2 of that 1e-10 and the random sign is the wrong one the divisor cancels to ~0 and the
+    channel is blown up by 1e10: the global scale search then picks g = 0.01 .. 0.3 and the whole tensor is quantized to noise (rel
+    error 0.6 .. 1.0 where 0.04 is normal, proxy 0.6 .. 0.9). It depends on the seed: about 4% of the K3 groups of layers 0-2 were hit,
+    the neighbours of the same expert were fine. Weights below 1e-8 (the live ones are ~1e-3, bf16 resolution is 4e-3 relative) change
+    nothing a bf16 network computes, and exact zeros take regularize's dead-channel path (zero columns get sv = 0, zero rows stay 0), so
+    zeroing them removes the cancellation and nothing else. A tensor without such channels is returned unchanged (bit identical)."""
+    if below <= 0:
+        return w, 0, 0
+    a = w.abs()
+    rows = (a.amax(dim=1) < below) & (a.amax(dim=1) > 0)
+    cols = (a.amax(dim=0) < below) & (a.amax(dim=0) > 0)
+    if not bool(rows.any() or cols.any()):
+        return w, 0, 0
+    w = w.clone()
+    w[rows, :] = 0
+    w[:, cols] = 0
+    return w, int(rows.sum()), int(cols.sum())
+
+
+def null_group_result(weights: dict, H: torch.Tensor, K: float, enc, wmax: float) -> dict:
+    """What `tq.quantize_group` returns, for a group whose weights are negligible: all-zero trellis words (any word pattern decodes
+    to a closed ring), sign vectors su = 1 and sv = 0, so the stored linear reconstructs to EXACTLY zero.
+
+    Why: Ornith has pruned experts whose gate / up / down weights are all 1e-26 .. 1e-35 (layer 3: experts 72, 166, 180, 252) but which
+    the router still sends tokens to. Their output is below bf16 resolution of anything it is added to, there is nothing to quantize
+    (w^2 underflows fp32: the regularize / scale search would divide by 0) and no Hessian to quantize against. The container needs
+    every expert linear at the class's K, so the group is stored as zeros; what the container reconstructs equals the checkpoint's
+    expert up to ~1e-12 per weight. `rel_weight_err` is 1.0 by definition (||0 - W|| / ||W||), which is also what r4dx-convert's full
+    reconstruction check computes in double precision (it is NOT what tq.rel_cos gives: its fp32 products underflow to 0)."""
+    k = H.shape[0]
+    out = {}
+    for name, w in weights.items():
+        n = int(w.shape[0])
+        words = torch.zeros(k // 16, n // 16, 8 * int(K), dtype=torch.int32)
+        nonzero = bool((w != 0).any())
+        bits_t, bits_s = words.numel() * 32, (k + n) * 16
+        rec = {"encoding": tq.ENCODING_TRELLIS, "K": float(K), "codebook": enc.codebook, "k": k, "n": n, "shape_hf": [n, k],
+               "words_shape": list(words.shape),
+               "bits": {"trellis": bits_t, "scales": bits_s, "marker": 32, "total": bits_t + bits_s + 32,
+                        "bpw": (bits_t + bits_s + 32) / (k * n), "bpw_trellis": bits_t / (k * n)},
+               "proxy": 1.0, "proxy_damped_h": 1.0, "proxy_before_refit": 1.0, "proxy_before_refit_damped_h": 1.0,
+               "rel_weight_err": 1.0 if nonzero else 0.0, "cos": 0.0, "hessian_basis": "matched", "ldl_retries": 0, "seeds": {},
+               "regularize": {}, "refit": [], "tiles": {"ldlq": 0, "scale_search": 0}, "ldlq_batch": [name],
+               "seconds": {"regularize": 0.0, "ldlq_batch": 0.0, "finalize": 0.0},
+               "null_group": {"max_abs_weight": wmax, "threshold": NULL_WEIGHT_MAX,
+                              "stored": "zero words, su = 1, sv = 0: reconstructs to exactly 0"}}
+        out[name] = {"words": words, "suh": torch.ones(k, dtype=torch.float16), "svh": torch.zeros(n, dtype=torch.float16), "record": rec}
+    return out
+
+
 def quantize_group_record(args, arch, reader, enc, layer: int, g: dict, routing: dict, hman: dict, hdir: Path, device,
                           st_name: str, K: float) -> tuple[dict, dict]:
     """One shared-Hessian group -> (tensors {name.trellis/.suh/.svh: tensor}, records {name: record})."""
@@ -321,11 +385,30 @@ def quantize_group_record(args, arch, reader, enc, layer: int, g: dict, routing:
     H, rows = tq.read_hess(hdir / hfile, device)
     names = [b + ".weight" for b in g["bases"]]
     weights = {n: reader.linear_weight(b, device) for n, b in zip(names, g["bases"])}
-    res = tq.quantize_group(weights, H, {n: K for n in names}, enc,
-                            seed_group=tq.stable_seed("su", layer, g["tap"]),
-                            seeds={n: tq.stable_seed("sv", n) for n in names},
-                            hessian_basis="matched", verbose=args.verbose)
+    wmax = max(float(w.float().abs().max()) for w in weights.values())
+    cleaned_stats: dict[str, tuple[int, int]] = {}
+    if wmax >= NULL_WEIGHT_MAX and CLEAN_BELOW > 0:
+        for n_ in list(weights):
+            weights[n_], ro, co = clean_negligible_channels(weights[n_], CLEAN_BELOW)
+            if ro or co:
+                cleaned_stats[n_] = (ro, co)
+        if not any(bool((w != 0).any()) for w in weights.values()):
+            wmax = 0.0   # nothing but negligible channels: a null group
+    if wmax < NULL_WEIGHT_MAX:
+        res = null_group_result(weights, H, K, enc, wmax)
+        print(f"[oracle_q35] NOTE L{layer:02d} {g['tap']}: weights negligible (max |w| {wmax:.2e}), stored as a null group "
+              f"(record: null_group)", flush=True)
+    else:
+        res = tq.quantize_group(weights, H, {n: K for n in names}, enc,
+                                seed_group=tq.stable_seed("su", layer, g["tap"]),
+                                seeds={n: tq.stable_seed("sv", n) for n in names},
+                                hessian_basis="matched", verbose=args.verbose)
     hrec = {"file": hfile, "rows": rows, "key": g["bases"][0], "tokens": tokens}
+    for n in names:
+        rr = res[n]["record"]
+        if not rr.get("null_group") and (rr["proxy"] > POOR_PROXY or rr["regularize"]["g_scale"]["g"] <= POOR_G):
+            print(f"[oracle_q35] WARNING L{layer:02d} {g['tap']} {n.rsplit('.', 2)[-2]}: POOR group, proxy {rr['proxy']:.3f}, rel "
+                  f"{rr['rel_weight_err']:.3f}, g {rr['regularize']['g_scale']['g']:.3f} (a healthy one: proxy < 0.02, g ~0.7-1.4)", flush=True)
     n_fb = sum(refit_fallback.count_fallbacks(res[n]["record"]) for n in names)
     if n_fb:
         stages = sorted({r["fallback"]["stage"] for n in names for r in res[n]["record"]["refit"] if "fallback" in r})
@@ -334,13 +417,19 @@ def quantize_group_record(args, arch, reader, enc, layer: int, g: dict, routing:
     probe = probe_errors(arch, reader, layer, g, res, weights, enc, device, K)
     if g["cls"] != "p":
         e = g["expert"]
-        hrec.update({"routed": routing["tokens_routed"][e], "fallback": e in (fb_gu if g["cls"] == "gu" else fb_dn)})
+        no_ev = set(routing.get("no_evidence", {}).get("gate_up" if g["cls"] == "gu" else "down", []))
+        hrec.update({"routed": routing["tokens_routed"][e], "fallback": e in (fb_gu if g["cls"] == "gu" else fb_dn),
+                     "no_evidence": e in no_ev})
+    elif hfile in set(routing.get("no_evidence", {}).get("dense", [])):   # a dense tap with an all-zero Hessian: identity was used
+        hrec["no_evidence"] = True
     tensors_out, records = {}, {}
     for n, b in zip(names, g["bases"]):
         r = res[n]
         Wf = weights[n].float().T.contiguous()
         energy = tq.hessian_energy(Wf, H)
         rec = r["record"]
+        if n in cleaned_stats:  # only then: a tensor without negligible channels keeps the record it always had
+            rec["cleaned_channels"] = {"out": cleaned_stats[n][0], "in": cleaned_stats[n][1], "below": CLEAN_BELOW}
         if refit_fallback.count_fallbacks(rec):  # only then: a group that never fell back keeps the record it always had
             rec["refit_fallbacks"] = refit_fallback.count_fallbacks(rec)
         rec.update({"layer": layer, "class": g["cls"], "tap": g["tap"], "module": b[len(arch.layer_prefix(layer)):],
@@ -586,10 +675,17 @@ def verify_dir(out_dir: Path, model_dir: Path, layer: int, K: float, classes: st
                 for suf, shape in ((".trellis", r["words_shape"]), (".suh", [r["k"]]), (".svh", [r["n"]])):
                     if n + suf not in keys or list(f.get_slice(n + suf).get_shape()) != shape:
                         problems.append(f"{st.name}: {n}{suf} missing or wrong shape")
+            for n in names:   # every null group, not just the sampled ones: stored as zeros, sv == 0
+                if doc["tensors"][n].get("null_group") and bool((f.get_tensor(n + ".svh") != 0).any()):
+                    problems.append(f"{n}: null group with a nonzero sv")
             step = max(1, len(names) // max(sample, 1))
             for n in names[::step][:sample]:
                 r = doc["tensors"][n]
                 words, suh, svh = f.get_tensor(n + ".trellis"), f.get_tensor(n + ".suh"), f.get_tensor(n + ".svh")
+                if r.get("null_group"):   # stored as zeros: the bits must reconstruct to exactly 0 (rel 1.0 is by definition)
+                    if bool((svh != 0).any()) or r["rel_weight_err"] not in (0.0, 1.0):
+                        problems.append(f"{n}: null group with a nonzero sv or rel_weight_err {r['rel_weight_err']}")
+                    continue
                 cb = cb_cache.setdefault("cb", torch.from_numpy(tq.codebook_np(r["codebook"]).copy()))
                 what = tq.reconstruct(words, suh, svh, r["K"], cb)  # [k, n]
                 w = reader.linear_weight(n[:-len(".weight")], torch.device("cpu")).float().T
@@ -597,6 +693,24 @@ def verify_dir(out_dir: Path, model_dir: Path, layer: int, K: float, classes: st
                 if abs(rel - r["rel_weight_err"]) > 1e-4 * max(r["rel_weight_err"], 1e-3):
                     problems.append(f"{n}: reconstructed rel err {rel} != recorded {r['rel_weight_err']}")
     return problems
+
+
+def cmd_status(args) -> int:
+    """Exit 0 when every chunk of the layer is usable in every given `--out-dir <dir>@<K>` (their jobs match this code, the layer's
+    Hessian DONE.json is the one they were quantized from), 1 otherwise: pipeline.ps1 asks before it re-captures the Hessians
+    that `verify --delete-hessians` removed."""
+    model_dir = Path(args.model_dir)
+    arch = Qwen35MoeArch.from_config(model_dir / "config.json")
+    hess_sha = hessian_done_sha(Path(args.hessian_root), args.layer)
+    missing = []
+    for spec in args.out_dir:
+        d, _, k = spec.partition("@")
+        job = make_job(model_dir, float(k))
+        for c in chunk_ids(arch, args.classes, args.chunk_experts):
+            if not chunk_usable(Path(d), args.layer, c, job, hess_sha, args.chunk_experts):
+                missing.append(f"{Path(d).name}:{c}")
+    print(f"[oracle_q35] status L{args.layer:02d}: {'complete' if not missing else str(len(missing)) + ' chunk(s) not usable: ' + ', '.join(missing[:6])}")
+    return 1 if missing else 0
 
 
 def cmd_verify(args) -> int:
@@ -628,6 +742,9 @@ def main() -> int:
     sub = ap.add_subparsers(dest="cmd", required=True)
 
     def common(p):
+        p.add_argument("--clean-below", type=float, default=CLEAN_BELOW,
+                       help="zero weight rows / columns whose max |w| is below this before quantizing (clean_negligible_channels); "
+                            "0 = off, the job key then omits it and matches chunks written before the cleaning existed")
         p.add_argument("--model-dir", default=str(MODEL_DIR))
         p.add_argument("--classes", default="all", choices=sorted(CLASSES))
         p.add_argument("--chunk-experts", type=int, default=32)
@@ -656,6 +773,13 @@ def main() -> int:
     p.add_argument("--K", type=float, required=True)
     p.set_defaults(fn=cmd_manifest)
 
+    p = sub.add_parser("status", help="exit 0 when every chunk of a layer is usable in the given oracle dirs")
+    common(p)
+    p.add_argument("--layer", type=int, required=True)
+    p.add_argument("--out-dir", action="append", required=True, help="<dir>@<K>; repeat")
+    p.add_argument("--hessian-root", default=str(Q4_ROOT))
+    p.set_defaults(fn=cmd_status)
+
     p = sub.add_parser("verify", help="check a layer's chunks in one or more oracle dirs; optionally delete its Hessians")
     common(p)
     p.add_argument("--layer", type=int, required=True)
@@ -665,6 +789,8 @@ def main() -> int:
     p.add_argument("--hessian-root", default=str(Q4_ROOT))
     p.set_defaults(fn=cmd_verify)
     args = ap.parse_args()
+    global CLEAN_BELOW
+    CLEAN_BELOW = args.clean_below
     return args.fn(args)
 
 

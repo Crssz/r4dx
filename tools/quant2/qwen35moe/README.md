@@ -157,9 +157,76 @@ Could it hit again? **Yes, anywhere the refit system is ill-conditioned; the fix
 * GDN `out_proj` (k = 8192, 709 dead channels in layer 2): cond(A) = 2.3e8, also fragile. GDN `in` (qkv, z): 1.7e4, safe. Full-attention
   q/k/v/o (layers 3, 7, ...): not measured yet; `o_proj` (input = attention output x gate) can have dead channels like `out_proj`.
 * Shared experts: not quantized (bf16 in the container), no group, no refit.
+## Experts without calibration evidence, null groups (found at layer 3, 2026-10-21)
+
+The layer-3 Hessian capture was refused: `non-finite Hessians, or Hessians without a live channel ... L03.e0072.down.hess, e0166, e0180, e0252`.
+* **Which condition:** "no live channel", not non-finite. The four `down` Hessians are finite and EXACTLY zero (diagonal max 0.0, header
+  trace 0.0); the `[0, 1, ..., 7]` in the message was just the first eight channel indices of the (truncated) list of non-positive channels,
+  i.e. all 1024 of them.
+* **Why they fall outside the Q16 fallback:** the fallback is for experts with FEWER routed rows than the input width. These four are the
+  busiest experts of the layer: 63,208 / 66,225 / 55,076 / 59,893 routed rows (median 28,292), none "never routed".
+* **Hypotheses falsified, on the real layer-3 data (probe rows + weights):** (a) never fires on this corpus: no, 55-66k rows each;
+  (b) bf16 overflow in silu * up: no, no NaN/inf anywhere, `h` is exactly 0 in fp32 and in bf16; (c) accumulator bug with few rows: no, the
+  same code gives live Hessians for the neighbours (expert 71: 28,984 rows, trace 0.30) and these experts' own gate_up Hessians are live
+  (trace 741, the input `x` is normal, |x| max 14).
+  **Cause: the checkpoint.** All three weight matrices of these experts are ~0: mean |w| 1.8e-35 (e72), 3.4e-34 (e166), 1.5e-26 (e180), 4.1e-31
+  (e252); gate pre-activations ~1e-32, so silu(gate) * up underflows to exactly 0. They are pruned experts the router still sends tokens to
+  (their output is below bf16 resolution of anything it is added to). Expert 71 shows the same pruning at channel level (511 of 1024
+  gate rows ~0).
+* **Policy (all logged):**
+  1. `hessian_q35.py`: a NaN / inf Hessian FAILS the layer, naming the expert (`expert_hessian_usable`). An expert Hessian with no positive
+     diagonal entry is "no evidence": the layer-wide diagonal of the Q16 fallback is written instead, the expert is listed in
+     `routing_counts.json` / `capture.json` `no_evidence` (`gate_up`, `down`, and `dense` for a mixer tap, which gets a data-free identity)
+     and in `fallback`. A Hessian with some live channels and some dead ones is untouched (dead channels are normal here).
+  2. `oracle_q35.py`: a group whose weights are negligible (largest |w| < 1e-12; w^2 underflows fp32, so the regularize / scale search
+     cannot run on them) is a NULL GROUP: zero words, su = 1, sv = 0, the stored linear reconstructs to exactly 0, `rel_weight_err` = 1.0
+     (what r4dx-convert's double-precision check computes; `tq.rel_cos` would say 0.0 here), record key `null_group`, `proxy_abs` 0. It
+     keeps the class's K and shapes, so the container stays uniform. A group with normal weights but no evidence would be quantized against
+     the layer-wide diagonal (recorded `hessian.no_evidence`, `fallback`).
+  3. `alloc_q35.py`'s report counts, per class and per layer, the tensors quantized without evidence and the null groups.
+* **Checks:** layer 3 re-finalized from its saved accumulator state (scratch root `q35moe-fix3`): `no_evidence` down [72, 166, 180, 252],
+  `hessian_q35.py check`: 0 problems; the oracle (K4, K3) of that layer, including the first full-attention q/k/v/o groups, ran through
+  (numbers below); r4dx-convert's full reconstruction check accepts null groups (tiny mix with an expert replaced by null groups:
+  `rel 1 (oracle 1) OK`).
+* **Could the refusal hit again?** Layer-3 attention Hessians (`in`, `out`) have no dead channel at all. Later layers: a dense tap with
+  an all-zero Hessian (a dead mixer) is now an identity-Hessian + `no_evidence.dense` entry instead of a stop; a NaN / inf still stops.
+
+## Garbage groups: the `+ 1e-10` cancellation in regularize (found while checking layer 3, affects layers 0-2)
+
+Looking at the layer-3 K4 records I found four expert `down_proj` groups with proxy 0.6 - 0.83 and `rel_weight_err` 1.2 - 1.7 (healthy: proxy
+< 0.02, rel 0.04 - 0.4 where half the rows are dead), all with the global scale `g` at its floor 0.010. They were NOT calibration problems:
+they reproduce with an identity Hessian, in the weights alone.
+* **Cause.** `trellis_quant.regularize` divides every column of W^T by `c * sign + 1e-10` and every row by `r * sign / -1.2437 + 1e-10`. Ornith's
+  pruned experts keep channels with weights 1e-12 .. 1e-30 (not exact zeros, which regularize handles). When such a channel's scale lands
+  within a factor ~2 of 1e-10 and the random sign (seeded per tensor) is the wrong one, the divisor cancels to ~0 and the channel is blown up
+  by up to 1e10 (layer 3 expert 108: row rms up to 179 against 1.24); the scale search then picks g = 0.01 and the whole tensor is quantized
+  to noise. Which tensors are hit depends on the seed, so neighbours of the same expert are fine. Reproduced synthetically (tests): 4 of 8
+  seeds fail on weights with log-uniform 1e-14.5 .. 1e-10 channels, none after the fix.
+* **How many.** Finished oracle records of layers 0-2 (before the fix): proxy > 0.05 on K3: layer 0: 26 of 771 tensors, layer 1: 60, layer 2: 19;
+  on K4: 12, 20, 10; `g <= 0.011` on 1-3 tensors per layer and K (the `down` signature), the others (`gu` groups with 92% pruned output rows,
+  `g` 0.3, rel ~1.0) are the same failure on the column side. Together about 4% of the tensors of those layers.
+* **Fix (oracle only, `trellis_quant.py` untouched).** `oracle_q35.clean_negligible_channels`: before quantizing, output rows / input columns
+  of the HF weight whose largest |w| is below `--clean-below` (default 1e-8; live weights are ~1e-3 and bf16 resolves 4e-3 relative) are set
+  to exactly 0, which takes regularize's dead-channel path. A tensor without such channels is returned unchanged. A group that is nothing
+  but negligible channels becomes a null group. The record gets `cleaned_channels {out, in, below}`.
+* **Verified on the real layer 3, K4 (same Hessians, same seeds):** tensors with proxy > 0.3: 4 -> 0 (max proxy 0.828 -> 0.007, the four
+  experts 174 / 85 / 126 / 108: proxy 0.83 / 0.77 / 0.72 / 0.60 -> 0.0012 / 0.0022 / 0.0016 / 0.0011, `g` 0.010 -> 0.56 .. 1.21); medians per
+  class unchanged (p 0.00056, gu 0.00031, down 0.00123 -> 0.00117); verify 0 problems.
+* **Consequence: layers 0-2 must be redone.** The cleaning changes the numerics of any group with such channels (756 of 772 layer-3 records
+  have some), so the job key carries `clean_channels_below` and every chunk written before is stale; `--clean-below 0` restores the old
+  key (and the old garbage). Layers 0-2 had their Hessians deleted by `verify`: `pipeline.ps1` now notices (`.hess` files gone and
+  `oracle_q35.py status` says the chunks are not usable) and captures them again -- from layer 0, because the boundaries between layers were
+  deleted too. Cost: 3 x ~7 min of Hessians + 3 x (K3 ~14 + K4 ~13 min) of oracle.
+* **So it cannot happen silently again:** the oracle prints `WARNING ... POOR group` (proxy > 0.3 or g <= 0.05) and `alloc_q35.py`'s report
+  counts POOR groups in the chosen mix.
+## Failure marker
+
+`pipeline.ps1 -Run` deletes `<Root>\FAILED.txt` at start and writes one line on any stage failure (a step's non-zero exit, a refused
+prerequisite, any exception): `2026-10-21T10:12:12 FAILED step=hessian-L3: exit 1 after 4.2 min: RuntimeError: layer 3: ... [log <path>]`
+(the step, the exit code, the last Python exception line of the step's log, the log path; <= 600 characters). A monitor polls for the file.
 ## Tests
 
-`tests\reference\test_refit_fallback.py` (CPU, ~1 min: the refit fallback and the EOL-tolerant job match); `tools\reference\qwen35moe\test_ref.py` (CPU: the streaming reference equals a plain HF forward on the tiny model, bit for bit with the eager
+`tests\reference\test_refit_fallback.py` (CPU, ~1 min: the refit fallback and the EOL-tolerant job match); `tests\reference\test_no_evidence.py` (CPU, ~1 min, 30 checks: the no-evidence policy through finalize_layer, null groups, the oracle record, the allocation report); `tools\reference\qwen35moe\test_ref.py` (CPU: the streaming reference equals a plain HF forward on the tiny model, bit for bit with the eager
 experts); `tiny_e2e.py` runs the whole chain on tiny-q35moe (`--device cuda --gpu-device 0` for the oracle).
 Note for the owner of `tiny_golden.py`: its docstring says "eager per-expert MoE loop", but HF 5.18's default `experts_implementation` is
 `grouped_mm`, which is what the goldens ran (`load_hf_model` sets the wrong attribute). Eager and grouped_mm differ by ~1 bf16 ulp per

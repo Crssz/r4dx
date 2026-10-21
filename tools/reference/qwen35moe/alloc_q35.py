@@ -213,7 +213,7 @@ def class_stats(man: dict, loss_mode: str = "out") -> dict[tuple, dict]:
         c = out.setdefault((layer, kind), {"loss_local": 0.0, "loss_out": 0.0, "proxy_rel_sum": 0.0, "rel_num": 0.0,
                                            "numel": 0, "n": 0, "fallback": set(), "experts": set(), "names": [],
                                            "bits": 0, "probe_experts": set(), "rel_sum_t": 0.0, "mixer_energy": None,
-                                           "refit_fb": 0, "refit_fb_rounds": 0})
+                                           "refit_fb": 0, "refit_fb_rounds": 0, "no_evidence": 0, "null": 0, "poor": 0})
         h = r.get("hessian", {})
         w = 1.0
         if kind != "p":
@@ -222,6 +222,12 @@ def class_stats(man: dict, loss_mode: str = "out") -> dict[tuple, dict]:
         if r.get("refit_fallbacks"):       # oracle_q35.py: scale-refit solves that raised and went down refit_fallback's ladder
             c["refit_fb"] += 1
             c["refit_fb_rounds"] += int(r["refit_fallbacks"])
+        if h.get("no_evidence"):           # hessian_q35.py: routed >= K rows but an exactly zero Hessian (pruned expert): layer-wide diagonal
+            c["no_evidence"] += 1
+        if r.get("null_group"):            # oracle_q35.py: negligible weights, stored as zeros (sv = 0)
+            c["null"] += 1
+        elif r["proxy"] > 0.3:             # a quantization failure (healthy groups are < 0.02): see oracle_q35.clean_negligible_channels
+            c["poor"] += 1
         c["loss_local"] += w * r["proxy_abs"]
         c["proxy_rel_sum"] += r["proxy"] * r["numel"]
         c["rel_num"] += (r["rel_weight_err"] ** 2) * r["numel"]
@@ -363,8 +369,15 @@ def build_report(model: Model, stats, ks, cap: int, log, sources: dict[float, di
             pass
     # fallback share per kind: experts whose Hessian is the fallback diagonal (count and loss share)
     rfb = {kd: {"tensors": 0, "classes": 0, "rounds": 0} for kd in KINDS}
+    noev = {kd: {"no_evidence": 0, "null": 0, "poor": 0} for kd in KINDS}
+    null_layers: dict[int, int] = {}
     for (i, kd), K in ks.items():
         st = stats[K][(i, kd)]
+        noev[kd]["no_evidence"] += st["no_evidence"]
+        noev[kd]["null"] += st["null"]
+        noev[kd]["poor"] += st["poor"]
+        if st["null"]:
+            null_layers[i] = null_layers.get(i, 0) + st["null"]
         rfb[kd]["tensors"] += st["refit_fb"]
         rfb[kd]["rounds"] += st["refit_fb_rounds"]
         rfb[kd]["classes"] += 1 if st["refit_fb"] else 0
@@ -382,7 +395,8 @@ def build_report(model: Model, stats, ks, cap: int, log, sources: dict[float, di
     doc = {"cap_gib": cap / GIB, "k": k, "device0_gib": d0 / GIB, "device1_gib": d1 / GIB, "total_gib": total / GIB,
            "fixed_gib": fixed / GIB, "trellis_gib": (total - fixed) / GIB, "layers": L,
            "by_kind": {kd: {"gib": v["bytes"] / GIB, "K_counts": v["K"], "loss": v["loss"]} for kd, v in by_kind.items()},
-           "expected_loss": loss, "baselines": baselines, "fallback": fb, "refit_fallbacks": rfb, "floor": floor,
+           "expected_loss": loss, "baselines": baselines, "fallback": fb, "refit_fallbacks": rfb, "no_evidence": noev,
+           "null_tensors_by_layer": {str(i): n for i, n in sorted(null_layers.items())}, "floor": floor,
            "sources": {f"{K:g}": s["_path"] for K, s in sources.items()}, "promotions": len(log),
            "per_layer": [{"layer": i, "gib": pl[i] / GIB, "K": {kd: ks[(i, kd)] for kd in KINDS},
                           "loss": {kd: stats[ks[(i, kd)]][(i, kd)]["loss"] for kd in KINDS}} for i in range(L)]}
@@ -402,6 +416,13 @@ def build_report(model: Model, stats, ks, cap: int, log, sources: dict[float, di
               "", "scale-refit solver fallbacks (refit_fallback.py: a solve that raised was redone in float64 / ridged / min-norm): "
               + (", ".join(f"{kd} {v['tensors']} tensor(s) in {v['classes']} class(es), {v['rounds']} round(s)" for kd, v in rfb.items() if v["tensors"])
                  if sum(v["tensors"] for v in rfb.values()) else "none"),
+              "", "experts quantized WITHOUT calibration evidence (all-zero Hessian despite enough routed rows; layer-wide diagonal used): "
+              + (", ".join(f"{kd} {v['no_evidence']} tensor(s)" for kd, v in noev.items() if v["no_evidence"]) or "none"),
+              "", "null groups (negligible weights, stored as exact zeros): "
+              + ((", ".join(f"{kd} {v['null']}" for kd, v in noev.items() if v["null"])
+                  + "; tensors by layer " + ", ".join(f"L{i}:{n}" for i, n in sorted(null_layers.items()))) if null_layers else "none"),
+              "", "POOR groups (proxy > 0.3, quantization failures; healthy < 0.02) in the chosen mix: "
+              + (", ".join(f"{kd} {v['poor']}" for kd, v in noev.items() if v["poor"]) or "none"),
               "", f"{len(log)} promotions in order of loss reduction per GiB; the first 12:"]
     for p in log[:12]:
         lines.append(f"  - L{p['layer']:02d} {p['class']} K{p['from']:g} -> K{p['to']:g}: -{p['gain']:.4g} for "

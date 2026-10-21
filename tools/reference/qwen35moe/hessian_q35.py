@@ -417,6 +417,21 @@ def write_hess(path: Path, h: torch.Tensor, rows: int) -> dict:
     return st
 
 
+def expert_hessian_usable(layer: int, e: int, cls: str, h: torch.Tensor, n: int) -> bool:
+    """Policy for an expert Hessian `h` (= accumulator / n) of an expert routed n >= K rows.
+    * a NaN / inf entry is a defect (overflow in silu * up, a bad kernel): RuntimeError naming the expert -- never absorbed;
+    * (practically) no energy on the diagonal = the linear never saw a nonzero input = NO CALIBRATION EVIDENCE: returns False and the
+      caller substitutes the layer-wide diagonal (the Q16 fallback) and lists the expert in `no_evidence`. Ornith has pruned experts
+      (all weights 1e-26 .. 1e-35) that the router still feeds with tens of thousands of rows: silu(gate) * up is exactly 0 for all of
+      them, so their down_proj Hessian is exactly 0 (layer 3: experts 72, 166, 180, 252);
+    * otherwise True (channels that are dead individually are fine, see finalize_layer)."""
+    if not bool(torch.isfinite(h).all()):
+        raise RuntimeError(f"layer {layer}: expert {e} {cls} Hessian is not finite ({int((~torch.isfinite(h)).sum())} entries "
+                           f"NaN/inf, {n} routed rows)")
+    # mean(diag) below 1e-20 is what trellis_quant.damp_hessian refuses ("no usable Hessian"): treat it as no evidence here, where a
+    # fallback exists, instead of stopping the oracle hours later (an expert with tiny but nonzero silu * up: H = h^2 underflows)
+    return float(torch.diagonal(h).double().mean()) >= 1e-20
+
 def finalize_layer(root: Path, layer: int, taps: LayerTaps, ref: Qwen35MoeStreamingReference, corpus: dict,
                    timing: dict) -> dict:
     """Write every .hess, hessian.json, routing_counts.json, capture.json, DONE.json for a layer whose pass is complete."""
@@ -428,10 +443,19 @@ def finalize_layer(root: Path, layer: int, taps: LayerTaps, ref: Qwen35MoeStream
     asym: dict[str, float] = {}
     t0 = time.perf_counter()
 
+    no_evidence_dense: list[str] = []   # dense taps (GDN / attention in, out) whose Hessian has no positive diagonal at all
     for rep_full, tap in taps.rep_tap.items():
         acc = taps.dense[rep_full]
         rows = acc.rows
         h = acc.finalize_fp32()
+        if not expert_hessian_usable(layer, -1, tap, h, rows):    # raises on NaN / inf
+            # Every token passes through a mixer, so an all-zero input Hessian means a dead mixer (no precedent in Ornith: layers 0-3
+            # have none). Not a reason to stop a multi-hour run: a DATA-FREE identity Hessian is used, the tap is listed in
+            # `no_evidence["dense"]` (routing_counts.json / capture.json), and a group whose weights are negligible becomes a null group.
+            print(f"[hessian_q35] WARNING L{layer:02d} {tap}: dense Hessian is exactly zero over {rows} rows: identity Hessian, no evidence",
+                  flush=True)
+            no_evidence_dense.append(hess_name(layer, tap))
+            h = torch.eye(h.shape[0], dtype=torch.float32, device=h.device)
         asym[hess_name(layer, tap)] = float((h - h.T).abs().max() / h.diagonal().abs().max())
         files[hess_name(layer, tap)] = write_hess(out / hess_name(layer, tap), h, rows)
         del h
@@ -445,16 +469,23 @@ def finalize_layer(root: Path, layer: int, taps: LayerTaps, ref: Qwen35MoeStream
     fb_gu = fallback_diag(m_in)
     fb_dn = fallback_diag(m_h)
     fallback = {"gate_up": [], "down": []}
+    no_evidence = {"gate_up": [], "down": [], "dense": no_evidence_dense}   # experts WITH enough routed rows whose Hessian is exactly zero (see below)
     worst_asym = 0.0
     for e in range(E):
         for cls, acc_t, n, k, fb, fb_rows in (("gu", taps.gu, int(taps.n_gu[e]), taps.gu_k, fb_gu, taps.t_in),
                                                ("down", taps.dn, int(taps.n_dn[e]), taps.down_k, fb_dn, taps.pairs)):
             fname = expert_file(layer, e, cls)
-            if n < k:
-                fallback["gate_up" if cls == "gu" else "down"].append(e)
+            kind = "gate_up" if cls == "gu" else "down"
+            h = None
+            if n >= k:
+                h = acc_t[e] / float(n)
+                if not expert_hessian_usable(layer, e, cls, h, n):
+                    no_evidence[kind].append(e)
+                    h = None
+            if h is None:
+                fallback[kind].append(e)
                 files[fname] = write_hess(out / fname, fb, fb_rows)
             else:
-                h = acc_t[e] / float(n)
                 worst_asym = max(worst_asym, float((h - h.T).abs().max() / h.diagonal().abs().max()))
                 files[fname] = write_hess(out / fname, h, n)
             if cls == "gu":
@@ -471,14 +502,16 @@ def finalize_layer(root: Path, layer: int, taps: LayerTaps, ref: Qwen35MoeStream
     # channels of an expert, 45 of the 8192 GDN output channels). Their Hessian rows / columns are zero, which is the truth, not a
     # capture defect: the oracle adds trellis' 0.025 mean(diag) damping and nothing in the loss depends on those weights. They are
     # RECORDED (capture.json dead_channels); only a non-finite file or one with no live channel at all is refused.
+    # (a file with no live channel is now only possible for the dense taps and a degenerate layer-wide fallback: still refused)
     bad = {f: s for f, s in files.items() if not (s["finite"] and s["dead_channels"] < s["K"])}
     fb_set = {expert_file(layer, e, "gu") for e in fallback["gate_up"]} | {expert_file(layer, e, "down") for e in fallback["down"]}
-    nonpos = {f: s["nonpos_channels"][:8] for f, s in bad.items() if f not in fb_set}
+    nonpos = {f: s["nonpos_channels"][:8] for f, s in bad.items()}
     dead_ch = {f: s["dead_channels"] for f, s in files.items() if s["dead_channels"] > 0 and f not in fb_set}
     share = {"gate_up": len(fallback["gate_up"]) / E, "down": len(fallback["down"]) / E}
     routing = {"layer": layer, "tokens": taps.t_in, "top_k": taps.top_k, "pairs": taps.pairs,
                "threshold": {"gate_up": taps.gu_k, "down": taps.down_k},
                "tokens_routed": [int(v) for v in taps.routed], "fallback": fallback, "fallback_share": share,
+               "no_evidence": no_evidence,
                "experts_never_routed": [int(e) for e in np.flatnonzero(taps.routed == 0)],
                "min_routed": int(taps.routed.min()), "max_routed": int(taps.routed.max()),
                "median_routed": float(np.median(taps.routed)), "formula": FORMULA,
@@ -495,7 +528,7 @@ def finalize_layer(root: Path, layer: int, taps: LayerTaps, ref: Qwen35MoeStream
                           "triangle of the accumulator is stored; non-sequential: inputs of the bf16 reference",
              "corpus": {k: corpus[k] for k in ("path", "sha256", "segments", "tokens", "tokenizer_mode")},
              "fallback": {"formula": FORMULA, "damp": FALLBACK_DAMP, "threshold": routing["threshold"],
-                          "experts": fallback, "share": share},
+                          "experts": fallback, "share": share, "no_evidence": no_evidence},
              "shared_input_gate": taps.shared, "asymmetry": asym,
              "accumulation": {"dense": "fp32 GEMM (<= 2048 rows) into fp64, fp32 result",
                               "experts": "fp32 GEMM per (segment, expert) call into an fp32 accumulator"}}
@@ -503,6 +536,7 @@ def finalize_layer(root: Path, layer: int, taps: LayerTaps, ref: Qwen35MoeStream
     timing["finalize_s"] = time.perf_counter() - t0
     cap = {"layer": layer, "layer_type": lt, "tokens": taps.t_in, "files": len(files), "bytes": sum(s["bytes"] for s in files.values()),
            "fallback_share": share, "fallback_count": {k: len(v) for k, v in fallback.items()},
+           "no_evidence": no_evidence, "no_evidence_count": {k: len(v) for k, v in no_evidence.items()},
            "nonpositive_diag_nonfallback": nonpos,
            "dead_channels": {"files_with_dead_channels": len(dead_ch), "total": sum(dead_ch.values()),
                              "worst_fraction": max((n / files[f]["K"] for f, n in dead_ch.items()), default=0.0),
@@ -619,7 +653,8 @@ def capture_layer(args) -> int:
     if not args.keep_boundary and layer > 0:
         b_in.delete()
     print(f"[hessian_q35] L{layer:02d} DONE: {cap['files']} files, {cap['bytes'] / 2**30:.2f} GiB, fallback "
-          f"gate_up {cap['fallback_count']['gate_up']}/{arch.n_experts} down {cap['fallback_count']['down']}/{arch.n_experts}, "
+          f"gate_up {cap['fallback_count']['gate_up']}/{arch.n_experts} down {cap['fallback_count']['down']}/{arch.n_experts} "
+          f"(no evidence: gate_up {cap['no_evidence_count']['gate_up']} down {cap['no_evidence_count']['down']}), "
           f"forward {timing['seconds_forward_total']:.0f}s, finalize {timing['finalize_s']:.0f}s, "
           f"peak RSS {cap['peak_rss_gib']:.1f} GiB, peak VRAM {cap['peak_vram_gib']}", flush=True)
     return 0

@@ -104,6 +104,33 @@ if ($layerList | Where-Object { $_ -lt 0 -or $_ -gt 47 }) { throw '[pipeline] -L
 
 $script:refused = $false
 $script:problems = @()
+$script:failedMarker = Join-Path $Root 'FAILED.txt'   # one line: time, step, exit code, the last error line, the log; a monitor polls for it
+$script:markerWritten = $false
+
+# The line of a step's log that says why it failed: the last Python exception line, else a verify summary with problems, else the last
+# "refused / NOT READY / FAILED" line, else the last line; PowerShell's own error-record decoration and torch's device-count noise are skipped.
+function LastErrorLine([string]$log) {
+  if (-not $log -or -not (Test-Path $log)) { return '(no log)' }
+  $noise = '^\s*\+|^\s*At line|CategoryInfo|FullyQualifiedErrorId|NativeCommandError|Failed to get device count|^\s*$'
+  $lines = @(Get-Content $log -Tail 200 -ErrorAction SilentlyContinue | Where-Object { $_ -and $_ -notmatch $noise })
+  if ($lines.Count -eq 0) { return '(empty log)' }
+  foreach ($pat in '^\s*[\w\.]*(Error|Exception|SystemExit)\b', '\b[1-9]\d* problem\(s\)', 'refused|NOT READY|FAILED|\bfailed\b|Traceback') {
+    $hit = $lines | Where-Object { $_ -match $pat } | Select-Object -Last 1
+    if ($hit) { return $hit.Trim() }
+  }
+  return $lines[-1].Trim()
+}
+
+function Write-Failed([string]$step, [string]$msg, [string]$log = '') {
+  try {
+    New-Item -ItemType Directory -Force (Split-Path -Parent $script:failedMarker) | Out-Null
+    $line = ("{0} FAILED step={1}: {2}" -f (Get-Date -Format 'yyyy-MM-ddTHH:mm:ss'), $step, ($msg -replace '[\r\n]+', ' '))
+    if ($line.Length -gt 600) { $line = $line.Substring(0, 600) + '...' }
+    if ($log) { $line += "  [log $log]" }
+    Set-Content -Path $script:failedMarker -Value $line -Encoding ascii
+    $script:markerWritten = $true
+  } catch { }
+}
 
 # ---- helpers ----------------------------------------------------------------------------------------
 function Q([string]$a) { if ($a -match '^[A-Za-z0-9_\-\.\\:/=,]+$') { $a } else { '"' + $a.Replace('"', '\"') + '"' } }
@@ -114,6 +141,19 @@ function FreeGiB([string]$path) {
   return [math]::Round((Get-PSDrive $r.Substring(0, 1)).Free / 1GB, 1)
 }
 function HessianDone([int]$L) { Test-Path (Join-Path $Root ("hessian\L{0:D2}\DONE.json" -f $L)) }
+# `verify --delete-hessians` removes a layer's .hess files and keeps DONE.json, so DONE alone does not mean the Hessians exist
+function HessianFiles([int]$L) {
+  $d = Join-Path $Root ("hessian\L{0:D2}" -f $L)
+  (Test-Path $d) -and ($null -ne (Get-ChildItem $d -Filter '*.hess' -File -ErrorAction SilentlyContinue | Select-Object -First 1))
+}
+# True when every oracle chunk of layer $L is usable in every -Ks directory for the CURRENT code / job key (oracle_q35.py status)
+function OracleComplete([int]$L) {
+  $a = @($oracleScript, 'status', '--layer', "$L", '--model-dir', $Model, '--hessian-root', $Root)
+  foreach ($k in $kList) { $a += @('--out-dir', ((OracleDir $k) + "@$k")) }
+  $saved = $env:HIP_VISIBLE_DEVICES; $env:HIP_VISIBLE_DEVICES = '-1'
+  $prev = $ErrorActionPreference; $ErrorActionPreference = 'Continue'   # torch writes "Failed to get device count" to stderr
+  try { & $OraclePython @a *> $null; return ($LASTEXITCODE -eq 0) } finally { $env:HIP_VISIBLE_DEVICES = $saved; $ErrorActionPreference = $prev }
+}
 
 function Open-Gpu {
   if ($Device -notmatch '^[01]$') { $script:problems += "-Device must be 0 or 1, got '$Device'" }
@@ -157,7 +197,10 @@ function Step([string]$name, [string]$exe, [string[]]$a, [bool]$gpu, [bool]$read
     }
   } finally { $ErrorActionPreference = $prev }
   $min = [math]::Round(((Get-Date) - $t0).TotalMinutes, 1)
-  if ($rc -ne 0) { throw "[pipeline] $name failed (exit $rc) after $min min, see $log" }
+  if ($rc -ne 0) {
+    Write-Failed $name ("exit $rc after $min min: " + (LastErrorLine $log)) $log
+    throw "[pipeline] $name failed (exit $rc) after $min min, see $log"
+  }
   Write-Host "[pipeline] $name done in $min min (log $log)"
 }
 
@@ -186,11 +229,19 @@ function Stage-Hessian([int]$L) {
   Open-Gpu
   Need (Test-Path $Tokens) "no $Tokens (run -Stage corpus)"
   Need ((FreeGiB $Root) -ge $MinFreeGiB) "less than $MinFreeGiB GiB free on $Root (a layer step needs two 6 GB residual boundaries + 11 GB of accumulators + 6 GB of Hessians; -Stage budget has the whole chain)"
-  if ((HessianDone $L) -and -not $Force) { Write-Host "[pipeline] hessian L${L}: DONE already, skipping (-Force redoes it)"; Flush-Problems "hessian-L$L"; return }
+  $recapture = $false
+  if ((HessianDone $L) -and -not $Force) {
+    if (HessianFiles $L) { Write-Host "[pipeline] hessian L${L}: DONE already, skipping (-Force redoes it)"; Flush-Problems "hessian-L$L"; return }
+    if (OracleComplete $L) { Write-Host "[pipeline] hessian L${L}: DONE, Hessians already deleted after a verified oracle: not needed"; Flush-Problems "hessian-L$L"; return }
+    # DONE, the .hess files are gone (verify --delete-hessians) and the oracle chunks are NOT usable for this code (the job key changed,
+    # a chunk is missing): the Hessians are needed again. Needs the layer's input boundary: redo the layers from the first stale one.
+    Write-Host "[pipeline] hessian L${L}: DONE but its .hess files were deleted and its oracle chunks are stale or missing: capturing again"
+    $recapture = $true
+  }
   Flush-Problems "hessian-L$L"
   $a = @($hessScript, 'capture', '--layer', "$L", '--root', $Root, '--tokens', $Tokens, '--model-dir', $Model,
          '--budget-seconds', "$BudgetSeconds")
-  if ($Force) { $a += '--force' }
+  if ($Force -or $recapture) { $a += '--force' }
   Step "hessian-L$L" $Python $a $true
   Step "hessian-check-L$L" $Python @($hessScript, 'check', '--layer', "$L", '--root', $Root, '--eig-sample', '2') $false
 }
@@ -260,7 +311,9 @@ function Stage-Convert {
 
 # ---- dispatch ---------------------------------------------------------------------------------------
 if (-not $Run) { Write-Host '[pipeline] PLAN ONLY: no -Run, nothing is executed' }
+elseif (Test-Path $script:failedMarker) { Remove-Item $script:failedMarker -Force }
 Write-Host "[pipeline] root $Root, layers $($layerList -join ','), K in $($kList -join ','), cap $CapGib GiB per card, device $Device"
+try {
 switch ($Stage) {
   'corpus'  { Stage-Corpus }
   'hessian' { foreach ($L in $layerList) { Stage-Hessian $L } }
@@ -281,4 +334,8 @@ switch ($Stage) {
     Stage-Alloc
     Stage-Convert
   }
+}
+} catch {
+  if ($Run -and -not $script:markerWritten) { Write-Failed "stage $Stage" ($_.Exception.Message) }
+  throw
 }

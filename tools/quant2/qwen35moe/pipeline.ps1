@@ -28,6 +28,13 @@
 # the next slice. State between slices lives under <Root>\work (hessian accumulators, residual boundaries) and in the oracle
 # chunk files, with content hashes. Everything is resumable: re-run the same command.
 #
+# TWO LANES (-Lanes 2, -Stage all): the K4 oracle runs on a second GPU in parallel with the Hessians + K3 oracle (README "Two lanes").
+#   lane A  HIP device -DeviceA (1), lock -LockA (gpu):      per layer  hessian -> check -> oracle K3
+#   lane B  HIP device -DeviceB (0), lock -LockB (gpu-dev0): per layer  (waits for the layer's hessian marker) -> oracle K4
+#   verify (CPU, deletes the Hessians) runs once per layer, by whichever lane finishes second. State: <Root>\lanes\ marker files.
+#   A failure in either lane writes <Root>\FAILED.txt (lane=A|B) and a STOP marker; the other lane stops at its next slice boundary.
+#   Default (-Lanes 1) is the single-lane behaviour below, unchanged.
+#
 # Python: -Python (the reference venv: transformers with qwen3_5_moe, torch 2.9.1+rocm) for everything: trellis_quant.block_ldl
 # factors on the CPU for GPU tensors, so no MAGMA venv is needed (-OraclePython overrides).
 param(
@@ -54,9 +61,20 @@ param(
   [string]$Exe = '',
   [string]$Device = '0',
   [int]$Threads = 32,
-  [double]$MinFreeGiB = 40               # free space a layer step needs under -Root (disk_budget.py: ~32 GiB of scratch + margin)
+  [double]$MinFreeGiB = 40,              # free space a layer step needs under -Root (disk_budget.py: ~32 GiB of scratch + margin)
+  [int]$Lanes = 1,                       # 2 = two GPU lanes in parallel (-Stage all only): lane A = hessian + K3 on -DeviceA, lane B = K4 on -DeviceB
+  [string]$Lane = '',                    # internal: 'A' or 'B', set by the -Lanes 2 supervisor for the lane processes it starts
+  [string]$DeviceA = '1',
+  [string]$DeviceB = '0',                # the display GPU: a probe runs first, a display-driver reset event stops both lanes
+  [string]$LockA = 'gpu',
+  [string]$LockB = 'gpu-dev0',           # tools\with_lock.ps1 -Name gpu-dev0: tests on device 0 should take it (or both locks)
+  [int]$MaxInFlight = 2,                 # layers whose Hessians may exist at once (lane A waits for verify of layer i-MaxInFlight)
+  [int]$CohortB = 0,                     # oracle cohort threads of lane B (0 = -Cohort)
+  [int]$PollSeconds = 20,
+  [double]$ProbeMinFreeGiB = 14          # lane B start: free VRAM the probe requires on the display GPU (the oracle cohort needs ~8 GiB)
 )
 $ErrorActionPreference = 'Stop'
+$script:boundParams = $PSBoundParameters   # the lane supervisor forwards them to its lane processes
 $repo = Split-Path -Parent (Split-Path -Parent (Split-Path -Parent $PSScriptRoot))
 Set-Location $repo
 $env:PYTHONIOENCODING = 'utf-8'
@@ -102,6 +120,8 @@ $layerList = ParseLayers $Layers
 $propList = if ($Propagate) { ParseLayers $Propagate } else { @() }
 if ($layerList | Where-Object { $_ -lt 0 -or $_ -gt 47 }) { throw '[pipeline] -Layers must be within 0..47' }
 
+$script:LockName = 'gpu'      # lane B uses -LockB
+$script:laneStart = Get-Date
 $script:refused = $false
 $script:problems = @()
 $script:failedMarker = Join-Path $Root 'FAILED.txt'   # one line: time, step, exit code, the last error line, the log; a monitor polls for it
@@ -124,11 +144,15 @@ function LastErrorLine([string]$log) {
 function Write-Failed([string]$step, [string]$msg, [string]$log = '') {
   try {
     New-Item -ItemType Directory -Force (Split-Path -Parent $script:failedMarker) | Out-Null
-    $line = ("{0} FAILED step={1}: {2}" -f (Get-Date -Format 'yyyy-MM-ddTHH:mm:ss'), $step, ($msg -replace '[\r\n]+', ' '))
+    $tag = if ($Lane) { "lane=$Lane " } else { '' }
+    $line = ("{0} FAILED {1}step={2}: {3}" -f (Get-Date -Format 'yyyy-MM-ddTHH:mm:ss'), $tag, $step, ($msg -replace '[\r\n]+', ' '))
     if ($line.Length -gt 600) { $line = $line.Substring(0, 600) + '...' }
     if ($log) { $line += "  [log $log]" }
-    Set-Content -Path $script:failedMarker -Value $line -Encoding ascii
+    if (-not (Test-Path $script:failedMarker)) {   # the FIRST failure of a run is the one that stays (-Run deletes the marker at start)
+      Set-Content -Path $script:failedMarker -Value $line -Encoding ascii
+    }
     $script:markerWritten = $true
+    if ($Lane) { LMark 'STOP' "lane $Lane failed at $step" }
   } catch { }
 }
 
@@ -147,9 +171,10 @@ function HessianFiles([int]$L) {
   (Test-Path $d) -and ($null -ne (Get-ChildItem $d -Filter '*.hess' -File -ErrorAction SilentlyContinue | Select-Object -First 1))
 }
 # True when every oracle chunk of layer $L is usable in every -Ks directory for the CURRENT code / job key (oracle_q35.py status)
-function OracleComplete([int]$L) {
-  $a = @($oracleScript, 'status', '--layer', "$L", '--model-dir', $Model, '--hessian-root', $Root)
-  foreach ($k in $kList) { $a += @('--out-dir', ((OracleDir $k) + "@$k")) }
+function OracleComplete([int]$L) { OracleCompleteFor $L $kList }
+function OracleCompleteFor([int]$L, [int[]]$ks) {
+  $a = @($oracleScript, 'status', '--layer', "$L", '--model-dir', $Model, '--hessian-root', $Root, '--chunk-experts', "$ChunkExperts")
+  foreach ($k in $ks) { $a += @('--out-dir', ((OracleDir $k) + "@$k")) }
   $saved = $env:HIP_VISIBLE_DEVICES; $env:HIP_VISIBLE_DEVICES = '-1'
   $prev = $ErrorActionPreference; $ErrorActionPreference = 'Continue'   # torch writes "Failed to get device count" to stderr
   try { & $OraclePython @a *> $null; return ($LASTEXITCODE -eq 0) } finally { $env:HIP_VISIBLE_DEVICES = $saved; $ErrorActionPreference = $prev }
@@ -173,8 +198,8 @@ function Step([string]$name, [string]$exe, [string[]]$a, [bool]$gpu, [bool]$read
   if ($gpu) {
     $pre = "set HIP_VISIBLE_DEVICES=$Device&& "
     if ($Device -eq '0') { $pre += 'set R4DX_ALLOW_GPU0=1&& ' }
-    $wl = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', (Join-Path $repo 'tools\with_lock.ps1'), '-Name', 'gpu', '-Run', ($pre + $inner))
-    $shown = "powershell -NoProfile -ExecutionPolicy Bypass -File tools\with_lock.ps1 -Name gpu -Run `"$pre$inner`""
+    $wl = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', (Join-Path $repo 'tools\with_lock.ps1'), '-Name', $script:LockName, '-Run', ($pre + $inner))
+    $shown = "powershell -NoProfile -ExecutionPolicy Bypass -File tools\with_lock.ps1 -Name $($script:LockName) -Run `"$pre$inner`""
   } else {
     $shown = "`$env:HIP_VISIBLE_DEVICES='-1'; $inner"
   }
@@ -192,7 +217,13 @@ function Step([string]$name, [string]$exe, [string[]]$a, [bool]$gpu, [bool]$read
         try { & $exe @a *>> $log } finally { $env:HIP_VISIBLE_DEVICES = $saved }
       }
       $rc = $LASTEXITCODE
-      if ($rc -eq 75 -and $gpu) { Write-Host ("[pipeline] {0}: slice done, more to do ({1:N1} min so far), lock released" -f $name, ((Get-Date) - $t0).TotalMinutes); continue }
+      if ($Lane -eq 'B' -and $gpu) {   # the display GPU: a driver reset in this run's lifetime stops everything, no blind retry
+        $ev = Display-Reset $script:laneStart
+        if ($ev) { Write-Failed $name "display driver reset event during lane B: $ev" $log; throw "[pipeline] $name stopped: $ev" }
+      }
+      if ($rc -eq 75 -and $gpu) {
+        if ($Lane -and (LHas 'STOP')) { Write-Host "[lane $Lane] stop requested between slices of ${name}: state saved, resumable"; throw 'LANE_STOP' }
+        LaneStatus "$name slice done, continuing"; Write-Host ("[pipeline] {0}: slice done, more to do ({1:N1} min so far), lock released" -f $name, ((Get-Date) - $t0).TotalMinutes); continue }
       break
     }
   } finally { $ErrorActionPreference = $prev }
@@ -246,15 +277,18 @@ function Stage-Hessian([int]$L) {
   Step "hessian-check-L$L" $Python @($hessScript, 'check', '--layer', "$L", '--root', $Root, '--eig-sample', '2') $false
 }
 
-function Stage-Oracle([int]$L) {
+function Stage-Oracle([int]$L, [int[]]$ks = @()) {
   if ($propList -contains $L) { return }
+  if ($ks.Count -eq 0) { $ks = $kList }
   Open-Gpu
   Need (Test-Path $OraclePython) "no oracle python at $OraclePython"
   if (-not (HessianDone $L) -and $Run) { $script:problems += "layer $L has no Hessians (run -Stage hessian)" }
   Flush-Problems "oracle-L$L"
-  foreach ($k in $kList) {
+  foreach ($k in $ks) {
+    if ($Lane -and $Run -and (OracleCompleteFor $L @($k))) { Write-Host "[lane $Lane] oracle-k$k-L${L}: every chunk usable already, skipping"; continue }
+    $coh = if ($Lane -eq 'B' -and $CohortB -gt 0) { $CohortB } else { $Cohort }
     $a = @($oracleScript, 'quantize', '--layer', "$L", '--K', "$k", '--out-dir', (OracleDir $k), '--hessian-root', $Root,
-           '--model-dir', $Model, '--chunk-experts', "$ChunkExperts", '--cohort', "$Cohort", '--budget-seconds', "$BudgetSeconds")
+           '--model-dir', $Model, '--chunk-experts', "$ChunkExperts", '--cohort', "$coh", '--budget-seconds', "$BudgetSeconds")
     if ($Force) { $a += '--force' }
     Step "oracle-k$k-L$L" $OraclePython $a $true
   }
@@ -262,7 +296,7 @@ function Stage-Oracle([int]$L) {
 
 function Stage-Verify([int]$L) {
   if ($propList -contains $L) { return }
-  $a = @($oracleScript, 'verify', '--layer', "$L", '--model-dir', $Model, '--hessian-root', $Root, '--delete-hessians')
+  $a = @($oracleScript, 'verify', '--layer', "$L", '--model-dir', $Model, '--hessian-root', $Root, '--chunk-experts', "$ChunkExperts", '--delete-hessians')
   foreach ($k in $kList) { $a += @('--out-dir', ((OracleDir $k) + "@$k")) }
   Step "verify-L$L" $OraclePython $a $false
 }
@@ -309,11 +343,157 @@ function Stage-Convert {
   if ($Run -and (Test-Path $Output)) { Write-Host "[pipeline] container ${Output}: $([math]::Round((Get-Item $Output).Length / 1GB, 2)) GB" }
 }
 
+
+# ---- two lanes ----------------------------------------------------------------------------------------------------
+# Marker files in <Root>\lanes\ (wiped by the supervisor at start; every fact is re-derived from the oracle dirs by the lanes):
+#   hess-LNN.ready     lane A: the layer's Hessians are on disk and checked (lane B may start its oracle)
+#   kK-LNN.done        the lane that owns K: every chunk of layer NN at K is usable
+#   verify-LNN.claim   created atomically (CreateNew) by the lane that runs verify; the other one finds it and moves on
+#   verify-LNN.done    verify ran (or was not needed): the layer's Hessians are deleted; lane A needs it for layer NN+MaxInFlight
+#   STOP               a lane failed: the other stops at its next slice boundary (it is never killed)
+#   lane-A.status / lane-B.status   one line: time, what the lane is doing
+$script:lanesDir = Join-Path $Root 'lanes'
+function Lk([string]$n) { Join-Path $script:lanesDir $n }
+function LTag([int]$L) { 'L{0:D2}' -f $L }
+function LMark([string]$n, [string]$text = '') {
+  try { New-Item -ItemType Directory -Force $script:lanesDir | Out-Null; Set-Content -Path (Lk $n) -Value ("{0} {1}" -f (Get-Date -Format 'yyyy-MM-ddTHH:mm:ss'), $text) -Encoding ascii } catch { }
+}
+function LHas([string]$n) { Test-Path (Lk $n) }
+function LaneStatus([string]$m) { if ($Lane -and $Run) { LMark "lane-$Lane.status" $m } }
+function Check-Stop {
+  if ($Lane -and $Run -and (LHas 'STOP')) { Write-Host "[lane $Lane] stop requested (the other lane failed): stopping at this boundary, state is resumable"; throw 'LANE_STOP' }
+}
+function Wait-For([scriptblock]$cond, [string]$what) {
+  if (-not $Run) { return }
+  $t0 = Get-Date; $say = Get-Date
+  while (-not (& $cond)) {
+    Check-Stop
+    LaneStatus "waiting for $what"
+    if (((Get-Date) - $say).TotalMinutes -ge 10) { Write-Host ("[lane {0}] still waiting for {1} ({2:N0} min)" -f $Lane, $what, ((Get-Date) - $t0).TotalMinutes); $say = Get-Date }
+    Start-Sleep -Seconds $PollSeconds
+  }
+}
+# Display-driver reset events (TDR) since $since; $null when none. Lane B runs on the display GPU.
+function Display-Reset([datetime]$since) {
+  try {
+    $e = Get-WinEvent -FilterHashtable @{ LogName = 'System'; ProviderName = 'Display', 'amdkmdag', 'amdwddmg'; Id = 4101, 117, 141; StartTime = $since } -MaxEvents 1 -ErrorAction Stop
+    return ("event {0} {1} at {2}" -f $e.Id, $e.ProviderName, $e.TimeCreated)
+  } catch { return $null }
+}
+# Whichever lane finishes second runs verify; the atomic CreateNew claim means no race and no double delete.
+function Try-Verify([int]$L) {
+  if (-not $Run) { if ($Lane -eq 'B') { Write-Host "[lane B] (verify of layer ${L}: run by whichever lane finishes the layer second)"; Stage-Verify $L }; return }
+  $t = LTag $L
+  if (LHas "verify-$t.done") { return }
+  foreach ($k in $kList) { if (-not (LHas "k$k-$t.done")) { return } }
+  try { $fs = [IO.File]::Open((Lk "verify-$t.claim"), [IO.FileMode]::CreateNew, [IO.FileAccess]::Write); $fs.Close() } catch { return }
+  if (HessianFiles $L) { LaneStatus "verify $t"; Stage-Verify $L } else { Write-Host "[lane $Lane] verify ${t}: Hessians already deleted, nothing to do" }
+  LMark "verify-$t.done" "lane $Lane"
+}
+
+function Run-Lane([string]$which) {
+  $script:Lane = $which
+  $script:LockName = if ($which -eq 'B') { $LockB } else { $LockA }
+  $script:Device = if ($which -eq 'B') { $DeviceB } else { $DeviceA }
+  $script:laneStart = Get-Date
+  $ks = @($kList)
+  if ($ks.Count -lt 2) { throw '[pipeline] -Lanes 2 needs two rates in -Ks (3,4)' }
+  $myKs = if ($which -eq 'A') { @($ks[0]) } else { @($ks[1..($ks.Count - 1)]) }
+  Write-Host "`n[lane $which] device $Device, lock $script:LockName, K $($myKs -join ','), layers $($layerList -join ',')"
+  if ($which -eq 'B') {
+    # a probe before any oracle work on the display GPU: responsive, enough free VRAM
+    Step 'gpu-probe-B' $Python @((Join-Path $qdir 'gpu_probe.py'), '--min-free-gib', "$ProbeMinFreeGiB") $true
+  }
+  for ($i = 0; $i -lt $layerList.Count; $i++) {
+    $L = $layerList[$i]; $t = LTag $L
+    Check-Stop
+    Write-Host "`n[lane $which] ===== layer $L"
+    if ($which -eq 'A') {
+      if ($i -ge $MaxInFlight) { $g = LTag $layerList[$i - $MaxInFlight]; Wait-For { LHas "verify-$g.done" } "verify of $g (at most $MaxInFlight layers of Hessians in flight)" }
+      LaneStatus "hessian $t"
+      Stage-Hessian $L
+      LMark "hess-$t.ready" 'hessians on disk and checked, or not needed'
+    } else {
+      Wait-For { LHas "hess-$t.ready" } "the Hessians of $t (lane A)"
+    }
+    Check-Stop
+    foreach ($k in $myKs) {
+      LaneStatus "oracle K$k $t"
+      Stage-Oracle $L @($k)
+      LMark "k$k-$t.done" "lane $which"
+    }
+    Try-Verify $L
+  }
+  LaneStatus 'finished all layers'
+  Write-Host "[lane $which] finished all layers"
+}
+
+function Start-Lane([string]$which, [string]$dev) {
+  $a = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $PSCommandPath, '-Stage', 'all', '-Run', '-Lane', $which, '-Device', $dev)
+  foreach ($name in $script:forward.Keys) {
+    $v = $script:forward[$name]
+    if ($v -is [switch]) { if ($v.IsPresent) { $a += "-$name" } } else { $a += @("-$name", $(if ("$v" -match '\s') { '"' + "$v" + '"' } else { "$v" })) }
+  }
+  $out = Join-Path $logdir "lane-$which.out.log"; $err = Join-Path $logdir "lane-$which.err.log"
+  $pr = Start-Process -FilePath 'powershell.exe' -ArgumentList $a -WindowStyle Hidden -PassThru -RedirectStandardOutput $out -RedirectStandardError $err
+  $null = $pr.Handle   # PS 5.1: without the handle cached, ExitCode of a finished process reads as $null
+  Write-Host "[supervisor] lane $which started: pid $($pr.Id), device $dev, log $out"
+  return $pr
+}
+
+function Run-Supervisor {
+  if ($Stage -ne 'all') { throw '[pipeline] -Lanes 2 applies to -Stage all' }
+  if ($propList.Count -gt 0) { throw '[pipeline] -Lanes 2 does not support -Propagate' }
+  Stage-Corpus
+  if (-not $Run) {
+    Write-Host "`n[supervisor] PLAN for -Lanes 2: two processes, started detached, markers in $script:lanesDir, a failure in either stops both at a slice boundary."
+    Run-Lane 'A'
+    Run-Lane 'B'
+    $script:Lane = ''
+    Stage-Alloc
+    Stage-Convert
+    return
+  }
+  New-Item -ItemType Directory -Force $logdir | Out-Null
+  if (Test-Path $script:lanesDir) { Remove-Item -Recurse -Force $script:lanesDir }
+  New-Item -ItemType Directory -Force $script:lanesDir | Out-Null
+  $script:forward = [ordered]@{}
+  foreach ($kv in $script:boundParams.GetEnumerator()) {
+    if ($kv.Key -in 'Stage', 'Run', 'Lanes', 'Lane', 'Device') { continue }
+    $script:forward[$kv.Key] = $kv.Value
+  }
+  $pa = Start-Lane 'A' $DeviceA
+  $pb = Start-Lane 'B' $DeviceB
+  $say = Get-Date
+  while (-not ($pa.HasExited -and $pb.HasExited)) {
+    Start-Sleep -Seconds 30
+    foreach ($pr in @(@('A', $pa), @('B', $pb))) {
+      $w, $proc = $pr
+      if ($proc.HasExited -and $proc.ExitCode -notin 0, 3 -and -not (Test-Path $script:failedMarker)) {
+        Write-Failed "lane $w process" "exited with code $($proc.ExitCode) without a FAILED marker (see $logdir\lane-$w.err.log)"
+        LMark 'STOP' "lane $w process died"
+      }
+    }
+    if (((Get-Date) - $say).TotalMinutes -ge 10) {
+      $v = @(Get-ChildItem $script:lanesDir -Filter 'verify-*.done' -ErrorAction SilentlyContinue).Count
+      Write-Host ("[supervisor] {0} layers verified; A: {1}; B: {2}" -f $v, (Get-Content (Lk 'lane-A.status') -ErrorAction SilentlyContinue), (Get-Content (Lk 'lane-B.status') -ErrorAction SilentlyContinue))
+      $say = Get-Date
+    }
+  }
+  $pa.WaitForExit(); $pb.WaitForExit()
+  Write-Host "[supervisor] lane A exit $($pa.ExitCode), lane B exit $($pb.ExitCode)"
+  if (Test-Path $script:failedMarker) { throw "[pipeline] a lane failed: $(Get-Content $script:failedMarker -TotalCount 1)" }
+  if ($pa.ExitCode -ne 0 -or $pb.ExitCode -ne 0) { throw "[pipeline] a lane stopped without finishing (exit A $($pa.ExitCode), B $($pb.ExitCode))" }
+  Stage-Alloc
+  Stage-Convert
+}
+
 # ---- dispatch ---------------------------------------------------------------------------------------
 if (-not $Run) { Write-Host '[pipeline] PLAN ONLY: no -Run, nothing is executed' }
-elseif (Test-Path $script:failedMarker) { Remove-Item $script:failedMarker -Force }
+elseif (-not $Lane -and (Test-Path $script:failedMarker)) { Remove-Item $script:failedMarker -Force }   # a lane process must not delete the other lane's marker
 Write-Host "[pipeline] root $Root, layers $($layerList -join ','), K in $($kList -join ','), cap $CapGib GiB per card, device $Device"
 try {
+if ($Lane) { Run-Lane $Lane } elseif ($Lanes -ge 2) { Run-Supervisor } else {
 switch ($Stage) {
   'corpus'  { Stage-Corpus }
   'hessian' { foreach ($L in $layerList) { Stage-Hessian $L } }
@@ -335,7 +515,9 @@ switch ($Stage) {
     Stage-Convert
   }
 }
+}
 } catch {
+  if ($_.Exception.Message -eq 'LANE_STOP') { exit 3 }   # stopped on request, not a failure of this lane
   if ($Run -and -not $script:markerWritten) { Write-Failed "stage $Stage" ($_.Exception.Message) }
   throw
 }

@@ -4,6 +4,9 @@
 
 .DESCRIPTION
   -Name gpu    every process that touches a GPU (tests, tools, reference scripts with --device cuda)
+  -Name gpu-dev0  jobs on HIP device 0 only (the display GPU) while a second lane runs on device 1 under -Name gpu:
+                  tools\quant2\qwen35moe\pipeline.ps1 -Lanes 2 puts its K4 lane here; take it for anything else you run on device 0
+  -Name gpu-test  a second device-0 lock for tests of that two-lane driver itself
   -Name build  every cmake configure/build (one build tree, build\win-hip)
   -Run         the command line, executed with `cmd /c` in the caller's cwd.
   Waits up to -TimeoutMinutes for the lock (default 240) and returns the command's exit code
@@ -14,7 +17,7 @@
   powershell -NoProfile -ExecutionPolicy Bypass -File tools\with_lock.ps1 -Name gpu -Run "build\win-hip\tests\model\qwen4exp\test_gpu_qsa.exe"
 #>
 param(
-    [Parameter(Mandatory = $true)][ValidateSet("gpu", "build")][string]$Name,
+    [Parameter(Mandatory = $true)][ValidateSet("gpu", "gpu-dev0", "gpu-test", "build")][string]$Name,
     [Parameter(Mandatory = $true)][string]$Run,
     [int]$TimeoutMinutes = 240
 )

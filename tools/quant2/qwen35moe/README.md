@@ -219,6 +219,60 @@ they reproduce with an identity Hessian, in the weights alone.
   deleted too. Cost: 3 x ~7 min of Hessians + 3 x (K3 ~14 + K4 ~13 min) of oracle.
 * **So it cannot happen silently again:** the oracle prints `WARNING ... POOR group` (proxy > 0.3 or g <= 0.05) and `alloc_q35.py`'s report
   counts POOR groups in the chosen mix.
+## Two lanes (`-Lanes 2`): K3 and K4 on two GPUs
+
+```powershell
+.\tools\quant2\qwen35moe\pipeline.ps1 -Stage all -Layers 0..47 -Lanes 2            # the plan: both lanes' commands, nothing runs
+.\tools\quant2\qwen35moe\pipeline.ps1 -Stage all -Layers 0..47 -Lanes 2 -Run      # supervisor + lane A + lane B (detach the supervisor)
+```
+
+| | lane A | lane B |
+|---|---|---|
+| HIP device / lock | `-DeviceA 1` / `-LockA gpu` | `-DeviceB 0` (`R4DX_ALLOW_GPU0=1`) / `-LockB gpu-dev0` |
+| per layer | wait for verify of layer i-`MaxInFlight` -> hessian -> check -> oracle K3 | wait for A's `hess-LNN.ready` -> oracle K4 |
+| first thing | | `gpu_probe.py` (responsive, >= `-ProbeMinFreeGiB` 14 GiB free) |
+
+The supervisor (the process you start) wipes `<Root>\lanes\` and `FAILED.txt`, starts the two lane processes hidden with their output in
+`<Root>\logs\lane-A.out.log` / `lane-B.out.log`, prints a status line every 10 minutes, and runs alloc + convert when both lanes finished
+every layer. Lane processes are ordinary `pipeline.ps1 -Stage all -Lane A|B -Run` with the supervisor's parameters forwarded; each step is
+one 14-minute slice under its lock, as in single-lane mode (default `-Lanes 1` is unchanged).
+
+**State.** Everything is re-derived from the oracle directories (`oracle_q35.py status`, `.hess` files, `DONE.json`), so any interruption
+resumes by running the same command again; the marker files in `<Root>\lanes\` only coordinate the two live lanes:
+`hess-LNN.ready` (A -> B), `kK-LNN.done`, `verify-LNN.claim` / `.done`, `STOP`, `lane-A.status` / `lane-B.status` (one line: time, what it
+is doing). **Verify** (CPU, deletes the layer's Hessians) runs once per layer, by whichever lane finishes the layer second: both K done ->
+create `verify-LNN.claim` with `FileMode.CreateNew` (atomic: exactly one lane gets it) -> run verify -> `verify-LNN.done`. Tested: 12 layers,
+two jobs each finishing at random offsets, verify ran exactly 12 times. **Disk:** lane A starts the Hessians of layer i only when layer
+i-`MaxInFlight` (2) is verified, so at most two layers of Hessians (2 x 5 GiB) plus one capture's scratch (27 GiB) exist; layers already
+complete from an earlier run are passed by both lanes in seconds (`status`).
+
+**Failure.** A failing step in either lane (non-zero exit; a prerequisite refusal; a display-driver reset event) writes
+`<Root>\FAILED.txt` -- one line, `... FAILED lane=B step=oracle-k4-L17: exit 1 after 4.2 min: <last error line> [log ...]`, the FIRST failure of a
+run stays -- and `lanes\STOP`. **Both lanes stop** (my choice: a failure is usually deterministic and also hits the other lane, and a stop
+on the display GPU must not leave the other card running unattended): the other lane finishes its current slice (<= 14 min), notices STOP
+between slices, exits with code 3 and leaves resumable state; nothing is killed. The supervisor then exits non-zero.
+
+**Display safety (lane B is on the GPU that drives the display).** The probe runs first (lane B refuses to start if device 0 is
+unresponsive or has < 14 GiB free). After every lane-B slice the driver looks in the System event log for display-driver reset events
+(Display / amdkmdag / amdwddmg, ids 4101, 117, 141) since the lane started and stops both lanes if there is one. A HIP error in the oracle
+process is a non-zero exit -> FAILED.txt. Nothing retries: the only loop is "slice returned 75 = more work", as before.
+
+**Locks.** `tools\with_lock.ps1` accepts `-Name gpu-dev0` (and `gpu-test`). Lane B holds `gpu-dev0` only, lane A holds `gpu` only, so the
+two never wait for each other; any OTHER job that uses device 0 should take `gpu-dev0` (a job on device 1 keeps taking `gpu`).
+
+**Balance.** Per layer, lane A needs ~7 min of Hessians + ~14 min of K3 on device 1 (~21 min), lane B ~13-16 min of K4 on device 0, so lane A
+is the bottleneck: ~21 min per layer, ~12 h for 34 layers instead of ~19 h. Putting the Hessians on lane B instead would balance them at
+~14 vs ~20 min (no gain) and put the 18 GiB capture on the display GPU, so they stay on A.
+**CPU contention, measured (2026-10-22, with the main single-lane run live on device 1 as "lane A").** A real layer-3 K4 oracle chunk of 32
+experts on device 0 at the same time as the main run's K3 chunks on device 1 (the two-lane situation; `block_ldl` and the cohort threads
+share the 16-core / 32-thread CPU): the lane-B chunk took 114.7 s (23.6 k encoder tiles/s) at `--cohort 32`, 129.2 s at `--cohort 16`, 115.5 s at
+`--cohort 8`, against 92-98 s (28.4 k tiles/s) for the same K4 chunk running alone on device 1; the main run's K3 chunks went from ~110 s to
+113-117 s (about 5% slower). CPU load during the overlap averaged 41% (peaks 91-94% while several groups factor on the CPU at once). So the
+second oracle costs the first ~5% and itself ~15-20% against a lone run, and lowering the cohort does not help (8 = 32, 16 is worse):
+`-CohortB` exists but the default (= `-Cohort`, 32) stays. Per layer that is lane A ~7 min Hessians + ~16 min K3 and lane B ~16 min K4 ->
+~23 min per layer, ~12.5 h for the remaining ~33 layers. Lane B idles ~7 min per layer; splitting K3 chunks between the lanes (both work on a
+layer's chunks from opposite ends) would use that and reach ~19 min per layer, but chunks of one K are written by one process at a time today,
+so it is not built.
 ## Failure marker
 
 `pipeline.ps1 -Run` deletes `<Root>\FAILED.txt` at start and writes one line on any stage failure (a step's non-zero exit, a refused
@@ -226,7 +280,7 @@ prerequisite, any exception): `2026-10-21T10:12:12 FAILED step=hessian-L3: exit 
 (the step, the exit code, the last Python exception line of the step's log, the log path; <= 600 characters). A monitor polls for the file.
 ## Tests
 
-`tests\reference\test_refit_fallback.py` (CPU, ~1 min: the refit fallback and the EOL-tolerant job match); `tests\reference\test_no_evidence.py` (CPU, ~1 min, 30 checks: the no-evidence policy through finalize_layer, null groups, the oracle record, the allocation report); `tools\reference\qwen35moe\test_ref.py` (CPU: the streaming reference equals a plain HF forward on the tiny model, bit for bit with the eager
+`tests\reference\test_refit_fallback.py` (CPU, ~1 min: the refit fallback and the EOL-tolerant job match); `tests\reference\test_lanes.ps1 [-Gpu]` (the two-lane logic: verify exactly once under a race, STOP / FAILED markers, the plan; with `-Gpu` the tiny model through both lanes, ~17 min); `tests\reference\test_no_evidence.py` (CPU, ~1 min, 39 checks: the no-evidence policy through finalize_layer, null groups, the oracle record, the allocation report); `tools\reference\qwen35moe\test_ref.py` (CPU: the streaming reference equals a plain HF forward on the tiny model, bit for bit with the eager
 experts); `tiny_e2e.py` runs the whole chain on tiny-q35moe (`--device cuda --gpu-device 0` for the oracle).
 Note for the owner of `tiny_golden.py`: its docstring says "eager per-expert MoE loop", but HF 5.18's default `experts_implementation` is
 `grouped_mm`, which is what the goldens ran (`load_hf_model` sets the wrong attribute). Eager and grouped_mm differ by ~1 bf16 ulp per

@@ -551,7 +551,8 @@ def cmd_quantize(args) -> int:
         if i + 1 < len(todo) and args.budget_seconds and time.perf_counter() - t_start > args.budget_seconds:
             print(f"[oracle_q35] L{layer:02d} K{args.K:g}: budget reached, {len(todo) - i - 1} chunk(s) left; run again", flush=True)
             return EXIT_MORE
-    write_manifest(out_dir, model_dir, args.K, args.classes, args.chunk_experts)
+    if not args.no_manifest:
+        write_manifest(out_dir, model_dir, args.K, args.classes, args.chunk_experts)
     return 0
 
 
@@ -599,6 +600,15 @@ def combined_hessian_sha(chunk_docs: list[dict]) -> str:
     return hashlib.sha256("\n".join(f"{k}:{v}" for k, v in sorted(per_layer.items())).encode()).hexdigest()
 
 
+def atomic_manifest(path: Path, doc) -> None:
+    """Like tq.write_json_atomic, but the temporary file is private to this process: two processes refreshing the same
+    manifest (the work-queue mode's workers do, under a lock; a stray second `manifest` run must not corrupt it either) never
+    share a `.tmp` name."""
+    tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
+    tmp.write_text(json.dumps(doc, indent=2, default=str), encoding="utf-8")
+    os.replace(tmp, path)
+
+
 def write_manifest(out_dir: Path, model_dir: Path, K: float, classes: str, chunk_experts: int) -> dict:
     arch = Qwen35MoeArch.from_config(model_dir / "config.json")
     job = make_job(model_dir, K)
@@ -626,7 +636,7 @@ def write_manifest(out_dir: Path, model_dir: Path, K: float, classes: str, chunk
            "hessian_manifest_sha256": combined_hessian_sha(docs) if docs else None, "recipe": job["recipe"],
            "code_sha256": job["code_sha256"], "summary": summarize(tensors), "tensors": tensors,
            "generated_at": dt.datetime.now(dt.timezone.utc).isoformat(), "provenance": tq.provenance()}
-    tq.write_json_atomic(out_dir / tq.MANIFEST_NAME, man)
+    atomic_manifest(out_dir / tq.MANIFEST_NAME, man)
     return man
 
 
@@ -764,6 +774,9 @@ def main() -> int:
                    help="worker threads per class cohort inside a chunk whose encoder calls are batched (CohortEncoder, "
                         "bit-identical to 0 = off, ~18%% faster, ~8 GiB VRAM instead of 2)")
     p.add_argument("--force", action="store_true")
+    p.add_argument("--no-manifest", action="store_true",
+                   help="do not refresh weights_override.json at the end (pipeline.ps1 -Workers 2 refreshes it under a lock after each "
+                        "layer, because workers on different layers share one K directory)")
     p.add_argument("--verbose", action="store_true")
     p.set_defaults(fn=cmd_quantize)
 

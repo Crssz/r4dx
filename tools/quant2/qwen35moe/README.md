@@ -273,6 +273,43 @@ second oracle costs the first ~5% and itself ~15-20% against a lone run, and low
 ~23 min per layer, ~12.5 h for the remaining ~33 layers. Lane B idles ~7 min per layer; splitting K3 chunks between the lanes (both work on a
 layer's chunks from opposite ends) would use that and reach ~19 min per layer, but chunks of one K are written by one process at a time today,
 so it is not built.
+## Work queue (`-Workers 2`): both GPUs claim whole-layer oracle jobs (preferred over `-Lanes 2`)
+
+```powershell
+.\tools\quant2\qwen35moe\pipeline.ps1 -Stage all -Layers 0..47 -Workers 2            # the plan (what each worker runs; who gets which layer is decided at run time)
+.\tools\quant2\qwen35moe\pipeline.ps1 -Stage all -Layers 0..47 -Workers 2 -Run      # supervisor + worker G1 + worker G0 (detach the supervisor)
+```
+
+| | worker G1 | worker G0 |
+|---|---|---|
+| HIP device / lock | `-DeviceA 1` / `-LockA gpu` | `-DeviceB 0` (`R4DX_ALLOW_GPU0=1`) / `-LockB gpu-dev0` |
+| work | the Hessian chain FIRST (layer L needs the residual boundary of L-1), otherwise an oracle job | oracle jobs only; `gpu_probe.py` first |
+| oracle slice | `-OracleSliceG1` 420 s (so the chain waits at most ~7 min) | `-BudgetSeconds` 840 s |
+
+**The queue.** A job = one layer's oracle, K3 then K4, by one worker. A layer is claimable once the chain has marked its Hessians ready
+(`hess-LNN.ready`); a worker takes the LOWEST ready, unclaimed, unverified layer by creating `oracle-LNN.claim` with `FileMode.CreateNew`
+(atomic: tested, 12 layers, 3 concurrent claimers, every layer exactly once). A worker that holds a job still gives the chain priority: G1
+checks, between two oracle slices, whether the next chain layer may start (at most `-MaxInFlight` = 3 layers of Hessians in flight: the
+chain waits for verify of layer i-3), runs its Hessian capture to the end, then resumes its job (the oracle resumes at chunk granularity).
+When the job is done the same worker refreshes the manifests and runs verify (CPU, deletes the layer's Hessians), then claims the next layer.
+
+**Manifests.** Workers on different layers share one `oracle-kK` directory, whose `weights_override.json` is merged from every chunk file. The
+oracle therefore runs with `--no-manifest` in this mode, and each finished layer refreshes both manifests (`oracle_q35.py manifest`, CPU,
+~1 min) under a machine-wide mutex (`Global\r4dx-q35moe-manifest-<root>`); the manifest's temporary file is also private to the process now
+(`atomic_manifest`). The supervisor refreshes them once more before alloc. Chunk files are per layer (`LNN.<chunk>.json`), so nothing else is shared.
+
+**Everything else as in lane mode:** the supervisor wipes `<Root>\lanes\` and `FAILED.txt` and starts the two worker processes hidden (logs
+`<Root>\logs\worker-G0.out.log` / `worker-G1.out.log`); a failure in either worker writes `FAILED.txt` with `worker=G0|G1` (the first
+failure stays) and `STOP`, the other worker stops at its next slice boundary, nothing is killed; the display GPU is probed first and checked
+for driver-reset events after every G0 slice; no blind retries; resumable by running the same command (state is re-derived from the oracle
+directories; `-Layers` already complete are passed in seconds); default `-Workers 1` / `-Lanes 1` is the single-lane run, unchanged.
+
+**Why this beats the K3 / K4 lane split.** Per layer the GPU time is ~7 min of Hessians + ~15-16 min of K3 + ~14-15 min of K4 (device 1; device 0
+a little slower, and both ~5-15% slower while the other GPU runs an oracle: measured, "Two lanes" above). The lanes leave lane B idle 7 min of
+every 23; the queue keeps both GPUs busy: ~38-40 GPU-minutes per layer over two GPUs = ~19-20 min per layer, ~10.5-11 h for 33 layers against
+~12.5 h (the 16.5 min/layer of the ideal assumes no contention and a 5 min chain). What it costs: whole-layer jobs mean a layer's K3 and K4 finish
+~30 min after it starts (Hessians for up to 3 layers wait on disk, 3 x 5 GiB), the chain can wait up to one oracle slice (7 min) on G1, the manifest
+refresh adds ~1 min of CPU per layer, and the display GPU does a K3 job half of the time (it is ~15% slower at K3 than device 1).
 ## Failure marker
 
 `pipeline.ps1 -Run` deletes `<Root>\FAILED.txt` at start and writes one line on any stage failure (a step's non-zero exit, a refused
@@ -280,7 +317,7 @@ prerequisite, any exception): `2026-10-21T10:12:12 FAILED step=hessian-L3: exit 
 (the step, the exit code, the last Python exception line of the step's log, the log path; <= 600 characters). A monitor polls for the file.
 ## Tests
 
-`tests\reference\test_refit_fallback.py` (CPU, ~1 min: the refit fallback and the EOL-tolerant job match); `tests\reference\test_lanes.ps1 [-Gpu]` (the two-lane logic: verify exactly once under a race, STOP / FAILED markers, the plan; with `-Gpu` the tiny model through both lanes, ~17 min); `tests\reference\test_no_evidence.py` (CPU, ~1 min, 39 checks: the no-evidence policy through finalize_layer, null groups, the oracle record, the allocation report); `tools\reference\qwen35moe\test_ref.py` (CPU: the streaming reference equals a plain HF forward on the tiny model, bit for bit with the eager
+`tests\reference\test_refit_fallback.py` (CPU, ~1 min: the refit fallback and the EOL-tolerant job match); `tests\reference\test_lanes.ps1 [-Gpu | -GpuWorkers]` (CPU: verify exactly once under a race, the work-queue claim, STOP / FAILED markers, the plans; `-Gpu` / `-GpuWorkers`: the tiny model through both lanes / both workers, ~12-17 min); `tests\reference\test_no_evidence.py` (CPU, ~1 min, 39 checks: the no-evidence policy through finalize_layer, null groups, the oracle record, the allocation report); `tools\reference\qwen35moe\test_ref.py` (CPU: the streaming reference equals a plain HF forward on the tiny model, bit for bit with the eager
 experts); `tiny_e2e.py` runs the whole chain on tiny-q35moe (`--device cuda --gpu-device 0` for the oracle).
 Note for the owner of `tiny_golden.py`: its docstring says "eager per-expert MoE loop", but HF 5.18's default `experts_implementation` is
 `grouped_mm`, which is what the goldens ran (`load_hf_model` sets the wrong attribute). Eager and grouped_mm differ by ~1 bf16 ulp per

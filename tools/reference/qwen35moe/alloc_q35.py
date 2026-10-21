@@ -212,12 +212,16 @@ def class_stats(man: dict, loss_mode: str = "out") -> dict[tuple, dict]:
         layer, kind, e = parse_name(name)
         c = out.setdefault((layer, kind), {"loss_local": 0.0, "loss_out": 0.0, "proxy_rel_sum": 0.0, "rel_num": 0.0,
                                            "numel": 0, "n": 0, "fallback": set(), "experts": set(), "names": [],
-                                           "bits": 0, "probe_experts": set(), "rel_sum_t": 0.0, "mixer_energy": None})
+                                           "bits": 0, "probe_experts": set(), "rel_sum_t": 0.0, "mixer_energy": None,
+                                           "refit_fb": 0, "refit_fb_rounds": 0})
         h = r.get("hessian", {})
         w = 1.0
         if kind != "p":
             tokens = h.get("tokens") or 0
             w = (h.get("routed", 0) / tokens) if tokens else 0.0
+        if r.get("refit_fallbacks"):       # oracle_q35.py: scale-refit solves that raised and went down refit_fallback's ladder
+            c["refit_fb"] += 1
+            c["refit_fb_rounds"] += int(r["refit_fallbacks"])
         c["loss_local"] += w * r["proxy_abs"]
         c["proxy_rel_sum"] += r["proxy"] * r["numel"]
         c["rel_num"] += (r["rel_weight_err"] ** 2) * r["numel"]
@@ -358,6 +362,12 @@ def build_report(model: Model, stats, ks, cap: int, log, sources: dict[float, di
         except KeyError:
             pass
     # fallback share per kind: experts whose Hessian is the fallback diagonal (count and loss share)
+    rfb = {kd: {"tensors": 0, "classes": 0, "rounds": 0} for kd in KINDS}
+    for (i, kd), K in ks.items():
+        st = stats[K][(i, kd)]
+        rfb[kd]["tensors"] += st["refit_fb"]
+        rfb[kd]["rounds"] += st["refit_fb_rounds"]
+        rfb[kd]["classes"] += 1 if st["refit_fb"] else 0
     fb = {}
     for kd in ("gu", "down"):
         n = nfb = 0
@@ -372,7 +382,7 @@ def build_report(model: Model, stats, ks, cap: int, log, sources: dict[float, di
     doc = {"cap_gib": cap / GIB, "k": k, "device0_gib": d0 / GIB, "device1_gib": d1 / GIB, "total_gib": total / GIB,
            "fixed_gib": fixed / GIB, "trellis_gib": (total - fixed) / GIB, "layers": L,
            "by_kind": {kd: {"gib": v["bytes"] / GIB, "K_counts": v["K"], "loss": v["loss"]} for kd, v in by_kind.items()},
-           "expected_loss": loss, "baselines": baselines, "fallback": fb, "floor": floor,
+           "expected_loss": loss, "baselines": baselines, "fallback": fb, "refit_fallbacks": rfb, "floor": floor,
            "sources": {f"{K:g}": s["_path"] for K, s in sources.items()}, "promotions": len(log),
            "per_layer": [{"layer": i, "gib": pl[i] / GIB, "K": {kd: ks[(i, kd)] for kd in KINDS},
                           "loss": {kd: stats[ks[(i, kd)]][(i, kd)]["loss"] for kd in KINDS}} for i in range(L)]}
@@ -389,6 +399,9 @@ def build_report(model: Model, stats, ks, cap: int, log, sources: dict[float, di
         lines.append(f"- {name}: loss {b['loss']:.6g}, {b['total_gib']:.3f} GiB")
     lines += ["", f"fallback experts (diagonal Hessian): gate_up {fb['gu']['fallback']}/{fb['gu']['experts']} "
                   f"({fb['gu']['share']:.1%}), down {fb['down']['fallback']}/{fb['down']['experts']} ({fb['down']['share']:.1%})",
+              "", "scale-refit solver fallbacks (refit_fallback.py: a solve that raised was redone in float64 / ridged / min-norm): "
+              + (", ".join(f"{kd} {v['tensors']} tensor(s) in {v['classes']} class(es), {v['rounds']} round(s)" for kd, v in rfb.items() if v["tensors"])
+                 if sum(v["tensors"] for v in rfb.values()) else "none"),
               "", f"{len(log)} promotions in order of loss reduction per GiB; the first 12:"]
     for p in log[:12]:
         lines.append(f"  - L{p['layer']:02d} {p['class']} K{p['from']:g} -> K{p['to']:g}: -{p['gain']:.4g} for "

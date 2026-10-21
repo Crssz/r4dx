@@ -121,9 +121,45 @@ ideally generate thinking-mode samples with Ornith itself (the model is meant to
     what fires. **Check with the KL gate on held-out text (including non-English and code) before trusting the mix.**
   * 118 of 256 experts fell back to the diagonal gate_up Hessian only because this pilot corpus has ~3,300 routed rows per expert on
     average (threshold 3,072); at 1M tokens the average is ~31,000.
+## Singular refit (found in the 48-layer run, 2026-10-21; fixed in `refit_fallback.py`)
+
+The K4 oracle of layer 2 died in `trellis_quant.refit_scales` (`torch.linalg.solve ... input matrix is singular`) after ~5,000 solves
+had passed (layers 0-1 at K3 and K4, layer 2 at K3). Findings, all measured on the real layer-2 Hessians and K4 bits:
+
+* **Cause: dead channels, but through conditioning, not a zero diagonal.** The row refit solves `A = (Q Q^T) o H_damped + 1e-6 mean(diag A) I`.
+  H is damped (+0.025 mean(diag H) I), so no diagonal is zero; but an expert's `down_proj` input has up to 1014 of 1024 dead channels, so A is a
+  tiny live block plus a damped diagonal and `mean(diag A)` (which sets the ridge) is dominated by dead rows. For the 256 `down` systems of
+  layer 2: condition number 5e6 .. 8.5e8, median 4e7, **219 of 256 above 1/eps(fp32)** (1.7e7); the smallest eigenvalue of A before the ridge is
+  ~1e-25 relative, numerically 0 in float64. Not singular in exact arithmetic (the ridge keeps it positive), but an fp32 pivoted LU can hit an
+  exactly zero pivot: a knife edge.
+* **It does not reproduce deterministically.** Re-running layer 2 / K4 in full (projections + 8 expert chunks, same inputs, device 1, cohort 32)
+  raised nothing (`E:\models\r4dx\q35moe-repro`), the chunks both runs finished are bit-identical (all 288 + 9 tensors, all records), and 400 fp32
+  solves of the worst systems on the GPU raised nothing either. So the raise depends on rounding that a re-run did not repeat; the cause is
+  the ill-conditioning, the trigger is not pinned down further.
+* **Fix.** `refit_fallback.install(tq)` (called by `oracle_q35.py quantize`) wraps `tq.refit_scales` so that `torch.linalg.solve` is
+  `solve_with_fallback`: the first attempt is the original call (same bits when it works), only a raise goes down the ladder: float64 LU on the
+  CPU -> the same system with a ridge of 1e-4 then 1e-2 x mean(diag A) -> minimum-norm `lstsq` (gelsd). Every use is in the record
+  (`refit[round].fallback = {stage, error, device, k}`, `refit_fallbacks` = rounds, a WARNING line on stdout) and `alloc_q35.py`'s report
+  counts them per class. `trellis_quant.py` is NOT edited: its sha256 (and trellis_viterbi.hip's) is part of the oracle's job key, so any
+  edit would make every finished chunk stale.
+* **Existing chunks stay valid and reproducible, verified:** re-running layer 2 / K4 chunks `p` and `e00` with the fixed oracle gives
+  tensors and records identical to the original run's (288 / 288, 96 / 96), no fallback key. With every `down` solve forced to raise (the real
+  threaded cohort path), the 32 forced groups are flagged, their trellis words are identical, proxies move by <= 1.3e-7 relative, sign vectors
+  differ slightly (fp32 vs fp64 solve) and nothing else changes.
+* **Line endings.** `code_sha256` hashes the working-tree BYTES: the main checkout has CRLF files, a worktree has LF (`.gitattributes` eol=lf),
+  so the same source hashed differently and a chunk written from one checkout looked stale from the other. `oracle_q35.jobs_match` now
+  accepts a stored hash equal to the as-is, LF or CRLF form of the current file (a changed source still mismatches).
+
+Could it hit again? **Yes, anywhere the refit system is ill-conditioned; the fix covers every group the oracle quantizes.**
+* K3 on later layers: yes (A depends on Q and H, not on K; K3 passed 5,000 solves on layers 0-2 by luck of rounding, and dead channels are
+  common in the early layers).
+* Expert `down_proj` groups: the worst class (cond up to 8.5e8 on layer 2). Expert `gate_up`: cond ~1e4 (one dead hidden channel), safe.
+* GDN `out_proj` (k = 8192, 709 dead channels in layer 2): cond(A) = 2.3e8, also fragile. GDN `in` (qkv, z): 1.7e4, safe. Full-attention
+  q/k/v/o (layers 3, 7, ...): not measured yet; `o_proj` (input = attention output x gate) can have dead channels like `out_proj`.
+* Shared experts: not quantized (bf16 in the container), no group, no refit.
 ## Tests
 
-`tools\reference\qwen35moe\test_ref.py` (CPU: the streaming reference equals a plain HF forward on the tiny model, bit for bit with the eager
+`tests\reference\test_refit_fallback.py` (CPU, ~1 min: the refit fallback and the EOL-tolerant job match); `tools\reference\qwen35moe\test_ref.py` (CPU: the streaming reference equals a plain HF forward on the tiny model, bit for bit with the eager
 experts); `tiny_e2e.py` runs the whole chain on tiny-q35moe (`--device cuda --gpu-device 0` for the oracle).
 Note for the owner of `tiny_golden.py`: its docstring says "eager per-expert MoE loop", but HF 5.18's default `experts_implementation` is
 `grouped_mm`, which is what the goldens ran (`load_hf_model` sets the wrong attribute). Eager and grouped_mm differ by ~1 bf16 ulp per

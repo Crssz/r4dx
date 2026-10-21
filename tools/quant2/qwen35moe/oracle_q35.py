@@ -43,6 +43,8 @@ sys.path.insert(0, str(REPO / "tools" / "reference"))
 import torch  # noqa: E402
 
 import trellis_quant as tq  # noqa: E402
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import refit_fallback  # noqa: E402
 from qwen35moe.arch import FULL, GDN, Qwen35MoeArch  # noqa: E402
 from qwen35moe.ref import CheckpointReader  # noqa: E402
 
@@ -136,11 +138,29 @@ def hessian_done_sha(hroot: Path, layer: int) -> str | None:
     return sha256_path(p) if p.exists() else None
 
 
+def eol_variants(path: Path) -> set[str]:
+    """sha256 of a source file as it is, with LF endings, and with CRLF endings. `trellis_quant.code_sha256` hashes the working-tree
+    BYTES, so the same source hashes differently in a checkout with CRLF files (the main checkout) and one with LF files (a worktree
+    under .gitattributes eol=lf): a chunk written from one would look stale from the other."""
+    data = Path(path).read_bytes()
+    lf = data.replace(b"\r\n", b"\n")
+    return {hashlib.sha256(x).hexdigest() for x in (data, lf, lf.replace(b"\n", b"\r\n"))}
+
+
+def code_hash_matches(stored: dict, current: dict) -> bool:
+    """`job["code_sha256"]` equality up to line endings (and nothing else: a changed source still mismatches)."""
+    files = {"trellis_quant": Path(tq.__file__), "trellis_viterbi": Path(tq.NATIVE_SRC)}
+    if not isinstance(stored, dict) or stored.keys() != current.keys():
+        return False
+    return all(stored[k] == current[k] or (k in files and stored[k] in eol_variants(files[k])) for k in current)
+
+
 def jobs_match(a: dict, b: dict) -> bool:
     from common import same_path
 
     return isinstance(a, dict) and a.keys() == b.keys() and all(
-        same_path(a[k], b[k]) if k == "model_dir" else a[k] == b[k] for k in a)
+        same_path(a[k], b[k]) if k == "model_dir" else code_hash_matches(a[k], b[k]) if k == "code_sha256" else a[k] == b[k]
+        for k in a)
 
 
 def chunk_usable(out_dir: Path, layer: int, chunk: str, job: dict, hess_sha: str | None, chunk_experts: int) -> bool:
@@ -306,6 +326,11 @@ def quantize_group_record(args, arch, reader, enc, layer: int, g: dict, routing:
                             seeds={n: tq.stable_seed("sv", n) for n in names},
                             hessian_basis="matched", verbose=args.verbose)
     hrec = {"file": hfile, "rows": rows, "key": g["bases"][0], "tokens": tokens}
+    n_fb = sum(refit_fallback.count_fallbacks(res[n]["record"]) for n in names)
+    if n_fb:
+        stages = sorted({r["fallback"]["stage"] for n in names for r in res[n]["record"]["refit"] if "fallback" in r})
+        print(f"[oracle_q35] WARNING L{layer:02d} {g['tap']}: {n_fb} scale-refit solve(s) raised, solved by {stages} "
+              f"(record: refit_fallbacks)", flush=True)
     probe = probe_errors(arch, reader, layer, g, res, weights, enc, device, K)
     if g["cls"] != "p":
         e = g["expert"]
@@ -316,6 +341,8 @@ def quantize_group_record(args, arch, reader, enc, layer: int, g: dict, routing:
         Wf = weights[n].float().T.contiguous()
         energy = tq.hessian_energy(Wf, H)
         rec = r["record"]
+        if refit_fallback.count_fallbacks(rec):  # only then: a group that never fell back keeps the record it always had
+            rec["refit_fallbacks"] = refit_fallback.count_fallbacks(rec)
         rec.update({"layer": layer, "class": g["cls"], "tap": g["tap"], "module": b[len(arch.layer_prefix(layer)):],
                     "numel": rec["k"] * rec["n"], "energy": energy, "proxy_abs": rec["proxy"] * energy,
                     "hessian": hrec, "file": st_name, **({"probe": probe} if probe is not None else {})})
@@ -410,6 +437,7 @@ def cmd_quantize(args) -> int:
         print(f"[oracle_q35] L{layer:02d} K{args.K:g}: all chunks usable already", flush=True)
         return 0
     device = resolve_device(args.device)
+    refit_fallback.install(tq)  # before guard_linear_algebra() wraps tq.refit_scales in the solver lock
     enc = tq.TrellisEncoder(args.backend, device, threads=args.threads, grid=args.grid)
     print(f"[oracle_q35] encoder {enc.describe()}", flush=True)
     enc.check_against_reference({float(args.K)})

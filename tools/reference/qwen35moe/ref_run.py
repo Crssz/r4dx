@@ -108,6 +108,18 @@ class KvRecorder:
         self.v = {int(li): {n: torch.tensor(x) for n, x in d.items()} for li, d in st["v"].items()}
 
 
+def rtn_int8(w: torch.Tensor, group: int, device) -> torch.Tensor:
+    """The converter's w8a16 recipe (quant_int8.hpp QuantizeInt8Symmetric): symmetric int8 per (row, `group` along K), scale
+    = f16(amax / 127 * 2^12) * 2^-12, round half away from zero, clamp +-127; returns the dequantized weights in bf16 (on the CPU)."""
+    n, k = w.shape
+    x = w.to(device, torch.float32).reshape(n, k // group, group)
+    amax = x.abs().amax(-1, keepdim=True)
+    s_use = ((amax / 127.0) * 4096.0).to(torch.float16).to(torch.float32) / 4096.0
+    ok = s_use > 0
+    y = x / torch.where(ok, s_use, torch.ones_like(s_use))
+    q = (torch.sign(y) * torch.floor(y.abs() + 0.5)).clamp(-127, 127) * ok
+    return (q * s_use).reshape(n, k).to(torch.bfloat16).cpu()
+
 def run(args, mode: str) -> int:
     t_start = time.perf_counter()
     dtype = torch.float32 if getattr(args, "dtype", "bf16") == "fp32" else torch.bfloat16
@@ -129,14 +141,24 @@ def run(args, mode: str) -> int:
         lo, _, hi = (args.mix_layers or "").partition("-")
         layer_set = set(range(int(lo), int(hi or lo) + 1)) if lo else None
         pat = re.compile(args.mix_match) if args.mix_match else None
+        excl = re.compile(args.mix_exclude) if args.mix_exclude else None
+        rtn_group = int(args.rtn_group or 0)
+        p_linear = re.compile(r"\.(q_proj|k_proj|v_proj|o_proj|in_proj_qkv|in_proj_z|out_proj)\.weight$")
 
         class FilteredMix(MixReader):
-            """MixReader that reconstructs only the tensors of --mix-layers whose name matches --mix-match (the rest stay stock)."""
+            """MixReader that reconstructs only the tensors of --mix-layers whose name matches --mix-match and not --mix-exclude (the
+            rest stay stock; with --rtn-group G the excluded class-p linears are simulated w8a16 RTN at group G instead)."""
 
             def get(self, name, rows=None):
                 m = re.search(r"layers\.(\d+)\.", name)
                 use = (layer_set is None or (m is not None and int(m.group(1)) in layer_set)) and (pat is None or pat.search(name))
-                return super().get(name, rows) if use else CheckpointReader.get(self, name, rows)
+                skipped = excl is not None and excl.search(name)
+                if use and not skipped:
+                    return super().get(name, rows)
+                w = CheckpointReader.get(self, name, rows)
+                if skipped and rtn_group and rows is None and p_linear.search(name):
+                    return rtn_int8(w, rtn_group, device)
+                return w
 
         ref.reader = FilteredMix(args.model_dir, mix, device)
         ref.reader.weight_dtype = dtype
@@ -144,7 +166,8 @@ def run(args, mode: str) -> int:
     work.mkdir(parents=True, exist_ok=True)
     ident = {"mode": mode, "dtype": str(dtype), "tokens": str(Path(args.tokens).resolve()), "tokens_sha256": sha256_file(Path(args.tokens)),
              "segments": [n for n, _ in segs], "model_dir": str(args.model_dir), "mix": str(mix) if mix else None,
-             "mix_layers": getattr(args, "mix_layers", None), "mix_match": getattr(args, "mix_match", None)}
+             "mix_layers": getattr(args, "mix_layers", None), "mix_match": getattr(args, "mix_match", None),
+             "mix_exclude": getattr(args, "mix_exclude", None), "rtn_group": getattr(args, "rtn_group", 0)}
     kv = KvRecorder() if (mode == "kvcalib" or getattr(args, "record_kv", None)) else None
     if kv is not None:
         kv.install(ref)
@@ -215,7 +238,13 @@ def run(args, mode: str) -> int:
                 with open(out_dir / f"{name}.logprobs.f16", "wb") as fh:
                     for r0 in range(0, len(ids) - 1, 256):
                         logits = ref.logits_rows(hidden[r0:min(r0 + 256, len(ids) - 1)], mode_l)          # [rows, V] fp32
-                        lp = F.log_softmax(logits.float(), dim=-1).clamp_min(LOGPROB_CLAMP).to(torch.float16).cpu().numpy()
+                        lp16 = F.log_softmax(logits.float(), dim=-1).clamp_min(LOGPROB_CLAMP).to(torch.float16)
+                        # two dumps (of ~25) came out as unnormalised noise with a normal exit; refuse such rows
+                        dev = float(torch.logsumexp(lp16.float(), dim=-1).abs().max())
+                        if not dev < 0.05:
+                            raise RuntimeError(f"{name} rows {r0}..: log-probs are not normalised (max |logsumexp| {dev}); "
+                                               "bad GPU result, run again")
+                        lp = lp16.cpu().numpy()
                         fh.write(lp.astype("<f2").tobytes())
                 meta = {"T": len(ids), "V": int(logits.shape[-1]), "dtype": "float16", "rows": len(ids) - 1, "source": "reference",
                         "torch_dtype": str(dtype).replace("torch.", ""), "sha256_of_token_ids_json": token_ids_sha256(ids),
@@ -256,6 +285,10 @@ def main() -> int:
     p.add_argument("--mix-layers", default=None, help="with --mix: reconstruct only these layers, 'A-B' or 'A'")
     p.add_argument("--mix-match", default=None, help="with --mix: reconstruct only tensors whose HF name matches this regex "
                                                       "(e.g. '(self_attn|linear_attn)' = class p, 'experts.gate_up_proj', 'experts.down_proj')")
+    p.add_argument("--mix-exclude", default=None, help="with --mix: tensors whose HF name matches stay stock (e.g. '_attn\\.' = class p "
+                                                        "stays bf16, 'self_attn\\.' = the full-attention projections)")
+    p.add_argument("--rtn-group", type=int, default=0, help="with --mix-exclude: the excluded class-p linears become simulated w8a16 "
+                                                             "RTN (the converter's recipe) at this group (64 / 128) instead of stock")
     p.set_defaults(fn=lambda a: run(a, "logprobs"))
     p = sub.add_parser("kvcalib")
     common(p)

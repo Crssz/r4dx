@@ -57,6 +57,8 @@ from qwen35moe.arch import FULL, GDN, Qwen35MoeArch  # noqa: E402
 GIB = 2**30
 DEFAULT_CAP_GIB = 26.0
 DEFAULT_FLOOR = {"p": 4.0, "gu": 3.0, "down": 3.0}
+W8_K = 17.0     # sentinel of a class kept as w8a16 g64 (not supported by the converter / runtime next to trellis yet: prediction only)
+BF16_K = 16.0   # sentinel K of a class kept as plain bf16 (the container's <base>.bf16.w tier: 2 bytes per weight, no sign vectors)
 KINDS = ("p", "gu", "down")
 OVERRIDE_FORMAT = "r4dx-weights-override"
 MANIFEST_NAME = "weights_override.json"
@@ -69,7 +71,12 @@ LAYER_RE = "model.language_model.layers."
 
 
 def trellis_tensor_bytes(k: int, n: int, K: float) -> int:
-    """One quantized tensor on the device: words + suh + svh (fp32) + tickets (4 B per 128 output rows)."""
+    """One quantized tensor on the device: words + suh + svh (fp32) + tickets (4 B per 128 output rows); K == BF16_K: the bf16 twin
+    (Inspect: the tensor's own bytes, N * K * 2)."""
+    if K == BF16_K:
+        return 2 * k * n
+    if K == W8_K:                       # docs/w8a16.md: N * K int8 codes + one f16 scale per (row, 64 columns)
+        return k * n + 2 * n * (k // 64)
     return int(k * n * K) // 8 + 4 * k + 4 * n + 4 * ((n + 127) // 128)
 
 
@@ -280,7 +287,8 @@ def parse_floor(s: str | None) -> dict[str, float]:
 
 
 def allocate(model: Model, stats: dict[float, dict[tuple, dict]], cap: int, floor: dict[str, float],
-             layers: list[int] | None = None) -> tuple[dict[tuple, float], list[dict]]:
+             layers: list[int] | None = None, bf16_p: frozenset = frozenset(), w8_p: frozenset = frozenset()
+             ) -> tuple[dict[tuple, float], list[dict]]:
     """Greedy promotion (module docstring). `stats[K][(layer, kind)]` carry `loss`. Returns (K per class, promotion log)."""
     Ks = sorted(stats)
     L = model.L
@@ -293,6 +301,10 @@ def allocate(model: Model, stats: dict[float, dict[tuple, dict]], cap: int, floo
             if not cand and i in layers:
                 raise ValueError(f"no source has layer {i} class {kd} at K >= {floor[kd]:g}")
             ks[(i, kd)] = cand[0] if cand else floor[kd]
+    for i in bf16_p:
+        ks[(i, "p")] = BF16_K
+    for i in w8_p:
+        ks[(i, "p")] = W8_K
     model.split(ks, cap)  # raises when even the floor does not fit
     log: list[dict] = []
     dead: set[tuple] = set()
@@ -434,6 +446,22 @@ def build_report(model: Model, stats, ks, cap: int, log, sources: dict[float, di
     return doc, "\n".join(lines) + "\n"
 
 
+def bf16_layers(arch: Qwen35MoeArch, which: str) -> frozenset:
+    """Layers whose class p is kept bf16: none | attn (the full-attention layers) | gdn | all."""
+    if which == "none":
+        return frozenset()
+    sel = {"attn": (FULL,), "gdn": (GDN,), "all": (FULL, GDN)}[which]
+    return frozenset(i for i in range(arch.n_layers) if arch.layer_types[i] in sel)
+
+
+def scale_losses(stats: dict, scale: list[float]) -> None:
+    """Multiplies the expert classes' (gu, down) loss of layer i by scale[i] (measured sensitivity per layer, see --loss-scale)."""
+    for K, st in stats.items():
+        for (i, kd), c in st.items():
+            if kd != "p":
+                c["loss"] *= scale[i]
+
+
 def cmd_allocate(args) -> int:
     srcs = [load_source(Path(p)) for p in args.src]
     by_K = {s["_K"]: s for s in srcs}
@@ -449,13 +477,28 @@ def cmd_allocate(args) -> int:
     stats = {K: class_stats(s, args.loss) for K, s in by_K.items()}
     cap = int(args.cap_gib * GIB) if args.cap_bytes is None else args.cap_bytes
     floor = parse_floor(args.floor)
-    ks, log = allocate(model, stats, cap, floor)
+    bf16_p = bf16_layers(arch, args.p_bf16)
+    w8_p = bf16_layers(arch, args.p_w8)
+    if bf16_p & w8_p:
+        raise SystemExit("[alloc_q35] a layer's class p is either bf16 or w8a16")
+    for sentinel, layers_set in ((BF16_K, bf16_p), (W8_K, w8_p)):
+        if layers_set:
+            stats[sentinel] = {(i, "p"): {"loss": 0.0, "names": [], "no_evidence": 0, "null": 0, "poor": 0, "refit_fb": 0,
+                                          "refit_fb_rounds": 0, "experts": 0, "fallback": 0} for i in layers_set}
+    if args.loss_scale:
+        scale = json.loads(Path(args.loss_scale).read_text(encoding="utf-8"))["layers"]
+        if len(scale) != arch.n_layers:
+            raise SystemExit(f"[alloc_q35] --loss-scale wants {arch.n_layers} layer multipliers, got {len(scale)}")
+        scale_losses(stats, [float(x) for x in scale])
+    ks, log = allocate(model, stats, cap, floor, bf16_p=bf16_p, w8_p=w8_p)
     doc, text = build_report(model, stats, ks, cap, log, by_K, floor)
     out = Path(args.out_dir)
     out.mkdir(parents=True, exist_ok=True)
     tensors = {}
     counts: dict[str, int] = {}
     for (i, kd), K in sorted(ks.items()):
+        if K in (BF16_K, W8_K):
+            continue
         src = by_K[K]
         for name in stats[K][(i, kd)]["names"]:
             rec = dict(src["tensors"][name])
@@ -463,7 +506,8 @@ def cmd_allocate(args) -> int:
             rec["file"] = str(f if f.is_absolute() else Path(src["_dir"]) / f)
             tensors[name] = rec
             counts[f"{K:g}"] = counts.get(f"{K:g}", 0) + 1
-    expected = {n + ".weight" for i in range(arch.n_layers) for n in arch.quantized_linears(i)}
+    expected = {n + ".weight" for i in range(arch.n_layers) for n in arch.quantized_linears(i)
+                if not (parse_name(n + ".weight")[0] in (bf16_p | w8_p) and parse_name(n + ".weight")[1] == "p")}
     missing = sorted(expected - set(tensors))
     extra = sorted(set(tensors) - expected)
     if extra:
@@ -475,7 +519,7 @@ def cmd_allocate(args) -> int:
            "allocation": {"rule": "tools/reference/qwen35moe/alloc_q35.py: classes (layer, p|gu|down), one KB per class, start at "
                                   "the floor, promote by (proxy loss reduction per GiB) under choose_split's per-card cap",
                           "cap_gib": args.cap_gib if args.cap_bytes is None else args.cap_bytes / GIB,
-                          "floor": floor, "tensors_per_K": counts, "split": {"k": doc["k"], "device0_gib": doc["device0_gib"],
+                          "floor": floor, "p_bf16_layers": sorted(bf16_p), "p_w8a16_g64_layers": sorted(w8_p), "loss_scale": args.loss_scale, "tensors_per_K": counts, "split": {"k": doc["k"], "device0_gib": doc["device0_gib"],
                                                                             "device1_gib": doc["device1_gib"]},
                           "sources": {f"{K:g}": s["_path"] for K, s in by_K.items()},
                           "source_code_sha256": {f"{K:g}": s.get("code_sha256") for K, s in by_K.items()},
@@ -519,6 +563,14 @@ def main() -> int:
     p.add_argument("--cap-bytes", type=int, default=None, help="overrides --cap-gib (tests)")
     p.add_argument("--floor", default=None, help="p=4,gu=3,down=3")
     p.add_argument("--loss", default="out", choices=["out", "local"], help="class loss: output-referred (default) or local proxy")
+    p.add_argument("--p-bf16", default="none", choices=["none", "attn", "gdn", "all"],
+                   help="keep class p of these layer types as plain bf16 (converter: --keep-bf16): bytes counted as the bf16 twin, "
+                        "no tensors in the manifest, the experts get the remaining bytes")
+    p.add_argument("--p-w8", default="none", choices=["none", "attn", "gdn", "all"],
+                   help="PREDICTION ONLY: class p of these layer types as w8a16 g64 (bytes counted as docs/w8a16.md stores them); the "
+                        "converter / runtime cannot combine w8a16 with trellis yet")
+    p.add_argument("--loss-scale", default=None, help="json {\"layers\": [48 multipliers]} applied to the expert classes' loss "
+                                                      "(measured per-layer sensitivity / proxy)")
     p.set_defaults(fn=cmd_allocate)
     p = sub.add_parser("compare")
     p.add_argument("--src", action="append", required=True)

@@ -137,6 +137,30 @@ def main() -> int:
           "logprobs --record-kv (bf16) records the same amax as kvcalib")
     check(all(all(x > 0 for x in a[str(i)]["k_amax"] + a[str(i)]["v_amax"]) for i in full), "all amax are positive")
 
+    # simulated w8a16 (--rtn-group) equals the converter's python reference (tools/convert_ref/w8_ref.py), bf16-rounded
+    from ref_run import rtn_int8
+
+    rngw = np.random.default_rng(11)
+    w = (rngw.standard_normal((48, 256)) * 0.05).astype(np.float32)
+    w[3, :] = 0.0
+    w[5, 7] = 3.0
+    np.save(tmp / "w.npy", w)
+    snippet = ("import numpy as np, sys; sys.path.insert(0, sys.argv[1]); import w8_ref as R; w = np.load(sys.argv[2]); out = {}\n"
+               "for g in (64, 128):\n"
+               "    q, s16, _ = R.quantize_int8_symmetric(w, g); N, K = w.shape\n"
+               "    s = s16.view(np.float16).astype(np.float32) * np.float32(2.0 ** -12)\n"
+               "    out[str(g)] = ((q.astype(np.int32) - 128).astype(np.float32).reshape(N, K // g, g) * s[:, :, None]).reshape(N, K)\n"
+               "np.savez(sys.argv[3], **out)\n")
+    ok = subprocess.run([sys.executable, "-c", snippet, str(HERE.parents[1] / "convert_ref"), str(tmp / "w.npy"), str(tmp / "w8.npz")],
+                        capture_output=True, text=True, cwd=str(tmp))
+    check(ok.returncode == 0, "w8_ref.py ran" + ("" if ok.returncode == 0 else ": " + ok.stderr[-300:]))
+    if ok.returncode == 0:
+        ref8 = np.load(tmp / "w8.npz")
+        for g in (64, 128):
+            mine = rtn_int8(torch.from_numpy(w), g, torch.device("cpu")).float().numpy()
+            want = torch.from_numpy(ref8[str(g)]).to(torch.bfloat16).float().numpy()
+            check(np.array_equal(mine, want), f"rtn_int8 group {g} equals w8_ref.py dequant (bf16-rounded), rel err vs fp32 weights "
+                  f"{np.linalg.norm(mine - w) / np.linalg.norm(w):.4f}")
     bad = [w for ok, w in RESULTS if not ok]
     print(f"\n{len(RESULTS) - len(bad)}/{len(RESULTS)} checks passed")
     return 1 if bad else 0

@@ -22,6 +22,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 
 #include "gdn_state.h"
 #include "qwen4exp_config.h"
@@ -70,6 +71,8 @@ struct Qwen4ExpGdnCall {
   bool verify = false;
   const int32_t* num_accepted = nullptr;
   const int32_t* gdn_pending = nullptr;
+  // Profiling: called with a phase name right after each phase's launches are enqueued ("proj", "scan", "out_proj"); the caller records an event.
+  const std::function<void(const char*)>* mark = nullptr;
 };
 
 // The Gated DeltaNet geometry of one mixer, for architectures that are not qwen4_exp (qwen3_5_moe, docs/qwen35moe-plan.md):

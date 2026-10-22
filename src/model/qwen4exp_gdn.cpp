@@ -136,6 +136,7 @@ void Qwen4ExpGdn::Forward(hipStream_t s, core::Arena& arena, GdnStateManager& st
   uint16_t* z_buf = arena.Alloc<uint16_t>(static_cast<size_t>(T * value_dim_));
   qwen4exp::ApplyBf16Linear(s, arena, *w_.in_proj_z, x, z_buf, T);
 
+  if (call.mark != nullptr) (*call.mark)("proj");
   // ---- the GDN core -----------------------------------------------------------------------------------------------
   const int32_t* cache_idx_dev = control.CacheIdx(slot);
   uint16_t* q_buf = arena.Alloc<uint16_t>(static_cast<size_t>(T * Hg_ * K_));
@@ -249,6 +250,7 @@ void Qwen4ExpGdn::Forward(hipStream_t s, core::Arena& arena, GdnStateManager& st
     }
   }
 
+  if (call.mark != nullptr) (*call.mark)("scan");
   // ---- out_proj ---------------------------------------------------------------------------------------------------
   // temporal weight loads: out_proj is the first weight stream after the recurrent update left the new state dirty in
   // the L2 (gdn_layer.cpp, docs/trellis-kernel.md 10.6); ApplyBf16Linear has no such flag, so a trellis out_proj takes
@@ -258,6 +260,7 @@ void Qwen4ExpGdn::Forward(hipStream_t s, core::Arena& arena, GdnStateManager& st
   } else {
     qwen4exp::ApplyBf16Linear(s, arena, *w_.out_proj, out_core, out, T);
   }
+  if (call.mark != nullptr) (*call.mark)("out_proj");
 }
 
 }  // namespace r4dx::model

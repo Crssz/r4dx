@@ -1,4 +1,4 @@
-// r4dx::model::attention::AttentionLayer -- one Qwen3.5 full-attention decoder layer
+﻿// r4dx::model::attention::AttentionLayer -- one Qwen3.5 full-attention decoder layer
 // (docs/architecture.md "Attention layer (16 of 64 layers)"), exactly per
 // modeling_qwen3_5.py's Qwen3_5Attention.forward:
 //
@@ -234,7 +234,8 @@ class AttentionLayer {
                const void* x_normed_pre_data = nullptr, int next_epilogue = 0,
                void* next_epilogue_out = nullptr, const int32_t* rope_pos3 = nullptr,
                bool prefill_split_kv = false, int attn_slice = 0,
-               const int32_t* seqused_k_slices = nullptr, const AttnBatchView* batch = nullptr) {
+               const int32_t* seqused_k_slices = nullptr, const AttnBatchView* batch = nullptr, int decode_sub = 0,
+               const int32_t* seqused_k_sub = nullptr) {
     // `attn_slice` (256-row prefill chunk, Model's R4DX_PREFILL_CHUNK=256, docs/trellis-m256.md): 0 --
     // the default, every caller before it -- is the T = 1..64 call as always. 64: T is a multiple of 64
     // (up to 256) and everything row-independent (norms, the linears, split_qg, qk-norm, rope, the KV
@@ -484,6 +485,23 @@ class AttentionLayer {
         ProfiledCall(prof, stream, "attn.core_decode",
                      [&] { r4dx::core::r4d::AttnDecodeFp8Kv(a, stream); });
       }
+    } else if (decode_sub > 0 && T > decode_sub && decode_sub <= max_decode_q_len) {
+      // `decode_sub` (a speculative verify window that must equal plain decode bit for bit): the T rows through the DECODE kernel,
+      // `decode_sub` rows per launch, instead of the prefill kernel (whose arithmetic differs from the decode kernel's). Sub-launch j
+      // is rows [j * decode_sub, ...) with its own causal context seqused_k_sub[j] = start_pos + the rows up to its last one; the
+      // keys of all T rows are already in the cache (the KV write above covers them) and the causal mask hides the later rows.
+      // decode_sub == 1 is, launch for launch, what T plain decode steps run.
+      if (seqused_k_sub == nullptr) throw std::invalid_argument("AttentionLayer::Forward: decode_sub needs seqused_k_sub");
+      a.q_len = decode_sub;
+      const int64_t scratch_bytes = r4dx::core::r4d::AttnDecodeScratchBytes(a);
+      a.scratch = scratch_bytes > 0 ? arena.Alloc<uint8_t>(static_cast<size_t>(scratch_bytes), /*align_bytes=*/16) : nullptr;
+      for (int j = 0; j * decode_sub < T; ++j) {
+        a.q_len = std::min(decode_sub, T - j * decode_sub);
+        a.q = q + static_cast<size_t>(j) * decode_sub * H * D;
+        a.out = attn_out + static_cast<size_t>(j) * decode_sub * H * D;
+        a.seqused_k = seqused_k_sub + j;
+        ProfiledCall(prof, stream, "attn.core_decode", [&] { r4dx::core::r4d::AttnDecodeFp8Kv(a, stream); });
+      }
     } else if (T <= max_decode_q_len) {
       const int64_t scratch_bytes = r4dx::core::r4d::AttnDecodeScratchBytes(a);
       // align_bytes=16 (review finding, 2026-09-20): this feeds third_party/libr4d's own attention
@@ -648,3 +666,4 @@ class AttentionLayer {
 };
 
 }  // namespace r4dx::model::attention
+

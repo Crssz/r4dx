@@ -1,4 +1,4 @@
-// Qwen35GroupedMoeDecode at the REAL expert count (256 experts, top-8, hidden 3072, expert width 1024) on synthetic trellis
+﻿// Qwen35GroupedMoeDecode at the REAL expert count (256 experts, top-8, hidden 3072, expert width 1024) on synthetic trellis
 // weights, against the host-routed MoE (qwen4exp::MoeBlockBase with per-expert ApplyLinear), plus the per-layer decode benchmark.
 //
 // The weights are random trellis words (any bit pattern decodes to some value), random +-1 input signs and small positive output
@@ -361,11 +361,12 @@ int RunTest() {
       qwen4exp::MoeBlockBase host16(mc, 16);
       core::DeviceBuffer<uint16_t> yg(16 * kH), yh(16 * kH), y1(kH);
       std::vector<uint16_t> ga(16 * kH), ha(16 * kH), oa(kH);
-      const int skg_cfgs[][2] = {{1, 1}, {2, 2}, {1, 2}, {2, 1}};
+      const int skg_cfgs[][2] = {{4, 4}, {1, 1}, {2, 2}, {1, 2}};
       for (const auto& cfg : skg_cfgs) {
         moe_r.SetRowSplits(cfg[0], cfg[1]);
         double worst_host = 0, worst_m1 = 0;
         int cases = 0;
+        int64_t differing_vs_m1 = 0;
         for (int rows : {2, 3, 5, 8, 12, 16}) {
           for (int rep = 0; rep < 6; ++rep) {
             const uint16_t* x = xs.data() + static_cast<size_t>((rep * 7 + rows) % (kInputs - 16)) * kH;
@@ -388,6 +389,7 @@ int RunTest() {
                 sq += ref * ref;
                 sum += std::fabs(got - ref);
                 sum1 += std::fabs(got - one);
+                if (ga[static_cast<size_t>(r) * kH + d] != oa[static_cast<size_t>(d)]) ++differing_vs_m1;
               }
               const double rms = std::sqrt(sq / kH);
               if (rms > 0) {
@@ -398,8 +400,9 @@ int RunTest() {
             }
           }
         }
-        std::printf("M-row grouped MoE (splits %d/%d) vs host-routed over %d rows (2..16 per call): mean|err|/rms worst %.5f; vs the M = 1 grouped kernel row by row: worst %.5f\n",
-                    cfg[0], cfg[1], cases, worst_host, worst_m1);
+        std::printf("M-row grouped MoE (splits %d/%d) vs host-routed over %d rows (2..16 per call): mean|err|/rms worst %.5f; vs the M = 1 grouped kernel row by row: worst %.5f, %lld output elements differ\n",
+                    cfg[0], cfg[1], cases, worst_host, worst_m1, static_cast<long long>(differing_vs_m1));
+        if (cfg[0] == 4 && cfg[1] == 4) Check(differing_vs_m1 == 0, "the 4/4 M-row kernel must equal the M = 1 grouped kernel bit for bit (row by row)");
         Check(worst_host <= 0.01, "M-row grouped output differs from the host-routed one beyond bf16 noise (mean/rms " + std::to_string(worst_host) + ")");
         Check(worst_m1 <= 0.01, "M-row grouped output differs from the M = 1 grouped kernel beyond bf16 noise (mean/rms " + std::to_string(worst_m1) + ")");
       }
@@ -480,7 +483,7 @@ int RunTest() {
     const double fixed_bytes = static_cast<double>(kE) * kH * 2 + 3.0 * kH * kI * 2 + kH * 2;
     const int rit = std::max(20, iters / 2);
     for (int rows : {2, 4, 6, 8, 12, 16}) {
-      for (const auto& cfg : {std::pair<int, int>{1, 1}, std::pair<int, int>{2, 2}}) {
+      for (const auto& cfg : {std::pair<int, int>{4, 4}, std::pair<int, int>{1, 1}, std::pair<int, int>{2, 2}}) {
         moe_r.SetRowSplits(cfg.first, cfg.second);
         for (int i = 0; i < 20; ++i) {
           const SynthLayer& l = L[static_cast<size_t>(i % layers)];
@@ -503,7 +506,7 @@ int RunTest() {
                     cfg.first, cfg.second, per_r, groups, mb, mb / 1e3 / (per_r * 1e-3));
       }
     }
-    moe_r.SetRowSplits(1, 1);
+    moe_r.SetRowSplits(4, 4);
     {
       std::vector<hipEvent_t> evs;
       std::vector<std::string> names;
@@ -540,3 +543,5 @@ int RunTest() {
   std::printf("\n%s (%d failure(s))\n", g_failures == 0 ? "PASS" : "FAIL", g_failures);
   return g_failures == 0 ? 0 : 1;
 }
+
+

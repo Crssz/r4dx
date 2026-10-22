@@ -1,4 +1,4 @@
-// Qwen35GroupedMoeDecode -- the qwen3_5_moe sparse MoE block for ONE decode token (M = 1) entirely on the device, no host
+﻿// Qwen35GroupedMoeDecode -- the qwen3_5_moe sparse MoE block for ONE decode token (M = 1) entirely on the device, no host
 // synchronization (docs/qwen35moe-plan.md section 7; the qwen4_exp counterpart is RunMoeGroupedDecode in qwen4exp_stage.cpp):
 //
 //   router GEMM (bf16) -> route (softmax, top-k, norm) -> shared expert (bf16 GEMVs, sigmoid gate logit) -> sort the k ids
@@ -67,7 +67,7 @@ class Qwen35GroupedMoeDecode {
   // expert's weights are streamed once for all of the rows that picked it (moe_trellis_grouped.h's M-row kernels). Only enqueues.
   void RunRows(hipStream_t stream, core::Arena& arena, const Qwen35GroupedMoeWeights& w, const Qwen35MoeTrellisPtrs& p,
                const uint16_t* x, uint16_t* y, int64_t rows, const std::function<void(const char*)>* mark = nullptr);
-  // Benchmark / test hook: the split-group counts (1 or 2) of the M-row GEMMs. Default 1 / 1.
+  // Benchmark / test hook: the split-group counts (1, 2 or 4) of the M-row GEMMs. Default 4 / 4 = the M = 1 kernels' counts, which makes a row's\n  // output bit-identical to Run()'s (the verify window then equals plain decode token for token).
   void SetRowSplits(int gate_up_skg, int down_skg);
   // The plan of the last RunRows call, D2H (tests): kMoePlanInts int32.
   std::vector<int32_t> ReadPlan(hipStream_t stream) const;
@@ -95,7 +95,7 @@ class Qwen35GroupedMoeDecode {
 
   // ---- M-row scratch (max_rows_ > 1) ----
   int max_rows_ = 1;
-  int rows_gu_skg_ = 1, rows_down_skg_ = 1;
+  int rows_gu_skg_ = 4, rows_down_skg_ = 4;
   core::DeviceBuffer<uint16_t> r_logits_, r_a0_gu_, r_a1_gu_, r_gu_, r_a0_down_, r_yp_, r_shared_g_, r_shared_u_, r_shared_h_, r_shared_y_,
       r_shared_gate_logit_;
   core::DeviceBuffer<int32_t> r_ids_, r_plan_;
@@ -104,3 +104,4 @@ class Qwen35GroupedMoeDecode {
 };
 
 }  // namespace r4dx::model
+

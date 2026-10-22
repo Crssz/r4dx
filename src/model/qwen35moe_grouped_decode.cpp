@@ -1,4 +1,4 @@
-#include "qwen35moe_grouped_decode.h"
+﻿#include "qwen35moe_grouped_decode.h"
 
 #include <hip/hip_runtime.h>
 
@@ -87,8 +87,9 @@ Qwen35GroupedMoeDecode::Qwen35GroupedMoeDecode(int experts, int top_k, bool norm
 }
 
 void Qwen35GroupedMoeDecode::SetRowSplits(int gate_up_skg, int down_skg) {
-  if ((gate_up_skg != 1 && gate_up_skg != 2) || (down_skg != 1 && down_skg != 2)) {
-    throw std::invalid_argument("Qwen35GroupedMoeDecode::SetRowSplits: 1 or 2");
+  const auto ok = [](int v) { return v == 1 || v == 2 || v == 4; };
+  if (!ok(gate_up_skg) || !ok(down_skg)) {
+    throw std::invalid_argument("Qwen35GroupedMoeDecode::SetRowSplits: 1, 2 or 4");
   }
   rows_gu_skg_ = gate_up_skg;
   rows_down_skg_ = down_skg;
@@ -210,3 +211,4 @@ void Qwen35GroupedMoeDecode::ReadSelection(hipStream_t stream, int32_t* ids, flo
 }
 
 }  // namespace r4dx::model
+

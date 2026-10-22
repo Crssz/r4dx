@@ -645,6 +645,10 @@ int64_t Qwen35MoeModel::DflashInjectedCount() const {
 void Qwen35MoeModel::SetDflashInjectionEnabled(bool enabled) {
   if (enabled && !dflash_) Fail("SetDflashInjectionEnabled(true): no drafter is loaded");
   dflash_injection_ = enabled;
+  // No drafter feeding: the stages stop capturing too (8 small D2H copies per step that a plain decode step can do without).
+  if (dflash_) {
+    for (auto& st : stages_) st->SetFeatureDest(enabled ? feat_host_.data() : nullptr);
+  }
 }
 
 void Qwen35MoeModel::InjectCaptured(int64_t rows, int64_t start_pos, int64_t min_pos) {

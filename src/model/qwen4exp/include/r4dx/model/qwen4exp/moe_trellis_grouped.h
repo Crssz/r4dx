@@ -1,4 +1,4 @@
-// src/model/qwen4exp/include/r4dx/model/qwen4exp/moe_trellis_grouped.h
+﻿// src/model/qwen4exp/include/r4dx/model/qwen4exp/moe_trellis_grouped.h
 //
 // Grouped (all selected experts in one launch) trellis decode MoE, M = 1. The kernels are instantiated for exactly one
 // geometry: hidden 2560, expert intermediate 640 (gate_up N 1280, two parts), at most 16 experts per token, at most
@@ -124,8 +124,10 @@ constexpr int kMoePlanGrpExpert = kMoePlanPosOfSrc + kMoePlanMaxPairs;
 constexpr int kMoePlanGrpStart = kMoePlanGrpExpert + kMoePlanMaxPairs;
 constexpr int kMoePlanGrpCount = kMoePlanGrpStart + kMoePlanMaxPairs;
 constexpr int kMoePlanInts = kMoePlanGrpCount + kMoePlanMaxPairs;
-// Split-group counts of the M-row GEMMs (1, 2): ws floats >= max_groups * skg * 16 * N, tickets u32 >= max_groups * N / 128.
-constexpr int kMoeRowsMaxSkg = 2;
+// Split-group counts of the M-row GEMMs (1, 2 or 4): ws floats >= max_groups * skg * 16 * N, tickets u32 >= max_groups * N / 128.
+// With skg == kGroupedQ35GuSkg / kGroupedQ35DownSkg (4 / 4, the M = 1 kernels' counts) a row's k-split sums run in the M = 1 kernel's order
+// and the output equals the M = 1 grouped kernel's bit for bit, row by row.
+constexpr int kMoeRowsMaxSkg = 4;
 
 // ids: int32 [rows * top_k] (router order per token) -> plan. rows * top_k <= kMoePlanMaxPairs.
 hipError_t GroupedMoePlanRows(const int32_t* ids, int32_t* plan, int rows, int top_k, void* stream);
@@ -152,3 +154,4 @@ hipError_t GroupedMoeCombineRowsRouterOrder(const uint16_t* yp, const float* wei
 }  // namespace qwen4exp
 }  // namespace model
 }  // namespace r4dx
+

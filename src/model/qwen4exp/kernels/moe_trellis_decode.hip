@@ -1,4 +1,4 @@
-// src/model/qwen4exp/kernels/moe_trellis_decode.hip
+﻿// src/model/qwen4exp/kernels/moe_trellis_decode.hip
 #include "r4dx/model/qwen4exp/moe_trellis_grouped.h"
 
 #include <hip/hip_runtime.h>
@@ -1061,6 +1061,8 @@ hipError_t GroupedTrellisGemvGateUpQ35Rows(int kb, const uint16_t* in_a0, const 
   const auto st = static_cast<hipStream_t>(stream);
   if (kb == 3 && skg == 1) return LaunchGuQ35Rows<3, 1>(in_a0, in_a1, plan, all_w, all_svh, out_c, ws, all_tickets, max_groups, st);
   if (kb == 3 && skg == 2) return LaunchGuQ35Rows<3, 2>(in_a0, in_a1, plan, all_w, all_svh, out_c, ws, all_tickets, max_groups, st);
+  if (kb == 3 && skg == 4) return LaunchGuQ35Rows<3, 4>(in_a0, in_a1, plan, all_w, all_svh, out_c, ws, all_tickets, max_groups, st);
+  if (kb == 4 && skg == 4) return LaunchGuQ35Rows<4, 4>(in_a0, in_a1, plan, all_w, all_svh, out_c, ws, all_tickets, max_groups, st);
   if (kb == 4 && skg == 1) return LaunchGuQ35Rows<4, 1>(in_a0, in_a1, plan, all_w, all_svh, out_c, ws, all_tickets, max_groups, st);
   if (kb == 4 && skg == 2) return LaunchGuQ35Rows<4, 2>(in_a0, in_a1, plan, all_w, all_svh, out_c, ws, all_tickets, max_groups, st);
   return hipErrorInvalidValue;
@@ -1082,6 +1084,8 @@ hipError_t GroupedTrellisGemvDownQ35Rows(int kb, const uint16_t* in_a0, const in
   const auto st = static_cast<hipStream_t>(stream);
   if (kb == 3 && skg == 1) return LaunchDownQ35Rows<3, 1>(in_a0, plan, all_w_down, all_svh_down, out_yp, ws, all_tickets_down, max_groups, st);
   if (kb == 3 && skg == 2) return LaunchDownQ35Rows<3, 2>(in_a0, plan, all_w_down, all_svh_down, out_yp, ws, all_tickets_down, max_groups, st);
+  if (kb == 3 && skg == 4) return LaunchDownQ35Rows<3, 4>(in_a0, plan, all_w_down, all_svh_down, out_yp, ws, all_tickets_down, max_groups, st);
+  if (kb == 4 && skg == 4) return LaunchDownQ35Rows<4, 4>(in_a0, plan, all_w_down, all_svh_down, out_yp, ws, all_tickets_down, max_groups, st);
   if (kb == 4 && skg == 1) return LaunchDownQ35Rows<4, 1>(in_a0, plan, all_w_down, all_svh_down, out_yp, ws, all_tickets_down, max_groups, st);
   if (kb == 4 && skg == 2) return LaunchDownQ35Rows<4, 2>(in_a0, plan, all_w_down, all_svh_down, out_yp, ws, all_tickets_down, max_groups, st);
   return hipErrorInvalidValue;
@@ -1101,3 +1105,4 @@ hipError_t GroupedMoeCombineRowsRouterOrder(const uint16_t* yp, const float* wei
 }  // namespace qwen4exp
 }  // namespace model
 }  // namespace r4dx
+

@@ -207,6 +207,9 @@ def run(args, mode: str) -> int:
         print(f"[ref_run] layer {i} ({arch.layer_types[i]}): load {t_load:.1f}s, total {time.perf_counter() - t0:.1f}s "
               f"({sum(len(x) for _, x in segs)} tokens in {len(segs)} segments)", flush=True)
         more = i + 1 < arch.n_layers
+        if i + 1 == arch.n_layers and mode == "logprobs":      # the residuals of all segments: a failed final stage restarts from here
+            torch.save([t.cpu() for t in resid], resid_path)
+            state_path.write_text(json.dumps({"ident": ident, "next_layer": arch.n_layers}), encoding="utf-8")
         if more and args.budget_seconds and time.perf_counter() - t_start > args.budget_seconds:
             torch.save([t.cpu() for t in resid], resid_path)
             doc = {"ident": ident, "next_layer": i + 1}
@@ -244,7 +247,16 @@ def run(args, mode: str) -> int:
                         if not dev < 0.05:
                             raise RuntimeError(f"{name} rows {r0}..: log-probs are not normalised (max |logsumexp| {dev}); "
                                                "bad GPU result, run again")
-                        lp = lp16.cpu().numpy()
+                        for attempt in range(4):
+                            lp = lp16.cpu().numpy()
+                            # the same check on the host copy: a device->host copy came back as noise after the device check passed
+                            host = float(np.abs(np.log(np.exp(lp.astype(np.float32)).sum(axis=1))).max())
+                            if host < 0.05:
+                                break
+                            print(f"[ref_run] {name} rows {r0}..: host copy not normalised (max |logsumexp| {host:.3g}), copy again "
+                                  f"({attempt + 1}/4)", flush=True)
+                        else:
+                            raise RuntimeError(f"{name} rows {r0}..: the host copy of the log-probs stays unnormalised; bad GPU, run again")
                         fh.write(lp.astype("<f2").tobytes())
                 meta = {"T": len(ids), "V": int(logits.shape[-1]), "dtype": "float16", "rows": len(ids) - 1, "source": "reference",
                         "torch_dtype": str(dtype).replace("torch.", ""), "sha256_of_token_ids_json": token_ids_sha256(ids),

@@ -80,3 +80,52 @@ allocation a measured per-class loss instead of the Hessian proxy for p. A re-qu
 Paths under `E:\models\r4dx\q35moe`: `kvcalib.json`, `tokens_kvcalib.json`, `kl\tokens_gate.json`, dumps `kl\{hf_bf16,hf_fp32,hf_mixrecon,
 hf_mix_*,r4dx_placeholder,r4dx_kv}`, logs `logs\kl-*.log`. Costs on this machine: kvcalib 151k tokens 21 min (2 slices); HF bf16 dump of
 19.6k tokens 8 min, fp32 12 min, each weight-only run 9 min; r4dx dump 6.5 min + 90 s load per container; CPU comparison ~4 min per dump.
+
+
+## Class-p precision experiment (2026-10-22): does spending bytes on attention/GDN projections help?
+
+Question: class p (attention + GDN projections, K4, 1.92 GiB) causes about half of the weight-only excess; pay for better p by demoting
+experts K4 -> K3 (both oracles exist). Method: weight-only runs (HF bf16 stack with trellis reconstructions, `ref_run.py logprobs --mix ...
+--mix-exclude --rtn-group`, KL against the fp32 truth, N = 0.04603, same 18,454 rows), then one real container end to end.
+
+**What the runtime and converter support for p.** bf16 per linear: yes, no code change (`r4dx-convert --keep-bf16`, the loader's bf16 twin
+tier, `Inspect` counts the bytes). Trellis K5: accepted, but our oracle has p only at K4; a K5 oracle needs the Hessians recaptured
+(about 4 h GPU), not done. w8a16: not next to trellis (the converter refuses it, the loader has one body layout); it is simulated here only
+(`rtn_int8`, equal to `tools/convert_ref/w8_ref.py`, tested), pending a decision on a converter/loader change of an estimated 150-250 lines.
+
+**The Hessian proxy ranks depth badly.** Experts-only weight-only runs on layer quartiles of the shipped mix (excess over N / proxy loss sum):
+layers 0-11 (all K3) 0.0173 / 0.19, 12-23 0.0190 / 0.79, 24-35 0.0126 / 1.6, 36-47 0.0057 / 10.3. Layers 43-47 are nearly harmless, the early
+layers need the bits. `alloc_q35.py --loss-scale loss_scale_depth_2026-10-22.json` multiplies the expert classes' proxy loss by the measured
+ratio (log-linear in depth); `--p-bf16 / --p-w8 none|attn|gdn|all` fix class p in a format, count its bytes exactly as `Inspect` does
+(bf16 twin = 2 bytes per weight; w8a16 = 1 byte + one f16 scale per 64) and re-spend the 26 GiB/card cap on the experts.
+
+| class p | extra bytes vs K4 | KL(truth) proxy loss | KL(truth) measured depth loss | change vs re-allocation alone |
+|---|---:|---:|---:|---:|
+| shipped mix | 0 | 0.1194 | - | - |
+| K4 (re-allocation only) | 0 | - | 0.1144 | 0 |
+| attention bf16 | +1.3 GiB | 0.1142 | 0.1139 | -0.0005 (0.0004 / GiB) |
+| GDN bf16 | +4.4 GiB | - | 0.1132 | -0.0012 (0.0003 / GiB) |
+| all p bf16 | +5.7 GiB (+2.9 GiB / card read per token) | 0.1100 | 0.1084 | -0.0060 (0.0011 / GiB) |
+| GDN w8a16 g64 (simulated) | +1.5 GiB | - | 0.0998 | -0.0147 (0.0098 / GiB) |
+| all p w8a16 g64 (simulated) | +2.0 GiB | 0.0949 | 0.0900 | -0.0244 (0.0122 / GiB) |
+
+(The run-to-run sampling noise of these differences is about 0.003: any change of weights re-rolls the bf16 rounding of the dump.)
+Without moving any expert bytes: shipped experts with p stock bf16 0.0904, with p simulated w8a16 g64 0.0871, only GDN stock 0.0939, only
+attention stock 0.1121.
+
+**Result with the formats that exist: not better.** bf16 for p costs more in expert demotions than it removes. The only cheap lever is the
+re-allocation; its weight-only prediction was 0.1144 vs 0.1194. Built and measured as a real container
+(`ornith-1.5-122b-trellis-mix-p2.r4dx`: p K4, depth-scaled allocation, calibrated KV; split k = 25, 25.98 / 25.90 GiB weights, 26.9 GiB used per
+card at load; gate rows: `E:\models\r4dx\q35moe\kl\gate_report_p2.md`):
+
+| 18,454 held-out rows | KL vs bf16 | top-1 vs bf16 | KL vs truth | top-1 vs truth | english / thai / code KL vs truth | prefill 7,125 tok | decode |
+|---|---:|---:|---:|---:|---|---:|---:|
+| shipped, calibrated KV | 0.12464 | 88.41% | 0.12361 | 88.20% | 0.0520 / 0.0740 / 0.0394 | 693 tok/s | 67.6 tok/s |
+| p2 (re-allocation) | 0.12424 | 88.23% | 0.12457 | 88.39% | 0.0541 / 0.0803 / 0.0394 | 523 tok/s | 65.5 tok/s |
+
+The engine shows no gain (+0.001 KL vs truth, inside the noise) and p2 prefills 25% slower (more K4 down projections; the France prompt and
+the long prompt both answer correctly). So the re-allocation is not adopted, and the weight-only prediction of -0.005 does not survive the
+real engine. What is left that works: w8a16 for p, predicted 0.090 (excess 0.044, still above the gate B limit 0.074; gate A is out of reach),
+for +2.0 GiB, if the converter/loader change is approved. Experts, not p, then carry the remaining error (0.044 excess with p exact).
+Note on tooling: three of about 30 HF dumps came back as noise from the device-to-host copy; `ref_run.py` now checks every row's
+log-sum-exp on the host copy and retries.

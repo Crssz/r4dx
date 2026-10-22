@@ -82,50 +82,96 @@ hf_mix_*,r4dx_placeholder,r4dx_kv}`, logs `logs\kl-*.log`. Costs on this machine
 19.6k tokens 8 min, fp32 12 min, each weight-only run 9 min; r4dx dump 6.5 min + 90 s load per container; CPU comparison ~4 min per dump.
 
 
-## Class-p precision experiment (2026-10-22): does spending bytes on attention/GDN projections help?
+## Options evaluated, not built (class-p precision and expert re-allocation, 2026-10-22)
 
-Question: class p (attention + GDN projections, K4, 1.92 GiB) causes about half of the weight-only excess; pay for better p by demoting
-experts K4 -> K3 (both oracles exist). Method: weight-only runs (HF bf16 stack with trellis reconstructions, `ref_run.py logprobs --mix ...
---mix-exclude --rtn-group`, KL against the fp32 truth, N = 0.04603, same 18,454 rows), then one real container end to end.
+Decision (user): stop here and accept the current quality. Nothing below is built; the numbers are kept because they say what would and
+would not help. **None of the predicted variants reaches gate B**: the best (class p as w8a16 g64 plus the depth-measured re-allocation)
+is 0.090 against the limit 0.0740 (and nowhere near gate A, 0.02).
 
-**What the runtime and converter support for p.** bf16 per linear: yes, no code change (`r4dx-convert --keep-bf16`, the loader's bf16 twin
-tier, `Inspect` counts the bytes). Trellis K5: accepted, but our oracle has p only at K4; a K5 oracle needs the Hessians recaptured
-(about 4 h GPU), not done. w8a16: not next to trellis (the converter refuses it, the loader has one body layout); it is simulated here only
-(`rtn_int8`, equal to `tools/convert_ref/w8_ref.py`, tested), pending a decision on a converter/loader change of an estimated 150-250 lines.
+Question: class p (attention + GDN projections, K4, 1.92 GiB) causes about half of the weight-only excess; could bytes spent on p, paid for
+by demoting experts K4 -> K3 (both oracles exist for every layer), remove it? Method: weight-only runs (the HF bf16 stack with the
+trellis linears replaced by their reconstructions, `ref_run.py logprobs --mix ... [--mix-exclude] [--rtn-group]`, KL against the fp32
+truth, N = 0.04603, the same 18,454 held-out rows); one candidate was also built and run as a real container.
 
-**The Hessian proxy ranks depth badly.** Experts-only weight-only runs on layer quartiles of the shipped mix (excess over N / proxy loss sum):
-layers 0-11 (all K3) 0.0173 / 0.19, 12-23 0.0190 / 0.79, 24-35 0.0126 / 1.6, 36-47 0.0057 / 10.3. Layers 43-47 are nearly harmless, the early
-layers need the bits. `alloc_q35.py --loss-scale loss_scale_depth_2026-10-22.json` multiplies the expert classes' proxy loss by the measured
-ratio (log-linear in depth); `--p-bf16 / --p-w8 none|attn|gdn|all` fix class p in a format, count its bytes exactly as `Inspect` does
-(bf16 twin = 2 bytes per weight; w8a16 = 1 byte + one f16 scale per 64) and re-spend the 26 GiB/card cap on the experts.
+### What the runtime and converter support for class p
 
-| class p | extra bytes vs K4 | KL(truth) proxy loss | KL(truth) measured depth loss | change vs re-allocation alone |
+| format for p | supported today | cost vs the K4 trellis |
+|---|---|---:|
+| trellis K4 (shipped) | yes | 0 |
+| bf16, per linear | yes, no code change: `r4dx-convert --keep-bf16 <regex>` writes `<base>.bf16.w`; the loader's tier order is requested layout, bf16 twin, bare (`qwen35moe_container.cpp` `ResolveTier` / `LoadQuantLinearWithFallback`), `Inspect` counts the bytes | attention only +1.3 GiB, GDN only +4.4 GiB, all p +5.7 GiB (about +2.9 GiB per card read per token) |
+| trellis K5 | the converter and kernels accept KB 3/4/5, but our oracle has p only at K4: a K5 oracle needs the Hessians re-captured (about 5 min per layer, about 4 h GPU) | about +0.5 GiB |
+| w8a16 (int8 codes, f16 scale per 64, RTN) | NO next to trellis: `r4dx-convert` refuses it (`CheckW8a16Flags`: "no mixed trellis + w8a16 container in v1") and the loader has one body layout plus the bf16 twin. Simulated only | all p +2.0 GiB, GDN only +1.5 GiB |
+
+**w8a16 implementation plan (150-250 lines, not started).** (1) `src/convert/main.cpp`: a flag (e.g. `--w8a16-linears <regex>`) that, with
+`--trellis-from`, gives the matched body linears a w8a16-only `LayoutSet` the way `--keep-bf16` gives a bf16-only one (`add_linear`, about line 2323;
+`trellis.Resolve(..., kept = true, ...)` already exempts a kept base from coverage), writes the `quant.w8a16` metadata block, and relaxes
+`CheckW8a16Flags` for exactly that case. (2) `src/model/qwen35moe_container.cpp`: a w8a16 tier in `ResolveTier` (`.w8a16.wq` / `.ws` present),
+its bytes in `Inspect`, the load through the existing `container_load_util.cpp` `Layout::kW8a16` case, and `CheckW8a16Choice` (today gated on
+a *requested* w8a16 layout) enabled when the container carries the block. (3) a tiny-container test of the converter/loader pair, then the
+real smoke and the gate. The int8 GEMM kernels (`w8a16_gemm.h`) and tuning exist; the quantizer recipe is already reproduced bit for bit in
+`ref_run.py rtn_int8` (tested against `tools/convert_ref/w8_ref.py`).
+
+### The Hessian proxy ranks depth badly (per-depth-quartile measurement)
+
+Experts-only weight-only runs on layer quartiles of the shipped mix (p stock; excess over N; proxy = the allocation report's loss sum):
+
+| layers | K in the shipped mix | excess over N | proxy loss | measured / proxy |
+|---|---|---:|---:|---:|
+| 0-11 | gu K3, down K3 | 0.0173 | 0.188 | 0.092 |
+| 12-23 | gu K3; down K3 in 6 of 12 layers | 0.0190 | 0.792 | 0.024 |
+| 24-35 | mostly K4 | 0.0126 | 1.594 | 0.0079 |
+| 36-47 | K4 | 0.0057 | 10.28 | 0.00055 |
+
+Layers 43-47 (62% of the proxy loss) are nearly harmless, early layers need the bits. `alloc_q35.py --loss-scale
+tools/reference/qwen35moe/loss_scale_depth_2026-10-22.json` multiplies the expert classes' proxy loss of layer i by the measured/proxy ratio
+(log-linear in depth between the quartile centres). The depth scale is not a model of the error, only a correction measured on this model.
+
+### Weight-only table (KL vs truth, all rows; shipped mix 0.1194 = excess +0.0733)
+
+Class p laid out per sub-class, experts re-spent to the 26 GiB/card cap by `alloc_q35.py`. "Proxy" = unscaled proxy loss, "depth" = with
+`--loss-scale`. The reference for "gain" is the re-allocation alone (p K4, depth): 0.1144, i.e. -0.005 vs the shipped mix for no extra bytes.
+
+| class p | extra bytes vs K4 | proxy | depth | gain vs re-allocation alone (per GiB) |
 |---|---:|---:|---:|---:|
-| shipped mix | 0 | 0.1194 | - | - |
-| K4 (re-allocation only) | 0 | - | 0.1144 | 0 |
-| attention bf16 | +1.3 GiB | 0.1142 | 0.1139 | -0.0005 (0.0004 / GiB) |
-| GDN bf16 | +4.4 GiB | - | 0.1132 | -0.0012 (0.0003 / GiB) |
-| all p bf16 | +5.7 GiB (+2.9 GiB / card read per token) | 0.1100 | 0.1084 | -0.0060 (0.0011 / GiB) |
-| GDN w8a16 g64 (simulated) | +1.5 GiB | - | 0.0998 | -0.0147 (0.0098 / GiB) |
-| all p w8a16 g64 (simulated) | +2.0 GiB | 0.0949 | 0.0900 | -0.0244 (0.0122 / GiB) |
+| K4 (shipped / re-allocation only) | 0 | 0.1194 | 0.1144 | 0 |
+| attention bf16 | +1.3 GiB | 0.1142 | 0.1139 | -0.0005 (0.0004) |
+| GDN bf16 | +4.4 GiB | - | 0.1132 | -0.0012 (0.0003) |
+| all p bf16 | +5.7 GiB | 0.1100 | 0.1084 | -0.0060 (0.0011) |
+| GDN w8a16 g64 (simulated) | +1.5 GiB | - | 0.0998 | -0.0147 (0.0098) |
+| all p w8a16 g64 (simulated) | +2.0 GiB | 0.0949 | 0.0900 | -0.0244 (0.0122) |
 
-(The run-to-run sampling noise of these differences is about 0.003: any change of weights re-rolls the bf16 rounding of the dump.)
-Without moving any expert bytes: shipped experts with p stock bf16 0.0904, with p simulated w8a16 g64 0.0871, only GDN stock 0.0939, only
-attention stock 0.1121.
+Sampling noise of a difference is about 0.003 (any change of weights re-rolls the bf16 rounding of the dump). Without moving any expert bytes
+(shipped experts): p stock bf16 0.0904, p simulated w8a16 g64 0.0871, only GDN stock 0.0939, only attention stock 0.1121 - GDN is the main part
+of p's damage. The class-p-only and expert-only single-class runs of "Where the loss is" overlap (their excesses add to 0.090 against 0.073).
+Reading: bf16 is not worth its bytes (10x less per GiB than w8a16, and it slows decode); w8a16 g64 removes 40% of the excess for +2.0 GiB but
+still leaves 0.090; after it the experts carry the rest (0.044 excess with p exact).
 
-**Result with the formats that exist: not better.** bf16 for p costs more in expert demotions than it removes. The only cheap lever is the
-re-allocation; its weight-only prediction was 0.1144 vs 0.1194. Built and measured as a real container
-(`ornith-1.5-122b-trellis-mix-p2.r4dx`: p K4, depth-scaled allocation, calibrated KV; split k = 25, 25.98 / 25.90 GiB weights, 26.9 GiB used per
-card at load; gate rows: `E:\models\r4dx\q35moe\kl\gate_report_p2.md`):
+### The one candidate that was built (and why it is not adopted)
+
+The re-allocation alone (p K4, depth scale) was converted as a real container and run through the same gate (it was built before the stop
+decision arrived; its dump and container were deleted afterwards, the two Ornith containers are untouched). Split k = 25, 25.98 / 25.90 GiB
+of weights, 26.9 GiB used per card at load; France and a 7k-token prompt answer correctly.
 
 | 18,454 held-out rows | KL vs bf16 | top-1 vs bf16 | KL vs truth | top-1 vs truth | english / thai / code KL vs truth | prefill 7,125 tok | decode |
 |---|---:|---:|---:|---:|---|---:|---:|
 | shipped, calibrated KV | 0.12464 | 88.41% | 0.12361 | 88.20% | 0.0520 / 0.0740 / 0.0394 | 693 tok/s | 67.6 tok/s |
-| p2 (re-allocation) | 0.12424 | 88.23% | 0.12457 | 88.39% | 0.0541 / 0.0803 / 0.0394 | 523 tok/s | 65.5 tok/s |
+| re-allocation (p K4) | 0.12424 | 88.23% | 0.12457 | 88.39% | 0.0541 / 0.0803 / 0.0394 | 523 tok/s | 65.5 tok/s |
 
-The engine shows no gain (+0.001 KL vs truth, inside the noise) and p2 prefills 25% slower (more K4 down projections; the France prompt and
-the long prompt both answer correctly). So the re-allocation is not adopted, and the weight-only prediction of -0.005 does not survive the
-real engine. What is left that works: w8a16 for p, predicted 0.090 (excess 0.044, still above the gate B limit 0.074; gate A is out of reach),
-for +2.0 GiB, if the converter/loader change is approved. Experts, not p, then carry the remaining error (0.044 excess with p exact).
-Note on tooling: three of about 30 HF dumps came back as noise from the device-to-host copy; `ref_run.py` now checks every row's
-log-sum-exp on the host copy and retries.
+The engine shows no gain (+0.001, inside the noise: the weight-only prediction of -0.005 does not survive) and prefill is 25% slower (more K4 down
+projections). Gates A and B fail for both, in every group and position bucket (`gate_report_p2.md` next to the other reports).
+
+### Allocator options (CPU, `tools/reference/qwen35moe/alloc_q35.py allocate`)
+
+* `--p-bf16 none|attn|gdn|all` fixes class p of the full-attention layers, the GDN layers or both as bf16 (the container's `<base>.bf16.w` tier;
+  bytes 2 per weight, as `Inspect`): no tensors of those linears go into the manifest (convert with `--keep-bf16` over the same bases), the
+  experts get the remaining bytes. `--p-w8 ...` the same for a w8a16 g64 prediction (1 byte + an f16 scale per 64 columns): PREDICTION ONLY,
+  the converter and loader cannot use it. `--loss-scale file.json` (`{"layers": [48 multipliers]}`) scales the expert classes' loss per layer.
+* Example: `python tools\reference\qwen35moe\alloc_q35.py allocate --src E:\models\r4dx\q35moe\oracle-k3 --src E:\models\r4dx\q35moe\oracle-k4
+  --out-dir <dir> --p-bf16 attn --loss-scale tools\reference\qwen35moe\loss_scale_depth_2026-10-22.json`. Without the new options the output is
+  identical to the shipped mix (checked: same `class_K`). Test: `tools/reference/qwen35moe/test_alloc_q35.py`.
+
+### Tooling note
+
+Three of about 30 HF dumps came back as noise from the device-to-host copy (rows with |log-sum-exp| up to 1e5, a normal exit): the cause was
+not found. `ref_run.py` now checks every row's log-sum-exp on the device and again on the host copy, retries the copy up to 4 times and fails
+loudly; it also keeps the final residuals so a failed last stage restarts in seconds. Look at a row's log-sum-exp when a KL is negative.

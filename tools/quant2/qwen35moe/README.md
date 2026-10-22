@@ -352,3 +352,15 @@ Everything runs through the streaming reference, layer-major over many segments 
   log-sum-exp when a KL is negative or absurd (all dumps used below were checked: |logsumexp| <= 3e-3 = fp16 rounding).
 
 Results are in `docs/qwen35moe-kl-gate.md`.
+### Allocator options for class p and measured depth sensitivity (not used for the shipped mix)
+
+`alloc_q35.py allocate` also takes `--p-bf16 none|attn|gdn|all` (class p kept as plain bf16: bytes as the container's bf16 twin, no manifest
+tensors, convert with `--keep-bf16` over the same bases), `--p-w8 ...` (w8a16 g64 byte model, PREDICTION ONLY: the converter cannot combine w8a16 with
+trellis) and `--loss-scale <json {"layers": [48 multipliers]}>` (per-layer multiplier of the expert classes' loss; the measured one is
+`tools/reference/qwen35moe/loss_scale_depth_2026-10-22.json`). Example, attention bf16 with the depth-measured loss:
+
+    python tools\reference\qwen35moe\alloc_q35.py allocate --src E:\models\r4dx\q35moe\oracle-k3 --src E:\models\r4dx\q35moe\oracle-k4
+        --out-dir E:\models\r4dx\q35moe\cand\m_attn_bf16 --p-bf16 attn --loss-scale tools\reference\qwen35moe\loss_scale_depth_2026-10-22.json
+
+CPU test: `tools/reference/qwen35moe/test_alloc_q35.py`. What the variants predicted and why none was built: docs/qwen35moe-kl-gate.md,
+"Options evaluated, not built".

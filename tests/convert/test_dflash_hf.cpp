@@ -337,6 +337,71 @@ int main() try {
     Check(Throws([&] { convert_dir(root / "hf", 2); }, "offset"), "refuses a layer offset outside {0, 1}");
   }
 
+  // ---- native DFlash2 (DFlash2DraftModel, incoai/Ornith-1.5-122B-DFlash2): real conv + selector are copied ---------------
+  {
+    Ckpt nat = ck;
+    std::normal_distribution<float> nd(0.0f, 1.0f);
+    auto put = [&](const std::string& n, std::vector<int64_t> shape, float sigma) {
+      Tensor t;
+      t.shape = shape;
+      int64_t cnt = 1;
+      for (auto d2 : shape) cnt *= d2;
+      t.bf16.resize(static_cast<size_t>(cnt));
+      for (auto& v : t.bf16) v = r4dx::core::FloatToBf16(sigma * nd(rng));
+      nat[n] = std::move(t);
+    };
+    const int64_t groups = kHidden / 16;
+    for (int i = 0; i < kLayers; ++i) {
+      const std::string h = "layers." + std::to_string(i) + ".";
+      for (const char* cv : {"attention_conv", "mlp_conv"}) {
+        put(h + cv + ".base_kernel", {2, 2, kHidden}, 0.5f);
+        put(h + cv + ".kernel_projection.weight", {2 * 2 * groups, kHidden}, 0.05f);
+      }
+    }
+    put("candidate_selector.hidden_projection.weight", {256, kHidden}, 0.05f);
+    put("candidate_selector.predecessor_codebook", {kVocab, 256}, 0.3f);
+    put("candidate_selector.successor_codebook", {kVocab, 256}, 0.3f);
+    json cfg = Config();
+    cfg["architectures"] = {"DFlash2DraftModel"};
+    cfg.erase("block_size");
+    cfg.erase("final_logit_softcapping");
+    cfg["is_causal"] = false;
+    cfg["dflash_config"] = {{"block_size", 16}, {"conv_group_size", 16}, {"conv_kernel_size", 2}, {"mask_token_id", 4},
+                            {"selector_rank", 256}, {"selector_top_k", 16}, {"target_layer_ids", kIds}};
+    WriteDir(root / "native", nat, cfg);
+    DflashHfOptions o;
+    o.input_dir = (root / "native").string();
+    o.output_path = (root / "native.r4dx").string();
+    o.quiet = true;
+    ConvertDflashHf(o);
+    const json nd2 = ReadMeta(o.output_path).at("dflash2");
+    Check(!nd2.contains("variant"), "native: no v1_identity variant");
+    Check(nd2.at("block_size") == 16 && nd2.at("selector_rank") == 256 && nd2.at("conv_kernel_size") == 2 && nd2.at("mask_token_id") == 4,
+          "native: geometry from dflash_config");
+    Check(nd2.at("target_layers").get<std::vector<int64_t>>() == std::vector<int64_t>({2, 3}), "native: target_layers = ids + 1");
+    Check(!nd2.contains("logit_softcap"), "native: no softcap");
+    SafetensorsReader nr(Utf8ToWide(o.output_path));
+    auto bytes_ok = [&](const std::string& hf, const std::string& name) {
+      const Tensor& t = nat.at(hf);
+      return nr.Has(name) && (nr.Meta(name).end - nr.Meta(name).begin) == t.bf16.size() * 2 &&
+             std::memcmp(nr.Data(name), t.bf16.data(), t.bf16.size() * 2) == 0;
+    };
+    bool ok = true;
+    for (int i = 0; i < kLayers; ++i) {
+      const std::string h = "layers." + std::to_string(i) + ".", b = "dflash.layers." + std::to_string(i) + ".";
+      ok &= bytes_ok(h + "attention_conv.base_kernel", b + "self_attn.conv.base");
+      ok &= bytes_ok(h + "mlp_conv.base_kernel", b + "mlp.conv.base");
+      ok &= bytes_ok(h + "attention_conv.kernel_projection.weight", b + "self_attn.conv.proj.bf16.w");
+      ok &= bytes_ok(h + "mlp_conv.kernel_projection.weight", b + "mlp.conv.proj.bf16.w");
+      ok &= nr.Meta(b + "self_attn.conv.base").shape == std::vector<int64_t>({2, 2, kHidden, 2});
+    }
+    ok &= bytes_ok("candidate_selector.hidden_projection.weight", "dflash.selector.hidden.bf16.w");
+    ok &= bytes_ok("candidate_selector.predecessor_codebook", "dflash.selector.predecessor");
+    ok &= bytes_ok("candidate_selector.successor_codebook", "dflash.selector.successor");
+    Check(ok, "native: conv base / proj and the selector are the checkpoint's bytes");
+    Check(nr.Names().size() == 1 + 2 + 3 + static_cast<size_t>(kLayers) * (7 + 4 + 2 + 2), "native: same tensor set as v1");
+  }
+
   fs::remove_all(root);
   std::printf("%d checks, %d failures\n", g_checks, g_fail);
   return g_fail == 0 ? 0 : 1;

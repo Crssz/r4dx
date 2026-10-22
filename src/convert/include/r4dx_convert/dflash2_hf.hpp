@@ -11,6 +11,18 @@
 //               score[a,b] = unary[b]; the walk emits each position's top-1 (candidate 0), i.e. the v1
 //               per-position argmax (the lm_head top-16 is sorted, ties to the lower id like argmax).
 //
+// NATIVE DFlash 2 (architectures DFlash2DraftModel, incoai/Ornith-1.5-122B-DFlash2; reference model code:
+// tools/reference/gemma/zlab_dflash_model.py, DFlash2DraftModel): the checkpoint ships the real conv and selector, so they are
+// copied instead of synthesized, and the geometry (block_size, conv_kernel_size, conv_group_size, selector_rank,
+// selector_top_k, mask_token_id, target_layer_ids) comes from `dflash_config`. Extra tensors (same byte layouts as the
+// llama.cpp GGUF path, see the model file's _grouped_dynamic_convolve / GroupedDynamicCausalConv / CandidateSelector):
+//   layers.i.{attention,mlp}_conv.base_kernel            [2 side][K taps][H] -> dflash.layers.i.{self_attn,mlp}.conv.base (bf16)
+//   layers.i.{attention,mlp}_conv.kernel_projection.weight  [2*K*H/16, H]    -> ...conv.proj (linear; row = side*K*G + tap*G + group)
+//   candidate_selector.hidden_projection.weight          [rank, H]           -> dflash.selector.hidden (linear)
+//   candidate_selector.{predecessor,successor}_codebook  [vocab, rank]       -> dflash.selector.{predecessor,successor} (bf16)
+// The metadata has no `variant` (a native DFlash2 for the runtime: non-causal block, real conv, real selector). Target features
+// are `hidden_states[id + 1]` exactly as in v1, so the default --dflash-target-layer-offset 1 is right for it too.
+//
 // Tensor map (HF name -> container name; every linear [N,K] row-major, the same bytes both sides):
 //   fc.weight                          -> dflash.fc                         (linear, K = n_target_layers * hidden)
 //   hidden_norm.weight                 -> dflash.enc_output_norm            (f32)   z-lab: hidden_norm(fc(feats))
@@ -72,6 +84,11 @@ struct DflashHfConfig {
   int64_t vocab = 0;
   int64_t context = 0;
   double input_embedding_scale = 1.0;
+  // Native DFlash 2 (architectures DFlash2DraftModel, e.g. incoai/Ornith-1.5-122B-DFlash2): the checkpoint carries the real
+  // dynamic two-tap conv (`layers.i.{attention,mlp}_conv.{base_kernel,kernel_projection.weight}`) and the candidate selector
+  // (`candidate_selector.*`), and its geometry comes from `dflash_config`. The tensors are copied, nothing is synthesized.
+  bool native_v2 = false;
+  int64_t conv_kernel_size = 2, conv_group_size = 16, selector_rank = 256, selector_top_k = 16;
 };
 
 inline std::string ReadTextFileUtf8(const std::string& path) {
@@ -89,8 +106,12 @@ inline DflashHfConfig ParseDflashHfConfig(const nlohmann::json& j) {
   };
   if (j.contains("architectures")) {
     bool ok = false;
-    for (const auto& a : j.at("architectures")) ok |= a.get<std::string>() == "DFlashDraftModel";
-    if (!ok) throw std::runtime_error("dflash2_hf: config.json architectures is not DFlashDraftModel");
+    for (const auto& a : j.at("architectures")) {
+      const std::string name = a.get<std::string>();
+      ok |= name == "DFlashDraftModel" || name == "DFlash2DraftModel";
+      c.native_v2 |= name == "DFlash2DraftModel";
+    }
+    if (!ok) throw std::runtime_error("dflash2_hf: config.json architectures is not DFlashDraftModel / DFlash2DraftModel");
   }
   c.hidden = get_int(j, "hidden_size");
   c.layers = get_int(j, "num_hidden_layers");
@@ -100,7 +121,6 @@ inline DflashHfConfig ParseDflashHfConfig(const nlohmann::json& j) {
   c.head_dim = j.contains("head_dim") && !j.at("head_dim").is_null() ? j.at("head_dim").get<int64_t>()
                                                                      : c.hidden / c.heads;
   if (j.contains("rms_norm_eps")) c.rms_eps = j.at("rms_norm_eps").get<double>();
-  c.block_size = get_int(j, "block_size");
   c.vocab = get_int(j, "vocab_size");
   c.context = j.contains("max_position_embeddings") ? j.at("max_position_embeddings").get<int64_t>() : 0;
   if (j.contains("rope_parameters") && j.at("rope_parameters").contains("rope_theta")) {
@@ -130,8 +150,18 @@ inline DflashHfConfig ParseDflashHfConfig(const nlohmann::json& j) {
   if (!j.contains("dflash_config"))
     throw std::runtime_error("dflash2_hf: config.json has no dflash_config");
   const auto& d = j.at("dflash_config");
+  c.block_size = (j.contains("block_size") && !j.at("block_size").is_null()) ? j.at("block_size").get<int64_t>()
+                                                                             : get_int(d, "block_size");
   c.target_layer_ids = d.at("target_layer_ids").get<std::vector<int64_t>>();
   c.mask_token_id = get_int(d, "mask_token_id");
+  if (c.native_v2) {
+    c.conv_kernel_size = get_int(d, "conv_kernel_size");
+    c.conv_group_size = get_int(d, "conv_group_size");
+    c.selector_rank = get_int(d, "selector_rank");
+    c.selector_top_k = get_int(d, "selector_top_k");
+    if (j.contains("is_causal") && j.at("is_causal").get<bool>())
+      throw std::runtime_error("dflash2_hf: a native DFlash2 drafter with is_causal = true is not supported");
+  }
   if (j.contains("final_logit_softcapping") && !j.at("final_logit_softcapping").is_null())
     c.softcap = j.at("final_logit_softcapping").get<double>();
   for (const nlohmann::json* o : {&j, &d}) {
@@ -171,10 +201,10 @@ inline Dflash2Metadata MakeDflash2MetadataFromHf(const DflashHfConfig& c, int64_
   m.rope_dimension_sections = {c.head_dim / 2, 0, 0, 0};
   m.n_rot = c.head_dim;
   m.block_size = c.block_size;
-  m.conv_kernel_size = 2;
-  m.conv_group_size = 16;
-  m.selector_rank = 256;
-  m.selector_top_k = 16;
+  m.conv_kernel_size = c.conv_kernel_size;
+  m.conv_group_size = c.conv_group_size;
+  m.selector_rank = c.selector_rank;
+  m.selector_top_k = c.selector_top_k;
   m.target_layers.clear();
   for (int64_t id : c.target_layer_ids) {
     if (id < 0) throw std::runtime_error("dflash2_hf: negative target_layer_id");
@@ -186,7 +216,7 @@ inline Dflash2Metadata MakeDflash2MetadataFromHf(const DflashHfConfig& c, int64_
   m.file_type = -1;
   m.logit_softcap = c.softcap;
   m.embed_scale = embed_scale > 0.0 ? embed_scale : c.input_embedding_scale;
-  m.variant = "v1_identity";
+  m.variant = c.native_v2 ? "" : "v1_identity";
   m.target_layer_offset = layer_offset;
   return m;
 }
@@ -290,12 +320,33 @@ inline void ConvertDflashHf(const DflashHfOptions& o) {
     });
   };
 
+  // Native DFlash2: a bf16 tensor copied verbatim (the checkpoint is bf16; ReadTensorAsFloat -> bf16 is exact). `shape` is the
+  // row-major HF shape; the container records it with the trailing byte-width axis.
+  auto copy_bf16 = [&](const std::string& hf, const std::string& name, std::vector<int64_t> shape) {
+    check_shape(hf, shape);
+    uint64_t n = 1;
+    for (int64_t d : shape) n *= static_cast<uint64_t>(d);
+    shape.push_back(2);
+    writer.Plan(name, shape, n * 2);
+    emit.push_back([&, hf, name] {
+      const auto b = EncodeBf16(ReadTensorAsFloat(src, hf));
+      writer.WriteTensor(name, b.data(), b.size());
+    });
+  };
+  const int64_t taps = meta.conv_kernel_size;
+
   linear("fc.weight", "dflash.fc", c.hidden, feat);
   norm("hidden_norm.weight", "dflash.enc_output_norm", c.hidden);
   norm("norm.weight", "dflash.output_norm", c.hidden);
-  zero_linear("dflash.selector.hidden", meta.selector_rank, c.hidden);
-  zero_bf16_rows("dflash.selector.predecessor", c.vocab, meta.selector_rank);
-  zero_bf16_rows("dflash.selector.successor", c.vocab, meta.selector_rank);
+  if (c.native_v2) {
+    linear("candidate_selector.hidden_projection.weight", "dflash.selector.hidden", meta.selector_rank, c.hidden);
+    copy_bf16("candidate_selector.predecessor_codebook", "dflash.selector.predecessor", {c.vocab, meta.selector_rank});
+    copy_bf16("candidate_selector.successor_codebook", "dflash.selector.successor", {c.vocab, meta.selector_rank});
+  } else {
+    zero_linear("dflash.selector.hidden", meta.selector_rank, c.hidden);
+    zero_bf16_rows("dflash.selector.predecessor", c.vocab, meta.selector_rank);
+    zero_bf16_rows("dflash.selector.successor", c.vocab, meta.selector_rank);
+  }
   for (int64_t i = 0; i < c.layers; ++i) {
     const std::string h = "layers." + std::to_string(i) + ".";
     const std::string b = "dflash.layers." + std::to_string(i) + ".";
@@ -306,14 +357,24 @@ inline void ConvertDflashHf(const DflashHfOptions& o) {
     linear(h + "self_attn.o_proj.weight", b + "self_attn.o_proj", c.hidden, q_n);
     norm(h + "self_attn.q_norm.weight", b + "self_attn.q_norm", c.head_dim);
     norm(h + "self_attn.k_norm.weight", b + "self_attn.k_norm", c.head_dim);
-    conv_base(b + "self_attn.conv.base");
-    zero_linear(b + "self_attn.conv.proj", dyn_n, c.hidden);
+    if (c.native_v2) {
+      copy_bf16(h + "attention_conv.base_kernel", b + "self_attn.conv.base", {2, taps, c.hidden});
+      linear(h + "attention_conv.kernel_projection.weight", b + "self_attn.conv.proj", dyn_n, c.hidden);
+    } else {
+      conv_base(b + "self_attn.conv.base");
+      zero_linear(b + "self_attn.conv.proj", dyn_n, c.hidden);
+    }
     norm(h + "post_attention_layernorm.weight", b + "post_attention_layernorm", c.hidden);
     linear(h + "mlp.gate_proj.weight", b + "mlp.gate_proj", c.ffn, c.hidden);
     linear(h + "mlp.up_proj.weight", b + "mlp.up_proj", c.ffn, c.hidden);
     linear(h + "mlp.down_proj.weight", b + "mlp.down_proj", c.hidden, c.ffn);
-    conv_base(b + "mlp.conv.base");
-    zero_linear(b + "mlp.conv.proj", dyn_n, c.hidden);
+    if (c.native_v2) {
+      copy_bf16(h + "mlp_conv.base_kernel", b + "mlp.conv.base", {2, taps, c.hidden});
+      linear(h + "mlp_conv.kernel_projection.weight", b + "mlp.conv.proj", dyn_n, c.hidden);
+    } else {
+      conv_base(b + "mlp.conv.base");
+      zero_linear(b + "mlp.conv.proj", dyn_n, c.hidden);
+    }
   }
 
   // Coverage audit: the drafter has no embedding / lm_head of its own (it uses the target's), so a
@@ -331,10 +392,11 @@ inline void ConvertDflashHf(const DflashHfOptions& o) {
   metadata["r4dx_format_version"] = "1";
   metadata["container_kind"] = "dflash2_draft";
   const size_t slash = o.input_dir.find_last_of("/\\");
-  metadata["model_id"] = "dflash-v1-identity:" + (slash == std::string::npos ? o.input_dir : o.input_dir.substr(slash + 1));
+  metadata["model_id"] = std::string(c.native_v2 ? "dflash2:" : "dflash-v1-identity:") +
+                         (slash == std::string::npos ? o.input_dir : o.input_dir.substr(slash + 1));
   metadata["produced_by"] = "r4dx-convert --dflash-hf (r4dx dev build)";
   metadata["source_hf"] = {{"dir", slash == std::string::npos ? o.input_dir : o.input_dir.substr(slash + 1)},
-                           {"architectures", "DFlashDraftModel"}};
+                           {"architectures", c.native_v2 ? "DFlash2DraftModel" : "DFlashDraftModel"}};
   metadata["dflash2"] = BuildDflash2MetadataJson(meta);
   metadata["dflash2"]["layout"] = o.layout;
   if (!o.quant_metadata.is_null()) {

@@ -314,9 +314,14 @@ No task-accuracy benchmark has been run: KL measures drift, not accuracy.
 MTP is probably dropped in favour of DFlash2 (drafter downloaded to `E:\models\r4dx\Ornith-1.5-122B-DFlash2`).
 
 **Open items, in priority order (estimates):** P1 accuracy benchmark + 32k needle test (3-4 h); P2 prefill speed, grouped prefill MoE GEMM (6-12 h); P3 vision tower (4-8 h);
-P4 w8a16 for class p (3-4 h, only if P1 shows a real loss); P5 DFlash2 (DONE 2026-10-23, section 6); P6 `--tp 2` (2-4 days); P7 MTP (0.5-1.5 days); P8 K5 / host-RAM expert tier;
+P4 w8a16 for class p (3-4 h, only if P1 shows a real loss); P5 DFlash2 (DONE 2026-10-23, section 6); P6 `--tp 2` (design done, `docs/qwen35moe-tp-design.md`: 70-95 h in seven phases, ~1.5x plain decode, trellis slices exactly, no re-quantization; implementation not started); P7 MTP (0.5-1.5 days, dropped in favour of DFlash2 unless asked); P8 K5 / host-RAM expert tier;
 P9 qwen4exp regression check with its real container (the shared kernel code was edited; only a synthetic test ran).
 
 **Operational notes.** The 48-layer quantization stalled three times (singular refit solve, a zero-Hessian expert, pruned-channel blow-up in `regularize`) and once more on an unexplained
 process kill; all fixes are in `tools/quant2/qwen35moe/`. `E:` is the tight resource (about 74 GiB free; `oracle-k3` + `oracle-k4` hold 99 GiB and are only needed for re-allocation).
 Live progress table: `tools\q35_progress.ps1`.
+
+**Update 2026-10-23 (DFlash2 merged, `d6507d5`).** DFlash2 works and is lossless (every stream equals plain greedy decode). Use:
+`--dflash E:\models\r4dx\ornith-1.5-122b-dflash2-w4a16.r4dx --dflash-k 11 --dflash-p-min 0.8` (the CLI / server default p_min is 0 and must be passed; at p_min 0 chat is ~1.0x and k=15 can be slower than plain).
+Measured against a same-process plain baseline of ~61 tok/s (399 tokens, both cards): code 1.8-2.1x, math 2.2-2.3x, chat 1.3-1.4x, a 4.4k-token prompt 1.3x. Acceptance is below the model card's
+(math 4.8-6.5 vs 8.3-9.2 tokens per round), most likely because the target is a 3.4-bit mix. Extra VRAM on device 1 is an estimate of ~1.3 GiB (not measured). `--max-ctx 16384` loads and serves with `--dflash`.

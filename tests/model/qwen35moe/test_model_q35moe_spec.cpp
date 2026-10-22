@@ -1,4 +1,4 @@
-// Speculative verify + rollback of the qwen3_5_moe model (docs/qwen35moe-plan.md section 6): the write-once GDN window state, the
+﻿// Speculative verify + rollback of the qwen3_5_moe model (docs/qwen35moe-plan.md section 6): the write-once GDN window state, the
 // uncommitted KV rows of a verify window, the speculation-to-plain / speculation-to-prefill transitions, and the DFlash2 driver.
 // On the TRELLIS tiny container (hidden 3072, 4 layers: 3 GDN + 1 attention, 16 experts).
 //
@@ -90,13 +90,16 @@ void ScriptedWindows(Qwen35MoeModel& m, const Golden& g, int steps, uint64_t see
   int i = 0;  // ref.tokens[i] is the next token to feed (position T + i)
   long rows_checked = 0, flips = 0, plain_steps = 0, windows = 0, prefills = 0;
   double worst_plain = 0, worst_verify = 0;
+  bool exact = true;  // no prefill chunk has run since the start: the state is the pure decode run's, so every row must be bit-identical
   while (i + 1 < steps) {
     const int kind = static_cast<int>(rng() % 10);
     if (kind == 0) {  // a plain step (speculation -> plain)
       const std::vector<float> got = m.DecodeStep(ref.tokens[static_cast<size_t>(i)]);
       const double e = MeanNorm(got, ref.logits[static_cast<size_t>(i) + 1]);
       worst_plain = std::max(worst_plain, e);
-      Check(e <= 0.03, "T" + std::to_string(T) + ": plain step after speculation at token " + std::to_string(i) + " drifts (mean/rms " +
+      // BIT-exact: the state a verify window + commit leaves (GDN B + replay, conv history, KV) is the state plain decode steps leave,
+      // and the plain step is the same kernels as the reference run's.
+      Check(exact ? e == 0.0 : e <= 0.03, "T" + std::to_string(T) + ": plain step after speculation at token " + std::to_string(i) + " is not bit-identical to plain decode (mean/rms " +
                            std::to_string(e) + ")");
       ++plain_steps;
       ++i;
@@ -111,6 +114,7 @@ void ScriptedWindows(Qwen35MoeModel& m, const Golden& g, int steps, uint64_t see
       Check(e <= 0.03, "T" + std::to_string(T) + ": prefill after speculation at token " + std::to_string(i) + " drifts (mean/rms " +
                            std::to_string(e) + ")");
       ++prefills;
+      exact = false;  // a prefill chunk's GEMM / chunked-scan numerics differ from decode's: the state is only noise-level close from here
       i += n;
       continue;
     }
@@ -130,8 +134,10 @@ void ScriptedWindows(Qwen35MoeModel& m, const Golden& g, int steps, uint64_t see
       const std::vector<float> row(vl.begin() + static_cast<ptrdiff_t>(r) * vocab, vl.begin() + static_cast<ptrdiff_t>(r + 1) * vocab);
       const double e = MeanNorm(row, want);
       worst_verify = std::max(worst_verify, e);
-      Check(e <= 0.04, "T" + std::to_string(T) + ": verify row " + std::to_string(r) + " of the window at token " + std::to_string(i) +
-                           " drifts from the reference logits (mean/rms " + std::to_string(e) + ")");
+      // A verify row is the plain decode step of its position, bit for bit (the M-row MoE runs the M = 1 kernel's split groups, the attention
+      // runs the decode kernel one row per launch, and the batched linears give a row the same bits at any M).
+      Check(exact ? e == 0.0 : e <= 0.04, "T" + std::to_string(T) + ": verify row " + std::to_string(r) + " of the window at token " + std::to_string(i) +
+                           " is not bit-identical to the plain decode logits (mean/rms " + std::to_string(e) + ")");
       if (am[static_cast<size_t>(r)] != ref.tokens[static_cast<size_t>(i + r + 1)]) {
         ++flips;
         std::vector<float> sorted = want;
@@ -289,3 +295,5 @@ int RunTest() {
   std::printf("\n%s (%d failure(s))\n", g_failures == 0 ? "PASS" : "FAIL", g_failures);
   return g_failures == 0 ? 0 : 1;
 }
+
+

@@ -13,6 +13,12 @@
 //
 // Every public method makes the stage's device the calling thread's device for its duration (and restores the previous
 // one). Single sequence. A chunk is T <= 64 rows, or a multiple of 64 up to 256 rows (the attention layer's sliced path).
+//
+// Speculative verify (spec_window > 1): a chunk with `verify` set is 1..spec_window rows that commit nothing until CommitVerified(n).
+// GDN state is the 27B's write-once window state (state B + a log of the window's rows, gdn_state.h); the attention KV of rejected rows
+// is overwritten by the next write; the MoE of 2..16 rows takes the M-row grouped kernels; the attention runs the decode kernel a few rows
+// per launch and the M-row MoE uses the M = 1 kernels' split groups, so every row equals the plain decode step of its position bit for bit.
+// SetFeatureCapture copies the residual entering the DFlash2 drafter's tap layers to pinned host memory.
 #pragma once
 
 #include <hip/hip_runtime.h>

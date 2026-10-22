@@ -114,7 +114,7 @@ struct Qwen35MoeStage::Impl {
   core::DeviceBuffer<int32_t> seqused_k; // [1]
   core::DeviceBuffer<int32_t> seqused_k_slices;  // [max_rows / 64]
   core::DeviceBuffer<int32_t> seqused_sub;       // [max_rows] verify windows: the causal context of each decode sub-launch
-  int verify_sub = 1;                            // rows per decode-kernel launch of a verify window's attention (0: the prefill kernel)
+  int verify_sub = 4;                            // rows per decode-kernel launch of a verify window's attention (0: the prefill kernel)
   core::PinnedBuffer<int32_t> positions_host, seqused_host, slices_host, sub_host;
 
   GdnControlCache control;
@@ -154,6 +154,7 @@ struct Qwen35MoeStage::Impl {
   std::vector<hipEvent_t> prof_ev;       // [3 * layers + 1]
   double prof_ms[3] = {0, 0, 0};         // gdn, attention, moe
   int64_t prof_calls = 0, prof_rows = 0;
+  double prof_enqueue_ms = 0, prof_wall_ms = 0;  // host time to enqueue a verify chunk's layers / until the stream is done
   bool prof_phase = false;               // R4DX_Q35_PROFILE=2: the GDN layers' phases
   hipEvent_t prof_phase_ev[4];
   double prof_phase_ms[3] = {0, 0, 0};   // proj, scan, out_proj
@@ -163,6 +164,11 @@ struct Qwen35MoeStage::Impl {
   std::vector<Qwen35MoeFeatureTap> taps;
   int64_t tap_pitch = 0;
   uint16_t* tap_dst = nullptr;
+  // The taps of a stage sit in consecutive columns of the host buffer (the model assigns them in layer order), so the rows are gathered
+  // on the device into tap_dev ([rows, ntaps * hidden], one small D2D copy per tap) and leave for the host in ONE 2D copy at the end of
+  // the chunk: 8 separate strided D2H copies per step cost ~3 ms of stream bubbles on a 17 ms decode step.
+  bool tap_contiguous = false;
+  core::DeviceBuffer<uint16_t> tap_dev;
 
   Qwen35MoeCaptureFn capture;
   double last_run_ms = 0, last_head_ms = 0;
@@ -457,6 +463,9 @@ Qwen35MoeStage::Qwen35MoeStage(const Qwen35MoeStageOptions& options, std::vector
   m.seqused_k_slices = core::DeviceBuffer<int32_t>(static_cast<size_t>(std::max<int64_t>(1, R / 64)));
   m.seqused_sub = core::DeviceBuffer<int32_t>(static_cast<size_t>(R));
   m.sub_host = core::PinnedBuffer<int32_t>(static_cast<size_t>(R));
+  // The decode kernel serves q_len * gqa <= 64 rows (4 here); its split law (decode_splits_g16) depends on the cache capacity and the kv heads,
+  // not on q_len, so a q_len = 4 launch rounds every row exactly like a q_len = 1 launch (audit: windows 5, 8, 16 bit-identical to decode at 4.4k context).
+  m.verify_sub = std::max<int>(1, static_cast<int>(64 / (cfg.num_attention_heads / cfg.num_key_value_heads)));
   if (const char* e = std::getenv("R4DX_Q35_VERIFY_SUB"); e != nullptr && e[0] != 0) m.verify_sub = std::atoi(e);
   m.positions_host = core::PinnedBuffer<int32_t>(static_cast<size_t>(R));
   m.seqused_host = core::PinnedBuffer<int32_t>(1);
@@ -492,10 +501,10 @@ Qwen35MoeStage::~Qwen35MoeStage() {
   if (impl_->prof_on && impl_->prof_calls > 0) {
     const double n = static_cast<double>(impl_->prof_calls);
     std::fprintf(stderr,
-                 "[Qwen35MoeStage dev %d, layers %lld-%lld] verify profile over %lld calls (avg %.1f rows): GDN %.2f ms, attention %.2f ms, MoE %.2f ms per call\n",
+                 "[Qwen35MoeStage dev %d, layers %lld-%lld] verify profile over %lld calls (avg %.1f rows): GDN %.2f ms, attention %.2f ms, MoE %.2f ms per call; host enqueue %.1f ms of %.1f ms wall per call\n",
                  impl_->device, static_cast<long long>(impl_->first), static_cast<long long>(impl_->end - 1),
                  static_cast<long long>(impl_->prof_calls), static_cast<double>(impl_->prof_rows) / n, impl_->prof_ms[0] / n,
-                 impl_->prof_ms[1] / n, impl_->prof_ms[2] / n);
+                 impl_->prof_ms[1] / n, impl_->prof_ms[2] / n, impl_->prof_enqueue_ms / n, impl_->prof_wall_ms / n);
   }
   if (impl_->prof_phase && impl_->prof_phase_calls > 0) {
     const double n = static_cast<double>(impl_->prof_phase_calls);
@@ -710,11 +719,19 @@ void Qwen35MoeStage::RunLayers(const Qwen35MoeChunk& c) {
   for (auto& lp : m.layers) {
     LayerRt& L = *lp;
     if (c.only_layer >= 0 && L.index != c.only_layer) continue;
-    for (const Qwen35MoeFeatureTap& tap : m.taps) {
+    for (size_t ti = 0; ti < m.taps.size(); ++ti) {
+      const Qwen35MoeFeatureTap& tap = m.taps[ti];
       if (tap.layer != L.index || m.tap_dst == nullptr) continue;
-      R4DX_HIP_CHECK(hipMemcpy2DAsync(m.tap_dst + tap.column * m.hidden, static_cast<size_t>(m.tap_pitch) * 2, m.h.data(),
-                                      static_cast<size_t>(m.hidden) * 2, static_cast<size_t>(m.hidden) * 2,
-                                      static_cast<size_t>(T), hipMemcpyDeviceToHost, m.stream.get()));
+      if (m.tap_contiguous) {
+        const size_t width = static_cast<size_t>(m.taps.size() * m.hidden) * 2;
+        R4DX_HIP_CHECK(hipMemcpy2DAsync(m.tap_dev.data() + static_cast<int64_t>(ti) * m.hidden, width, m.h.data(),
+                                        static_cast<size_t>(m.hidden) * 2, static_cast<size_t>(m.hidden) * 2, static_cast<size_t>(T),
+                                        hipMemcpyDeviceToDevice, m.stream.get()));
+      } else {
+        R4DX_HIP_CHECK(hipMemcpy2DAsync(m.tap_dst + tap.column * m.hidden, static_cast<size_t>(m.tap_pitch) * 2, m.h.data(),
+                                        static_cast<size_t>(m.hidden) * 2, static_cast<size_t>(m.hidden) * 2,
+                                        static_cast<size_t>(T), hipMemcpyDeviceToHost, m.stream.get()));
+      }
     }
     m.CapBf16(L.index, "residual_in", m.h.data(), T, m.hidden, c.first_pos);
     const bool prof = m.prof_on && c.verify;
@@ -743,8 +760,16 @@ void Qwen35MoeStage::RunLayers(const Qwen35MoeChunk& c) {
       m.book.OnPlainDecode();
     }
   }
+  if (m.tap_contiguous && m.tap_dst != nullptr && !m.taps.empty()) {
+    const size_t width = static_cast<size_t>(m.taps.size() * m.hidden) * 2;
+    R4DX_HIP_CHECK(hipMemcpy2DAsync(m.tap_dst + m.taps.front().column * m.hidden, static_cast<size_t>(m.tap_pitch) * 2, m.tap_dev.data(),
+                                    width, width, static_cast<size_t>(T), hipMemcpyDeviceToHost, m.stream.get()));
+  }
+  const double enqueue_ms = MsSince(t0);
   if (!is_decode) m.stream.Synchronize();
   if (m.prof_on && c.verify) {
+    m.prof_enqueue_ms += enqueue_ms;
+    m.prof_wall_ms += MsSince(t0);
     for (auto& lp : m.layers) {
       const size_t li = static_cast<size_t>(lp->index - m.first);
       float a = 0, b = 0;
@@ -943,9 +968,18 @@ void Qwen35MoeStage::SetFeatureCapture(std::vector<Qwen35MoeFeatureTap> taps, in
   }
   m.taps = std::move(taps);
   m.tap_pitch = row_pitch;
+  m.tap_contiguous = !m.taps.empty();
+  for (size_t i = 0; i < m.taps.size(); ++i) m.tap_contiguous = m.tap_contiguous && m.taps[i].column == m.taps[0].column + static_cast<int64_t>(i);
+  if (m.tap_contiguous) {
+    Qwen35MoeDeviceScope dev(m.device);
+    m.tap_dev = core::DeviceBuffer<uint16_t>(static_cast<size_t>(m.opt.max_rows * static_cast<int64_t>(m.taps.size()) * m.hidden));
+  }
 }
 
 void Qwen35MoeStage::SetFeatureDest(uint16_t* host_dst) { impl_->tap_dst = host_dst; }
 
 }  // namespace r4dx::model
+
+
+
 

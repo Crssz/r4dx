@@ -16,6 +16,12 @@
 // them; SaveCheckpoint / RestoreCheckpoint keep Qwen3.5's contract (ModelOptions::prompt_checkpoint, one slot, valid right
 // after a Prefill).
 //
+// Speculative decoding (docs/qwen35moe-plan.md section 6, docs/dflash2.md section 14): with Qwen35MoeModelOptions::spec_window > 1 (or a
+// DFlash2 drafter) VerifyWindow runs [anchor, drafts...] as one chunk that commits nothing and CommitVerifiedWindow(n) commits its first n rows;
+// the GDN layers keep the 27B's write-once window state so rejected rows cost nothing to roll back. A verify row is bit-identical to the
+// plain decode step of its position (tool_q35moe_dflash --audit-only), so a DFlash2 run equals plain greedy decode token for token.
+// With a drafter the model injects the target features of every committed row into it (Prefill, DecodeStep*, accepted verify rows).
+//
 // Not thread-safe; callers must serialize. After an exception out of Prefill / Decode*, call Reset().
 #pragma once
 

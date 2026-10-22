@@ -1,8 +1,9 @@
-// r4dx::model::Qwen35MoeLocalTextModel -- the TextModel of a qwen3_5_moe container (docs/qwen35moe-plan.md M3): one
+﻿// r4dx::model::Qwen35MoeLocalTextModel -- the TextModel of a qwen3_5_moe container (docs/qwen35moe-plan.md M3): one
 // Qwen35MoeModel, which itself drives its one or two stages (devices) on the calling thread, every method a forward to the
-// Qwen35MoeModel method of the same name. MTP, DFlash, vision and audio are not supported yet (MTP and vision are plan M6;
-// no DFlash drafter exists): the model options refuse them by name at load, their methods throw std::runtime_error naming
-// the feature, and MtpEnabled() / HasVision() / DflashEnabled() are false. TpWorld() is 1: the two cards are a layer split
+// Qwen35MoeModel method of the same name. DFlash2 is supported (docs/qwen35moe-plan.md section 6: `--dflash <drafter.r4dx> --dflash-k N`,
+// greedy rounds; a temperature > 0 round is one plain sampled step). MTP, vision and audio are not supported yet (MTP and vision are plan M6):
+// the model options refuse them by name at load, their methods throw std::runtime_error naming the feature, and MtpEnabled() /
+// HasVision() are false. TpWorld() is 1: the two cards are a layer split
 // inside the model, not tensor parallelism. LoadQwen35MoeTextModel (declared in text_model.h) is the qwen3_5_moe branch of
 // LoadTextModel.
 #pragma once
@@ -77,3 +78,4 @@ class Qwen35MoeLocalTextModel final : public TextModel {
 Qwen35MoeModelOptions MakeQwen35MoeModelOptions(const ModelOptions& opts);
 
 }  // namespace r4dx::model
+

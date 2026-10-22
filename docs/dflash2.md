@@ -1432,3 +1432,65 @@ r4dx-cli --model <same> --dflash E:\models\r4dx\gemma4-12b-dflash-bf16.r4dx --df
 `tools/gemma_dflash_ab.ps1` wraps these. Known risk to expect: verify rows run a different GEMM shape than single-row decode, so a rare
 near-tie can flip an argmax (the precedent of docs/mtp.md / tools/validate_dflash.ps1's control run); a divergence is a real bug only if the
 plain-MTP-style control does not show it. The bar to justify the fine-tune (plan D-7) is >= 2.0 tokens per round at k = 7.
+## 14. Ornith-1.5-122B (`qwen3_5_moe`): the native DFlash2 drafter on a two-card MoE target (branch q35moe-dflash2)
+
+Measured numbers and the launch line are in `docs/qwen35moe-plan.md` section 6; this section records the conventions and the code.
+
+### 14.1 The drafter checkpoint
+
+`incoai/Ornith-1.5-122B-DFlash2` (`DFlash2DraftModel`, 0.9 B, bf16, 1.86 GB, at `E:\models\r4dx\Ornith-1.5-122B-DFlash2`): 6 layers, hidden 3072, ffn 9216,
+32 q / 8 kv heads x 128, window 2048, rope theta 1e7, block 16 (15 drafted tokens), `target_layer_ids` [1,7,14,20,26,32,39,45], two-tap conv in groups of 16,
+selector rank 256 / top-k 16, mask token 248077, vocab 248320, `is_causal` false. It is the same model family as the 27B's GGUF drafter, as HF tensors:
+`layers.i.{attention,mlp}_conv.{base_kernel [2,2,H], kernel_projection.weight [4 * H / 16, H]}`, `candidate_selector.{hidden_projection.weight,
+predecessor_codebook, successor_codebook}`, `fc.weight`, `hidden_norm.weight`, `norm.weight`. Its reference code is the `DFlash2DraftModel` in the
+vendored `tools/reference/gemma/zlab_dflash_model.py`; every convention of sections 2-5 holds unchanged (plain RMSNorm, NeoX rope over all 128 dims, conv
+`out = (base0 + dyn0) * h[t] + (base1 + dyn1) * h[t-1]`, `dyn` computed once per sub-block, selector score `unary + <pred[P] * gate, succ[cand]>`).
+
+What the 27B drafter did not need: **only a converter path.** `r4dx-convert --dflash-hf <dir> --out <container> [--layout bf16|w4a16]` (`dflash2_hf.hpp`) now accepts
+`DFlash2DraftModel`: it copies the real conv and selector tensors (the v1 path synthesizes an identity conv and a zero selector), reads the geometry from
+`dflash_config`, and stores `target_layers = ids + 1` = [2,8,15,21,27,33,40,46] (the residual stream ENTERING those layers == HF `hidden_states[id + 1]`). The
+runtime (`DflashDraft`) already handled block 16, hidden 3072, 6 layers, 8 taps (24576 feature columns) and the non-causal block. `convert_dflash_hf` has a native
+fixture. Outputs: `E:\models\r4dx\ornith-1.5-122b-dflash2-{bf16,w4a16}.r4dx` (1.86 GB / 0.71 GB).
+
+**Golden against the HF model on the real weights** (`tools/reference/qwen35moe/dflash2_ornith_golden.py`, `tests/model/qwen35moe/test_q35moe_dflash2_golden.cpp`): the
+vendored z-lab module on CPU in fp32, random features / embedding, 40 context rows. HF's own bf16 run differs from its fp32 run by RelL2 4.5e-2 on this input; r4dx's
+bf16 drafter differs from the fp32 reference by 5.1e-2 on the final normed hidden state, the top-16 candidates overlap 227 of 240, and its selector path equals HF's on 13 of
+15 positions. A wrong layout, tap or norm convention would sit near 1. The w4a16 drafter lands at RelL2 0.79 on this (random-feature) input -- see the speed table for what that costs in acceptance.
+
+### 14.2 The target side (`Qwen35MoeStage` / `Qwen35MoeModel`)
+
+* **Placement.** The drafter, its stream, arena and ring live on the LAST stage's device (device 1), next to the lm_head it shares; the embedding rows
+  come from the host table the first stage already gathers from. The taps span both cards (inputs of layers 2, 8, 15, 21, 27 on device 0; 33, 40, 46 on device 1):
+  each stage copies the residual entering its tap layers into a small device buffer (one D2D copy per tap) and ships it to ONE pinned host buffer
+  `[rows, 8 * 3072]` with a single 2D copy at the end of the chunk (eight separate strided D2H copies per step cost ~3 ms of stream bubbles on a 17 ms decode step). After a prefill
+  chunk, a decode step or an accepted verify prefix the model uploads the committed rows and calls `DflashDraft::InjectFeatures` (<= 64 rows per call). A prompt only injects its
+  last 2048 positions (the drafter's window: older rows are masked for every later query, so skipping them is exact; the ring takes the gap through `ValidFrom()`).
+* **GDN rollback** (`ModelOptions` window = k + 1, `Qwen35MoeStageOptions::spec_window`): every GDN layer's `GdnStateManager` is the 27B's write-once one (docs/gdn-write-once.md): one
+  state B per layer plus two ping-pong logs of the last verify window's per-row updates (u, kk, eg: ~0.66 MiB per layer at 16 rows), the conv history in a rolling buffer of
+  width - 2 + window. A verify chunk (`Qwen35MoeChunk::verify`) runs ONE `conv_update` over the T rows (history offset = the previous window's committed count) and the
+  `recurrent_update_wo` kernel in LOG mode; `CommitVerified(n)` records n; the NEXT call replays the first n log rows into B inside its seed load. Rejecting rows costs nothing (nothing is
+  copied back); a plain decode step after a window takes the same pending-replay path; a prefill after one first replays and shifts the conv history back
+  (`Impl::CollapseWindow`, the model's `CollapseSpeculativeWindow`). The 27B's kernels are generic in the head counts: 16 key / 64 value heads ran unchanged.
+* **Attention rollback.** The 12 attention layers write the K/V of all T rows into the paged fp8 cache before attending; `pos` only advances by the committed count, so a rejected
+  row's slot is overwritten by the next write at that position before any query can read it (queries read `<= seqused_k`).
+* **MoE for T rows** (`Qwen35GroupedMoeDecode::RunRows`, `moe_trellis_decode.hip`): router GEMM + route for T rows, the shared expert for T rows, then a device-side plan kernel sorts the T x 8 (token, expert)
+  pairs by expert, and one launch per phase streams each distinct expert's weights ONCE for all of the rows that picked it: the M = 1 grouped GEMV kernel with the WMMA tile's 16 rows carrying
+  the expert's pairs (lane l of an A fragment reads row min(l % 16, count - 1) of the group) instead of 16 copies of one. No host sync. On synthetic 256-expert layers it
+  streams 560-585 GB/s (the M = 1 kernel: 440): 16 rows / 103 distinct experts in 0.91 ms. On the real model the 16 consecutive rows of a verify window pick far fewer distinct experts than random
+  routing does (a layer-call averaged 0.2 ms at 8 rows).
+* **Bit-exactness.** See 14.3.
+
+### 14.3 The verify window equals plain decode, bit for bit
+
+The first version of the verify path agreed with plain decode only to bf16 noise, and on the real 3.4-bit container "noise" was not small: `tool_q35moe_dflash --audit-only` (verify windows over the
+reference stream against the decode logits of the same positions) measured a mean |delta| of 0.7-1.2 on the top logit of each position, a p99 of 6-10 and a maximum of 31, with 1.3-4.5% of rows flipping their argmax.
+Part of that is the model, not the engine: swapping the MoE of plain decode for the (bit-near-identical, 8 elements in 860k) host-routed one moves the same logits by up to 10 and flips 3 argmaxes in 399.
+The tool then showed that a verify window with the HOST-routed MoE was bit-identical to host-routed decode, and that windows of 1, 2 and 4 rows were exact while 8 and 16 were not, which isolated two causes:
+
+1. the M-row MoE ran 1/1 split groups where the M = 1 grouped kernel runs 4/4 (a different fp32 summation order of the same products): with `Qwen35GroupedMoeDecode::SetRowSplits(4, 4)` (now the default) a row's output equals the M = 1 kernel's bit for bit
+   (`test_q35moe_grouped_moe_kernel`: 0 of 276 x 3072 elements differ);
+2. for more than 4 rows (`q_len * gqa <= 64` with gqa 16) the attention took the prefill kernel. A verify chunk now runs the DECODE kernel `decode_sub` = 4 rows per launch
+   (`AttentionLayer::Forward`'s `decode_sub` / `seqused_k_sub`; the decode split law depends on the cache capacity and the kv heads, not on q_len, so every row rounds like a q_len = 1 launch).
+
+After both: noise 0.000 and 0 flips on every audited prompt and window (2, 4, 5, 8, 12, 16), including a 4.4k-token context; every DFlash2 stream in the speed table is identical to the plain greedy stream. Once a prefill chunk intervenes
+(different GEMM / chunked-scan numerics from decode) the state is again only noise-level close, which is why a conversation that is prefilled and then decoded is equal to "prefill + plain decode", not to a pure-decode run.

@@ -34,7 +34,7 @@ class Qwen35MoeLocalTextModel final : public TextModel {
   bool HasVision() const override { return false; }
   bool MtpEnabled() const override { return false; }
   bool MtpUsingReducedVocabDraft() const override { return false; }
-  bool DflashEnabled() const override { return false; }
+  bool DflashEnabled() const override { return m_->DflashEnabled(); }
   int64_t SampledFallbackRows() const override { return m_->SampledFallbackRows(); }
   int64_t PositionCount() const override { return m_->PositionCount(); }
   int64_t NumLoadedLayers() const override { return m_->NumLoadedLayers(); }

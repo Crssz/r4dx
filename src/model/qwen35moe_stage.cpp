@@ -134,6 +134,22 @@ struct Qwen35MoeStage::Impl {
   core::DeviceBuffer<uint16_t> logits_all;     // capture mode: [max_rows, vocab] bf16
   core::DeviceBuffer<uint16_t> norm_all;       // capture mode: [max_rows, hidden]
 
+  // ---- speculative window (spec_window > 1): the 27B Model's bookkeeping (mtp_num_accepted_dev_, gdn_book_) per stage -------
+  int64_t spec_window = 1;
+  core::DeviceBuffer<int32_t> num_accepted_dev;  // [1] rows the last window committed (conv history offset / replay length)
+  core::PinnedBuffer<int32_t> num_accepted_host; // [1] staging of the async write above
+  bool num_accepted_valid = false;
+  int64_t last_committed = 1;
+  GdnPendingBook book;
+  core::DeviceBuffer<float> logits_rows;         // [spec_window, vocab] fp32 (HeadRows)
+  core::DeviceBuffer<int32_t> argmax_rows_dev;   // [spec_window]
+  core::PinnedBuffer<int32_t> argmax_rows_host;  // [spec_window]
+
+  // ---- DFlash2 feature capture ---------------------------------------------------------------------------------------
+  std::vector<Qwen35MoeFeatureTap> taps;
+  int64_t tap_pitch = 0;
+  uint16_t* tap_dst = nullptr;
+
   Qwen35MoeCaptureFn capture;
   double last_run_ms = 0, last_head_ms = 0;
   int64_t last_first_pos = 0;  // first position of the chunk RunLayers ran last (the head's capture rows start there)
@@ -165,6 +181,42 @@ struct Qwen35MoeStage::Impl {
                            rows * hidden, reinterpret_cast<int64_t>(stream.get()));
   }
 
+  // Prefill after speculation: replays the committed prefix of the last log into every GDN state and moves the conv history back
+  // to offset 0 (Model::CollapseSpeculativeWindow).
+  void CollapseWindow() {
+    if (spec_window <= 1) return;
+    if (book.Pending()) {
+      for (auto& lp : layers) {
+        if (lp->gdn_states) lp->gdn_states->Materialize(0, book.Count(), stream);
+      }
+    }
+    book.Clear();
+    if (num_accepted_valid && last_committed > 1) {
+      for (auto& lp : layers) {
+        if (lp->gdn_states) lp->gdn_states->ShiftConv(0, last_committed, stream);
+      }
+    }
+    num_accepted_valid = false;
+    last_committed = 1;
+  }
+  void ResetSpec() {
+    num_accepted_valid = false;
+    last_committed = 1;
+    book.Clear();
+  }
+  // Async write of `n` into num_accepted_dev. The value is staged in pinned memory: slot 0 for a commit (written only while the
+  // device is idle -- the previous verify synchronized), slot 1 holds the constant 1 of a plain decode step for good, so the
+  // host never rewrites a staging word an enqueued copy has yet to read.
+  void WriteNumAccepted(int32_t n, bool plain_step = false) {
+    int32_t* src = num_accepted_host.data();
+    if (plain_step) {
+      src += 1;
+    } else {
+      src[0] = n;
+    }
+    R4DX_HIP_CHECK(hipMemcpyAsync(num_accepted_dev.data(), src, sizeof(int32_t), hipMemcpyHostToDevice, stream.get()));
+  }
+
   void RunGdn(LayerRt& L, const Qwen35MoeChunk& c);
   void RunAttention(LayerRt& L, const Qwen35MoeChunk& c);
   void RunMoe(LayerRt& L, const Qwen35MoeChunk& c);
@@ -193,6 +245,10 @@ Qwen35MoeStage::Qwen35MoeStage(const Qwen35MoeStageOptions& options, std::vector
     Fail("max_rows must be in [1, 64] or a multiple of 64 up to 256");
   }
   if (options.max_ctx < 1) Fail("max_ctx must be >= 1");
+  if (options.spec_window < 1 || options.spec_window > std::min<int64_t>(options.max_rows, 64)) {
+    Fail("spec_window must be in [1, min(max_rows, 64)]");
+  }
+  m.spec_window = options.spec_window;
   m.first = layers.front().index;
   m.end = m.first + static_cast<int64_t>(layers.size());
   for (size_t i = 0; i < layers.size(); ++i) {
@@ -262,7 +318,8 @@ Qwen35MoeStage::Qwen35MoeStage(const Qwen35MoeStageOptions& options, std::vector
       L->gdn = std::make_unique<Qwen4ExpGdn>(geo, r.gdn);
       L->gdn_states = std::make_unique<GdnStateManager>(
           /*max_seqs=*/1, cfg.linear_num_value_heads, cfg.linear_value_head_dim, cfg.linear_key_head_dim,
-          L->gdn->ConvDim(), cfg.linear_conv_kernel_dim, /*max_decode_window=*/1, /*write_once=*/false);
+          L->gdn->ConvDim(), cfg.linear_conv_kernel_dim, /*max_decode_window=*/options.spec_window,
+          /*write_once=*/options.spec_window > 1);
       L->gdn_states->ZeroAll(m.stream);
       if (options.prompt_checkpoint) L->gdn_states->AllocateCheckpoint();
       bump(L->gdn->ArenaBytes(R));
@@ -352,6 +409,22 @@ Qwen35MoeStage::Qwen35MoeStage(const Qwen35MoeStageOptions& options, std::vector
     m.summary_lse_dev = core::DeviceBuffer<float>(1);
     m.topk_ws = core::DeviceBuffer<uint8_t>(static_cast<size_t>(r4dx_topk_lse_workspace_bytes()));
     bump(Padded(static_cast<size_t>(m.vocab) * 2));
+    if (options.spec_window > 1) {
+      m.logits_rows = core::DeviceBuffer<float>(static_cast<size_t>(options.spec_window * m.vocab));
+      m.argmax_rows_dev = core::DeviceBuffer<int32_t>(static_cast<size_t>(options.spec_window));
+      m.argmax_rows_host = core::PinnedBuffer<int32_t>(static_cast<size_t>(options.spec_window));
+      bump(Padded(static_cast<size_t>(options.spec_window * m.vocab) * 2));
+    }
+  }
+  if (options.spec_window > 1) {
+    m.num_accepted_dev = core::DeviceBuffer<int32_t>(1);
+    m.num_accepted_host = core::PinnedBuffer<int32_t>(2);
+    m.num_accepted_host[0] = 0;
+    m.num_accepted_host[1] = 1;  // the constant a plain decode step writes
+    m.num_accepted_dev.Zero();
+    // The control arrays of the window path, uploaded now (a first use is a blocking hipMalloc + copy in the middle of a step).
+    const int32_t slot = m.layers.empty() || !m.layers.front()->gdn_states ? 1 : m.layers.front()->gdn_states->SlotForSeq(0);
+    m.control.Prewarm(options.spec_window, slot, options.spec_window);
   }
 
   // ---- stage-wide buffers -----------------------------------------------------------------------------------------
@@ -446,6 +519,13 @@ void Qwen35MoeStage::Impl::RunGdn(LayerRt& L, const Qwen35MoeChunk& c) {
   call.is_prefill = c.is_prefill;
   call.has_init = c.first_pos > 0;
   call.prefill_recurrent = c.gdn_prefill_recurrent;
+  if (spec_window > 1 && !c.is_prefill) {
+    // The 27B's protocol (Model::RunChunk / VerifyWindow): the conv history offset is the last window's committed count, and a
+    // committed prefix of the last log still pending is replayed in this call's seed load.
+    call.verify = c.verify;
+    call.num_accepted = num_accepted_valid ? num_accepted_dev.data() : nullptr;
+    call.gdn_pending = book.Pending() ? num_accepted_dev.data() : nullptr;
+  }
   L.gdn->Forward(stream.get(), arena, *L.gdn_states, control, x.data(), blk.data(), c.rows, call);
   arena.Reset();
   CapBf16(L.index, "attn_out", blk.data(), c.rows, hidden, c.first_pos);
@@ -526,12 +606,23 @@ void Qwen35MoeStage::RunLayers(const Qwen35MoeChunk& c) {
          ") exceed max_ctx " + std::to_string(m.opt.max_ctx));
   }
   const int64_t T = c.rows;
+  if (c.verify && (c.is_prefill || T > m.spec_window || m.spec_window <= 1)) {
+    Fail("RunLayers: a verify chunk needs spec_window > 1, !is_prefill and rows <= spec_window");
+  }
+  if (m.spec_window > 1 && !c.is_prefill && !c.verify && T != 1) Fail("RunLayers: a speculative stage decodes one row (or verifies)");
   const bool is_decode = (T == 1 && !c.is_prefill && !m.capture);
   m.arena.Reset();
+  if (c.is_prefill) m.CollapseWindow();
 
   for (auto& lp : m.layers) {
     LayerRt& L = *lp;
     if (c.only_layer >= 0 && L.index != c.only_layer) continue;
+    for (const Qwen35MoeFeatureTap& tap : m.taps) {
+      if (tap.layer != L.index || m.tap_dst == nullptr) continue;
+      R4DX_HIP_CHECK(hipMemcpy2DAsync(m.tap_dst + tap.column * m.hidden, static_cast<size_t>(m.tap_pitch) * 2, m.h.data(),
+                                      static_cast<size_t>(m.hidden) * 2, static_cast<size_t>(m.hidden) * 2,
+                                      static_cast<size_t>(T), hipMemcpyDeviceToHost, m.stream.get()));
+    }
     m.CapBf16(L.index, "residual_in", m.h.data(), T, m.hidden, c.first_pos);
     if (L.full) {
       m.RunAttention(L, c);
@@ -541,6 +632,18 @@ void Qwen35MoeStage::RunLayers(const Qwen35MoeChunk& c) {
     m.CapBf16(L.index, "residual_attn", m.hmid.data(), T, m.hidden, c.first_pos);
     m.RunMoe(L, c);
     m.CapBf16(L.index, "residual_out", m.h.data(), T, m.hidden, c.first_pos);
+  }
+  if (m.spec_window > 1 && !c.is_prefill && c.only_layer < 0) {
+    if (c.verify) {
+      m.book.OnVerifyLaunched(T);
+    } else {
+      // A plain decode step "commits" its one row: the next call's conv history sits at offset 0, nothing is pending (this
+      // step's kernel replayed any pending prefix and stored the final state into B).
+      m.WriteNumAccepted(1, /*plain_step=*/true);
+      m.num_accepted_valid = true;
+      m.last_committed = 1;
+      m.book.OnPlainDecode();
+    }
   }
   if (!is_decode) m.stream.Synchronize();
   m.last_run_ms = MsSince(t0);
@@ -644,6 +747,7 @@ void Qwen35MoeStage::Reset() {
   m.stream.Synchronize();
   m.arena.Reset();
   m.expert_arena.Reset();
+  m.ResetSpec();
 }
 
 void Qwen35MoeStage::SaveCheckpoint() {
@@ -666,6 +770,71 @@ void Qwen35MoeStage::RestoreCheckpoint(int64_t /*pos*/) {
   m.stream.Synchronize();
   m.arena.Reset();
   m.expert_arena.Reset();
+  m.ResetSpec();  // the checkpoint was taken right after a prefill, with nothing pending
 }
+
+// ---- speculative window ----------------------------------------------------------------------------------------------
+
+int64_t Qwen35MoeStage::SpecWindow() const { return impl_->spec_window; }
+
+void Qwen35MoeStage::CommitVerified(int64_t n) {
+  Impl& m = *impl_;
+  Qwen35MoeDeviceScope dev(m.device);
+  if (m.spec_window <= 1) Fail("CommitVerified: the stage was built without a speculative window");
+  if (n < 1 || n > m.book.LastVerifyT()) {
+    Fail("CommitVerified: n = " + std::to_string(n) + " is outside [1, " + std::to_string(m.book.LastVerifyT()) +
+         "] (the rows of the last verify call)");
+  }
+  m.WriteNumAccepted(static_cast<int32_t>(n));
+  m.num_accepted_valid = true;
+  m.last_committed = n;
+  static_cast<void>(m.book.OnCommit(n));  // pending iff the call logged (T > 1)
+}
+
+std::vector<int32_t> Qwen35MoeStage::HeadRows(int64_t rows) {
+  Impl& m = *impl_;
+  Qwen35MoeDeviceScope dev(m.device);
+  if (!m.head_refs) Fail("HeadRows: this stage has no head");
+  if (m.spec_window <= 1 || rows < 1 || rows > m.spec_window) Fail("HeadRows: rows out of range / no speculative window");
+  const auto t0 = Clock::now();
+  const hipStream_t s = m.stream.get();
+  m.arena.Reset();
+  m.Norm(m.h.data(), m.head_refs->final_norm, m.x.data(), rows);
+  uint16_t* logits_bf16 = m.arena.Alloc<uint16_t>(static_cast<size_t>(rows * m.vocab));
+  ApplyLinear(s, m.arena, *m.head_refs->lm_head, m.x.data(), logits_bf16, rows);
+  // The widen is exact, so the comparisons of the f32 row argmax are the bf16 ones (r4dx_argmax_bf16's, the plain decode step's).
+  r4dx_model_widen_bf16_to_f32(reinterpret_cast<int64_t>(logits_bf16), reinterpret_cast<int64_t>(m.logits_rows.data()),
+                               rows * m.vocab, reinterpret_cast<int64_t>(s));
+  r4dx_argmax_rows_f32(reinterpret_cast<int64_t>(m.logits_rows.data()), m.vocab,
+                       reinterpret_cast<int64_t>(m.argmax_rows_dev.data()), /*out_val=*/0, /*out_stride=*/1, rows, m.vocab,
+                       reinterpret_cast<int64_t>(s));
+  R4DX_HIP_CHECK(hipMemcpyAsync(m.argmax_rows_host.data(), m.argmax_rows_dev.data(), static_cast<size_t>(rows) * sizeof(int32_t),
+                                hipMemcpyDeviceToHost, s));
+  m.stream.Synchronize();
+  m.arena.Reset();
+  std::vector<int32_t> out(m.argmax_rows_host.data(), m.argmax_rows_host.data() + rows);
+  m.last_head_ms = MsSince(t0);
+  return out;
+}
+
+std::vector<float> Qwen35MoeStage::LastHeadRowsLogits(int64_t rows) {
+  Impl& m = *impl_;
+  Qwen35MoeDeviceScope dev(m.device);
+  if (m.logits_rows.size() == 0 || rows < 1 || rows > m.spec_window) Fail("LastHeadRowsLogits: no HeadRows result / rows out of range");
+  std::vector<float> out(static_cast<size_t>(rows * m.vocab));
+  m.logits_rows.CopyToHost(out.data(), out.size());
+  return out;
+}
+
+void Qwen35MoeStage::SetFeatureCapture(std::vector<Qwen35MoeFeatureTap> taps, int64_t row_pitch) {
+  Impl& m = *impl_;
+  for (const Qwen35MoeFeatureTap& t : taps) {
+    if (t.column < 0 || (t.column + 1) * m.hidden > row_pitch) Fail("SetFeatureCapture: a tap column is outside the row pitch");
+  }
+  m.taps = std::move(taps);
+  m.tap_pitch = row_pitch;
+}
+
+void Qwen35MoeStage::SetFeatureDest(uint16_t* host_dst) { impl_->tap_dst = host_dst; }
 
 }  // namespace r4dx::model

@@ -105,7 +105,12 @@ size_t Qwen4ExpGdn::ArenaBytes(int64_t T) const {
 void Qwen4ExpGdn::Forward(hipStream_t s, core::Arena& arena, GdnStateManager& states, GdnControlCache& control,
                           const uint16_t* x, uint16_t* out, int64_t T, const Qwen4ExpGdnCall& call) const {
   if (T < 1) Fail("T must be >= 1");
-  if (states.MaxDecodeWindow() != 1 || states.WriteOnce()) Fail("the state manager must be the window-1, single-slot one");
+  const bool spec = states.MaxDecodeWindow() > 1;  // write-once speculative window (Qwen4ExpGdnCall::verify)
+  if (spec ? !states.WriteOnce() : states.WriteOnce()) {
+    Fail("the state manager must be the window-1 single-slot one or a write-once window > 1 one");
+  }
+  if (spec && !call.is_prefill && T > states.MaxDecodeWindow()) Fail("T exceeds the state manager's window");
+  if (spec && states.KeyHeads() != Hg_) Fail("the write-once state was sized for another key-head count");
   if (states.NumHeads() != H_ || states.ValueDim() != V_ || states.KeyDim() != K_ || states.ConvDim() != conv_dim_) {
     Fail("the state manager's geometry does not match this layer");
   }
@@ -188,6 +193,41 @@ void Qwen4ExpGdn::Forward(hipStream_t s, core::Arena& arena, GdnStateManager& st
                                    out_core + r0 * value_dim_, static_cast<int64_t>(ts) * H_, V_, V_, V_, Vi, eps_,
                                    kActSilu, s);
       }
+    }
+  } else if (spec && !call.is_prefill) {
+    // The speculative window (gdn_layer.cpp's decode / verify branch, same calls): ONE conv_update over the T rows reading its
+    // history at the offset the previous window's acceptance left, then
+    //   T == 1, nothing pending : the legacy recurrent kernel in place (a plain decode step, byte for byte);
+    //   T == 1, pending         : replay the committed prefix of the last log in the seed load, run the row, store the state;
+    //   T  > 1                  : log the rows (no state store), replaying the pending prefix first; the next ping-pong half
+    //                             takes the log.
+    // The window's rows are consecutive tokens of ONE sequence, so cu = {0, T}.
+    const int64_t window = states.MaxDecodeWindow();
+    const int32_t* cu_dev = control.CuPair(T);
+    const int32_t* sidx_dev = control.SidxBase(slot, window);
+    core::r4d::GdnConvUpdate(mixed_qkv, conv_dim_, w_.conv1d_weight, /*bias=*/nullptr, states.ConvBase(),
+                             states.ConvSeqStride(), states.ConvDimStride(), states.ConvTokStride(),
+                             static_cast<int>(states.StateLenMax()), cache_idx_dev, /*ci_stride=*/1, call.num_accepted,
+                             q_buf, k_buf, v_buf, cu_dev, /*N=*/1, Hi, Hgi, Ki, Vi, static_cast<int>(width_),
+                             /*max_query_len=*/static_cast<int>(window), s);
+    const int act = sigmoid_gate_ ? kActSigmoid : kActSilu;
+    if (T == 1 && call.gdn_pending == nullptr) {
+      core::r4d::GdnRecurrentUpdate(q_buf, k_buf, v_buf, a_buf, b_buf, /*ab_stride=*/H_, /*ab_is_bf16=*/1, w_.A_log,
+                                    w_.dt_bias, states.RecurrentBase(), states.RecurrentSlotStride(),
+                                    states.RecurrentHeadStride(), out_core, cu_dev, sidx_dev,
+                                    /*indices_stride=*/window, /*num_accepted=*/nullptr, z_buf, w_.norm_weight, eps_, act,
+                                    /*N=*/1, Hi, Hgi, Ki, Vi, scale, kSoftplusThr, s);
+    } else {
+      const bool direct = (T == 1);
+      const float* log_in = call.gdn_pending != nullptr ? states.LogIn() : nullptr;
+      float* log_out = direct ? nullptr : states.LogOut();
+      core::r4d::GdnRecurrentUpdateWo(q_buf, k_buf, v_buf, a_buf, b_buf, /*ab_stride=*/H_, /*ab_is_bf16=*/1, w_.A_log,
+                                      w_.dt_bias, states.RecurrentBase(), states.RecurrentSlotStride(),
+                                      states.RecurrentHeadStride(), out_core, cu_dev, sidx_dev, z_buf, w_.norm_weight, eps_,
+                                      act, log_in, log_out, call.gdn_pending, static_cast<int>(window),
+                                      direct ? R4D_GDN_WO_DIRECT : R4D_GDN_WO_LOG, /*N=*/1, Hi, Hgi, Ki, Vi, scale,
+                                      kSoftplusThr, s);
+      if (!direct) states.FlipParity();
     }
   } else {
     // One token per kernel pair, the decode kernels: a decode step (T == 1), or a prefill that must not take the chunked

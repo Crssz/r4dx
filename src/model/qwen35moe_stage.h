@@ -93,6 +93,17 @@ struct Qwen35MoeStageOptions {
   // Decode (one row, no capture) runs the MoE on the device without a host sync per layer (qwen35moe_grouped_decode.h) when the
   // layer's geometry and trellis experts allow it. -1 = R4DX_Q35_GROUPED (default on; 0 = the host-routed MoE), 0 / 1 force it.
   int grouped_decode = -1;
+  // Speculative verify window (DFlash2): 1 = none. > 1 sizes every GDN layer's state for write-once speculation (the 27B's
+  // protocol, docs/gdn-write-once.md: one state B plus a log of the last verify window's per-row updates, so rejecting rows costs
+  // nothing and no state is copied) and the head for `spec_window` rows. A verify chunk (Qwen35MoeChunk::verify) is 1..spec_window rows.
+  int64_t spec_window = 1;
+};
+
+// One tap of the DFlash2 feature capture: the residual stream ENTERING global layer `layer` goes to column `column` (of
+// `row_pitch` elements per row) of the host buffer handed to SetFeatureCapture.
+struct Qwen35MoeFeatureTap {
+  int64_t layer = 0;
+  int64_t column = 0;
 };
 
 // Test hook: a named intermediate of the forward pass, handed to the callback with a DEVICE pointer that is valid on
@@ -115,6 +126,8 @@ struct Qwen35MoeChunk {
   int64_t rows = 0;       // 1..max_rows; <= 64, or a multiple of 64
   int64_t first_pos = 0;  // sequence position of row 0
   bool is_prefill = true; // false: a decode step (rows == 1) -- the GDN recurrent kernels, not the chunked scan
+  // false + verify: a speculative verify window (rows 1..spec_window): the rows are logged, committed by CommitVerified afterwards.
+  bool verify = false;
   // GDN layers of a prefill chunk take the recurrent decode kernels token by token instead of the chunked scan
   // (Qwen4ExpGdnCall::prefill_recurrent): the slow reference path. Ignored for a decode step.
   bool gdn_prefill_recurrent = false;
@@ -169,6 +182,24 @@ class Qwen35MoeStage {
   Qwen35MoeHeadResult Head(int64_t rows, const Qwen35MoeHeadRequest& request);
   // The fp32 logits row of the last kLogits / kSummary head call (the sampler's row-granular fallback), D2H.
   std::vector<float> LastLogitsRow();
+  // A verify window's head: final norm + lm_head over ALL `rows` rows of the chunk just run (1..spec_window), the per-row argmax.
+  // Synchronizes. The lm_head runs as an M = rows GEMM (not rows x M = 1), as the 27B's VerifyWindow does.
+  std::vector<int32_t> HeadRows(int64_t rows);
+  // Test hook: the fp32 logits [rows, vocab] of the last HeadRows call, D2H.
+  std::vector<float> LastHeadRowsLogits(int64_t rows);
+
+  // ---- speculative window (spec_window > 1) -------------------------------------------------------------------------
+  int64_t SpecWindow() const;
+  // The count of rows of the last verify chunk that are committed (1..rows of that chunk): the next decode / verify call replays
+  // that prefix of the log in its state seed load and reads the conv history at that offset. Enqueued; no synchronize.
+  void CommitVerified(int64_t n);
+  // ---- DFlash2 feature capture --------------------------------------------------------------------------------------
+  // Every RunLayers copies the residual entering each tap layer (this stage's layers only) of its `rows` rows into
+  // `host_dst + row * row_pitch + tap.column * hidden` (device-to-host, enqueued; complete once the stage's stream is
+  // synchronized, i.e. after the prefill RunLayers, StoreResidual or Head of the same chunk). `host_dst` must be pinned and stay
+  // valid; SetFeatureDest moves it between chunks. An empty `taps` switches the capture off.
+  void SetFeatureCapture(std::vector<Qwen35MoeFeatureTap> taps, int64_t row_pitch);
+  void SetFeatureDest(uint16_t* host_dst);
 
   // ---- sequence state -----------------------------------------------------------------------------------------------
   void Reset();  // GDN state; synchronous

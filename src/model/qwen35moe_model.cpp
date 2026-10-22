@@ -14,8 +14,13 @@
 #include <string>
 #include <utility>
 
+#include <memory>
+#include <optional>
+
+#include "quant_linear.h"
 #include "r4dx/core/device_buffer.hpp"
 #include "r4dx/core/error.hpp"
+#include "r4dx/kernels/embedding.hpp"
 #include "r4dx/kernels/summary_sampler.hpp"
 
 namespace r4dx::model {
@@ -226,6 +231,41 @@ std::unique_ptr<Qwen35MoeModel> Qwen35MoeModel::Load(const Qwen35MoeModelOptions
     std::fprintf(stderr, "[r4dx::model::Qwen35MoeModel] GDN prefill through the recurrent decode kernels (reference path, slow)\n");
   }
 
+  // ---- speculation: the verify window, the drafter's contract with this container ----------------------------------
+  int64_t window = std::max<int64_t>(options.spec_window, 1);
+  std::optional<Dflash2Config> dc;
+  std::vector<int64_t> taps;  // global layer indices (layer INPUTS) the drafter reads
+  if (!options.dflash_container.empty()) {
+    if (options.dflash_draft_k < 1) {
+      throw std::invalid_argument("Qwen35MoeModel::Load: dflash_container is set but dflash_draft_k < 1");
+    }
+    const DflashDraftWeights peek = DflashDraftWeights::Open(options.dflash_container);  // CPU: metadata + directory only
+    dc = peek.Config();
+    if (dc->layout.empty()) Fail("the dflash container has no layout in its __metadata__.dflash2 block");
+    if (dc->hidden_size != cfg.hidden_size) {
+      Fail("the dflash container's hidden_size " + std::to_string(dc->hidden_size) + " != the target's " +
+           std::to_string(cfg.hidden_size));
+    }
+    if (options.dflash_small_vocab ? dc->vocab_size < cfg.vocab_size : dc->vocab_size != cfg.vocab_size) {
+      Fail("the dflash container's vocab_size " + std::to_string(dc->vocab_size) + " != the target's " +
+           std::to_string(cfg.vocab_size) + " (it shares the target's embedding and lm_head)");
+    }
+    if (options.dflash_draft_k > dc->block_size - 1) {
+      throw std::invalid_argument("Qwen35MoeModel::Load: dflash_draft_k " + std::to_string(options.dflash_draft_k) +
+                                  " exceeds the drafter's block_size - 1 = " + std::to_string(dc->block_size - 1));
+    }
+    taps = options.dflash_target_layers.empty() ? dc->target_layers : options.dflash_target_layers;
+    if (taps.size() != dc->target_layers.size()) Fail("dflash_target_layers must name as many layers as the drafter reads");
+    for (int64_t l : taps) {
+      if (l < 0 || l >= L) {
+        Fail("the dflash drafter reads the input of target layer " + std::to_string(l) + ", but this container has layers [0, " +
+             std::to_string(L) + ")");
+      }
+    }
+    window = std::max<int64_t>(window, options.dflash_draft_k + 1);
+  }
+  m.opt_.spec_window = window;
+
   // ---- containers and stages ------------------------------------------------------------------------------------
   struct Range {
     int device;
@@ -269,6 +309,7 @@ std::unique_ptr<Qwen35MoeModel> Qwen35MoeModel::Load(const Qwen35MoeModelOptions
     so.max_rows = kChunkRows;
     so.prompt_checkpoint = options.prompt_checkpoint;
     so.grouped_decode = options.grouped_decode;
+    so.spec_window = window;
     m.stages_.push_back(std::make_unique<Qwen35MoeStage>(so, std::move(layers), std::move(head)));
     {
       Qwen35MoeDeviceScope dev(r.device);
@@ -285,6 +326,41 @@ std::unique_ptr<Qwen35MoeModel> Qwen35MoeModel::Load(const Qwen35MoeModelOptions
   const size_t R = static_cast<size_t>(kChunkRows);
   m.embed_rows_host_ = core::PinnedBuffer<uint16_t>(R * static_cast<size_t>(cfg.hidden_size));
   if (m.stages_.size() > 1) m.handoff_host_ = core::PinnedBuffer<uint16_t>(R * static_cast<size_t>(cfg.hidden_size));
+
+  // ---- the DFlash2 drafter -----------------------------------------------------------------------------------------
+  if (dc) {
+    const int64_t hidden = cfg.hidden_size;
+    m.feat_cols_ = static_cast<int64_t>(taps.size()) * hidden;
+    m.feat_host_ = core::PinnedBuffer<uint16_t>(R * static_cast<size_t>(m.feat_cols_));
+    for (size_t s = 0; s < m.stages_.size(); ++s) {
+      std::vector<Qwen35MoeFeatureTap> st_taps;
+      for (size_t c = 0; c < taps.size(); ++c) {
+        if (taps[c] >= m.stages_[s]->FirstLayer() && taps[c] < m.stages_[s]->EndLayer()) {
+          st_taps.push_back({taps[c], static_cast<int64_t>(c)});
+        }
+      }
+      m.stages_[s]->SetFeatureCapture(std::move(st_taps), m.feat_cols_);
+      m.stages_[s]->SetFeatureDest(m.feat_host_.data());
+    }
+    Qwen35MoeDeviceScope dev(m.stages_.back()->Device());
+    m.dflash_stream_ = std::make_unique<core::Stream>();
+    m.dflash_arena_.Reserve(size_t{128} << 20);
+    m.dflash_feat_dev_ = core::DeviceBuffer<uint16_t>(R * static_cast<size_t>(m.feat_cols_));
+    DflashDraftOptions d;
+    d.container_path = options.dflash_container;
+    d.layout = LayoutFromName(dc->layout);
+    d.max_inject_rows = 64;
+    d.lm_head_vocab = cfg.vocab_size;
+    if (options.dflash_small_vocab) d.mask_token_id_override = cfg.vocab_size - 1;
+    m.dflash_ = DflashDraft::Load(d);
+    m.dflash_k_ = options.dflash_draft_k;
+    m.dflash_stream_->Synchronize();
+    std::fprintf(stderr, "[r4dx::model::Qwen35MoeModel] DFlash2 drafter loaded: %s (layout %s, block %lld, k %lld, target layer inputs [",
+                 options.dflash_container.c_str(), dc->layout.c_str(), static_cast<long long>(dc->block_size),
+                 static_cast<long long>(options.dflash_draft_k));
+    for (size_t i = 0; i < taps.size(); ++i) std::fprintf(stderr, "%s%lld", i ? "," : "", static_cast<long long>(taps[i]));
+    std::fprintf(stderr, "], verify window %lld)\n", static_cast<long long>(window));
+  }
   return mp;
 }
 
@@ -293,9 +369,12 @@ Qwen35MoeModel::~Qwen35MoeModel() = default;
 // ---- one chunk -------------------------------------------------------------------------------------------------------
 
 void Qwen35MoeModel::RunChunk(const int32_t* tokens, int64_t rows, bool is_prefill, const Qwen35MoeHeadRequest* head,
-                              HeadOut* out, const IsolatedLayer* iso) {
+                              HeadOut* out, const IsolatedLayer* iso, std::vector<int32_t>* verify_out) {
   if (rows < 1 || rows > kChunkRows || (rows > 64 && rows % 64 != 0)) {
     Fail("a chunk is 1..64 rows or a multiple of 64 up to " + std::to_string(kChunkRows) + " (got " + std::to_string(rows) + ")");
+  }
+  if (verify_out != nullptr && (is_prefill || head != nullptr || iso != nullptr || rows > opt_.spec_window)) {
+    Fail("a verify window is 1.." + std::to_string(opt_.spec_window) + " rows of a decode-kind chunk with no head request");
   }
   if (pos_ + rows > opt_.max_ctx) {
     Fail("position " + std::to_string(pos_ + rows) + " exceeds max_ctx " + std::to_string(opt_.max_ctx));
@@ -322,6 +401,7 @@ void Qwen35MoeModel::RunChunk(const int32_t* tokens, int64_t rows, bool is_prefi
   chunk.rows = rows;
   chunk.first_pos = pos_;
   chunk.is_prefill = is_prefill;
+  chunk.verify = verify_out != nullptr;
   chunk.gdn_prefill_recurrent = gdn_recurrent_;
   if (iso != nullptr) chunk.only_layer = iso->layer;
 
@@ -363,6 +443,14 @@ void Qwen35MoeModel::RunChunk(const int32_t* tokens, int64_t rows, bool is_prefi
       out->summary = r.summary;
     }
   }
+  if (verify_out != nullptr) {
+    Qwen35MoeStage& last = *stages_.back();
+    *verify_out = last.HeadRows(rows);
+    last_.head_ms += last.LastHeadMs();
+    last_.rows = rows;
+    ++last_.chunks;
+    return;  // nothing is committed: pos_ moves in CommitVerifiedWindow
+  }
   pos_ += rows;
   last_.rows = rows;
   ++last_.chunks;
@@ -397,10 +485,16 @@ std::vector<float> Qwen35MoeModel::Prefill(const std::vector<int32_t>& token_ids
   const Qwen35MoeHeadRequest req{Qwen35MoeHeadRequest::Kind::kLogits, 0.0f};
   const std::vector<int64_t> plan = PlanChunks(static_cast<int64_t>(token_ids.size()));
   int64_t off = 0;
+  // The drafter only ever attends to the last `sliding_window` positions, so the earlier rows of a long prompt are never injected
+  // (a gap, DflashDraft::InjectFeatures -- exact, the window masks those keys for every later query).
+  const int64_t inject_from =
+      dflash_ ? pos_ + static_cast<int64_t>(token_ids.size()) - dflash_->Config().attention.sliding_window : 0;
   for (size_t i = 0; i < plan.size(); ++i) {
     const bool last_chunk = i + 1 == plan.size();
+    const int64_t p0 = pos_;
     RunChunk(token_ids.data() + off, plan[i], /*is_prefill=*/true, (last_chunk || capture_active_) ? &req : nullptr,
              last_chunk ? &out : nullptr);
+    InjectCaptured(plan[i], p0, inject_from);
     off += plan[i];
   }
   at_prefill_end_ = true;
@@ -414,7 +508,9 @@ std::vector<float> Qwen35MoeModel::DecodeStep(int32_t token_id) {
   at_prefill_end_ = false;
   HeadOut out;
   const Qwen35MoeHeadRequest req{Qwen35MoeHeadRequest::Kind::kLogits, 0.0f};
+  const int64_t p0 = pos_;
   RunChunk(&token_id, 1, /*is_prefill=*/false, &req, &out);
+  InjectCaptured(1, p0);
   last_.total_ms = MsSince(t0);
   return std::move(out.logits);
 }
@@ -425,7 +521,9 @@ int32_t Qwen35MoeModel::DecodeStepGreedy(int32_t token_id) {
   at_prefill_end_ = false;
   HeadOut out;
   const Qwen35MoeHeadRequest req{Qwen35MoeHeadRequest::Kind::kArgmax, 0.0f};
+  const int64_t p0 = pos_;
   RunChunk(&token_id, 1, /*is_prefill=*/false, &req, &out);
+  InjectCaptured(1, p0);
   last_.total_ms = MsSince(t0);
   return out.token;
 }
@@ -445,7 +543,9 @@ int32_t Qwen35MoeModel::DecodeStepSampled(int32_t token_id, const kernels::Sampl
   at_prefill_end_ = false;
   HeadOut out;
   const Qwen35MoeHeadRequest req{Qwen35MoeHeadRequest::Kind::kSummary, inv_t};
+  const int64_t p0 = pos_;
   RunChunk(&token_id, 1, /*is_prefill=*/false, &req, &out);
+  InjectCaptured(1, p0);
   last_.total_ms = MsSince(t0);
   const double u = kernels::DrawUniform01(rng);
   const kernels::SummarySampleResult r = kernels::SampleFromSummary(out.summary, params, u);
@@ -467,6 +567,8 @@ void Qwen35MoeModel::Reset() {
   pos_ = 0;
   at_prefill_end_ = false;
   ckpt_pos_ = -1;
+  verified_rows_ = 0;
+  if (dflash_) dflash_->Reset();  // host-only counters: the ring's bytes are overwritten before they are read again
   last_ = Timings{};
 }
 
@@ -491,6 +593,139 @@ void Qwen35MoeModel::RestoreCheckpoint() {
   for (auto& st : stages_) st->RestoreCheckpoint(ckpt_pos_);
   pos_ = ckpt_pos_;
   at_prefill_end_ = true;  // the restored state IS a post-prefill state
+  verified_rows_ = 0;
+  if (dflash_ && dflash_->InjectedCount() > pos_) dflash_->Rewind(pos_);
+}
+
+// ---- speculative decoding ---------------------------------------------------------------------------------------------
+
+std::vector<int32_t> Qwen35MoeModel::VerifyWindow(const std::vector<int32_t>& candidates) {
+  if (opt_.spec_window <= 1) Fail("VerifyWindow: the model was loaded without a speculative window (Qwen35MoeModelOptions::spec_window)");
+  const int64_t rows = static_cast<int64_t>(candidates.size());
+  if (rows < 1 || rows > opt_.spec_window) {
+    Fail("VerifyWindow: " + std::to_string(rows) + " candidates, the window is 1.." + std::to_string(opt_.spec_window));
+  }
+  const auto t0 = Clock::now();
+  last_ = Timings{};
+  at_prefill_end_ = false;
+  std::vector<int32_t> argmax;
+  RunChunk(candidates.data(), rows, /*is_prefill=*/false, nullptr, nullptr, nullptr, &argmax);
+  verified_rows_ = rows;
+  last_.total_ms = MsSince(t0);
+  return argmax;
+}
+
+std::vector<float> Qwen35MoeModel::LastVerifyLogits() const {
+  if (verified_rows_ < 1) Fail("LastVerifyLogits: no uncommitted VerifyWindow");
+  return stages_.back()->LastHeadRowsLogits(verified_rows_);
+}
+
+void Qwen35MoeModel::CommitVerifiedWindow(int64_t n) {
+  if (verified_rows_ < 1 || n < 1 || n > verified_rows_) {
+    Fail("CommitVerifiedWindow: n = " + std::to_string(n) + " is outside [1, " + std::to_string(verified_rows_) +
+         "] (the rows of the last VerifyWindow)");
+  }
+  for (auto& st : stages_) st->CommitVerified(n);
+  pos_ += n;
+  verified_rows_ = 0;
+  at_prefill_end_ = false;
+}
+
+int64_t Qwen35MoeModel::DflashInjectedCount() const {
+  if (!dflash_) Fail("DflashInjectedCount: no drafter is loaded");
+  return dflash_->InjectedCount();
+}
+
+void Qwen35MoeModel::SetDflashInjectionEnabled(bool enabled) {
+  if (enabled && !dflash_) Fail("SetDflashInjectionEnabled(true): no drafter is loaded");
+  dflash_injection_ = enabled;
+}
+
+void Qwen35MoeModel::InjectCaptured(int64_t rows, int64_t start_pos, int64_t min_pos) {
+  if (!dflash_ || !dflash_injection_ || rows <= 0) return;
+  const int64_t skip = std::clamp<int64_t>(min_pos - start_pos, 0, rows);
+  if (skip >= rows) return;
+  Qwen35MoeDeviceScope dev(stages_.back()->Device());
+  core::Stream& s = *dflash_stream_;
+  // <= 64 rows per call (DflashDraftOptions::max_inject_rows); each slice is waited for because InjectFeatures stages its rope
+  // positions in ONE pinned array.
+  for (int64_t r0 = skip; r0 < rows; r0 += 64) {
+    const int64_t n = std::min<int64_t>(64, rows - r0);
+    R4DX_HIP_CHECK(hipMemcpyAsync(dflash_feat_dev_.data(), feat_host_.data() + r0 * feat_cols_,
+                                  static_cast<size_t>(n * feat_cols_) * sizeof(uint16_t), hipMemcpyHostToDevice, s.get()));
+    dflash_->InjectFeatures(s, dflash_arena_, dflash_feat_dev_.data(), n, start_pos + r0);
+    s.Synchronize();
+  }
+  dflash_arena_.Reset();
+}
+
+std::vector<int32_t> Qwen35MoeModel::DecodeStepDflashGreedy(int32_t token_id, int64_t k, float p_min, int64_t n_min,
+                                                            int64_t* walk_len_out) {
+  if (!dflash_) Fail("DecodeStepDflashGreedy: no drafter is loaded (Qwen35MoeModelOptions::dflash_container)");
+  if (k < 0 || k > dflash_k_) Fail("DecodeStepDflashGreedy: k must be in [0, " + std::to_string(dflash_k_) + "]");
+  if (!dflash_injection_) {
+    Fail("DecodeStepDflashGreedy: drafter injection is disabled (SetDflashInjectionEnabled(false)); its ring frontier lags the position");
+  }
+  if (dflash_->InjectedCount() != pos_) {
+    Fail("DecodeStepDflashGreedy: drafter frontier (" + std::to_string(dflash_->InjectedCount()) + ") != position (" +
+         std::to_string(pos_) + ")");
+  }
+  if (pos_ + 1 > opt_.max_ctx) Fail("DecodeStepDflashGreedy: position " + std::to_string(pos_ + 1) + " exceeds max_ctx");
+  k = std::min<int64_t>(k, opt_.max_ctx - pos_ - 1);  // the window is k + 1 rows; k = 0 still verifies the anchor
+  const auto t0 = Clock::now();
+
+  DflashDraftResult draft;
+  {
+    Qwen35MoeDeviceScope dev(stages_.back()->Device());
+    const uint16_t* table = containers_.front()->EmbedTokensHost();
+    const int64_t hidden = cfg_.hidden_size, vocab = cfg_.vocab_size;
+    auto staging = std::make_shared<std::vector<uint16_t>>();
+    const DflashEmbeddingProvider embed = [table, hidden, vocab, staging](core::Stream& stream, const int32_t* ids_host,
+                                                                          const int32_t*, int64_t n, uint16_t* out_dev) {
+      staging->resize(static_cast<size_t>(n * hidden));
+      const std::vector<int32_t> ids(ids_host, ids_host + n);
+      kernels::EmbeddingGatherHost(table, vocab, hidden, ids, staging->data());
+      R4DX_HIP_CHECK(hipMemcpyAsync(out_dev, staging->data(), staging->size() * sizeof(uint16_t), hipMemcpyHostToDevice,
+                                    stream.get()));
+    };
+    const DflashLmHeadProvider lm_head = MakeLmHeadProviderFromLinear(&containers_.back()->LmHead());
+    draft = dflash_->DraftRound(*dflash_stream_, dflash_arena_, token_id, k, p_min, n_min, embed, lm_head);
+    dflash_arena_.Reset();
+  }
+  last_.draft_ms = MsSince(t0);
+  if (draft_override_) {
+    draft.tokens = draft_override_(token_id, k);
+    if (static_cast<int64_t>(draft.tokens.size()) > k) draft.tokens.resize(static_cast<size_t>(k));
+    draft.walk_len = static_cast<int64_t>(draft.tokens.size());
+  }
+  if (walk_len_out != nullptr) *walk_len_out = draft.walk_len;
+  last_drafts_ = draft.tokens;
+
+  std::vector<int32_t> cands;
+  cands.reserve(draft.tokens.size() + 1);
+  cands.push_back(token_id);
+  cands.insert(cands.end(), draft.tokens.begin(), draft.tokens.end());
+  const double draft_ms = last_.draft_ms;
+  const std::vector<int32_t> argmax = VerifyWindow(cands);
+  last_.draft_ms = draft_ms;
+
+  // Greedy acceptance: draft i (candidates[i + 1]) is confirmed iff the target's argmax after candidates[i] equals it.
+  int64_t accepted = 0;
+  while (accepted < static_cast<int64_t>(draft.tokens.size()) &&
+         argmax[static_cast<size_t>(accepted)] == draft.tokens[static_cast<size_t>(accepted)]) {
+    ++accepted;
+  }
+  const int64_t committed = accepted + 1;  // the anchor + the accepted drafts
+  std::vector<int32_t> result(argmax.begin(), argmax.begin() + committed);  // accepted drafts, then the bonus token
+
+  // The committed rows' own captured features (rows 0 .. committed-1 of the window) go into the drafter's ring at its frontier,
+  // THEN the model commits. The rejected rows' features are never injected.
+  const auto t1 = Clock::now();
+  InjectCaptured(committed, dflash_->InjectedCount());
+  last_.inject_ms = MsSince(t1);
+  CommitVerifiedWindow(committed);
+  last_.total_ms = MsSince(t0);
+  return result;
 }
 
 void Qwen35MoeModel::SetCapture(Qwen35MoeCaptureFn fn) {

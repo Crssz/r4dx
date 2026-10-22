@@ -27,12 +27,16 @@
 #include <string>
 #include <vector>
 
+#include "dflash_draft.h"
 #include "model_config.h"
 #include "qwen35moe_config.h"
 #include "qwen35moe_container.h"
 #include "qwen35moe_stage.h"
 #include "quant_linear.h"
+#include "r4dx/core/arena.hpp"
+#include "r4dx/core/device_buffer.hpp"
 #include "r4dx/core/pinned_buffer.hpp"
+#include "r4dx/core/stream.hpp"
 #include "r4dx/kernels/sampler.hpp"
 #include "text_model.h"  // VramReport
 
@@ -57,6 +61,20 @@ struct Qwen35MoeModelOptions {
   bool gdn_prefill_recurrent = false;
   // The on-device M = 1 MoE of a decode step (Qwen35GroupedMoeDecode): -1 = R4DX_Q35_GROUPED (default on, 0 = the host-routed MoE), 0 / 1 force.
   int grouped_decode = -1;
+  // Speculative verify window: the most rows VerifyWindow takes (1 = none). The GDN state is then the 27B's write-once window
+  // state. A drafter (below) raises it to at least dflash_draft_k + 1.
+  int64_t spec_window = 1;
+  // DFlash2 drafter (docs/dflash2.md): a dflash2_draft container ("" = none) and the longest draft it is asked for (1 ..
+  // block_size - 1). The drafter lives on the LAST stage's device next to the lm_head it shares; the residual stream entering its
+  // `target_layers` is captured by the stages into pinned host memory and injected into the drafter after each committed chunk.
+  std::string dflash_container;
+  int64_t dflash_draft_k = 0;
+  // Test hook: read these layer inputs instead of the drafter's own target_layers (same count), for a container with fewer layers
+  // than the drafter was trained against. Empty = the drafter's.
+  std::vector<int64_t> dflash_target_layers;
+  // Test hook: a target whose vocabulary is SMALLER than the drafter's (the tiny test container, 4096 vs 248320): the drafter's mask
+  // token becomes vocab - 1 and only the first `vocab` rows of its codebooks are read.
+  bool dflash_small_vocab = false;
 };
 
 class Qwen35MoeModel {
@@ -97,6 +115,35 @@ class Qwen35MoeModel {
   int32_t DecodeStepGreedy(int32_t token_id);
   int32_t DecodeStepSampled(int32_t token_id, const kernels::SampleParams& params, std::mt19937_64& rng);
 
+  // ---- speculative decoding (Qwen35MoeModelOptions::spec_window > 1) -------------------------------------------------------
+  int64_t SpecWindow() const { return opt_.spec_window; }
+  // Runs `candidates` (1 .. SpecWindow(): the last committed token, then drafts) as ONE chunk at PositionCount() and returns, for
+  // every row, the argmax of the target's next token. Commits nothing: the KV rows and the GDN window rows it wrote stay
+  // uncommitted until CommitVerifiedWindow(n) says how many leading rows are real (n >= 1: row 0, the anchor, always is), and a
+  // rejected row's KV slot is simply overwritten by the next write at that position.
+  std::vector<int32_t> VerifyWindow(const std::vector<int32_t>& candidates);
+  void CommitVerifiedWindow(int64_t n);
+  // Test hook: the fp32 logits [rows, vocab] behind the last VerifyWindow's argmax (D2H).
+  std::vector<float> LastVerifyLogits() const;
+
+  // DFlash2. DecodeStepDflashGreedy: the round (draft k tokens after `token_id`, verify, accept the longest prefix the target's own
+  // argmax confirms, inject the accepted rows' features, commit) returns the accepted drafts and the bonus token (1..k+1
+  // tokens); the output equals what that many greedy DecodeStepGreedy calls would return, token for token, up to the batched
+  // verify GEMMs' rounding (docs/dflash2.md section 7a item 4).
+  bool DflashEnabled() const { return dflash_.has_value(); }
+  int64_t DflashDraftK() const { return dflash_k_; }
+  int64_t DflashInjectedCount() const;
+  void SetDflashInjectionEnabled(bool enabled);
+  std::vector<int32_t> DecodeStepDflashGreedy(int32_t token_id, int64_t k, float p_min, int64_t n_min,
+                                              int64_t* walk_len_out = nullptr);
+  // Test hook: replaces the drafter's tokens of every round (anchor, k) -> drafts (at most k) after the real draft round has run, so a
+  // test drives every partial-accept length through the round's own accept / inject / commit code. Empty function = off.
+  void SetDraftOverride(std::function<std::vector<int32_t>(int32_t anchor, int64_t k)> fn) { draft_override_ = std::move(fn); }
+  // The drafts the last DecodeStepDflashGreedy verified (tests / stats).
+  const std::vector<int32_t>& LastDrafts() const { return last_drafts_; }
+  // Pinned [rows, FeatureCols] features captured by the last chunk / verify window (valid until the next one).
+  const uint16_t* FeatureRowsHost() const { return feat_host_.data(); }
+
   // ---- diagnostics / tests --------------------------------------------------------------------------------------------
   // Installs `fn` on every stage (see Qwen35MoeCapture). With a capture installed every chunk of a Prefill also runs the
   // head so `norm_out` / `logits` cover all rows. An empty function removes it.
@@ -118,6 +165,8 @@ class Qwen35MoeModel {
     double stage_ms[2] = {0, 0};
     double handoff_ms = 0;     // host wall of the residual hand-off between the stages
     double head_ms = 0;        // final norm + lm_head + readback
+    double draft_ms = 0;       // DecodeStepDflashGreedy: the draft round (host wall)
+    double inject_ms = 0;      // ... and the injection of the committed rows' features
     int64_t rows = 0;          // rows of the LAST chunk
     int64_t chunks = 0;
   };
@@ -141,8 +190,12 @@ class Qwen35MoeModel {
     int64_t layer;
     const uint16_t* residual_in;  // this chunk's rows [rows, hidden]
   };
+  // verify_out != null: a verify window (spec_window rows max, !is_prefill, pos_ is not advanced), the per-row argmax goes there.
   void RunChunk(const int32_t* tokens, int64_t rows, bool is_prefill, const Qwen35MoeHeadRequest* head, HeadOut* out,
-                const IsolatedLayer* iso = nullptr);
+                const IsolatedLayer* iso = nullptr, std::vector<int32_t>* verify_out = nullptr);
+  // Feeds the first `rows` captured feature rows (positions start_pos ...) to the drafter's ring.
+  // Rows at positions below `min_pos` are skipped (a prompt's rows older than the drafter's window).
+  void InjectCaptured(int64_t rows, int64_t start_pos, int64_t min_pos = 0);
 
   Qwen35MoeModelOptions opt_;
   Qwen35MoeConfig cfg_;
@@ -157,6 +210,19 @@ class Qwen35MoeModel {
 
   core::PinnedBuffer<uint16_t> embed_rows_host_;  // [kChunkRows, hidden]
   core::PinnedBuffer<uint16_t> handoff_host_;     // [kChunkRows, hidden]
+
+  // ---- DFlash2 (all on the last stage's device) ----
+  std::optional<DflashDraft> dflash_;
+  std::unique_ptr<core::Stream> dflash_stream_;
+  core::Arena dflash_arena_;
+  core::DeviceBuffer<uint16_t> dflash_feat_dev_;  // [kChunkRows, FeatureCols] injection staging
+  core::PinnedBuffer<uint16_t> feat_host_;        // [kChunkRows, FeatureCols] captured by the stages
+  int64_t feat_cols_ = 0;
+  int64_t dflash_k_ = 0;
+  bool dflash_injection_ = true;
+  std::vector<int32_t> last_drafts_;
+  std::function<std::vector<int32_t>(int32_t, int64_t)> draft_override_;
+  int64_t verified_rows_ = 0;
 
   int64_t pos_ = 0;
   bool at_prefill_end_ = false;

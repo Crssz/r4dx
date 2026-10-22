@@ -57,6 +57,19 @@ struct Qwen4ExpGdnCall {
   // tests (tests/model/qwen4exp/test_model_q4exp_layers.cpp). (The earlier shipped r4d_gdn_chunk_scan clamped e^{G_i-G_j} and
   // diverged from the recurrent rule when a 64-row chunk's gate span was large; that was a kernel defect, not model conditioning.)
   bool prefill_recurrent = false;
+
+  // ---- speculative window (GdnLayer::Forward's protocol, docs/gdn-write-once.md) ---------------------------------------
+  // Only with a GdnStateManager that has MaxDecodeWindow() > 1 AND write-once state (the stage's spec_window > 1); a window-1
+  // manager ignores all three. Meaningful for !is_prefill calls (a decode step, T == 1, or a verify window, T <= window):
+  //   verify        : log the T rows (conv_update + the write-once kernel in LOG mode), commit nothing -- the owner says how many
+  //                   rows are committed afterwards (Qwen35MoeStage::CommitVerified) and the NEXT call replays that prefix.
+  //   num_accepted  : device int32, the row count the previous window committed: the conv history offset (naccept - 1). null =
+  //                   the history sits at offset 0 (nothing speculated since the last prefill).
+  //   gdn_pending   : device int32, the committed prefix of the previous window's log still to be replayed into the state;
+  //                   null when nothing is pending.
+  bool verify = false;
+  const int32_t* num_accepted = nullptr;
+  const int32_t* gdn_pending = nullptr;
 };
 
 // The Gated DeltaNet geometry of one mixer, for architectures that are not qwen4_exp (qwen3_5_moe, docs/qwen35moe-plan.md):

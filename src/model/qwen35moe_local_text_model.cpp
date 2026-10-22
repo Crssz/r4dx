@@ -16,8 +16,8 @@ namespace {
 }  // namespace
 
 void Qwen35MoeLocalTextModel::SetDflashInjectionEnabled(bool enabled) {
-  // The server only calls this when a drafter container is configured, which MakeQwen35MoeModelOptions refused.
-  if (enabled) Unsupported("DFlash", "no DFlash drafter exists for this model");
+  // The server calls this with `true` only when a drafter container is configured (DflashEnabled()).
+  m_->SetDflashInjectionEnabled(enabled);
 }
 
 void Qwen35MoeLocalTextModel::EncodeImages(const float*, int64_t, const std::vector<vision::GridThw>&, ImageRows*,
@@ -40,14 +40,22 @@ std::vector<int32_t> Qwen35MoeLocalTextModel::DecodeStepMtpSampled(int32_t, int6
   Unsupported("MTP", "the MTP head is plan milestone M6");
 }
 
-std::vector<int32_t> Qwen35MoeLocalTextModel::DecodeStepDflashGreedy(int32_t, int64_t, float, int64_t, int64_t*) {
-  Unsupported("DFlash", "no drafter exists for this model");
+std::vector<int32_t> Qwen35MoeLocalTextModel::DecodeStepDflashGreedy(int32_t token_id, int64_t k, float p_min, int64_t n_min,
+                                                                      int64_t* walk_len_out) {
+  return m_->DecodeStepDflashGreedy(token_id, k, p_min, n_min, walk_len_out);
 }
 
-std::vector<int32_t> Qwen35MoeLocalTextModel::DecodeStepDflashSampled(int32_t, int64_t, float, int64_t,
-                                                                      const kernels::SampleParams&, std::mt19937_64&,
-                                                                      int64_t*) {
-  Unsupported("DFlash", "no drafter exists for this model");
+std::vector<int32_t> Qwen35MoeLocalTextModel::DecodeStepDflashSampled(int32_t token_id, int64_t k, float p_min, int64_t n_min,
+                                                                      const kernels::SampleParams& params,
+                                                                      std::mt19937_64& rng, int64_t* walk_len_out) {
+  if (params.temperature > 0.0f) {
+    // A sampled DFlash round (rejection sampling over the drafter) is not implemented for this model: take one plain sampled
+    // step instead. It commits one row and injects it, so the drafter frontier stays == PositionCount() and a later greedy round
+    // on the same request still works. Correct output, no speculation speedup.
+    if (walk_len_out != nullptr) *walk_len_out = 0;
+    return {m_->DecodeStepSampled(token_id, params, rng)};
+  }
+  return m_->DecodeStepDflashGreedy(token_id, k, p_min, n_min, walk_len_out);
 }
 
 StepProfile Qwen35MoeLocalTextModel::DecodeStepProfiled(int32_t) {
@@ -62,8 +70,11 @@ Qwen35MoeModelOptions MakeQwen35MoeModelOptions(const ModelOptions& opts) {
   if (opts.mtp_draft_k > 0) {
     throw std::invalid_argument("LoadTextModel: MTP is not available for qwen3_5_moe yet (plan milestone M6)");
   }
-  if (!opts.dflash_container.empty() || opts.dflash_draft_k > 0) {
-    throw std::invalid_argument("LoadTextModel: DFlash is not available for qwen3_5_moe (no drafter exists for this model)");
+  if (opts.dflash_container.empty() != (opts.dflash_draft_k <= 0)) {
+    throw std::invalid_argument("LoadTextModel: --dflash <container> and --dflash-k N go together for qwen3_5_moe");
+  }
+  if (!opts.dflash_container.empty() && opts.mtp_draft_k > 0) {
+    throw std::invalid_argument("LoadTextModel: --dflash and --mtp are exclusive");
   }
   if (opts.vision == ModelOptions::VisionMode::kOn) {
     throw std::invalid_argument("LoadTextModel: --vision on is not available for qwen3_5_moe yet (plan milestone M6); "
@@ -83,6 +94,8 @@ Qwen35MoeModelOptions MakeQwen35MoeModelOptions(const ModelOptions& opts) {
   o.layout = opts.layout;
   o.max_ctx = opts.max_ctx;
   o.prompt_checkpoint = opts.prompt_checkpoint;
+  o.dflash_container = opts.dflash_container;
+  o.dflash_draft_k = opts.dflash_draft_k;
   // devices / split: Qwen35MoeModel::Load reads R4DX_Q35_DEVICES / R4DX_Q35_SPLIT (ModelOptions has no field for them)
   return o;
 }

@@ -200,3 +200,44 @@ b. Larger chunks (512-1024 rows) so each expert sees more rows and weights are s
 c. fp8 / int8 MoE prefill path (already the M6 "prefill int8 path").
 d. Overlap chunks across both cards (`docs/pp-prefill.md`, not ported to this model) and/or `--tp 2`.
 e. Profile first: add an `R4DX_Q35_PROFILE` timing breakdown for prefill (per-layer MoE / GDN / attention) before changing kernels.
+
+## 9. Status 2026-10-22: what shipped, measured numbers, decisions
+
+**Usable model.** `E:\models\r4dx\ornith-1.5-122b-trellis-mix-kv.r4dx` (56.5 GB file; calibrated fp8 KV; same trellis bytes as `ornith-1.5-122b-trellis-mix.r4dx`).
+KB 4 for attention / GDN projections, experts KB 3 / KB 4 mixed (allocation: `E:\models\r4dx\q35moe\mix\allocation_report.md`); 51.5 GiB of weights, layers 0-26 on
+device 0 (25.93 GiB) and 27-47 on device 1 (25.57 GiB); about 26.9 GiB used per card with `--max-ctx 16384`.
+
+```
+set R4DX_ALLOW_GPU0=1
+build\win-hip\src\cli\r4dx-cli.exe --model E:\models\r4dx\ornith-1.5-122b-trellis-mix-kv.r4dx --layout trellis --tokenizer-dir E:\models\r4dx\Ornith-1.5-122B --chat --max-ctx 16384 --stats
+build\win-hip\src\server\r4dx-server.exe --model <same> --layout trellis --tokenizer-dir <same> --port 8080 --max-ctx 16384
+```
+(through `tools\with_lock.ps1 -Name gpu -Run "..."` whenever another GPU job may be running; the model needs both cards.)
+
+**Measured (not estimated), 2026-10-22, one prompt each, so first readings.**
+
+| item | result |
+|---|---|
+| load | 75-94 s |
+| decode (grouped MoE kernel, default) | 56-70 tok/s (7 to 128 generated tokens; 60 tok/s at 7k context) |
+| prefill | 117-230 tok/s on 24-43 token prompts; 7,125 tokens in 10.3 s (693 tok/s) on a quiet machine, 14.5 s (492) and 523 tok/s on later runs; plan on ~500 tok/s |
+| chat / code / Thai / reasoning | correct on the CLI prompts; thinking on and off |
+| server | plain, thinking (`reasoning_content`), tool call + follow-up turn, streaming: all passed |
+
+**Quality (Rung 4 KL gate, `docs/qwen35moe-kl-gate.md`): NOT MET and accepted by the user.** Pooled over 18,454 held-out rows the calibrated container has KL 0.125 vs
+bf16 (gate A <= 0.02) and 0.124 vs the fp32 truth (gate B <= 0.074), top-1 88.4% (gate >= 93%). Tool-use turns 0.034 / 94.4%, code 0.040 / 91.5%, English 0.053 / 90.3%,
+Thai 0.071 / 88.1%, long text 0.184 / 86.8%. The loss is in the 3.4-bit weights (engine adds ~0.003, KV calibration changes nothing); it grows with context.
+Class p (attention + GDN projections) causes about half of it. Evaluated and NOT built (user decision to stop): re-allocation only (predicted -0.005, measured +0.001 end to end),
+bf16 class p (-0.006, slower), w8a16 class p (0.090 predicted, 150-250 lines, needs converter + loader), K5 class p (~4 h of Hessians).
+No task-accuracy benchmark has been run: KL measures drift, not accuracy.
+
+**Decisions.** Roadmap changes: the grouped decode kernel made decode fast enough (>= 35 tok/s bar met), so speculative decoding is lower priority than first planned;
+MTP is probably dropped in favour of DFlash2 (drafter downloaded to `E:\models\r4dx\Ornith-1.5-122B-DFlash2`).
+
+**Open items, in priority order (estimates):** P1 accuracy benchmark + 32k needle test (3-4 h); P2 prefill speed, grouped prefill MoE GEMM (6-12 h); P3 vision tower (4-8 h);
+P4 w8a16 for class p (3-4 h, only if P1 shows a real loss); P5 DFlash2 (1-2 days); P6 `--tp 2` (2-4 days); P7 MTP (0.5-1.5 days); P8 K5 / host-RAM expert tier;
+P9 qwen4exp regression check with its real container (the shared kernel code was edited; only a synthetic test ran).
+
+**Operational notes.** The 48-layer quantization stalled three times (singular refit solve, a zero-Hessian expert, pruned-channel blow-up in `regularize`) and once more on an unexplained
+process kill; all fixes are in `tools/quant2/qwen35moe/`. `E:` is the tight resource (about 74 GiB free; `oracle-k3` + `oracle-k4` hold 99 GiB and are only needed for re-allocation).
+Live progress table: `tools\q35_progress.ps1`.

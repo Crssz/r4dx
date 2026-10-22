@@ -105,6 +105,12 @@ def main() -> int:
     check(set(n_["gate_b"]["groups"]) >= {"english", "thai", "code", "ALL"}, "gate B reports english / thai / code / ALL")
     check((tmp / "report.md").read_text().count("## ") >= 3, "markdown report written")
 
+    rc = run(str(HERE / "gate_q35.py"), "attrib", "--tokens", str(tok), "--stock", str(tmp / "bf16"), "--test", f"noisy={noisy}",
+             "--test", f"same={same}", "--out", str(tmp / "attrib"), "--row-chunk", "16")
+    att = json.loads((tmp / "attrib.json").read_text())["tests"]
+    check(rc.returncode == 0 and abs(att[0]["groups"]["ALL"]["mean_kl"] - got["mean_kl"]) < 1e-12 and att[1]["groups"]["ALL"]["mean_kl"] == 0.0,
+          "attrib: same pooled KL as eval for the noisy dump, 0 for the identical one")
+
     bad = [w for ok, w in RESULTS if not ok]
     print(f"\n{len(RESULTS) - len(bad)}/{len(RESULTS)} checks passed")
     return 1 if bad else 0

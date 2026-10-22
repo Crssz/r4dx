@@ -168,6 +168,36 @@ def evaluate(a) -> int:
     return 0 if ok_all else 1
 
 
+def attribute(a) -> int:
+    """KL / top-1 of several dumps against ONE reference dump (the stock bf16 one), pooled and by group and position: the table of
+    the weight-only attribution runs (ref_run.py logprobs --mix ... --mix-layers / --mix-match)."""
+    doc = json.loads(Path(a.tokens).read_text(encoding="utf-8"))
+    segs = doc["segments"]
+    rows = []
+    for t in a.test:
+        label, _, path = t.partition("=")
+        res = compare_all(segs, Path(a.stock), Path(path), a.row_chunk)
+        pg = {g: pooled(res, g) for g in GATED + REPORTED}
+        rows.append({"label": label, "dir": path, "groups": {g: brief(v) for g, v in pg.items() if v}, "by_position": bucketed(res)})
+        print(f"[gate_q35] {label}: ALL KL {pg['ALL']['mean_kl']:.5f} top-1 {pg['ALL']['top1_pct']:.2f}%", flush=True)
+    L = ["| dump | ALL KL | ALL top-1 | english | thai | code | tool | long | KL 0-512 | KL 512-2048 | KL 2048+ |", "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|"]
+    for r in rows:
+        g, bp = r["groups"], r["by_position"]
+
+        def win(lo, hi):
+            sel = [b for b in bp if b["from"] >= lo and (hi is None or b["from"] < hi)]
+            n = sum(b["rows"] for b in sel)
+            return sum(b["mean_kl"] * b["rows"] for b in sel) / n if n else float("nan")
+
+        L.append(f"| {r['label']} | {g['ALL']['mean_kl']:.5f} | {g['ALL']['top1_pct']:.2f}% | " + " | ".join(f"{g[k]['mean_kl']:.5f}" if k in g else "-" for k in
+                 ("english", "thai", "code", "tool", "long")) + f" | {win(0, 512):.5f} | {win(512, 2048):.5f} | {win(2048, None):.5f} |")
+    out = Path(a.out)
+    out.with_suffix(".json").write_text(json.dumps({"stock": a.stock, "tests": rows}, indent=1), encoding="utf-8")
+    out.with_suffix(".md").write_text(f"# KL vs the stock HF bf16 dumps (`{a.stock}`)\n\n" + "\n".join(L) + "\n", encoding="utf-8")
+    print("\n".join(L))
+    return 0
+
+
 def markdown(rep: dict) -> str:
     L = ["# Ornith-1.5-122B trellis container: Rung 4 KL gate", "", f"- gate A: {rep['rules']['gate_a']}", f"- gate B: {rep['rules']['gate_b']}",
          f"- stock bf16 dumps: `{rep['stock']}`; fp32 truth dumps: `{rep['truth']}`", ""]
@@ -217,8 +247,14 @@ def main() -> int:
     p.add_argument("--test", action="append", required=True, help="label=dir of r4dx dumps (repeatable)")
     p.add_argument("--out", required=True, help="report path without extension (.json and .md are written)")
     p.add_argument("--row-chunk", type=int, default=256)
+    p = sub.add_parser("attrib", help="KL of several dumps against the stock bf16 dump only (no truth / noise)")
+    p.add_argument("--tokens", required=True)
+    p.add_argument("--stock", required=True)
+    p.add_argument("--test", action="append", required=True, help="label=dir (repeatable)")
+    p.add_argument("--out", required=True)
+    p.add_argument("--row-chunk", type=int, default=256)
     a = ap.parse_args()
-    return prep(a.out) if a.cmd == "prep" else evaluate(a)
+    return prep(a.out) if a.cmd == "prep" else attribute(a) if a.cmd == "attrib" else evaluate(a)
 
 
 if __name__ == "__main__":

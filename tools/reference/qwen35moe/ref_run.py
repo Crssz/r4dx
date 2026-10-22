@@ -121,14 +121,30 @@ def run(args, mode: str) -> int:
     mix =getattr(args, "mix", None)
     if mix:
         # weight-only diagnostic: every trellis linear of the mix replaced by its reconstruction (kl_mix.MixReader), the rest stock
-        from qwen35moe.kl_mix import MixReader
+        import re
 
-        ref.reader = MixReader(args.model_dir, mix, device)
+        from qwen35moe.kl_mix import MixReader
+        from qwen35moe.ref import CheckpointReader
+
+        lo, _, hi = (args.mix_layers or "").partition("-")
+        layer_set = set(range(int(lo), int(hi or lo) + 1)) if lo else None
+        pat = re.compile(args.mix_match) if args.mix_match else None
+
+        class FilteredMix(MixReader):
+            """MixReader that reconstructs only the tensors of --mix-layers whose name matches --mix-match (the rest stay stock)."""
+
+            def get(self, name, rows=None):
+                m = re.search(r"layers\.(\d+)\.", name)
+                use = (layer_set is None or (m is not None and int(m.group(1)) in layer_set)) and (pat is None or pat.search(name))
+                return super().get(name, rows) if use else CheckpointReader.get(self, name, rows)
+
+        ref.reader = FilteredMix(args.model_dir, mix, device)
         ref.reader.weight_dtype = dtype
     work = Path(args.work)
     work.mkdir(parents=True, exist_ok=True)
     ident = {"mode": mode, "dtype": str(dtype), "tokens": str(Path(args.tokens).resolve()), "tokens_sha256": sha256_file(Path(args.tokens)),
-             "segments": [n for n, _ in segs], "model_dir": str(args.model_dir), "mix": str(mix) if mix else None}
+             "segments": [n for n, _ in segs], "model_dir": str(args.model_dir), "mix": str(mix) if mix else None,
+             "mix_layers": getattr(args, "mix_layers", None), "mix_match": getattr(args, "mix_match", None)}
     kv = KvRecorder() if (mode == "kvcalib" or getattr(args, "record_kv", None)) else None
     if kv is not None:
         kv.install(ref)
@@ -237,6 +253,9 @@ def main() -> int:
     p.add_argument("--record-kv", default=None, help="also write the per-layer K / V amax of these segments here")
     p.add_argument("--mix", default=None, help="a mix / oracle dir (weights_override.json): the HF stack with the trellis linears "
                                                 "replaced by their reconstructions (weight-only diagnostic, lm_head stays bf16)")
+    p.add_argument("--mix-layers", default=None, help="with --mix: reconstruct only these layers, 'A-B' or 'A'")
+    p.add_argument("--mix-match", default=None, help="with --mix: reconstruct only tensors whose HF name matches this regex "
+                                                      "(e.g. '(self_attn|linear_attn)' = class p, 'experts.gate_up_proj', 'experts.down_proj')")
     p.set_defaults(fn=lambda a: run(a, "logprobs"))
     p = sub.add_parser("kvcalib")
     common(p)

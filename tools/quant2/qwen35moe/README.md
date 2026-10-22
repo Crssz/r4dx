@@ -322,3 +322,33 @@ experts); `tiny_e2e.py` runs the whole chain on tiny-q35moe (`--device cuda --gp
 Note for the owner of `tiny_golden.py`: its docstring says "eager per-expert MoE loop", but HF 5.18's default `experts_implementation` is
 `grouped_mm`, which is what the goldens ran (`load_hf_model` sets the wrong attribute). Eager and grouped_mm differ by ~1 bf16 ulp per
 layer; the streaming reference uses eager.
+
+
+## fp8 KV calibration and the Rung 4 KL gate (2026-10-22)
+
+Everything runs through the streaming reference, layer-major over many segments (`tools/reference/qwen35moe/ref_run.py`: each layer's
+5.3 GB is read once for all segments, residuals for all segments stay on the card, GPU slices of 14 minutes under the `gpu` lock via
+`tools/reference/qwen35moe/run_slices.ps1`, resumable: exit 75 = run me again). CPU tests: `test_ref_run.py`, `test_gate_q35.py`.
+
+* **KV calibration**: `ref_run.py kvcalib` records, for the 12 full-attention layers, the per-kv-head |max| of K (after q/k-norm and rope,
+  what the paged fp8 cache stores) and V (raw v_proj) with HF's own sdpa path unchanged (a registered attention function). 51 evenly spread
+  segments of `tokens_calib.json` (151,028 tokens: 27 hessian-v2 of 2048, 24 SFT of up to 4096, 21 of them 4096 long) ->
+  `E:\models\r4dx\q35moe\kvcalib.json` (+ `.meta.json` with the per-segment maxima). amax: K 7.6-21.1, V 4.7-27.4 (descale 0.010-0.061, the
+  placeholder is 1.0), spread over segments <= 1.4x of the median except one V head (2.0x), and the *held-out* corpus (19,575 tokens, up to
+  10k long) reaches 0.58-1.03x of the calibrated amax in every head: no saturation (448 / amax >= 16x headroom).
+  `r4dx-convert --kv-calib` -> `ornith-1.5-122b-trellis-mix-kv.r4dx` (37020/37020 trellis tensors verified, 308 s CPU);
+  `check_kvcalib_q35.py <container> kvcalib.json`: 24 descale tensors = amax/448, 0 placeholders; the first container is untouched (all 1.0).
+* **KL gate**: held-out corpus `tools/reference/kl_corpus/build_chat_q35.py` (Ornith tokenizer: 12 thinking / tool chat conversations scored on
+  model-turn tokens, english / thai / python / cpp, 4 raw 1024-token texts, one 10,261-token mix of them), `gate_q35.py prep|eval|attrib`.
+  HF bf16 and HF fp32 ("truth") dumps from `ref_run.py logprobs --dtype bf16|fp32`; r4dx dumps from `r4dx_dump.ps1` (both cards, both locks,
+  `tool_teacher_forced_logprobs.exe --layout trellis`: Prefill(1) + DecodeStep, 19.0 ms/row). Gate A and the noise-relative gate B as in
+  `tools/reference/qwen4exp/gate_eval.py`; noise N = KL(truth || stock HF bf16) on the same rows.
+* **Weight-only diagnostic**: `ref_run.py logprobs --mix <mix dir> [--mix-layers A-B] [--mix-match REGEX]` runs the HF bf16 stack with the trellis
+  linears (all, or a layer range / name pattern) replaced by their reconstructions (`kl_mix.MixReader`), lm_head / router / shared expert
+  stock. It separates what the bits cost from what the engine adds. (Attribute against the fp32 truth, not the stock bf16 dump: any change of
+  weights re-rolls the bf16 rounding noise, which is part of every KL against a bf16 dump.)
+* A dump of one attribution run (layers 0-42 only) came out as unnormalised noise once (row log-sum-exp ~ 5e5, positive "log-probs"); the
+  identical command repeated gave a valid dump. Cause not found; `gate_q35.py` does not check normalisation, so look at one row's
+  log-sum-exp when a KL is negative or absurd (all dumps used below were checked: |logsumexp| <= 3e-3 = fp16 rounding).
+
+Results are in `docs/qwen35moe-kl-gate.md`.

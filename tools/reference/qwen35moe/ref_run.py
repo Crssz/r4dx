@@ -112,12 +112,23 @@ def run(args, mode: str) -> int:
     t_start = time.perf_counter()
     dtype = torch.float32 if getattr(args, "dtype", "bf16") == "fp32" else torch.bfloat16
     segs = load_segments(Path(args.tokens), args.segments.split(",") if getattr(args, "segments", None) else None)
+    if mode == "logprobs":
+        bad = [n for n, _ in segs if "/" in n or "\\" in n]
+        if bad:
+            raise SystemExit(f"segment names become file names: {bad[:3]} contain a path separator")
     ref = Qwen35MoeStreamingReference(args.model_dir, args.device, dtype=dtype)
     device, arch = ref.device, ref.arch
+    mix =getattr(args, "mix", None)
+    if mix:
+        # weight-only diagnostic: every trellis linear of the mix replaced by its reconstruction (kl_mix.MixReader), the rest stock
+        from qwen35moe.kl_mix import MixReader
+
+        ref.reader = MixReader(args.model_dir, mix, device)
+        ref.reader.weight_dtype = dtype
     work = Path(args.work)
     work.mkdir(parents=True, exist_ok=True)
     ident = {"mode": mode, "dtype": str(dtype), "tokens": str(Path(args.tokens).resolve()), "tokens_sha256": sha256_file(Path(args.tokens)),
-             "segments": [n for n, _ in segs], "model_dir": str(args.model_dir)}
+             "segments": [n for n, _ in segs], "model_dir": str(args.model_dir), "mix": str(mix) if mix else None}
     kv = KvRecorder() if (mode == "kvcalib" or getattr(args, "record_kv", None)) else None
     if kv is not None:
         kv.install(ref)
@@ -224,6 +235,8 @@ def main() -> int:
     p.add_argument("--out-dir", required=True)
     p.add_argument("--dtype", default="bf16", choices=["bf16", "fp32"])
     p.add_argument("--record-kv", default=None, help="also write the per-layer K / V amax of these segments here")
+    p.add_argument("--mix", default=None, help="a mix / oracle dir (weights_override.json): the HF stack with the trellis linears "
+                                                "replaced by their reconstructions (weight-only diagnostic, lm_head stays bf16)")
     p.set_defaults(fn=lambda a: run(a, "logprobs"))
     p = sub.add_parser("kvcalib")
     common(p)

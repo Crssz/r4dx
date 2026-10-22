@@ -1,4 +1,4 @@
-// r4dx_kernels.hip -- every r4dx-owned device kernel (docs/architecture.md "Own kernels"),
+﻿// r4dx_kernels.hip -- every r4dx-owned device kernel (docs/architecture.md "Own kernels"),
 // compiled as one hipcc translation unit (mirrors third_party/CMakeLists.txt's per-unit recipe
 // for r4d_core; see docs/build-windows.md). One row per workgroup for the row-reduction kernels
 // (rmsnorm and its fused residual form).
@@ -1400,7 +1400,8 @@ __global__ __launch_bounds__(kThreads) void TopkLseMergeKernel(int32_t* __restri
 // This is a two-pass (materialise-then-normalise) softmax rather than a streaming online one: the
 // whole visible row is at most 2063 scores (window 2048 - 1 + a 16-wide block), which fits LDS
 // comfortably, and it is the numerically identical max-subtracted fp32 softmax with less state.
-constexpr int kAttnThreads = 128;
+constexpr int kAttnKeyGroups = 4;                 // pass 2b: key groups of head_dim threads each
+constexpr int kAttnThreads = 128 * kAttnKeyGroups;  // head_dim <= 128 dims x 4 key groups (pass 1 uses them as 16 waves over the keys)
 constexpr int kAttnMaxT = 16;        // the block size: 8 (Qwen DFlash2) or 16 (Gemma 4 / DFlash v1)
 constexpr int kAttnMaxKeys = 2048 - 1 + kAttnMaxT + 1;  // (window - 1) + T <= 2047 + 16 (2064 floats x 4 q-heads = 33 KB LDS)
 constexpr int kAttnMaxRatio = 4;     // heads_q / heads_kv
@@ -1494,27 +1495,42 @@ __global__ __launch_bounds__(kAttnThreads) void DflashAttnKernel(
   }
   __syncthreads();
 
+  // Pass 2b, key-parallel: kAttnKeyGroups groups of head_dim threads each sweep every kAttnKeyGroups-th key (the serial sweep of up to
+  // 2063 keys by 128 threads was latency-bound: ~2.5 ms per layer at a full 2048 window), then the groups' partial outputs are added
+  // in a FIXED order (group 0, 1, 2, ...) so the result is reproducible.
+  __shared__ float s_part[kAttnKeyGroups][kAttnMaxRatio][kAttnMaxHeadDim];
+  {
+    const int g = tid / head_dim;
+    const int d = tid - g * head_dim;
+    if (g < kAttnKeyGroups) {
+      float acc[kAttnMaxRatio] = {0.0f, 0.0f, 0.0f, 0.0f};
+      for (int j = g; j < total; j += kAttnKeyGroups) {
+        const __hip_bfloat16* vp;
+        if (j < n_store) {
+          const int slot = (lo + j) % slots;
+          vp = v_store + (static_cast<int64_t>(slot) * heads_kv + kvh) * head_dim;
+        } else {
+          vp = v_block + (static_cast<int64_t>(j - n_store) * heads_kv + kvh) * head_dim;
+        }
+        const float vv = __bfloat162float(vp[d]);
+#pragma unroll
+        for (int r = 0; r < kAttnMaxRatio; ++r) {
+          if (r < ratio) acc[r] += s_sc[r][j] * vv;
+        }
+      }
+#pragma unroll
+      for (int r = 0; r < kAttnMaxRatio; ++r) s_part[g][r][d] = acc[r];
+    }
+  }
+  __syncthreads();
   if (tid < head_dim) {
     const int d = tid;
-    float acc[kAttnMaxRatio] = {0.0f, 0.0f, 0.0f, 0.0f};
-    for (int j = 0; j < total; ++j) {
-      const __hip_bfloat16* vp;
-      if (j < n_store) {
-        const int slot = (lo + j) % slots;
-        vp = v_store + (static_cast<int64_t>(slot) * heads_kv + kvh) * head_dim;
-      } else {
-        vp = v_block + (static_cast<int64_t>(j - n_store) * heads_kv + kvh) * head_dim;
-      }
-      const float vv = __bfloat162float(vp[d]);
-#pragma unroll
-      for (int r = 0; r < kAttnMaxRatio; ++r) {
-        if (r < ratio) acc[r] += s_sc[r][j] * vv;
-      }
-    }
     for (int r = 0; r < ratio; ++r) {
+      float acc = 0.0f;
+#pragma unroll
+      for (int g = 0; g < kAttnKeyGroups; ++g) acc += s_part[g][r][d];
       const int hq = kvh * ratio + r;
-      out[(static_cast<int64_t>(t) * heads_q + hq) * head_dim + d] =
-          __float2bfloat16(acc[r] / s_l[r]);
+      out[(static_cast<int64_t>(t) * heads_q + hq) * head_dim + d] = __float2bfloat16(acc / s_l[r]);
     }
   }
 }
@@ -2264,3 +2280,4 @@ int64_t r4dx_kernel_launch_counter_get() { return g_launch_count.load(std::memor
 void r4dx_kernel_launch_counter_add(int64_t n) { CountLaunches(n); }
 
 }  // extern "C"
+

@@ -307,10 +307,10 @@ void TestDflashFlags() {
     }
     CHECK(threw);
   }
-  {  // --dflash-k out of [1,7] is an error, but only when --dflash is actually given
+  {  // --dflash-k out of [1,15] is an error, but only when --dflash is actually given
     std::vector<std::string> storage = {"r4dx-cli", "--model", "m.r4dx", "--layout", "bf16",
                                          "--prompt", "hi",      "--dflash", "draft.r4dx",
-                                         "--dflash-k", "8"};
+                                         "--dflash-k", "16"};
     auto argv = ToArgv(storage);
     bool threw = false;
     try {

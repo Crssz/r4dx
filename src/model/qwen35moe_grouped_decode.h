@@ -15,6 +15,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <functional>
+#include <vector>
 
 #include "r4dx/core/arena.hpp"
 #include "quant_linear.h"
@@ -54,8 +55,22 @@ class Qwen35GroupedMoeDecode {
   static bool Supported(int64_t hidden, int64_t inter, int64_t shared_inter, int64_t experts, int64_t top_k,
                         const Qwen35MoeTrellisPtrs& p);
 
+  // The most rows RunRows takes (the plan kernel sorts rows * top_k pairs in one workgroup of 256).
+  static constexpr int kMaxRows = 16;
+
   // Allocates the scratch on the calling thread's current device and zeroes the split-group tickets (synchronizing).
-  Qwen35GroupedMoeDecode(int experts, int top_k, bool norm_topk);
+  // max_rows > 1 also sizes the M-row scratch of RunRows (about 90 MB at 16 rows, top-8).
+  Qwen35GroupedMoeDecode(int experts, int top_k, bool norm_topk, int max_rows = 1);
+
+  // The M-row MoE of a speculative verify window: x / y device bf16 [rows, hidden] (2 <= rows <= max_rows; rows == 1 is Run), the same
+  // block as Run for every row -- router, route, shared expert, then the routed experts of ALL rows grouped by expert: each distinct
+  // expert's weights are streamed once for all of the rows that picked it (moe_trellis_grouped.h's M-row kernels). Only enqueues.
+  void RunRows(hipStream_t stream, core::Arena& arena, const Qwen35GroupedMoeWeights& w, const Qwen35MoeTrellisPtrs& p,
+               const uint16_t* x, uint16_t* y, int64_t rows, const std::function<void(const char*)>* mark = nullptr);
+  // Benchmark / test hook: the split-group counts (1 or 2) of the M-row GEMMs. Default 1 / 1.
+  void SetRowSplits(int gate_up_skg, int down_skg);
+  // The plan of the last RunRows call, D2H (tests): kMoePlanInts int32.
+  std::vector<int32_t> ReadPlan(hipStream_t stream) const;
 
   // x: device bf16 [1, hidden] (the post-attention-normed residual); y: device bf16 [1, hidden], disjoint from x. Only enqueues
   // on `stream`. `arena` serves the bf16 GEMVs' scratch (the caller resets it). Throws std::runtime_error on a launch error.
@@ -77,6 +92,15 @@ class Qwen35GroupedMoeDecode {
   core::DeviceBuffer<float> ws_gu_, ws_down_;
   core::DeviceBuffer<uint16_t> shared_g_, shared_u_, shared_h_, shared_y_, shared_gate_logit_;
   core::DeviceBuffer<uint32_t> tickets_gu_, tickets_down_;
+
+  // ---- M-row scratch (max_rows_ > 1) ----
+  int max_rows_ = 1;
+  int rows_gu_skg_ = 1, rows_down_skg_ = 1;
+  core::DeviceBuffer<uint16_t> r_logits_, r_a0_gu_, r_a1_gu_, r_gu_, r_a0_down_, r_yp_, r_shared_g_, r_shared_u_, r_shared_h_, r_shared_y_,
+      r_shared_gate_logit_;
+  core::DeviceBuffer<int32_t> r_ids_, r_plan_;
+  core::DeviceBuffer<float> r_weights_, r_ws_gu_, r_ws_down_;
+  core::DeviceBuffer<uint32_t> r_tickets_gu_, r_tickets_down_;
 };
 
 }  // namespace r4dx::model

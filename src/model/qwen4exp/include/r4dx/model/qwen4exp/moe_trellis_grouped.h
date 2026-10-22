@@ -101,6 +101,54 @@ hipError_t GroupedTrellisGemvDownQ35(int kb, const uint16_t* in_a0, const int32_
                                      const float* all_svh_down, uint16_t* out_yp, float* ws, unsigned* all_tickets_down,
                                      int top_k, void* stream);
 
+// ---- qwen3_5_moe geometry, M ROWS (a speculative verify window): 2..16 tokens at once, ~top_k * rows (token, expert) pairs over
+// the distinct experts they pick. The M = 1 kernels above run one expert per grid slot and fill one of the 16 rows of every WMMA
+// tile; these put an expert's tokens in the tile's rows (the activation row of lane l is the group's l-th pair), so each routed
+// expert's weights are decoded and streamed ONCE however many of the rows chose it. Nothing leaves the device: the plan kernel
+// sorts the pairs by expert and writes the groups to the device, the grids are launched for the largest possible group count
+// and the blocks past the real one return at once.
+//
+// The plan (int32, kMoePlanInts of them):
+//   [kMoePlanNGroups]                   number of distinct experts
+//   [kMoePlanPairExpert + p]            expert of sorted pair p (pairs sorted by (expert, source slot))
+//   [kMoePlanPairToken + p]             token row of sorted pair p
+//   [kMoePlanPosOfSrc + s]              sorted position of source slot s = token * top_k + j (j = router rank)
+//   [kMoePlanGrpExpert/Start/Count + g] group g: expert, first sorted pair, number of pairs (<= 16)
+constexpr int kMoeRowsMax = 16;
+constexpr int kMoePlanMaxPairs = 256;  // rows * top_k
+constexpr int kMoePlanNGroups = 0;
+constexpr int kMoePlanPairExpert = 16;
+constexpr int kMoePlanPairToken = kMoePlanPairExpert + kMoePlanMaxPairs;
+constexpr int kMoePlanPosOfSrc = kMoePlanPairToken + kMoePlanMaxPairs;
+constexpr int kMoePlanGrpExpert = kMoePlanPosOfSrc + kMoePlanMaxPairs;
+constexpr int kMoePlanGrpStart = kMoePlanGrpExpert + kMoePlanMaxPairs;
+constexpr int kMoePlanGrpCount = kMoePlanGrpStart + kMoePlanMaxPairs;
+constexpr int kMoePlanInts = kMoePlanGrpCount + kMoePlanMaxPairs;
+// Split-group counts of the M-row GEMMs (1, 2): ws floats >= max_groups * skg * 16 * N, tickets u32 >= max_groups * N / 128.
+constexpr int kMoeRowsMaxSkg = 2;
+
+// ids: int32 [rows * top_k] (router order per token) -> plan. rows * top_k <= kMoePlanMaxPairs.
+hipError_t GroupedMoePlanRows(const int32_t* ids, int32_t* plan, int rows, int top_k, void* stream);
+// x [rows, 3072] bf16 -> A0 / A1 [pairs, 3072] fp16 (row p: the sorted pair p's token transformed with its expert's sign vectors).
+hipError_t GroupedTrellisInputGateUpQ35Rows(const uint16_t* x, const int32_t* plan, const float* all_suh, uint16_t* out_a0,
+                                            uint16_t* out_a1, int n_pairs, void* stream);
+// -> out_c [pairs, 2048] bf16. `max_groups` = min(experts, pairs): the grid is launched for it.
+hipError_t GroupedTrellisGemvGateUpQ35Rows(int kb, const uint16_t* in_a0, const uint16_t* in_a1, const int32_t* plan,
+                                           const uint32_t* all_w, const float* all_svh, uint16_t* out_c, float* ws,
+                                           unsigned* all_tickets, int max_groups, int skg, void* stream);
+// gu [pairs, 2048] bf16 -> out_a0 [pairs, 1024] fp16 (silu rounded to bf16 first, like the M = 1 kernel).
+hipError_t GroupedSiluMulTrellisInputDownQ35Rows(const uint16_t* gu, const int32_t* plan, const float* all_suh_down,
+                                                 uint16_t* out_a0, int n_pairs, void* stream);
+// -> out_yp [pairs, 3072] bf16.
+hipError_t GroupedTrellisGemvDownQ35Rows(int kb, const uint16_t* in_a0, const int32_t* plan, const uint32_t* all_w_down,
+                                         const float* all_svh_down, uint16_t* out_yp, float* ws, unsigned* all_tickets_down,
+                                         int max_groups, int skg, void* stream);
+// out[t, d] = bf16( sum_j yp[posOfSrc[t * top_k + j], d] * weights[t * top_k + j] (j in router order, fp32)
+//                   + Rb(Rb(sigmoid(shared_gate_logit[t])) * shared_y[t, d]) ): the M = 1 router-order combine, per token.
+hipError_t GroupedMoeCombineRowsRouterOrder(const uint16_t* yp, const float* weights, const int32_t* plan, const uint16_t* shared_y,
+                                            const uint16_t* shared_gate_logit, uint16_t* out, int rows, int top_k, int hidden,
+                                            void* stream);
+
 }  // namespace qwen4exp
 }  // namespace model
 }  // namespace r4dx

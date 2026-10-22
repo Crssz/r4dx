@@ -139,6 +139,13 @@ class Qwen35MoeModel {
   // Test hook: replaces the drafter's tokens of every round (anchor, k) -> drafts (at most k) after the real draft round has run, so a
   // test drives every partial-accept length through the round's own accept / inject / commit code. Empty function = off.
   void SetDraftOverride(std::function<std::vector<int32_t>(int32_t anchor, int64_t k)> fn) { draft_override_ = std::move(fn); }
+  // Wall-clock breakdown of the DecodeStepDflashGreedy rounds since load (printed to stderr by the destructor when R4DX_Q35_STATS=1).
+  struct RoundStats {
+    int64_t rounds = 0, tokens = 0;
+    double total_ms = 0, draft_ms = 0, verify_ms = 0, inject_ms = 0, stage_ms[2] = {0, 0}, handoff_ms = 0, head_ms = 0;
+  };
+  const RoundStats& GetRoundStats() const { return round_stats_; }
+  std::string RoundStatsLine() const;
   // The drafts the last DecodeStepDflashGreedy verified (tests / stats).
   const std::vector<int32_t>& LastDrafts() const { return last_drafts_; }
   // Pinned [rows, FeatureCols] features captured by the last chunk / verify window (valid until the next one).
@@ -223,6 +230,7 @@ class Qwen35MoeModel {
   std::vector<int32_t> last_drafts_;
   std::function<std::vector<int32_t>(int32_t, int64_t)> draft_override_;
   int64_t verified_rows_ = 0;
+  RoundStats round_stats_;
 
   int64_t pos_ = 0;
   bool at_prefill_end_ = false;

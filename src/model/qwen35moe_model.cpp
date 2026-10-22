@@ -364,7 +364,13 @@ std::unique_ptr<Qwen35MoeModel> Qwen35MoeModel::Load(const Qwen35MoeModelOptions
   return mp;
 }
 
-Qwen35MoeModel::~Qwen35MoeModel() = default;
+Qwen35MoeModel::~Qwen35MoeModel() {
+  const char* e = std::getenv("R4DX_Q35_STATS");
+  if (e != nullptr && e[0] == '1') {
+    const std::string line = RoundStatsLine();
+    if (!line.empty()) std::fprintf(stderr, "[r4dx::model::Qwen35MoeModel] %s\n", line.c_str());
+  }
+}
 
 // ---- one chunk -------------------------------------------------------------------------------------------------------
 
@@ -708,6 +714,12 @@ std::vector<int32_t> Qwen35MoeModel::DecodeStepDflashGreedy(int32_t token_id, in
   const double draft_ms = last_.draft_ms;
   const std::vector<int32_t> argmax = VerifyWindow(cands);
   last_.draft_ms = draft_ms;
+  round_stats_.verify_ms += last_.total_ms;
+  round_stats_.stage_ms[0] += last_.stage_ms[0];
+  round_stats_.stage_ms[1] += last_.stage_ms[1];
+  round_stats_.handoff_ms += last_.handoff_ms;
+  round_stats_.head_ms += last_.head_ms;
+  round_stats_.draft_ms += draft_ms;
 
   // Greedy acceptance: draft i (candidates[i + 1]) is confirmed iff the target's argmax after candidates[i] equals it.
   int64_t accepted = 0;
@@ -725,7 +737,23 @@ std::vector<int32_t> Qwen35MoeModel::DecodeStepDflashGreedy(int32_t token_id, in
   last_.inject_ms = MsSince(t1);
   CommitVerifiedWindow(committed);
   last_.total_ms = MsSince(t0);
+  ++round_stats_.rounds;
+  round_stats_.tokens += committed;
+  round_stats_.inject_ms += last_.inject_ms;
+  round_stats_.total_ms += last_.total_ms;
   return result;
+}
+
+std::string Qwen35MoeModel::RoundStatsLine() const {
+  const RoundStats& r = round_stats_;
+  if (r.rounds == 0) return "";
+  const double n = static_cast<double>(r.rounds);
+  char buf[512];
+  std::snprintf(buf, sizeof(buf),
+                "dflash rounds: %lld, %.2f tokens/round; per round %.1f ms = draft %.1f + verify %.1f (stage0 %.1f, stage1 %.1f, handoff %.1f, head %.1f) + inject %.1f",
+                static_cast<long long>(r.rounds), static_cast<double>(r.tokens) / n, r.total_ms / n, r.draft_ms / n, r.verify_ms / n,
+                r.stage_ms[0] / n, r.stage_ms[1] / n, r.handoff_ms / n, r.head_ms / n, r.inject_ms / n);
+  return buf;
 }
 
 void Qwen35MoeModel::SetCapture(Qwen35MoeCaptureFn fn) {

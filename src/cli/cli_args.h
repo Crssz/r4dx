@@ -512,9 +512,12 @@ inline CliArgs ParseArgs(int argc, char** argv) {
     throw CliUsageError("--dflash and --mtp are mutually exclusive (docs/dflash2.md: DFlash2 and "
                          "MTP are separate self-speculation families, not combinable)");
   }
-  if (!a.dflash.empty() && (a.dflash_k < 1 || a.dflash_k > 7)) {
-    throw CliUsageError("--dflash-k must be in [1, 7] (DFlash2's block is 8 wide: anchor + up to "
-                         "block_size-1 drafted tokens)");
+  if (!a.dflash.empty() && (a.dflash_k < 1 || a.dflash_k > 15)) {
+    throw CliUsageError("--dflash-k must be in [1, 15] (the drafter's block is 8 (Qwen3.8-27B) or 16 (Ornith, Gemma 4) wide: "
+                         "anchor + up to block_size-1 drafted tokens; the model refuses a k above its drafter's block - 1)");
+  }
+  if (!a.dflash.empty() && a.tp == 2 && a.dflash_k > 7) {
+    throw CliUsageError("--tp 2 --dflash-k must be in [1, 7] (a tensor-parallel verify window is at most 8 rows, docs/tp.md N80)");
   }
   // Review finding (2026-09-21): DecodeStepProfiled/PrefillProfiled do not call
   // CaptureDflashLayerInput/DflashDraft::InjectFeatures, but both still advance Model::pos_ --

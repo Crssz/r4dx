@@ -119,6 +119,7 @@ struct Qwen35MoeStage::Impl {
   std::unique_ptr<qwen4exp::MoeBlockBase> moe;
   std::unique_ptr<Qwen35GroupedMoeDecode> gmoe;  // the M = 1 on-device MoE (null when no layer qualifies)
   bool grouped_on = false;                      // gmoe is used by the layers that qualify
+  int gmoe_rows_cap = 1;                        // verify windows of 2..cap rows take Qwen35GroupedMoeDecode::RunRows
   bool grouped_capture = false;                 // ... also while a capture is installed (tests)
   std::vector<Qwen35MoeLayerRefs> layer_refs;
   std::vector<std::unique_ptr<LayerRt>> layers;
@@ -384,8 +385,12 @@ Qwen35MoeStage::Qwen35MoeStage(const Qwen35MoeStageOptions& options, std::vector
 
   // The grouped decode MoE: one scratch set for the stage (its layers run one after another on the stream).
   if (std::any_of(m.layers.begin(), m.layers.end(), [](const auto& lp) { return lp->grouped; })) {
+    const int rows_cap = options.spec_window > 1
+                             ? static_cast<int>(std::min<int64_t>(options.spec_window, Qwen35GroupedMoeDecode::kMaxRows))
+                             : 1;
     m.gmoe = std::make_unique<Qwen35GroupedMoeDecode>(static_cast<int>(cfg.num_experts), static_cast<int>(cfg.num_experts_per_tok),
-                                                      cfg.norm_topk_prob);
+                                                      cfg.norm_topk_prob, rows_cap);
+    m.gmoe_rows_cap = rows_cap;
     int mode = options.grouped_decode;
     if (mode < 0) {
       const char* env = std::getenv("R4DX_Q35_GROUPED");
@@ -570,6 +575,15 @@ void Qwen35MoeStage::Impl::RunMoe(LayerRt& L, const Qwen35MoeChunk& c) {
     arena.Reset();
     CapBf16(L.index, "moe_out", blk.data(), 1, hidden, c.first_pos);
     ResidualAdd(hmid.data(), blk.data(), h.data(), 1);
+    return;
+  }
+  // A speculative verify window (2..cap rows): all rows through the M-row grouped kernels, no host sync, each routed expert's weights
+  // streamed once. (Prefill chunks, even short ones, keep the host-routed path: their numerics are the validated baseline.)
+  if (c.verify && c.rows >= 2 && c.rows <= gmoe_rows_cap && grouped_on && L.grouped && (!capture || grouped_capture)) {
+    gmoe->RunRows(s, arena, L.gmoe_w, e.trellis, x.data(), blk.data(), c.rows);
+    arena.Reset();
+    CapBf16(L.index, "moe_out", blk.data(), c.rows, hidden, c.first_pos);
+    ResidualAdd(hmid.data(), blk.data(), h.data(), c.rows);
     return;
   }
   // One expert GEMM's ApplyLinear scratch comes from its own small arena, reset before each call: the experts' calls (up to

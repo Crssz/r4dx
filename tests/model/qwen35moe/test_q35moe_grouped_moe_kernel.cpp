@@ -17,6 +17,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <functional>
 #include <map>
 #include <random>
 #include <set>
@@ -353,6 +354,56 @@ int RunTest() {
     R4DX_HIP_CHECK(hipStreamSynchronize(s));
     const double host_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count() / hit;
     std::printf("host-routed MoE layer (one layer's weights, so the 8 experts partly stay cached): %.3f ms per call\n", host_ms);
+
+    // ---- the M-row grouped MoE (a verify window) against the host-routed MoE, 2..16 rows ---------------------------------------
+    {
+      Qwen35GroupedMoeDecode moe_r(kE, kTopK, /*norm_topk=*/true, 16);
+      qwen4exp::MoeBlockBase host16(mc, 16);
+      core::DeviceBuffer<uint16_t> yg(16 * kH), yh(16 * kH), y1(kH);
+      std::vector<uint16_t> ga(16 * kH), ha(16 * kH), oa(kH);
+      const int skg_cfgs[][2] = {{1, 1}, {2, 2}, {1, 2}, {2, 1}};
+      for (const auto& cfg : skg_cfgs) {
+        moe_r.SetRowSplits(cfg[0], cfg[1]);
+        double worst_host = 0, worst_m1 = 0;
+        int cases = 0;
+        for (int rows : {2, 3, 5, 8, 12, 16}) {
+          for (int rep = 0; rep < 6; ++rep) {
+            const uint16_t* x = xs.data() + static_cast<size_t>((rep * 7 + rows) % (kInputs - 16)) * kH;
+            moe_r.RunRows(s, arena, weights_of(L[0]), L[0].p, x, yg.data(), rows);
+            arena.Reset();
+            host16.Forward(s, block_arena, mw, x, yh.data(), rows, fn);
+            block_arena.Reset();
+            R4DX_HIP_CHECK(hipStreamSynchronize(s));
+            yg.CopyToHost(ga.data(), static_cast<size_t>(rows) * kH);
+            yh.CopyToHost(ha.data(), static_cast<size_t>(rows) * kH);
+            for (int r = 0; r < rows; ++r) {
+              double sq = 0, sum = 0, sum1 = 0;
+              moe.Run(s, arena, weights_of(L[0]), L[0].p, x + static_cast<size_t>(r) * kH, y1.data());
+              arena.Reset();
+              R4DX_HIP_CHECK(hipStreamSynchronize(s));
+              y1.CopyToHost(oa.data(), kH);
+              for (int d = 0; d < kH; ++d) {
+                const double ref = Bf(ha[static_cast<size_t>(r) * kH + d]), got = Bf(ga[static_cast<size_t>(r) * kH + d]), one = Bf(oa[static_cast<size_t>(d)]);
+                if (!std::isfinite(got)) Check(false, "non-finite M-row MoE output");
+                sq += ref * ref;
+                sum += std::fabs(got - ref);
+                sum1 += std::fabs(got - one);
+              }
+              const double rms = std::sqrt(sq / kH);
+              if (rms > 0) {
+                worst_host = std::max(worst_host, sum / kH / rms);
+                worst_m1 = std::max(worst_m1, sum1 / kH / rms);
+              }
+              ++cases;
+            }
+          }
+        }
+        std::printf("M-row grouped MoE (splits %d/%d) vs host-routed over %d rows (2..16 per call): mean|err|/rms worst %.5f; vs the M = 1 grouped kernel row by row: worst %.5f\n",
+                    cfg[0], cfg[1], cases, worst_host, worst_m1);
+        Check(worst_host <= 0.01, "M-row grouped output differs from the host-routed one beyond bf16 noise (mean/rms " + std::to_string(worst_host) + ")");
+        Check(worst_m1 <= 0.01, "M-row grouped output differs from the M = 1 grouped kernel beyond bf16 noise (mean/rms " + std::to_string(worst_m1) + ")");
+      }
+    }
   }
 
   // ---- grouped benchmark over `layers` layers --------------------------------------------------------------------------
@@ -421,6 +472,69 @@ int RunTest() {
     for (const std::string& n : order) std::printf("     %-22s %.4f ms\n", n.c_str(), acc[n] / pit);
     static_cast<void>(hipEventDestroy(e0));
     static_cast<void>(hipEventDestroy(e1));
+
+    // ---- the M-row grouped MoE (a verify window) over the same layers ------------------------------------------------------------
+    Qwen35GroupedMoeDecode moe_r(kE, kTopK, /*norm_topk=*/true, 16);
+    core::DeviceBuffer<uint16_t> yr(16 * kH);
+    const double expert_bytes = static_cast<double>(2 * kI) * kH * gu_bits / 8.0 + static_cast<double>(kH) * kI * dn_bits / 8.0;
+    const double fixed_bytes = static_cast<double>(kE) * kH * 2 + 3.0 * kH * kI * 2 + kH * 2;
+    const int rit = std::max(20, iters / 2);
+    for (int rows : {2, 4, 6, 8, 12, 16}) {
+      for (const auto& cfg : {std::pair<int, int>{1, 1}, std::pair<int, int>{2, 2}}) {
+        moe_r.SetRowSplits(cfg.first, cfg.second);
+        for (int i = 0; i < 20; ++i) {
+          const SynthLayer& l = L[static_cast<size_t>(i % layers)];
+          moe_r.RunRows(s, arena, weights_of(l), l.p, xs.data() + static_cast<size_t>(i % (kInputs - 16)) * kH, yr.data(), rows);
+          arena.Reset();
+        }
+        R4DX_HIP_CHECK(hipStreamSynchronize(s));
+        const auto w0 = std::chrono::steady_clock::now();
+        for (int i = 0; i < rit; ++i) {
+          const SynthLayer& l = L[static_cast<size_t>(i % layers)];
+          moe_r.RunRows(s, arena, weights_of(l), l.p, xs.data() + static_cast<size_t>(i % (kInputs - 16)) * kH, yr.data(), rows);
+          arena.Reset();
+        }
+        R4DX_HIP_CHECK(hipStreamSynchronize(s));
+        const double per_r = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - w0).count() / rit;
+        const std::vector<int32_t> plan = moe_r.ReadPlan(s);
+        const int groups = plan[0];
+        const double mb = (groups * expert_bytes + fixed_bytes) / 1e6;
+        std::printf("   M-row grouped MoE, %2d rows, splits %d/%d: %.4f ms per layer-call (last call: %d distinct experts, %.0f MB -> %.0f GB/s)\n", rows,
+                    cfg.first, cfg.second, per_r, groups, mb, mb / 1e3 / (per_r * 1e-3));
+      }
+    }
+    moe_r.SetRowSplits(1, 1);
+    {
+      std::vector<hipEvent_t> evs;
+      std::vector<std::string> names;
+      const std::function<void(const char*)> mark = [&](const char* name) {
+        hipEvent_t e;
+        static_cast<void>(hipEventCreate(&e));
+        static_cast<void>(hipEventRecord(e, s));
+        evs.push_back(e);
+        names.push_back(name);
+      };
+      std::map<std::string, double> acc;
+      std::vector<std::string> order;
+      const int pit = 40;
+      for (int i = 0; i < pit; ++i) {
+        evs.clear();
+        names.clear();
+        const SynthLayer& l = L[static_cast<size_t>(i % layers)];
+        moe_r.RunRows(s, arena, weights_of(l), l.p, xs.data() + static_cast<size_t>(i % (kInputs - 16)) * kH, yr.data(), 16, &mark);
+        arena.Reset();
+        R4DX_HIP_CHECK(hipStreamSynchronize(s));
+        for (size_t k = 1; k < evs.size(); ++k) {
+          float t = 0;
+          R4DX_HIP_CHECK(hipEventElapsedTime(&t, evs[k - 1], evs[k]));
+          if (acc.find(names[k]) == acc.end()) order.push_back(names[k]);
+          acc[names[k]] += t;
+        }
+        for (hipEvent_t e : evs) static_cast<void>(hipEventDestroy(e));
+      }
+      std::printf("   16-row phases (event-bracketed):\n");
+      for (const std::string& n : order) std::printf("     %-22s %.4f ms\n", n.c_str(), acc[n] / pit);
+    }
   }
 
   std::printf("\n%s (%d failure(s))\n", g_failures == 0 ? "PASS" : "FAIL", g_failures);

@@ -1,4 +1,4 @@
-# Ornith-1.5-122B (`qwen3_5_moe`) support for r4dx -- design and task plan
+﻿# Ornith-1.5-122B (`qwen3_5_moe`) support for r4dx -- design and task plan
 
 Written 2026-10-20. Design only: nothing here has been built or run on a GPU yet. Items tagged **VERIFY** come
 from the HF `config.json` / model card and must be checked against the downloaded safetensors index and a golden.
@@ -92,40 +92,119 @@ Reuse, do not copy:
 - Every GPU job runs through `tools\with_lock.ps1 -Name gpu` and one at a time (dual-GPU sustained load has reset the display on this machine).
 
 
-## 6. DFlash2 speculative decoding (planned, not started)
+## 6. DFlash2 speculative decoding (built and measured 2026-10-23)
 
-Source: `incoai/Ornith-1.5-122B-DFlash2` (Apache-2.0, `qwen3` architecture, 0.9 B parameters, BF16, ~1.8 GB). A block-diffusion drafter for
-`ornith-ai/Ornith-1.5-122B`: block of 16 (15 drafted tokens per verification step), lossless (greedy output equals the target's). Downloaded 2026-10-21 to
-`E:\models\r4dx\Ornith-1.5-122B-DFlash2` (6 layers, hidden 3072, 32 q / 8 kv heads x 128, sliding window 2048, target taps at layers
-1, 7, 14, 20, 26, 32, 39, 45, two-tap conv group 16, selector rank 256 / top-k 16, mask token 248077; not yet checked against r4dx's
-DFlash2 driver). Numbers below are from its model card (SGLang 0.5.21, two NVIDIA GB300, TP 2, Ornith default sampling, thinking on,
-4096 new tokens), NOT measured on r4dx / R9700.
+Source: `incoai/Ornith-1.5-122B-DFlash2` (Apache-2.0, 0.9 B, bf16, 1.86 GB; 6 layers, hidden 3072, 32 q / 8 kv heads x 128, window 2048, block 16 = anchor + 15 drafted tokens,
+target taps at layers 1, 7, 14, 20, 26, 32, 39, 45, two-tap conv in groups of 16, selector rank 256 / top-k 16, mask token 248077). Model-card numbers (SGLang on two GB300,
+bf16 target, 4096 new tokens, thinking on, NOT this machine): acceptance length 5.4 (MT-Bench) / 6.4 (MBPP) / 8.3 (GSM8K) / 8.6 (HumanEval) / 9.2 (MATH-500).
+Everything below is r4dx on the two R9700, container `ornith-1.5-122b-trellis-mix-kv.r4dx`, greedy, thinking on, tool `tool_q35moe_dflash`. Design and conventions: `docs/dflash2.md` section 14.
 
-| Task | Acceptance length | Speedup at concurrency 1 |
-|---|---:|---:|
-| GSM8K | 8.33 | 2.27x |
-| MATH-500 | 9.20 | 2.65x |
-| HumanEval | 8.64 | 2.53x |
-| MBPP | 6.37 | 1.98x |
-| MT-Bench | 5.41 | 1.34x |
+### 6.1 Measured result
 
-### 6.1 Expected value on r4dx (estimate, unmeasured)
+`r4dx-cli` / `r4dx-server`: `--dflash E:\models\r4dx\ornith-1.5-122b-dflash2-w4a16.r4dx --dflash-k 11 --dflash-p-min 0.8` (flags as for the other models; `--dflash-k` up to 15; the
+global `--dflash-p-min` default stays 0, so pass it). Every DFlash2 stream below is **token-for-token identical to plain greedy decode** (section 6.3). Speed is the in-process tok/s of 399 decoded tokens
+(`--max-ctx 8192`), best of 2, against plain decode run in the same process (plain: 60.6-61.9 tok/s, ~16.3 ms per token; it moves by +-3% between sessions, so only the ratios mean anything).
 
-A 16-row verify step in the MoE touches about 100 of 256 experts per layer (256 x (1 - (1 - 8/256)^16)), i.e. ~40% of the expert weights: roughly
-20 GB read per step against ~5 GB for a single-token decode step. At the qwen4exp-measured efficiency that is ~70-80 ms per verify step against ~20 ms
-for plain decode; with 5-9 accepted tokens per step the estimate is 70-120 tok/s, about 1.5-2.5x over a ~45 tok/s pipeline-split baseline. Low
-confidence: it assumes the 16-row grouped expert GEMM runs at decent efficiency.
+| prompt (class) | plain tok/s | k=4, p_min 0.35 | k=7, p_min 0.8 | **k=11, p_min 0.8** | tokens per round at k=11 / p 0.8 |
+|---|---:|---:|---:|---:|---:|
+| code1 CSV parser (code) | 61.4 | 1.55x | 1.81x | **1.82x** (111 tok/s) | 3.47 |
+| code2 LRU cache (code) | 60.8 | 1.82x | 2.06x | **2.13x** (130 tok/s) | 4.16 |
+| math1 trains + primes (math) | 61.0 | 1.85x | 2.17x | **2.27x** (140 tok/s) | 4.75 |
+| math2 dice (math) | 61.3 | 1.78x | 2.18x | **2.33x** (142 tok/s) | 5.05 |
+| chat1 Kyoto itinerary (chat) | 61.9 | 1.05x | 1.29x | **1.30x** (80 tok/s) | 2.04 |
+| chat2 vaccines (chat) | 61.7 | 1.21x | 1.41x | **1.40x** (85 tok/s) | 2.40 |
+| long1 4.4k-token prompt, summarise (chat) | 60.6 | 1.26x | 1.33x | **1.30x** (78 tok/s) | 2.83 |
 
-### 6.2 Work items (after M4 quantized container and the grouped M=1 decode kernel)
+**Plainly: with k=11 / p_min 0.8, chat about 1.3-1.4x, code about 1.8-2.1x, math about 2.3x, and a 4.4k-token prompt 1.3x.** That is at or above the 1.2x / 1.75x / 2.3x that section 7 expected, but only with a
+confidence cut: with `p_min` 0 (the CLI default) chat is 0.96-1.17x at k=7 and large k loses to plain decode (see the grids in 6.5); k=15 with p_min 0 measured 0.72-0.80x on chat and long1 (an earlier run, not repeated).
+Why: a verify round costs ~31-39 ms whatever the acceptance, plain decode produces a token every 16.3 ms, so a round must yield more than ~2.1-2.4 tokens to pay. Chat yields 2.0-2.5 per round even after the
+cut; the cut (`p_min`, a drafter-confidence walk over the selector's candidates that stops drafting early) removes the long, low-probability tails of the window, which cost verify rows and are rejected anyway
+(share of drafted tokens accepted on chat1 at k=7: 29% at p_min 0.35, 61% at 0.7). `p_min` 0.7-0.8 is a plateau (within 2-3% of each other on 7 of 7 prompts, 0.9 loses on code); k beyond 7 matters only on math and code.
+The acceptance is below the model card's (code 3.5-4.7 tokens per round at k=11-15 against 6.4-8.6, math 4.8-6.5 against 8.3-9.2, chat 2.0-2.8 against 5.4) for two reasons we can name: the target is a 3.4-bit
+trellis mix with KL 0.125 to bf16 (section 9), and the drafter was trained against the bf16 model; the card also averages over 4096-token generations at default sampling. Nothing here was tuned per prompt.
 
-1. Download the drafter; convert to the r4dx DFlash2 container with the existing tooling (`docs/dflash2.md`); check its config against the driver
-   (r4dx's current drafter is ~1.9 B and was trained for the Qwen3.8 27B: tap layers, hidden size, head layout, vocab).
-2. Tap target hidden features from the Ornith layers the drafter was trained on (`Qwen35MoeStage` capture hook already exists).
-3. Partial-accept rollback for the 36 GDN layers (the stage's GDN checkpoint exists but is untested for this use).
-4. Grouped MoE kernel for M = 16 verify rows at 3072 / 1024 (new; the M=1 decode kernel does not cover it).
-5. Driver wiring in `Qwen35MoeLocalTextModel`, server/CLI flags (`--dflash`), then a greedy-equality test against plain decode and an acceptance-length
-   measurement on code / math / chat prompts.
-6. Measure on r4dx; only then decide whether the MTP head (M6) is still worth building.
+An earlier run on the same build before the drafter-attention and p_min work (`--max-ctx 4096`, 300 tokens, k=7, p_min 0.35) measured chat 1.21x, code 1.75x, math 2.28x; the 8192 / 399-token runs above are the ones to quote.
+
+### 6.2 What was built (the work items of the original plan)
+
+1. **Drafter container**: `r4dx-convert --dflash-hf` accepts the native `DFlash2DraftModel` checkpoint (real conv and selector copied, geometry from `dflash_config`, taps stored as layer inputs
+   [2,8,15,21,27,33,40,46]); `E:\models\r4dx\ornith-1.5-122b-dflash2-{bf16,w4a16}.r4dx` (1.86 / 0.71 GB). The runtime's `DflashDraft` needed no change for the geometry. Checked against the vendored
+   z-lab HF module on the real weights (`test_q35moe_dflash2_golden`: RelL2 5.1e-2 vs HF's own bf16 floor of 4.5e-2). **w4a16 vs bf16** (k=7, p_min 0.35, earlier run): 1.80x vs 1.76x (code2), 2.08x vs 2.02x (math1),
+   1.12x vs 1.11x (chat2); the bf16 drafter does not accept more (5.47 vs 5.39 tokens per round on math1) and drafts ~1.8 ms/round slower, so w4a16 is the recommended drafter (and 1.15 GB smaller).
+2. **Feature taps**: each stage copies the residual entering its tap layers (5 taps on device 0, 3 on device 1) into a device staging buffer and sends one 2D copy per chunk to pinned host memory; the model uploads the committed
+   rows to the drafter (device 1) after every prefill chunk, decode step and accepted verify prefix. (Eight separate strided D2H copies per step cost ~3 ms; staging fixed it.)
+3. **Rollback**: GDN layers use the 27B's write-once window state (state B + per-row log, `docs/gdn-write-once.md`; the kernels ran unchanged at 16 key / 64 value heads); rejected attention rows are simply overwritten.
+4. **M-row grouped MoE** (`Qwen35GroupedMoeDecode::RunRows`): one launch per phase for 2-16 rows, each distinct expert streamed once for all the rows that chose it: 0.9 ms for 16 rows / 103 distinct experts on random routing (570-585 GB/s,
+   the M=1 kernel gets 440), and its output is bit-identical to the M=1 kernel's per row. Real routing is far friendlier than random: a verify window's rows pick ~25-35 distinct experts per layer, MoE is ~25% of a verify step.
+5. **Driver and flags**: `Qwen35MoeModel::{VerifyWindow, CommitVerifiedWindow, DecodeStepDflashGreedy}`, `Qwen35MoeLocalTextModel`, CLI/server flags; a temperature > 0 round is one plain sampled step (the server also switches injection off for sampled requests).
+6. **Drafter attention** (`DflashAttnKernel`): the key pass runs 4 key groups x head_dim threads with a fixed-order group sum; at a 4.4k-token context the draft costs 9.1 ms per round at k=4, and long1 went from 0.93x to 1.24x at k=4 (same container, before/after this kernel and the later drafter work).
+7. **Tests**: `test_model_q35moe_spec` (tiny trellis container: scripted windows with random rollbacks, plain-step and prefill transitions, DFlash rounds with random and scripted drafts; bit-identical to decode), `test_q35moe_grouped_moe_kernel` (M-row kernel vs host-routed and vs the M=1 kernel, plus the bench),
+   `test_q35moe_dflash2_golden`, `convert_dflash_hf` (native fixture), `tool_q35moe_dflash` (real container: speed table and lossless audit), `tools/q35moe_server_dflash_smoke.ps1` (real container through `r4dx-server`: a plain, a streaming and a tool-call request,
+   run with `--dflash` and without, greedy outputs byte-identical (tool call compared by function name and arguments; the random call id differs); 300-token chat end to end 87.9 tok/s with `--dflash` (k=7, p_min 0.35) vs 58.4 plain; the server log reports the round statistics).
+
+### 6.3 Lossless: the verify window equals plain decode, bit for bit
+
+The first working version was only noise-close: a teacher-forced audit (verify windows over the plain stream against the decode logits of the same positions) showed the top logit differing by 0.7-1.2 on average and up to 31, with 1.3-4.5% of
+positions flipping their argmax, so DFlash2 streams left plain greedy after 20-120 tokens. (This 3.4-bit model is that sensitive to last-bit changes: swapping only the MoE implementation of plain decode, with 8 of 860k elements differing, moves the
+same logits by up to 10 and flips 3 argmaxes in 399.) Two causes, both fixed: the M-row MoE used different split-group counts from the M=1 kernel (now 4/4 like it), and verify attention beyond 4 rows ran the prefill kernel (now the decode kernel, 4 rows per launch). Details in `docs/dflash2.md` section 14.3.
+After the fix: 0.000 noise and 0 flips on every audited prompt and window (2-16 rows, up to a 4.4k-token context), and **every DFlash2 stream of every row of section 6.5 is identical to the plain stream**. The caveat that remains: a prompt is prefilled with different kernels
+from decode, so "identical to plain greedy" means identical to prefill + plain decode of the same prompt.
+
+### 6.4 Where the time goes, memory
+
+Round at k=7 on math (8 rows), before the last tuning: ~39 ms = draft 5-7 + verify ~31 + inject 0.5 + sync; verify = GDN ~14 ms (36 layers), MoE ~11 (48), attention ~5 (12), head 1, the rest launch gaps (the verify step is ~1500 kernels; the GPU idles ~8 us between dependent small kernels, host enqueue is only ~1 ms of it).
+Plain decode is ~16.3 ms per token for the same 48 layers, so a verify of 8 rows costs ~2x one decode step, which caps the gain to ~(tokens per round) / 2. The `p_min` cut works by shrinking the window to the few leading drafts the drafter is confident about, which is why it helps most where acceptance is low.
+Memory: the drafter (w4a16 0.71 GB / bf16 1.86 GB), the write-once logs (0.66 MiB per GDN layer), the M-row MoE scratch (~170 MB per stage) and the staging buffers add roughly 1.3 GiB (w4a16) to device 1 (estimated from the allocations, not read back from the driver:
+the server does not print a per-card total; the weights are 25.9 GiB on device 0 and 25.6 GiB on device 1 as before). `--max-ctx 16384` loads and serves with `--dflash` on the 32 GB cards.
+
+### 6.5 Full grid (speed-up vs plain in the same run, tokens per round in brackets; k and p_min)
+
+Three sessions of the same build (cells appearing in several runs show the last one; run-to-run spread about 3%, up to 8% on a single cell). All streams identical to plain greedy.
+
+**k = 4** (speed-up vs plain; tokens per round in brackets)
+
+| prompt | plain tok/s | p_min 0.00 | p_min 0.35 | p_min 0.50 | p_min 0.70 | p_min 0.80 | p_min 0.90 |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| code1 | 61.4 | 1.51 (3.41) | 1.55 (3.41) | 1.57 (3.35) | 1.60 (3.02) | - | - |
+| code2 | 60.8 | 1.81 (3.84) | 1.82 (3.84) | 1.87 (3.80) | 1.72 (3.19) | - | - |
+| math1 | 61.0 | 1.77 (3.95) | 1.85 (3.95) | 1.82 (3.91) | 1.86 (3.66) | - | - |
+| math2 | 61.3 | 1.77 (3.91) | 1.78 (3.91) | 1.81 (3.91) | 1.84 (3.76) | - | - |
+| chat1 | 61.9 | 0.97 (2.32) | 1.05 (2.28) | 1.10 (2.24) | 1.20 (2.09) | - | - |
+| chat2 | 61.7 | 1.17 (2.64) | 1.21 (2.64) | 1.26 (2.57) | 1.32 (2.38) | - | - |
+| long1 | 60.6 | 1.24 (2.98) | 1.26 (2.98) | 1.28 (2.96) | 1.29 (2.79) | - | - |
+
+**k = 7** (speed-up vs plain; tokens per round in brackets)
+
+| prompt | plain tok/s | p_min 0.00 | p_min 0.35 | p_min 0.50 | p_min 0.70 | p_min 0.80 | p_min 0.90 |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| code1 | 61.4 | 1.64 (4.16) | 1.69 (4.11) | 1.75 (4.03) | 1.81 (3.63) | 1.81 (3.30) | 1.73 (2.98) |
+| code2 | 60.8 | 1.95 (4.69) | 1.94 (4.69) | 2.12 (4.64) | 2.02 (3.95) | 2.06 (3.84) | 1.91 (3.44) |
+| math1 | 61.0 | 2.08 (5.39) | 2.17 (5.32) | 2.16 (5.05) | 2.14 (4.59) | 2.17 (4.38) | 2.11 (4.07) |
+| math2 | 61.3 | 1.94 (4.81) | 1.95 (4.87) | 1.99 (4.75) | 2.15 (4.75) | 2.18 (4.48) | 2.16 (4.16) |
+| chat1 | 61.9 | 0.96 (2.53) | 1.07 (2.48) | 1.14 (2.40) | 1.31 (2.18) | 1.29 (2.03) | 1.26 (1.89) |
+| chat2 | 61.7 | 1.10 (2.77) | 1.15 (2.77) | 1.27 (2.70) | 1.38 (2.48) | 1.41 (2.38) | 1.39 (2.23) |
+| long1 | 60.6 | 1.12 (3.22) | 1.18 (3.22) | 1.25 (3.09) | 1.30 (2.91) | 1.33 (2.83) | 1.33 (2.71) |
+
+**k = 11** (speed-up vs plain; tokens per round in brackets)
+
+| prompt | plain tok/s | p_min 0.00 | p_min 0.35 | p_min 0.50 | p_min 0.70 | p_min 0.80 | p_min 0.90 |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| code1 | 61.4 | 1.48 (4.48) | 1.51 (4.43) | 1.66 (4.29) | 1.79 (3.76) | 1.82 (3.47) | 1.72 (3.12) |
+| code2 | 60.8 | 1.78 (5.18) | 1.85 (5.18) | 2.10 (5.12) | 2.10 (4.34) | 2.13 (4.16) | 1.98 (3.66) |
+| math1 | 61.0 | 2.14 (6.54) | 2.18 (6.44) | 2.25 (6.14) | 2.25 (5.12) | 2.27 (4.75) | 2.21 (4.38) |
+| math2 | 61.3 | 1.86 (5.62) | 1.93 (5.62) | 2.07 (5.62) | 2.22 (5.32) | 2.33 (5.05) | 2.32 (4.64) |
+| chat1 | 61.9 | - | - | - | 1.31 (2.19) | 1.30 (2.04) | 1.27 (1.89) |
+| chat2 | 61.7 | - | - | - | 1.38 (2.51) | 1.40 (2.40) | 1.38 (2.24) |
+| long1 | 60.6 | - | - | - | 1.29 (2.93) | 1.30 (2.83) | 1.32 (2.71) |
+
+### 6.6 What is not done / next
+
+* A sampled (temperature > 0) round is not speculated (one plain sampled step; injection is switched off, the next greedy request refills the ring).
+* `--tp 2` would shorten the verify step (plan section 7) and the drafter would then run replicated; not touched here (another session's work).
+* Cheaper verify: fewer kernels per layer (graph capture or fused GDN projections) is the largest remaining lever; the MoE kernel is at ~560 GB/s and the GDN scan is latency- not bandwidth-bound.
+* The defaults: `--dflash-p-min` is 0 for every model; for Ornith the table says 0.8 (and k 11) is better everywhere measured, so a per-model default would be a one-line follow-up (not done: the flag is shared with the 27B/Gemma paths, which were not re-measured).
+* Not run: a thinking-off / sampled-temperature table, prompts longer than 4.4k tokens, task-accuracy (the streams are identical to plain greedy, so it is the plain model's accuracy).
+* MTP is probably still not worth building next to this (plan section 9 decision stands).
 
 ## 7. Performance expectations (estimates, NOT measured on Ornith; written 2026-10-21)
 
@@ -146,7 +225,7 @@ P2P between the two R9700s is unavailable on Windows and would add only ~5%.
 | `--tp 2` + DFlash2: chat / code / math / MATH-500-like | 56-100 / 66-120 / 85-150 / 95-170 | 85 / 100 / 125 / 140 |
 
 Caveats: if the shared experts stay bf16 (as in qwen4exp) subtract ~8% from every row; run-to-run spread is ~10%; decode slows with context;
-DFlash2 and MTP gains are workload dependent (chat ~1.3x, code and math 1.5-2.2x) and need the new verify-row kernels.
+DFlash2 and MTP gains are workload dependent. **Measured** DFlash2 (section 6.1, k=11 / p_min 0.8, w4a16 drafter): chat 1.3-1.4x, code 1.8-2.1x, math 2.3x, 4.4k-token prompt 1.3x, i.e. about 80 / 111-130 / 140 / 78 tok/s on the 61 tok/s pipeline-split decode.
 
 ### 7.1 Grouped on-device decode MoE (measured 2026-10-21)
 
@@ -235,7 +314,7 @@ No task-accuracy benchmark has been run: KL measures drift, not accuracy.
 MTP is probably dropped in favour of DFlash2 (drafter downloaded to `E:\models\r4dx\Ornith-1.5-122B-DFlash2`).
 
 **Open items, in priority order (estimates):** P1 accuracy benchmark + 32k needle test (3-4 h); P2 prefill speed, grouped prefill MoE GEMM (6-12 h); P3 vision tower (4-8 h);
-P4 w8a16 for class p (3-4 h, only if P1 shows a real loss); P5 DFlash2 (1-2 days); P6 `--tp 2` (2-4 days); P7 MTP (0.5-1.5 days); P8 K5 / host-RAM expert tier;
+P4 w8a16 for class p (3-4 h, only if P1 shows a real loss); P5 DFlash2 (DONE 2026-10-23, section 6); P6 `--tp 2` (2-4 days); P7 MTP (0.5-1.5 days); P8 K5 / host-RAM expert tier;
 P9 qwen4exp regression check with its real container (the shared kernel code was edited; only a synthetic test ran).
 
 **Operational notes.** The 48-layer quantization stalled three times (singular refit solve, a zero-Hessian expert, pruned-channel blow-up in `regularize`) and once more on an unexplained

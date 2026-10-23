@@ -1,6 +1,6 @@
 # `--tp 2` for Ornith-1.5-122B (`qwen3_5_moe`): design
 
-Written 2026-10-23, branch `claude/q35moe-tp-design-8151ca` (from `qwen35moe` at `b7b6c83`). **Design spike only**: nothing here was built or
+**Implemented 2026-10-23: see [`qwen35moe-tp.md`](qwen35moe-tp.md) for what was built and measured (G1, G3', G4', G6' adapted, G7' pass; decode 1.60x).** Written 2026-10-23, branch `claude/q35moe-tp-design-8151ca` (from `qwen35moe` at `b7b6c83`). **Design spike only**: nothing here was built or
 run on a GPU. Every number is either read from the code / docs / container (and cited) or **derived on the CPU** by
 [`tools/tp/q35moe_tp_numbers.py`](../tools/tp/q35moe_tp_numbers.py) (byte model checked against the shipped allocation, routing statistics from
 the Hessian pass's `routing_counts.json`, 1,003,172 calibration tokens per layer), or an **estimate** and labelled as one. Inputs: `docs/tp.md`,

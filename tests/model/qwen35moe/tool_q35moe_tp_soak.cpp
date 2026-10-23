@@ -65,6 +65,8 @@ struct Args {
   int tp_ar_timeout_ms = 500;
   int tp_submit_layers = -1, tp_max_inflight = -1;
   double need_gib = 24.0;
+  std::string dflash;  // --dflash <drafter.r4dx>: DFlash2 greedy rounds join the mode mix (the canary stays plain greedy)
+  int64_t dflash_k = 11;
 };
 
 [[noreturn]] void Usage(const std::string& why) {
@@ -99,6 +101,8 @@ Args Parse(int argc, char** argv) {
       else if (s == "--tp-submit-layers") a.tp_submit_layers = std::stoi(next());
       else if (s == "--tp-max-inflight") a.tp_max_inflight = std::stoi(next());
       else if (s == "--need-gib") a.need_gib = std::stod(next());
+      else if (s == "--dflash") a.dflash = next();
+      else if (s == "--dflash-k") a.dflash_k = std::stoll(next());
       else Usage("unknown argument " + s);
     } catch (const std::exception&) {
       Usage("bad value for " + s);
@@ -108,7 +112,8 @@ Args Parse(int argc, char** argv) {
   if (!(a.minutes > 0) && a.iterations <= 0) Usage("--minutes must be > 0 (or give --iterations)");
   if (a.canary_every < 1) Usage("--canary-every must be >= 1");
   if (a.min_prompt < 1 || a.max_prompt < a.min_prompt || a.min_decode < 1 || a.max_decode < a.min_decode) Usage("need 1 <= --min-prompt <= --max-prompt and 1 <= --min-decode <= --max-decode");
-  if (a.max_prompt + a.max_decode > a.max_ctx || kCanaryPrompt + kCanaryDecode > a.max_ctx) Usage("--max-prompt + --max-decode and the 640-position canary must fit in --max-ctx");
+  const int64_t spec_slack = a.dflash.empty() ? 0 : 2 * (a.dflash_k + 1);
+  if (a.max_prompt + a.max_decode + spec_slack > a.max_ctx || kCanaryPrompt + kCanaryDecode > a.max_ctx) Usage("--max-prompt + --max-decode and the 640-position canary must fit in --max-ctx");
   if (a.tp_submit_layers < -1 || a.tp_submit_layers > 64 || a.tp_max_inflight < -1 || a.tp_max_inflight > 64) Usage("--tp-submit-layers and --tp-max-inflight must be in [0, 64]");
   return a;
 }
@@ -189,15 +194,17 @@ std::string Preflight(double need_gib) {
   return msg;
 }
 
-enum class Mode { kGreedy, kSampled, kFullRow };
-const char* ModeName(Mode m) { return m == Mode::kGreedy ? "greedy" : m == Mode::kSampled ? "sampled" : "full_row"; }
+enum class Mode { kGreedy, kSampled, kFullRow, kDflashGreedy };
+const char* ModeName(Mode m) {
+  return m == Mode::kGreedy ? "greedy" : m == Mode::kSampled ? "sampled" : m == Mode::kFullRow ? "full_row" : "dflash_greedy";
+}
 
 struct Gen {
   std::vector<int32_t> tokens;
   double prefill_s = 0, decode_s = 0;
 };
 
-Gen Generate(Qwen35MoeTpModel& m, const std::vector<int32_t>& prompt, int decode, Mode mode, uint64_t sample_seed) {
+Gen Generate(Qwen35MoeTpModel& m, const std::vector<int32_t>& prompt, int decode, Mode mode, uint64_t sample_seed, int64_t dflash_k = 0) {
   Gen g;
   const int64_t V = m.Config().vocab_size;
   kernels::SampleParams sp;
@@ -211,6 +218,18 @@ Gen Generate(Qwen35MoeTpModel& m, const std::vector<int32_t>& prompt, int decode
   const std::vector<float> logits = m.Prefill(prompt);
   int32_t next = mode == Mode::kSampled ? kernels::Sample(logits.data(), V, sp, rng) : kernels::Argmax(logits.data(), V);
   const auto t1 = Clock::now();
+  if (mode == Mode::kDflashGreedy) {
+    // whole rounds until at least `decode` tokens past the first one were emitted; every round's last token is the next round's (uncommitted) anchor
+    g.tokens.push_back(next);
+    while (static_cast<int>(g.tokens.size()) <= decode) {
+      const std::vector<int32_t> r = m.DecodeStepDflashGreedy(next, dflash_k, 0.8f, 0);
+      g.tokens.insert(g.tokens.end(), r.begin(), r.end());
+      next = r.back();
+    }
+    g.prefill_s = std::chrono::duration<double>(t1 - t0).count();
+    g.decode_s = std::chrono::duration<double>(Clock::now() - t1).count();
+    return g;
+  }
   for (int i = 0; i < decode; ++i) {
     g.tokens.push_back(next);
     if (mode == Mode::kGreedy) {
@@ -320,6 +339,10 @@ int main(int argc, char** argv) {
   opts.layout = r4dx::model::Layout::kTrellis;
   opts.max_ctx = a.max_ctx;
   opts.vision = ModelOptions::VisionMode::kOff;
+  if (!a.dflash.empty()) {
+    opts.dflash_container = a.dflash;
+    opts.dflash_draft_k = a.dflash_k;
+  }
   TpOptions tpo;
   tpo.world = 2;
   tpo.mode = TpOptions::Mode::kReal;
@@ -351,7 +374,8 @@ int main(int argc, char** argv) {
   std::mt19937_64 rng(a.seed);
   const std::vector<int32_t> canary_prompt(pool.begin(), pool.begin() + kCanaryPrompt);
   std::vector<int32_t> canary_ref;
-  const std::vector<Mode> modes = {Mode::kGreedy, Mode::kSampled, Mode::kFullRow};
+  std::vector<Mode> modes = {Mode::kGreedy, Mode::kSampled, Mode::kFullRow};
+  if (!a.dflash.empty()) modes.push_back(Mode::kDflashGreedy);
   int64_t iter = 0, canaries = 0, tokens_total = 0;
   bool canary_fail = false;
   try {
@@ -367,8 +391,8 @@ int main(int argc, char** argv) {
       std::vector<int32_t> prompt(static_cast<size_t>(P));
       for (int i = 0; i < P; ++i) prompt[static_cast<size_t>(i)] = pool[(start + static_cast<size_t>(i)) % pool.size()];
 
-      const Gen g = Generate(*m, prompt, D, mode, sample_seed);
-      tokens_total += P + D;
+      const Gen g = Generate(*m, prompt, D, mode, sample_seed, a.dflash_k);
+      tokens_total += P + static_cast<int64_t>(g.tokens.size());
       std::string canary_state = "null";
       double canary_s = 0;
       if (canary) {
@@ -391,12 +415,12 @@ int main(int argc, char** argv) {
       }
       const Snapshot s = Snap(*m);
       log->Line("{\"type\":\"iter\",\"iter\":" + std::to_string(iter) + ",\"t_s\":" + Num(since()) + ",\"mode\":\"" + ModeName(mode) + "\",\"prompt_tokens\":" + std::to_string(P) +
-                ",\"decode_tokens\":" + std::to_string(D) + ",\"start\":" + std::to_string(start) + ",\"prefill_tok_s\":" + Num(static_cast<double>(P) / g.prefill_s) +
-                ",\"decode_tok_s\":" + Num(static_cast<double>(D) / g.decode_s) + ",\"canary\":" + canary_state + ",\"canary_s\":" + Num(canary_s) + ",\"buffer_drift_mib\":" +
+                ",\"decode_tokens\":" + std::to_string(g.tokens.size()) + ",\"start\":" + std::to_string(start) + ",\"prefill_tok_s\":" + Num(static_cast<double>(P) / g.prefill_s) +
+                ",\"decode_tok_s\":" + Num(static_cast<double>(g.tokens.size()) / g.decode_s) + ",\"canary\":" + canary_state + ",\"canary_s\":" + Num(canary_s) + ",\"buffer_drift_mib\":" +
                 Arr(DriftMiB(s, first, true)) + ",\"vram_used_drift_mib\":" + Arr(DriftMiB(s, first, false)) + "," + CommJson(s) + ",\"fallback_rows\":" +
                 std::to_string(m->SampledFallbackRows()) + "}");
-      std::printf("[soak] iter %lld  %.0f s  %-8s prompt %5d  decode %3d  prefill %.0f tok/s  decode %.1f tok/s%s\n", static_cast<long long>(iter), since(), ModeName(mode), P, D,
-                  static_cast<double>(P) / g.prefill_s, static_cast<double>(D) / g.decode_s, canary ? (std::string("  canary ") + canary_state).c_str() : "");
+      std::printf("[soak] iter %lld  %.0f s  %-13s prompt %5d  decode %3d  prefill %.0f tok/s  decode %.1f tok/s%s\n", static_cast<long long>(iter), since(), ModeName(mode), P,
+                  static_cast<int>(g.tokens.size()), static_cast<double>(P) / g.prefill_s, static_cast<double>(g.tokens.size()) / g.decode_s, canary ? (std::string("  canary ") + canary_state).c_str() : "");
       if (canary_fail) break;
     }
   } catch (const std::exception& e) {

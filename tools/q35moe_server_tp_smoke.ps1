@@ -20,6 +20,8 @@
 param(
     [string]$Model = "E:\models\r4dx\ornith-1.5-122b-trellis-mix-kv.r4dx",
     [string]$Tokenizer = "E:\models\r4dx\Ornith-1.5-122B",
+    [string]$Dflash = "E:\models\r4dx\ornith-1.5-122b-dflash2-w4a16.r4dx",
+    [int]$DflashK = 11,
     [string[]]$Modes = @("split", "tp2"),
     [string]$Fault = "",
     [int]$Port = 8099,
@@ -168,6 +170,7 @@ try {
     foreach ($mode in $Modes) {
         if ($mode -eq "split") { $results[$mode] = Run-Server "split" @() $false "" }
         elseif ($mode -eq "tp2") { $results[$mode] = Run-Server "tp2" @("--tp", "2") $true $Fault }
+        elseif ($mode -eq "tp2dflash") { $results[$mode] = Run-Server "tp2dflash" @("--tp", "2", "--dflash", $Dflash, "--dflash-k", "$DflashK", "--dflash-p-min", "0.8") $true "" }
         else { throw "unknown mode $mode" }
         $r = $results[$mode]
         Write-Host ("[{0}] {1}{2}" -f $mode, $(if ($r.ok) { "PASS" } else { "FAIL" }), $(if ($r.why.Count) { ": " + ($r.why -join "; ") } else { "" }))
@@ -177,6 +180,15 @@ try {
         foreach ($n in "chat", "stream") {
             Write-Host ("`n--- {0}: layer split`n{1}`n--- {0}: tp 2`n{2}" -f $n, $results["split"][$n], $results["tp2"][$n])
         }
+    }
+    if ($results.ContainsKey("tp2") -and $results.ContainsKey("tp2dflash")) {
+        # DFlash2 is lossless inside one engine: the --tp 2 server with the drafter must answer byte for byte like the plain --tp 2 server
+        foreach ($n in "chat", "stream", "tool", "followup") {
+            $same = $results["tp2"][$n] -ceq $results["tp2dflash"][$n]
+            Write-Host ("{0}: --tp 2 --dflash output byte-identical to the plain --tp 2 server's: {1}" -f $n, $same)
+            if (-not $same) { $overall = $false }
+        }
+        Select-String -Path (Join-Path $OutDir "tp2dflash.server.err") -Pattern "dflash" | Select-Object -Last 4 | ForEach-Object { Write-Host $_.Line }
     }
     Select-String -Path (Join-Path $OutDir "tp2.server.err") -Pattern "tp: mode|\[stats\]|recovered|VRAM" -ErrorAction SilentlyContinue | Select-Object -Last 4 | ForEach-Object { Write-Host $_.Line }
 } finally {

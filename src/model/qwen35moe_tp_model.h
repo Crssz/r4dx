@@ -70,7 +70,7 @@ class Qwen35MoeTpModel final : public TextModel, public TpDiagnostics {
   bool HasVision() const override { return false; }
   bool MtpEnabled() const override { return false; }
   bool MtpUsingReducedVocabDraft() const override { return false; }
-  bool DflashEnabled() const override { return false; }
+  bool DflashEnabled() const override { return dflash_enabled_; }
   int64_t SampledFallbackRows() const override { return cached_fallback_rows_; }
   int64_t PositionCount() const override { return cached_position_; }
   int64_t NumLoadedLayers() const override { return num_loaded_layers_; }
@@ -79,7 +79,7 @@ class Qwen35MoeTpModel final : public TextModel, public TpDiagnostics {
 
   // ---- sequence state -------------------------------------------------------------------------
   void Reset() override;
-  void SetDflashInjectionEnabled(bool) override {}  // no drafter
+  void SetDflashInjectionEnabled(bool enabled) override;  // every rank's drafter (a no-op without --dflash)
   void SaveCheckpoint() override;     // each rank D2D-copies its own ShortConv state (needs ModelOptions::prompt_checkpoint)
   void RestoreCheckpoint() override;
 
@@ -239,6 +239,7 @@ class Qwen35MoeTpModel final : public TextModel, public TpDiagnostics {
   std::unique_ptr<tp::TpGroup> group_;
   std::vector<std::unique_ptr<RankSlot>> ranks_;
 
+  bool dflash_enabled_ = false;
   std::string model_id_;
   int64_t num_loaded_layers_ = 0;
   int64_t cached_position_ = 0;

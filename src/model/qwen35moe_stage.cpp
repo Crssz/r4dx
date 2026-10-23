@@ -315,7 +315,6 @@ Qwen35MoeStage::Qwen35MoeStage(const Qwen35MoeStageOptions& options, std::vector
     if (m.comm == nullptr || m.comm->World() != cfg.tp_world || m.comm->Rank() != cfg.tp_rank) {
       Fail("a tensor-parallel stage (config.tp_world > 1) needs a TpComm endpoint of the same world and rank");
     }
-    if (options.spec_window > 1) Fail("speculative verify windows are not supported under tensor parallelism yet (docs/qwen35moe-tp-design.md P6)");
     if (options.tp_submit_layers < 0 || options.tp_submit_layers > 64 || options.tp_max_inflight_units < 0 || options.tp_max_inflight_units > 64) {
       Fail("tp_submit_layers and tp_max_inflight_units must be in [0, 64]");
     }
@@ -482,10 +481,11 @@ Qwen35MoeStage::Qwen35MoeStage(const Qwen35MoeStageOptions& options, std::vector
     m.topk_ws = core::DeviceBuffer<uint8_t>(static_cast<size_t>(r4dx_topk_lse_workspace_bytes()));
     bump(Padded(static_cast<size_t>(m.vocab_local) * 2));
     if (options.spec_window > 1) {
-      m.logits_rows = core::DeviceBuffer<float>(static_cast<size_t>(options.spec_window * m.vocab));
-      m.argmax_rows_dev = core::DeviceBuffer<int32_t>(static_cast<size_t>(options.spec_window));
-      m.argmax_rows_host = core::PinnedBuffer<int32_t>(static_cast<size_t>(options.spec_window));
-      bump(Padded(static_cast<size_t>(options.spec_window * m.vocab) * 2));
+      m.logits_rows = core::DeviceBuffer<float>(static_cast<size_t>(options.spec_window * m.vocab_local));
+      // [window] row indices; under TP the {index, value} pairs of the rank's vocab slice ([window, 2] ints)
+      m.argmax_rows_dev = core::DeviceBuffer<int32_t>(static_cast<size_t>(options.spec_window) * (m.comm != nullptr ? 2 : 1));
+      m.argmax_rows_host = core::PinnedBuffer<int32_t>(static_cast<size_t>(options.spec_window) * (m.comm != nullptr ? 2 : 1));
+      bump(Padded(static_cast<size_t>(options.spec_window * m.vocab_local) * 2));
     }
   }
   if (options.spec_window > 1) {
@@ -1066,11 +1066,32 @@ std::vector<int32_t> Qwen35MoeStage::HeadRows(int64_t rows) {
   const hipStream_t s = m.stream.get();
   m.arena.Reset();
   m.Norm(m.h.data(), m.head_refs->final_norm, m.x.data(), rows);
-  uint16_t* logits_bf16 = m.arena.Alloc<uint16_t>(static_cast<size_t>(rows * m.vocab));
+  uint16_t* logits_bf16 = m.arena.Alloc<uint16_t>(static_cast<size_t>(rows * m.vocab_local));
   ApplyLinear(s, m.arena, *m.head_refs->lm_head, m.x.data(), logits_bf16, rows);
   // The widen is exact, so the comparisons of the f32 row argmax are the bf16 ones (r4dx_argmax_bf16's, the plain decode step's).
   r4dx_model_widen_bf16_to_f32(reinterpret_cast<int64_t>(logits_bf16), reinterpret_cast<int64_t>(m.logits_rows.data()),
-                               rows * m.vocab, reinterpret_cast<int64_t>(s));
+                               rows * m.vocab_local, reinterpret_cast<int64_t>(s));
+  if (m.comm != nullptr) {
+    // --tp 2: the argmax of each row over this rank's vocab slice with its value (pair t = {idx, val} at 2t, 2t + 1), merged over the ranks on the
+    // host in rank order (tp_vocab.h MergeArgmaxRows: exact, ties to the lowest global id) -- every rank returns the same tokens.
+    r4dx_argmax_rows_f32(reinterpret_cast<int64_t>(m.logits_rows.data()), m.vocab_local, reinterpret_cast<int64_t>(m.argmax_rows_dev.data()),
+                         reinterpret_cast<int64_t>(m.argmax_rows_dev.data() + 1), /*out_stride=*/2, rows, m.vocab_local,
+                         reinterpret_cast<int64_t>(s));
+    R4DX_HIP_CHECK(hipMemcpyAsync(m.argmax_rows_host.data(), m.argmax_rows_dev.data(), static_cast<size_t>(rows) * sizeof(tp::ArgmaxPair),
+                                  hipMemcpyDeviceToHost, s));
+    m.stream.Synchronize();
+    std::vector<tp::ArgmaxPair> mine(static_cast<size_t>(rows));
+    std::memcpy(mine.data(), m.argmax_rows_host.data(), static_cast<size_t>(rows) * sizeof(tp::ArgmaxPair));
+    for (tp::ArgmaxPair& p : mine) p.idx += static_cast<int32_t>(m.vocab_offset);
+    const int world = m.comm->World();
+    std::vector<tp::ArgmaxPair> all(static_cast<size_t>(world) * static_cast<size_t>(rows));
+    m.comm->HostAllGather(mine.data(), mine.size() * sizeof(tp::ArgmaxPair), all.data());
+    std::vector<int32_t> merged(static_cast<size_t>(rows));
+    tp::MergeArgmaxRows(all.data(), world, static_cast<int>(rows), merged.data());
+    m.arena.Reset();
+    m.last_head_ms = MsSince(t0);
+    return merged;
+  }
   r4dx_argmax_rows_f32(reinterpret_cast<int64_t>(m.logits_rows.data()), m.vocab,
                        reinterpret_cast<int64_t>(m.argmax_rows_dev.data()), /*out_val=*/0, /*out_stride=*/1, rows, m.vocab,
                        reinterpret_cast<int64_t>(s));
@@ -1085,6 +1106,23 @@ std::vector<int32_t> Qwen35MoeStage::HeadRows(int64_t rows) {
 
 std::vector<float> Qwen35MoeStage::LastHeadRowsLogits(int64_t rows) {
   Impl& m = *impl_;
+  if (m.comm != nullptr) {
+    // --tp 2 (a collective: every rank calls it): the ranks' vocab slices of the last HeadRows call gathered into full rows [rows, vocab]
+    if (m.logits_rows.size() == 0 || rows < 1 || rows > m.spec_window) Fail("LastHeadRowsLogits: no HeadRows result / rows out of range");
+    std::vector<float> mine(static_cast<size_t>(rows * m.vocab_local));
+    m.logits_rows.CopyToHost(mine.data(), mine.size());
+    const int world = m.comm->World();
+    std::vector<float> all(mine.size() * static_cast<size_t>(world));
+    m.comm->HostAllGather(mine.data(), mine.size() * sizeof(float), all.data());
+    std::vector<float> full(static_cast<size_t>(rows * m.vocab));
+    for (int r = 0; r < world; ++r) {
+      for (int64_t t = 0; t < rows; ++t) {
+        std::memcpy(full.data() + static_cast<size_t>(t * m.vocab + r * m.vocab_local), all.data() + static_cast<size_t>(r) * mine.size() + static_cast<size_t>(t * m.vocab_local),
+                    static_cast<size_t>(m.vocab_local) * sizeof(float));
+      }
+    }
+    return full;
+  }
   Qwen35MoeDeviceScope dev(m.device);
   if (m.logits_rows.size() == 0 || rows < 1 || rows > m.spec_window) Fail("LastHeadRowsLogits: no HeadRows result / rows out of range");
   std::vector<float> out(static_cast<size_t>(rows * m.vocab));

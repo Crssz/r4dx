@@ -27,6 +27,8 @@ q35moe_add_test(test_q35moe_dflash2_golden SINGLE_DEVICE)
 # --tp 2 (docs/qwen35moe-tp-design.md P1): two rank models on ONE device (EmulatedComm) against the single-device model, bf16 and trellis tiny containers.
 q35moe_add_test(test_model_q35moe_tp_tiny SINGLE_DEVICE)
 q35moe_add_test(test_q35moe_tp_container SINGLE_DEVICE)
+# speculative verify windows and DFlash2 rounds under --tp 2 (emulate; the spec test's two parts on a pair of rank models)
+q35moe_add_test(test_model_q35moe_tp_spec SINGLE_DEVICE)
 # the Qwen35MoeTpModel facade through LoadTextModel (emulate on one device; the real two-GPU part is opt-in: R4DX_TP2GPU=1 with both cards visible)
 q35moe_add_test(test_model_q35moe_tp_facade SINGLE_DEVICE)
 

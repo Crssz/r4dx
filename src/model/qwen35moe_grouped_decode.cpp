@@ -33,7 +33,6 @@ bool Qwen35GroupedMoeDecode::Supported(int64_t hidden, int64_t inter, int64_t sh
 Qwen35GroupedMoeDecode::Qwen35GroupedMoeDecode(int experts, int top_k, bool norm_topk, int max_rows, int inter)
     : experts_(experts), top_k_(top_k), norm_topk_(norm_topk), inter_(inter), max_rows_(max_rows) {
   if (inter != kInter && inter != kTp2Inter) throw std::invalid_argument("Qwen35GroupedMoeDecode: inter must be 1024 (TP=1) or 512 (a --tp 2 rank)");
-  if (inter == kTp2Inter && max_rows != 1) throw std::invalid_argument("Qwen35GroupedMoeDecode: the --tp 2 instance is M = 1 only");
   if (max_rows < 1 || max_rows > kMaxRows || max_rows * top_k > qwen4exp::kMoePlanMaxPairs) {
     throw std::invalid_argument("Qwen35GroupedMoeDecode: max_rows must be in [1, 16] with max_rows * top_k <= 256");
   }
@@ -70,16 +69,16 @@ Qwen35GroupedMoeDecode::Qwen35GroupedMoeDecode(int experts, int top_k, bool norm
     r_plan_ = core::DeviceBuffer<int32_t>(qwen4exp::kMoePlanInts);
     r_a0_gu_ = core::DeviceBuffer<uint16_t>(P * kHidden);
     r_a1_gu_ = core::DeviceBuffer<uint16_t>(P * kHidden);
-    r_gu_ = core::DeviceBuffer<uint16_t>(P * 2 * kInter);
-    r_ws_gu_ = core::DeviceBuffer<float>(G * qwen4exp::kMoeRowsMaxSkg * 16 * 2 * kInter);
-    r_tickets_gu_ = core::DeviceBuffer<uint32_t>(G * (2 * kInter / 128));
-    r_a0_down_ = core::DeviceBuffer<uint16_t>(P * kInter);
+    r_gu_ = core::DeviceBuffer<uint16_t>(P * 2 * static_cast<size_t>(inter));
+    r_ws_gu_ = core::DeviceBuffer<float>(G * qwen4exp::kMoeRowsMaxSkg * 16 * 2 * static_cast<size_t>(inter));
+    r_tickets_gu_ = core::DeviceBuffer<uint32_t>(G * (2 * static_cast<size_t>(inter) / 128));
+    r_a0_down_ = core::DeviceBuffer<uint16_t>(P * static_cast<size_t>(inter));
     r_yp_ = core::DeviceBuffer<uint16_t>(P * kHidden);
     r_ws_down_ = core::DeviceBuffer<float>(G * qwen4exp::kMoeRowsMaxSkg * 16 * kHidden);
     r_tickets_down_ = core::DeviceBuffer<uint32_t>(G * (kHidden / 128));
-    r_shared_g_ = core::DeviceBuffer<uint16_t>(R * kInter);
-    r_shared_u_ = core::DeviceBuffer<uint16_t>(R * kInter);
-    r_shared_h_ = core::DeviceBuffer<uint16_t>(R * kInter);
+    r_shared_g_ = core::DeviceBuffer<uint16_t>(R * static_cast<size_t>(inter));
+    r_shared_u_ = core::DeviceBuffer<uint16_t>(R * static_cast<size_t>(inter));
+    r_shared_h_ = core::DeviceBuffer<uint16_t>(R * static_cast<size_t>(inter));
     r_shared_y_ = core::DeviceBuffer<uint16_t>(R * kHidden);
     r_shared_gate_logit_ = core::DeviceBuffer<uint16_t>(R);
     r_plan_.Zero();
@@ -115,7 +114,7 @@ void Qwen35GroupedMoeDecode::RunRows(hipStream_t s, core::Arena& arena, const Qw
     Run(s, arena, w, p, x, y, mark);
     return;
   }
-  if (inter_ != kInter) throw std::logic_error("Qwen35GroupedMoeDecode::RunRows: the M-row kernels are not instantiated for a --tp 2 rank");
+  const bool tp2 = inter_ == kTp2Inter;
   if (rows < 1 || rows > max_rows_) throw std::invalid_argument("Qwen35GroupedMoeDecode::RunRows: rows out of range");
   const int R = static_cast<int>(rows), P = R * top_k_;
   const int max_groups = std::min(experts_, P);
@@ -128,7 +127,7 @@ void Qwen35GroupedMoeDecode::RunRows(hipStream_t s, core::Arena& arena, const Qw
   // 2. shared expert, all rows
   qwen4exp::ApplyBf16Linear(s, arena, *w.shared_gate_proj, x, r_shared_g_.data(), rows);
   qwen4exp::ApplyBf16Linear(s, arena, *w.shared_up_proj, x, r_shared_u_.data(), rows);
-  Check(q4x_moe_silu_mul_bf16(r_shared_g_.data(), r_shared_u_.data(), r_shared_h_.data(), rows, kInter, kInter, kInter, s), "shared silu_mul");
+  Check(q4x_moe_silu_mul_bf16(r_shared_g_.data(), r_shared_u_.data(), r_shared_h_.data(), rows, inter_, inter_, inter_, s), "shared silu_mul");
   qwen4exp::ApplyBf16Linear(s, arena, *w.shared_down_proj, r_shared_h_.data(), r_shared_y_.data(), rows);
   qwen4exp::ApplyBf16Linear(s, arena, *w.shared_gate, x, r_shared_gate_logit_.data(), rows);
   phase("shared expert");
@@ -138,16 +137,18 @@ void Qwen35GroupedMoeDecode::RunRows(hipStream_t s, core::Arena& arena, const Qw
   Check(qwen4exp::GroupedTrellisInputGateUpQ35Rows(x, r_plan_.data(), p.gate_up_suh, r_a0_gu_.data(), r_a1_gu_.data(), P, s),
         "gate_up input transform");
   phase("gate_up transform");
-  Check(qwen4exp::GroupedTrellisGemvGateUpQ35Rows(p.gate_up_bits, r_a0_gu_.data(), r_a1_gu_.data(), r_plan_.data(), p.gate_up_w,
-                                                  p.gate_up_svh, r_gu_.data(), r_ws_gu_.data(), r_tickets_gu_.data(), max_groups,
-                                                  rows_gu_skg_, s),
+  Check((tp2 ? qwen4exp::GroupedTrellisGemvGateUpQ35Tp2Rows : qwen4exp::GroupedTrellisGemvGateUpQ35Rows)(
+            p.gate_up_bits, r_a0_gu_.data(), r_a1_gu_.data(), r_plan_.data(), p.gate_up_w, p.gate_up_svh, r_gu_.data(), r_ws_gu_.data(),
+            r_tickets_gu_.data(), max_groups, rows_gu_skg_, s),
         "gate_up GEMM");
   phase("gate_up GEMM");
-  Check(qwen4exp::GroupedSiluMulTrellisInputDownQ35Rows(r_gu_.data(), r_plan_.data(), p.down_suh, r_a0_down_.data(), P, s),
+  Check((tp2 ? qwen4exp::GroupedSiluMulTrellisInputDownQ35Tp2Rows : qwen4exp::GroupedSiluMulTrellisInputDownQ35Rows)(
+            r_gu_.data(), r_plan_.data(), p.down_suh, r_a0_down_.data(), P, s),
         "silu_mul / down input transform");
   phase("silu+down transform");
-  Check(qwen4exp::GroupedTrellisGemvDownQ35Rows(p.down_bits, r_a0_down_.data(), r_plan_.data(), p.down_w, p.down_svh, r_yp_.data(),
-                                                r_ws_down_.data(), r_tickets_down_.data(), max_groups, rows_down_skg_, s),
+  Check((tp2 ? qwen4exp::GroupedTrellisGemvDownQ35Tp2Rows : qwen4exp::GroupedTrellisGemvDownQ35Rows)(
+            p.down_bits, r_a0_down_.data(), r_plan_.data(), p.down_w, p.down_svh, r_yp_.data(), r_ws_down_.data(), r_tickets_down_.data(),
+            max_groups, rows_down_skg_, s),
         "down GEMM");
   phase("down GEMM");
   // 4. combine

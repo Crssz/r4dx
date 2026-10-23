@@ -164,9 +164,6 @@ std::unique_ptr<Qwen35MoeModel> Qwen35MoeModel::Load(const Qwen35MoeModelOptions
         options.tp_comm->World() != options.tp_world || options.tp_comm->Rank() != options.tp_rank || options.tp_device < 0) {
       throw std::invalid_argument("Qwen35MoeModel::Load: tp_world 2 needs tp_rank in [0, 2), a TpComm endpoint of the same world and rank and a tp_device");
     }
-    if (options.spec_window > 1 || !options.dflash_container.empty()) {
-      throw std::invalid_argument("Qwen35MoeModel::Load: speculative windows / the DFlash2 drafter are not supported under tensor parallelism yet");
-    }
   } else if (options.tp_comm != nullptr || options.tp_rank != 0 || options.tp_device >= 0 || options.shared_embed_host) {
     throw std::invalid_argument("Qwen35MoeModel::Load: tp_comm / tp_rank / tp_device / shared_embed_host are tensor-parallel options (tp_world > 1 only)");
   }
@@ -374,7 +371,14 @@ std::unique_ptr<Qwen35MoeModel> Qwen35MoeModel::Load(const Qwen35MoeModelOptions
     d.container_path = options.dflash_container;
     d.layout = LayoutFromName(dc->layout);
     d.max_inject_rows = 64;
-    d.lm_head_vocab = cfg.vocab_size;
+    d.lm_head_vocab = cfg.VocabShardSize();  // the TARGET's lm_head rows: the whole vocabulary at TP=1, this rank's slice under TP
+    if (tp) {
+      // docs/tp.md 8.2: the drafter's per-rank top-16s are merged over the ranks (H7); the codebooks and token ids stay global
+      d.vocab_offset = cfg.VocabShardBegin();
+      d.global_vocab = cfg.vocab_size;
+      d.comm = options.tp_comm;
+      d.shared_codebooks = options.dflash_codebooks;
+    }
     if (options.dflash_small_vocab) d.mask_token_id_override = cfg.vocab_size - 1;
     m.dflash_ = DflashDraft::Load(d);
     m.dflash_k_ = options.dflash_draft_k;
@@ -804,6 +808,12 @@ void Qwen35MoeModel::TpWarmup() {
   std::mt19937_64 rng(0x7e57);
   (void)DecodeStepSampled(1, sp, rng);
   (void)DecodeStep(2);  // the full-row gather
+  if (DflashEnabled()) {
+    // the drafter's first round, the M-row verify kernels and the speculative-window GDN path, so none of their first-use launches lands in a request
+    Reset();
+    (void)Prefill(ids(64));
+    for (int round = 0; round < 3; ++round) (void)DecodeStepDflashGreedy(round, dflash_k_, 0.0f, 0);
+  }
   Reset();
 }
 

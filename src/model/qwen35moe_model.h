@@ -87,12 +87,14 @@ struct Qwen35MoeModelOptions {
   // tp_world > 1: this model is RANK `tp_rank` of the group: ONE stage holding all layers on `tp_device` (no hand-off), loaded sharded
   // (Qwen35MoeContainer::LoadShard), all-reducing through `tp_comm` (an endpoint of the same world and rank), its head a vocab slice merged
   // with the other rank. Config() is then the RANK-local config (heads, experts halved; vocab global). `shared_embed_host`: the process's one pinned
-  // copy of text.embed_tokens (never duplicated per rank). A drafter / speculative window is not supported under TP yet.
+  // copy of text.embed_tokens (never duplicated per rank). A speculative window / the DFlash2 drafter are supported under TP: the drafter is REPLICATED on each rank
+  // (it reads the replicated residual taps and merges its per-rank top-16 with the other rank; `dflash_codebooks` is the process's one host copy of its codebooks).
   int tp_world = 1;
   int tp_rank = 0;
   int tp_device = -1;
   core::TpComm* tp_comm = nullptr;
   std::shared_ptr<const core::PinnedBuffer<uint16_t>> shared_embed_host;
+  std::shared_ptr<const DflashHostCodebooks> dflash_codebooks;
   int tp_submit_layers = 0;        // Qwen35MoeStageOptions::tp_submit_layers / tp_max_inflight_units (bounded prefill submission on the desktop card)
   int tp_max_inflight_units = 0;
 };
@@ -157,6 +159,7 @@ class Qwen35MoeModel {
   // verify GEMMs' rounding (docs/dflash2.md section 7a item 4).
   bool DflashEnabled() const { return dflash_.has_value(); }
   int64_t DflashDraftK() const { return dflash_k_; }
+  int64_t DflashBlockSize() const { return dflash_ ? dflash_->BlockSize() : 0; }
   int64_t DflashInjectedCount() const;
   void SetDflashInjectionEnabled(bool enabled);
   std::vector<int32_t> DecodeStepDflashGreedy(int32_t token_id, int64_t k, float p_min, int64_t n_min,
@@ -209,7 +212,7 @@ class Qwen35MoeModel {
   // prefill chunk (the sliced all-reduces, the per-expert GEMM shapes), a 64-row chunk, then a greedy, a sampled (row-summary merge) and a full-logits
   // decode step, so no first-use launch or merge lands inside a request. Leaves the model Reset().
   void TpWarmup();
-  static int64_t WarmupPositions() { return kChunkRows + 64 + 3; }
+  static int64_t WarmupPositions() { return kChunkRows + 64 + 3 + 64; }  // (+ room for the 3 DFlash2 warm-up rounds)
   tp::SubmitBounder::Stats TpSubmitStats() const { return stages_.front()->SubmitStats(); }
 
   // GPU time of the last chunk, hipEvent spans on each stage's stream (the host clock of Timings only sees the enqueue of a decode step):

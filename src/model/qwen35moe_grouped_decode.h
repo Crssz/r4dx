@@ -61,8 +61,7 @@ class Qwen35GroupedMoeDecode {
 
   // Allocates the scratch on the calling thread's current device and zeroes the split-group tickets (synchronizing).
   // max_rows > 1 also sizes the M-row scratch of RunRows (about 90 MB at 16 rows, top-8).
-  // inter: the routed and shared expert width this instance serves: kInter (TP=1) or kTp2Inter (a --tp 2 rank; M = 1 only: the M-row kernels
-  // are not instantiated for it).
+  // inter: the routed and shared expert width this instance serves: kInter (TP=1) or kTp2Inter (a --tp 2 rank).
   Qwen35GroupedMoeDecode(int experts, int top_k, bool norm_topk, int max_rows = 1, int inter = kInter);
 
   // The M-row MoE of a speculative verify window: x / y device bf16 [rows, hidden] (2 <= rows <= max_rows; rows == 1 is Run), the same

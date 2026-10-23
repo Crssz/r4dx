@@ -147,9 +147,9 @@ std::unique_ptr<Qwen35MoeTpModel> Qwen35MoeTpModel::Load(const ModelOptions& opt
   }
   // The qwen3_5_moe option mapping (MTP / --vision on / a partial layer load refused) -- the same one TP=1 runs.
   Qwen35MoeModelOptions g = MakeQwen35MoeModelOptions(opts);
-  if (!g.dflash_container.empty()) {
-    throw std::invalid_argument("Qwen35MoeTpModel::Load: --dflash is not supported under --tp 2 yet (docs/qwen35moe-tp-design.md P6)");
-  }
+  // DFlash2 under TP (docs/qwen35moe-tp-design.md P6): every rank loads the (small) drafter next to its shard; the codebooks are read ONCE here, on the facade
+  // thread (CPU only), and shared.
+  if (!g.dflash_container.empty()) g.dflash_codebooks = DflashDraft::LoadHostCodebooks(g.dflash_container);
   const int64_t warmup_positions = Qwen35MoeModel::WarmupPositions();
   if (g.max_ctx > 0 && g.max_ctx < warmup_positions) {
     throw std::invalid_argument("Qwen35MoeTpModel::Load: --max-ctx must be at least " + std::to_string(warmup_positions) +
@@ -411,6 +411,7 @@ std::unique_ptr<Qwen35MoeTpModel> Qwen35MoeTpModel::Load(const ModelOptions& opt
          },
          CmdKind::kPlain, kNoStall);
   m->global_config_ = rank0_global_config;
+  m->dflash_enabled_ = !g.dflash_container.empty();
   for (size_t i = 1; i < caps.size(); ++i) {
     const Caps &a = caps[0], &b = caps[i];
     if (a.id != b.id || a.layers != b.layers || a.vocab != b.vocab || a.hidden != b.hidden) {
@@ -775,12 +776,32 @@ std::vector<int32_t> Qwen35MoeTpModel::DecodeStepMtpGreedy(int32_t, int64_t) {
 std::vector<int32_t> Qwen35MoeTpModel::DecodeStepMtpSampled(int32_t, int64_t, const kernels::SampleParams&, std::mt19937_64&) {
   throw std::runtime_error("Qwen35MoeTpModel: MTP is not available for qwen3_5_moe (plan milestone M6)");
 }
-std::vector<int32_t> Qwen35MoeTpModel::DecodeStepDflashGreedy(int32_t, int64_t, float, int64_t, int64_t*) {
-  throw std::runtime_error("Qwen35MoeTpModel: DFlash2 under --tp 2 is not implemented yet (docs/qwen35moe-tp-design.md P6)");
+// Rounds: every rank runs the SAME round (identical drafts -- the drafter reads the replicated taps and merges its top-16 with the peer's in rank order -- and the
+// verify window's merged argmax rows), so the accepted tokens agree; RequireAllEqual says so.
+std::vector<int32_t> Qwen35MoeTpModel::DecodeStepDflashGreedy(int32_t token_id, int64_t k, float p_min, int64_t n_min, int64_t* walk_len_out) {
+  if (!dflash_enabled_) throw std::runtime_error("Qwen35MoeTpModel::DecodeStepDflashGreedy: no drafter is loaded (--dflash)");
+  auto walks = std::make_shared<std::vector<int64_t>>(ranks_.size(), 0);
+  std::vector<std::vector<int32_t>> r = RunCollective([token_id, k, p_min, n_min, walks](Qwen35MoeModel& m, int slot) {
+    return m.DecodeStepDflashGreedy(token_id, k, p_min, n_min, &(*walks)[static_cast<size_t>(slot)]);
+  });
+  RequireAllEqual(r, "DecodeStepDflashGreedy round");
+  RequireAllEqual(*walks, "DecodeStepDflashGreedy walk_len");
+  if (walk_len_out != nullptr) *walk_len_out = (*walks)[0];
+  return std::move(r[0]);
 }
-std::vector<int32_t> Qwen35MoeTpModel::DecodeStepDflashSampled(int32_t, int64_t, float, int64_t, const kernels::SampleParams&,
-                                                          std::mt19937_64&, int64_t*) {
-  throw std::runtime_error("Qwen35MoeTpModel: DFlash2 under --tp 2 is not implemented yet (docs/qwen35moe-tp-design.md P6)");
+// A temperature > 0 round is one plain sampled step (the local model's contract: no rejection-sampled DFlash2 round for this arch).
+std::vector<int32_t> Qwen35MoeTpModel::DecodeStepDflashSampled(int32_t token_id, int64_t k, float p_min, int64_t n_min,
+                                                          const kernels::SampleParams& params, std::mt19937_64& rng, int64_t* walk_len_out) {
+  if (params.temperature > 0.0f) {
+    if (walk_len_out != nullptr) *walk_len_out = 0;
+    return {DecodeStepSampled(token_id, params, rng)};
+  }
+  return DecodeStepDflashGreedy(token_id, k, p_min, n_min, walk_len_out);
+}
+
+void Qwen35MoeTpModel::SetDflashInjectionEnabled(bool enabled) {
+  if (!dflash_enabled_) return;
+  RunAll([enabled](Qwen35MoeModel& m, int) { m.SetDflashInjectionEnabled(enabled); });
 }
 
 StepProfile Qwen35MoeTpModel::DecodeStepProfiled(int32_t) {

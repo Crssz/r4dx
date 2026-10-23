@@ -171,7 +171,17 @@ hipError_t GroupedSiluMulTrellisInputDownQ35Rows(const uint16_t* gu, const int32
 hipError_t GroupedTrellisGemvDownQ35Rows(int kb, const uint16_t* in_a0, const int32_t* plan, const uint32_t* all_w_down,
                                          const float* all_svh_down, uint16_t* out_yp, float* ws, unsigned* all_tickets_down,
                                          int max_groups, int skg, void* stream);
-// out[t, d] = bf16( sum_j yp[posOfSrc[t * top_k + j], d] * weights[t * top_k + j] (j in router order, fp32)
+// ---- the same M-row kernels at TP=2 (expert width 512): the verify window of --tp 2. The plan (GroupedMoePlanRows), the gate_up input transform
+// (GroupedTrellisInputGateUpQ35Rows, K 3072) and the router-order combine are the launchers above, unchanged. ws floats (gate_up) >= max_groups * skg *
+// 16 * 1024, (down) >= max_groups * skg * 16 * 3072; tickets u32 >= max_groups * 1024 / 128 and max_groups * 3072 / 128.
+hipError_t GroupedTrellisGemvGateUpQ35Tp2Rows(int kb, const uint16_t* in_a0, const uint16_t* in_a1, const int32_t* plan, const uint32_t* all_w,
+                                              const float* all_svh, uint16_t* out_c, float* ws, unsigned* all_tickets, int max_groups, int skg,
+                                              void* stream);
+// gu [pairs, 1024] bf16 -> out_a0 [pairs, 512] fp16.
+hipError_t GroupedSiluMulTrellisInputDownQ35Tp2Rows(const uint16_t* gu, const int32_t* plan, const float* all_suh_down, uint16_t* out_a0, int n_pairs,
+                                                    void* stream);
+hipError_t GroupedTrellisGemvDownQ35Tp2Rows(int kb, const uint16_t* in_a0, const int32_t* plan, const uint32_t* all_w_down, const float* all_svh_down,
+                                            uint16_t* out_yp, float* ws, unsigned* all_tickets_down, int max_groups, int skg, void* stream);// out[t, d] = bf16( sum_j yp[posOfSrc[t * top_k + j], d] * weights[t * top_k + j] (j in router order, fp32)
 //                   + Rb(Rb(sigmoid(shared_gate_logit[t])) * shared_y[t, d]) ): the M = 1 router-order combine, per token.
 hipError_t GroupedMoeCombineRowsRouterOrder(const uint16_t* yp, const float* weights, const int32_t* plan, const uint16_t* shared_y,
                                             const uint16_t* shared_gate_logit, uint16_t* out, int rows, int top_k, int hidden,

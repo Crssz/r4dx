@@ -37,6 +37,8 @@ class Qwen35PrefillMoe {
            uint16_t* y, int64_t rows, const std::function<void(const char*)>* mark = nullptr);
 
   size_t ScratchBytes() const { return scratch_bytes_; }
+  // The router's ids of the last Run, device int32 [rows, top_k] (router order) -- for the capture hook.
+  const int32_t* last_ids() const { return ids_.data(); }
   // The plan of the last Run, D2H (tests): kMoePlanInts int32.
   std::vector<int32_t> ReadPlan(hipStream_t stream) const;
 

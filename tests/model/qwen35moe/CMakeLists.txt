@@ -57,3 +57,8 @@ target_link_libraries(tool_q35moe_tp_soak PRIVATE r4dx_model r4dx_model_qwen4exp
 add_executable(tool_q35moe_dflash tool_q35moe_dflash.cpp)
 target_link_libraries(tool_q35moe_dflash PRIVATE r4dx_model r4dx_model_qwen4exp_kernels r4dx_core r4d_core)
 q35moe_add_test(test_model_q35moe_prefill SINGLE_DEVICE)
+
+# tool_q35moe_prefill_cmp: the prefill MoE against the host-routed MoE layer by layer on the real container (both cards; not a ctest).
+add_executable(tool_q35moe_prefill_cmp tool_q35moe_prefill_cmp.cpp)
+target_link_libraries(tool_q35moe_prefill_cmp PRIVATE r4dx_model r4dx_model_qwen4exp_kernels r4dx_core r4d_core)
+target_include_directories(tool_q35moe_prefill_cmp PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")

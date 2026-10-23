@@ -755,6 +755,7 @@ void Qwen35MoeStage::Impl::RunMoe(LayerRt& L, const Qwen35MoeChunk& c) {
     pmoe->Run(s, arena, L.gmoe_w, e.trellis, x.data(), blk.data(), c.rows, pm ? &pm : nullptr);
     arena.Reset();
     AllReduceBlock(c.rows);
+    if (capture) Cap(L.index, "topk_ids", pmoe->last_ids(), Qwen35MoeCapture::Dtype::kI32, c.rows, cfg.num_experts_per_tok, c.first_pos);
     CapBf16(L.index, "moe_out", blk.data(), c.rows, hidden, c.first_pos);
     ResidualAdd(hmid.data(), blk.data(), h.data(), c.rows);
     if (PprofOn(c)) pprof.Mark(s, "moe.resid");
@@ -813,6 +814,14 @@ void Qwen35MoeStage::RunLayers(const Qwen35MoeChunk& c) {
   }
   if (m.spec_window > 1 && !c.is_prefill && !c.verify && T != 1) Fail("RunLayers: a speculative stage decodes one row (or verifies)");
   const bool is_decode = (T == 1 && !c.is_prefill && !m.capture);
+  // A 256-row prefill chunk: the trellis linears (attention projections, GDN in_proj_qkv / in_proj_z / out_proj) run libr4d's M = 256 GEMM, one launch
+  // that reads each weight once instead of four 64-row slices that read it four times -- bit-identical to the slices (docs/trellis-m256.md).
+  // R4DX_Q35_M256=0 keeps the slices. The scope is thread-local, so it is opened here, on the thread that runs the layers.
+  static const bool m256_enabled = [] {
+    const char* e = std::getenv("R4DX_Q35_M256");
+    return !(e != nullptr && e[0] == '0');
+  }();
+  const ScopedTrellisM256 trellis_m256_scope(m256_enabled && c.is_prefill && !c.verify && T == kTrellisM256Rows);
   // Bounded prefill submission under TP, cut the same way on both ranks (lockstep): a 256-row chunk is four 64-row chunks' worth of work per layer.
   const bool bounded = m.comm != nullptr && c.is_prefill && m.submit.Active();
   int64_t unit_layers = bounded ? tp::UnitLayersForContext(m.submit_layers, c.first_pos + T) : 0;

@@ -427,6 +427,7 @@ int RunTest() {
         core::DeviceBuffer<int32_t> d_ids(ids.size()), d_plan(qwen4exp::kMoePlanInts), d_counts(kE);
         d_ids.CopyFromHost(ids);
         d_plan.Zero();
+        R4DX_HIP_CHECK(hipStreamSynchronize(nullptr));  // the memset runs on the null stream, which does not order against the stream below
         R4DX_HIP_CHECK(qwen4exp::GroupedMoePlanLarge(d_ids.data(), d_plan.data(), d_counts.data(), rows, kTopK, kE, s));
         R4DX_HIP_CHECK(hipStreamSynchronize(s));
         std::vector<int32_t> plan(static_cast<size_t>(qwen4exp::kMoePlanInts));
@@ -435,12 +436,6 @@ int RunTest() {
         std::vector<int> order(static_cast<size_t>(n));
         for (int i = 0; i < n; ++i) order[static_cast<size_t>(i)] = i;
         std::stable_sort(order.begin(), order.end(), [&](int a, int b) { return ids[static_cast<size_t>(a)] < ids[static_cast<size_t>(b)]; });
-        if (rows == 2) {
-          for (int r = 0; r < n; ++r) {
-            std::printf("   plan pair %2d: expert %3d token %d | src %2d expert %3d -> pos %d\n", r, plan[static_cast<size_t>(qwen4exp::kMoePlanPairExpert + r)], plan[static_cast<size_t>(qwen4exp::kMoePlanPairToken + r)], r,
-                        ids[static_cast<size_t>(r)], plan[static_cast<size_t>(qwen4exp::kMoePlanPosOfSrc + r)]);
-          }
-        }
         bool ok = true;
         for (int r = 0; r < n && ok; ++r) {
           const int p = order[static_cast<size_t>(r)];

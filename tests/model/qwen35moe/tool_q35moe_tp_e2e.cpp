@@ -22,6 +22,7 @@
 
 #include "model.h"
 #include "nlohmann/json.hpp"
+#include "qwen35moe_tp_model.h"
 #include "text_model.h"
 
 using r4dx::model::ModelOptions;
@@ -35,6 +36,7 @@ struct Args {
   std::string modes = "split,tp", json;
   int prompt_len = 512, tokens = 128, warmup = 16, repeats = 3, chain = 48;
   int64_t max_ctx = 4096;
+  bool rank_profile = false;  // --rank-profile: tp mode only, a per-rank GPU-span pass
 };
 
 Args Parse(int argc, char** argv) {
@@ -54,6 +56,7 @@ Args Parse(int argc, char** argv) {
     else if (k == "--chain") a.chain = std::stoi(val());
     else if (k == "--max-ctx") a.max_ctx = std::stoll(val());
     else if (k == "--json") a.json = val();
+    else if (k == "--rank-profile") a.rank_profile = true;
     else throw std::invalid_argument("unknown argument " + k);
   }
   return a;
@@ -77,6 +80,7 @@ ModeResult Measure(const std::string& mode, const Args& a, const std::vector<int
   ModelOptions o;
   o.container_path = a.container;
   o.max_ctx = a.max_ctx;
+  o.layout = r4dx::model::Layout::kTrellis;
   TpOptions tp;
   if (mode == "tp") {
     tp.world = 2;
@@ -105,6 +109,35 @@ ModeResult Measure(const std::string& mode, const Args& a, const std::vector<int
   }
   r.prefill_ms = Median(prefill);
   r.decode_ms = Median(decode);
+  if (mode == "tp" && a.rank_profile) {
+    // one more pass with the per-rank GPU spans on: where the ms of a TP step go (the layers' span includes the time spent in the all-reduces)
+    auto* tpm = dynamic_cast<r4dx::model::Qwen35MoeTpModel*>(m.get());
+    tpm->RunCollectiveForTest([](r4dx::model::Qwen35MoeModel& mm, int) { mm.EnableStepProfile(true); });
+    m->Reset();
+    (void)m->Prefill(prompt);
+    std::vector<double> lay[2], hd[2], wall;
+    auto lay_sink = std::make_shared<std::vector<std::vector<double>>>(2);
+    auto hd_sink = std::make_shared<std::vector<std::vector<double>>>(2);
+    for (int i = 0; i < a.warmup + a.tokens; ++i) {
+      const int32_t tok = prompt[static_cast<size_t>(i) % prompt.size()];
+      const auto t1 = std::chrono::steady_clock::now();
+      (void)m->DecodeStepGreedy(tok);
+      const double ms = Ms(t1);
+      tpm->RunCollectiveForTest([&](r4dx::model::Qwen35MoeModel& mm, int rank) {
+        if (i < a.warmup) return;
+        const auto g = mm.LastStepGpu();
+        (*lay_sink)[static_cast<size_t>(rank)].push_back(g.layers_ms[0]);
+        (*hd_sink)[static_cast<size_t>(rank)].push_back(g.head_ms);
+      });
+      if (i >= a.warmup) wall.push_back(ms);
+    }
+    for (int rk = 0; rk < 2; ++rk) {
+      std::printf("[tp] rank %d: layers GPU span median %.3f ms, head %.3f ms\n", rk, Median((*lay_sink)[static_cast<size_t>(rk)]), Median((*hd_sink)[static_cast<size_t>(rk)]));
+    }
+    std::printf("[tp] profiled pass: host wall median %.3f ms\n", Median(wall));
+    tpm->RunCollectiveForTest([](r4dx::model::Qwen35MoeModel& mm, int) { mm.EnableStepProfile(false); });
+    std::printf("[tp] %s\n", tpm->StatsLine().c_str());
+  }
   std::sort(decode.begin(), decode.end());
   r.decode_p10 = decode[static_cast<size_t>(0.1 * static_cast<double>(decode.size() - 1))];
   r.decode_p90 = decode[static_cast<size_t>(0.9 * static_cast<double>(decode.size() - 1))];

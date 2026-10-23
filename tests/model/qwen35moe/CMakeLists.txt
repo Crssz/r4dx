@@ -47,6 +47,10 @@ target_link_libraries(tool_q35moe_tp_step PRIVATE r4dx_model r4dx_model_qwen4exp
 add_executable(tool_q35moe_tp_e2e tool_q35moe_tp_e2e.cpp)
 target_link_libraries(tool_q35moe_tp_e2e PRIVATE r4dx_model r4dx_model_qwen4exp_kernels r4dx_core r4d_core)
 
+# tool_q35moe_tp_soak: the --tp 2 soak (G8'); wrapped by tools/tp/q35moe_soak.ps1 (TDR watch); not a ctest.
+add_executable(tool_q35moe_tp_soak tool_q35moe_tp_soak.cpp)
+target_link_libraries(tool_q35moe_tp_soak PRIVATE r4dx_model r4dx_model_qwen4exp_kernels r4dx_core r4d_core)
+
 # tool_q35moe_dflash: the real-container DFlash2 benchmark / lossless audit (not a ctest: it needs the 52 GB Ornith container and both cards).
 add_executable(tool_q35moe_dflash tool_q35moe_dflash.cpp)
 target_link_libraries(tool_q35moe_dflash PRIVATE r4dx_model r4dx_model_qwen4exp_kernels r4dx_core r4d_core)

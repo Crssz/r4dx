@@ -325,3 +325,10 @@ Live progress table: `tools\q35_progress.ps1`.
 `--dflash E:\models\r4dx\ornith-1.5-122b-dflash2-w4a16.r4dx --dflash-k 11 --dflash-p-min 0.8` (the CLI / server default p_min is 0 and must be passed; at p_min 0 chat is ~1.0x and k=15 can be slower than plain).
 Measured against a same-process plain baseline of ~61 tok/s (399 tokens, both cards): code 1.8-2.1x, math 2.2-2.3x, chat 1.3-1.4x, a 4.4k-token prompt 1.3x. Acceptance is below the model card's
 (math 4.8-6.5 vs 8.3-9.2 tokens per round), most likely because the target is a 3.4-bit mix. Extra VRAM on device 1 is an estimate of ~1.3 GiB (not measured). `--max-ctx 16384` loads and serves with `--dflash`.
+
+**Update 2026-10-23 (`--tp 2` merged, `10a246d`; details in `docs/qwen35moe-tp.md`).** `--tp 2` works on Ornith (opt-in; the layer split stays the default and the two modes cannot share one process well).
+Measured, same container and protocol, each mode in its own process: plain decode 9.19 ms/token = **108.7 tok/s** vs 14.67 ms = 68.2 tok/s on the layer split (**1.60x**); prefill of 512 tokens 1.10x; KL unchanged
+(0.12364 vs 0.12361 against truth); fault recovery and a 5-minute soak (1.24M all-reduces, no TDR) passed; the 60-minute soak has not been run (needs the owner's go, display risk). DFlash2 under TP is lossless and
+averages 116.7 tok/s over five corpus segments vs 85.4 for layer-split DFlash2 (1.37x), but only ~1.14-1.16x over plain TP, so with `--tp 2` the speculative gain is small (the `--dflash-k` cap of 7 in the shared parsers applies to `--tp 2`).
+Open follow-ups: shared-expert quantization (bf16 now; ~20% of the decode bytes), the grouped prefill GEMM (TP barely helps first-token time), a known 2x slowdown / 0.8 GiB leak when the layer split and `--tp 2` are loaded in one process.
+Commands: `r4dx-cli --model E:\models\r4dx\ornith-1.5-122b-trellis-mix-kv.r4dx --tokenizer-dir E:\models\r4dx\Ornith-1.5-122B --tp 2 --chat`, same flags for `r4dx-server`.

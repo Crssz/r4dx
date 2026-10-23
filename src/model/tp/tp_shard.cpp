@@ -225,6 +225,51 @@ bool LookupLfm2LayerRule(const std::string& s, const ModelConfig& g, int64_t lay
   return true;
 }
 
+// qwen3_5_moe (Ornith-1.5-122B, docs/qwen35moe-tp-design.md 1.3, 2.2, 3): the per-layer table, keyed by the suffix after
+// `text.layers.{i}.`. `g` is Qwen35MoeConfig::ToModelConfig() of the UNSHARDED config. The mixers are the dense Qwen3.5's
+// (LookupLayerRule: GDN and gated attention); every layer's FFN is the MoE, never a dense mlp:
+//   moe.router, moe.shared_gate                replicated (both ranks route on identical bits);
+//   moe.shared.gate | up (bf16)                column-parallel, one segment of shared_expert_intermediate rows each;
+//   moe.shared.down (bf16)                     row-parallel, K = shared_expert_intermediate;
+//   moe.experts.{e}.gate_up                    EVERY expert TP-split: two segments (gate | up) of moe_intermediate rows;
+//   moe.experts.{e}.down                       row-parallel, K = moe_intermediate.
+// The quant2 `.rotated` norm tails are refused (this arch has no residual rotation). Returns false for a name the table
+// does not know; throws for a tensor on the wrong kind of layer and an expert past num_experts.
+bool LookupQwen35MoeLayerRule(const std::string& s, const ModelConfig& g, ShardRule* rule, LayerKind* kind) {
+  *kind = LayerKind::kAny;
+  if (StartsWith(s, "mlp.")) return false;
+  if (s.size() > 8 && s.compare(s.size() - 8, 8, ".rotated") == 0) return false;
+  if (s == "moe.router" || s == "moe.shared_gate") {
+    *rule = Replicate();
+  } else if (s == "moe.shared.gate" || s == "moe.shared.up") {
+    *rule = Rows({g.shared_expert_intermediate_size});
+  } else if (s == "moe.shared.down") {
+    *rule = Cols(g.shared_expert_intermediate_size);
+  } else if (StartsWith(s, "moe.experts.")) {
+    // moe.experts.{e}.gate_up | moe.experts.{e}.down
+    const size_t p = sizeof("moe.experts.") - 1;
+    size_t q = p;
+    while (q < s.size() && q - p < 6 && s[q] >= '0' && s[q] <= '9') ++q;
+    if (q == p || q >= s.size() || s[q] != '.') return false;
+    const int64_t e = std::stoll(s.substr(p, q - p));
+    if (e >= g.num_experts) {
+      Fail("RuleFor: '" + s + "' names expert " + std::to_string(e) + " of a " + std::to_string(g.num_experts) +
+           "-expert layer");
+    }
+    const std::string tail = s.substr(q + 1);
+    if (tail == "gate_up") {
+      *rule = Rows({g.moe_intermediate_size, g.moe_intermediate_size});
+    } else if (tail == "down") {
+      *rule = Cols(g.moe_intermediate_size);
+    } else {
+      return false;
+    }
+  } else {
+    return LookupLayerRule(s, g, rule, kind);
+  }
+  return true;
+}
+
 void CheckWorldRank(const char* fn, int world, int rank) {
   if (world < 1 || rank < 0 || rank >= world) {
     Fail(std::string(fn) + ": need world >= 1 and 0 <= rank < world, got world " +
@@ -353,7 +398,9 @@ ShardRule RuleFor(const std::string& base, const ModelConfig& global) {
       return rule;
     }
     LayerKind kind;
-    if (!LookupLayerRule(base.substr(q + 1), global, &rule, &kind)) unknown();
+    const bool known = global.arch == Arch::kQwen35Moe ? LookupQwen35MoeLayerRule(base.substr(q + 1), global, &rule, &kind)
+                                                       : LookupLayerRule(base.substr(q + 1), global, &rule, &kind);
+    if (!known) unknown();
     const bool gdn_layer = global.IsGdnLayer(layer);
     if ((kind == LayerKind::kGdn && !gdn_layer) || (kind == LayerKind::kAttn && gdn_layer)) {
       Fail("RuleFor: '" + base + "' is a " + (gdn_layer ? "full-attention" : "GDN") +
@@ -365,6 +412,8 @@ ShardRule RuleFor(const std::string& base, const ModelConfig& global) {
   // LFM2 has no MTP head and no quant2 rotation (docs/lfm2-plan.md 4): those names must never be classified by the
   // Qwen / Gemma tables below.
   if (global.arch == Arch::kLfm2Moe && (StartsWith(base, "mtp.") || StartsWith(base, "rotation."))) unknown();
+  // qwen3_5_moe has no MTP head (ToModelConfig: mtp_num_hidden_layers 0) and no quant2 rotation either.
+  if (global.arch == Arch::kQwen35Moe && (StartsWith(base, "mtp.") || StartsWith(base, "rotation."))) unknown();
 
   if (StartsWith(base, "mtp.")) {
     // The MTP head is one full-attention decoder layer (sharded exactly like a body attention

@@ -62,6 +62,17 @@ struct Qwen35MoeConfig {
   int64_t vision_hidden_size = 0;
   int64_t vision_out_hidden_size = 0;
 
+  // ---- tensor parallel (docs/qwen35moe-tp-design.md section 1.3) ---------------------------------
+  // GLOBAL (tp_world == 1) or the rank-local view Shard() returns: attention heads / kv heads, GDN key / value heads,
+  // moe_intermediate_size and shared_expert_intermediate_size divided by tp_world. vocab_size stays GLOBAL
+  // (VocabShardSize() is the rank's lm_head slice); hidden_size, num_experts and num_experts_per_tok stay (the residual
+  // and the router are replicated, every rank runs every expert at half width).
+  int tp_world = 1;
+  int tp_rank = 0;
+  int64_t VocabShardSize() const { return vocab_size / tp_world; }
+  int64_t VocabShardBegin() const { return tp_rank * VocabShardSize(); }
+  bool IsShard() const { return tp_world > 1; }
+
   int64_t KeyDim() const { return linear_num_key_heads * linear_key_head_dim; }
   int64_t ValueDim() const { return linear_num_value_heads * linear_value_head_dim; }
   int64_t ConvDim() const { return 2 * KeyDim() + ValueDim(); }
@@ -102,6 +113,7 @@ struct Qwen35MoeConfig {
     m.intermediate_size = moe_intermediate_size;
     m.moe_intermediate_size = moe_intermediate_size;
     m.num_experts = num_experts;
+    m.shared_expert_intermediate_size = shared_expert_intermediate_size;
     m.partial_rotary_factor = partial_rotary_factor;
     m.rope_theta = rope_theta;
     m.mrope_interleaved = mrope_interleaved;
@@ -136,6 +148,74 @@ struct Qwen35MoeConfig {
       return c;
     }
     return FromTextConfig(config);
+  }
+
+  // The rank-local config of `global` for TP world `world`, rank `rank`. Throws std::invalid_argument naming the failing
+  // field unless every shape a rank's kernels, loader and byte plans see is legal:
+  //   world in {1,2}; 0 <= rank < world; global.tp_world == 1 (no double sharding);
+  //   attention heads, kv heads, GDN key / value heads, moe_intermediate_size and shared_expert_intermediate_size divide by world;
+  //   both GQA ratios are unchanged (attention 16 q per kv head, GDN 4 value heads per key head);
+  //   trellis rank ranges are whole 128-blocks (docs/trellis-kernel.md 2.4): every column-parallel segment's rows (the
+  //   three in_proj_qkv segments, in_proj_z, qg, k / v, an expert's gate and up) and every row-parallel K (out_proj, attn.o,
+  //   an expert's down);
+  //   row-parallel rank K % 256 == 0 (the relaxed FallbackTuning rule: SK 4 x 64);
+  //   the bf16 shared expert: rank rows % 16 and K % 16;
+  //   vocab_size % (16 * world) == 0 (the lm_head slice is whole 16-row tiles).
+  // Every check applies at world 1 too, so Shard() accepts exactly the configs TP can serve.
+  static Qwen35MoeConfig Shard(const Qwen35MoeConfig& global, int world, int rank) {
+    const std::string where = "Qwen35MoeConfig::Shard(world=" + std::to_string(world) + ", rank=" + std::to_string(rank) + "): ";
+    const auto fail = [&](const std::string& what) { throw std::invalid_argument(where + what); };
+    const auto require_div = [&](const std::string& field, int64_t value, int64_t divisor) {
+      if (divisor <= 0 || value % divisor != 0)
+        fail(field + " = " + std::to_string(value) + " is not divisible by " + std::to_string(divisor));
+    };
+    if (world != 1 && world != 2) fail("world must be 1 or 2");
+    if (rank < 0 || rank >= world) fail("rank must be in [0, world)");
+    if (global.tp_world != 1) fail("tp_world = " + std::to_string(global.tp_world) + " -- `global` is already a rank shard");
+
+    require_div("num_attention_heads", global.num_attention_heads, world);
+    require_div("num_key_value_heads", global.num_key_value_heads, world);
+    require_div("linear_num_key_heads", global.linear_num_key_heads, world);
+    require_div("linear_num_value_heads", global.linear_num_value_heads, world);
+    require_div("moe_intermediate_size", global.moe_intermediate_size, world);
+    require_div("shared_expert_intermediate_size", global.shared_expert_intermediate_size, world);
+
+    Qwen35MoeConfig r = global;
+    r.tp_world = world;
+    r.tp_rank = rank;
+    r.num_attention_heads = global.num_attention_heads / world;
+    r.num_key_value_heads = global.num_key_value_heads / world;
+    r.linear_num_key_heads = global.linear_num_key_heads / world;
+    r.linear_num_value_heads = global.linear_num_value_heads / world;
+    r.moe_intermediate_size = global.moe_intermediate_size / world;
+    r.shared_expert_intermediate_size = global.shared_expert_intermediate_size / world;
+
+    if (r.AttnGqa() != global.AttnGqa())
+      fail("the attention GQA changes from " + std::to_string(global.AttnGqa()) + " to " + std::to_string(r.AttnGqa()));
+    if (r.GqaRepeats() != global.GqaRepeats())
+      fail("the GDN value-per-key head ratio changes from " + std::to_string(global.GqaRepeats()) + " to " +
+           std::to_string(r.GqaRepeats()));
+
+    const int64_t q_dim = r.num_attention_heads * r.head_dim, kv_dim = r.num_key_value_heads * r.head_dim;
+    // Trellis: whole 128-blocks on every rank range (both Hadamards work in them).
+    require_div("gdn.in_proj_qkv rank q / k segment (key heads/world * key_head_dim)", r.KeyDim(), 128);
+    require_div("gdn.in_proj_qkv rank v segment and in_proj_z rows (value heads/world * value_head_dim)", r.ValueDim(), 128);
+    require_div("gdn.out_proj rank K (value heads/world * value_head_dim)", r.ValueDim(), 128);
+    require_div("attn.qg rank rows (2 * heads/world * head_dim)", 2 * q_dim, 128);
+    require_div("attn.k/v rank rows (kv heads/world * head_dim)", kv_dim, 128);
+    require_div("attn.o rank K (heads/world * head_dim)", q_dim, 128);
+    require_div("expert gate_up rank segment (moe_intermediate_size/world)", r.moe_intermediate_size, 128);
+    require_div("expert down rank K (moe_intermediate_size/world)", r.moe_intermediate_size, 128);
+    // Row-parallel rank K % 256 (the relaxed FallbackTuning rule, linear.cpp: SK 4 x 64).
+    require_div("gdn.out_proj rank K", r.ValueDim(), 256);
+    require_div("attn.o rank K", q_dim, 256);
+    require_div("expert down rank K", r.moe_intermediate_size, 256);
+    // bf16 shared expert and the GDN conv channels.
+    require_div("shared gate/up rank rows (shared_expert_intermediate_size/world)", r.shared_expert_intermediate_size, 16);
+    require_div("shared down rank K (shared_expert_intermediate_size/world)", r.shared_expert_intermediate_size, 16);
+    require_div("conv channels (2 * key dim + value dim)", r.ConvDim(), 16);
+    require_div("vocab_size (lm_head rank shard in whole 16-row tiles)", global.vocab_size, 16 * static_cast<int64_t>(world));
+    return r;
   }
 
  private:

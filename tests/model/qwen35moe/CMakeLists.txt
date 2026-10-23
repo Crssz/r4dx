@@ -25,6 +25,15 @@ q35moe_add_test(test_q35moe_grouped_moe_kernel SINGLE_DEVICE)
 q35moe_add_test(test_model_q35moe_spec SINGLE_DEVICE)
 q35moe_add_test(test_q35moe_dflash2_golden SINGLE_DEVICE)
 
+# test_q35moe_tp_shard (docs/qwen35moe-tp-design.md P0 / gate G1): the --tp 2 sharding contract of qwen3_5_moe -- Qwen35MoeConfig::Shard,
+# tp::RuleFor's qwen3_5_moe table, the trellis byte plans, and (when E:\models\r4dx\ornith-1.5-122b-trellis-mix-kv.r4dx exists, read-only)
+# decode(rank slice) == slice(decode(full)) on the real container's bytes. CPU only, no HIP call, so plain add_test (a missing
+# container is a printed SKIP inside the test, not a failure).
+add_executable(test_q35moe_tp_shard test_q35moe_tp_shard.cpp)
+target_link_libraries(test_q35moe_tp_shard PRIVATE r4dx_tp_shard r4dx_convert r4dx_core)
+add_test(NAME test_q35moe_tp_shard COMMAND test_q35moe_tp_shard)
+set_tests_properties(test_q35moe_tp_shard PROPERTIES LABELS "q35moe" ENVIRONMENT "HIP_VISIBLE_DEVICES=-1")
+
 # tool_q35moe_dflash: the real-container DFlash2 benchmark / lossless audit (not a ctest: it needs the 52 GB Ornith container and both cards).
 add_executable(tool_q35moe_dflash tool_q35moe_dflash.cpp)
 target_link_libraries(tool_q35moe_dflash PRIVATE r4dx_model r4dx_model_qwen4exp_kernels r4dx_core r4d_core)

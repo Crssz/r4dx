@@ -46,6 +46,9 @@ struct ModelConfig {
   int64_t moe_intermediate_size = 0;
   int64_t num_experts = 0;
   int64_t num_dense_layers = 0;
+  // qwen3_5_moe only (Qwen35MoeConfig::ToModelConfig; 0 elsewhere): the sigmoid-gated shared expert's width. tp::RuleFor reads it
+  // (with moe_intermediate_size / num_experts above) to classify text.layers.{i}.moe.shared.* / moe.experts.{e}.*.
+  int64_t shared_expert_intermediate_size = 0;
 
   double partial_rotary_factor = 0.25;
   double rope_theta = 1.0e7;

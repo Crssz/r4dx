@@ -1,9 +1,13 @@
 #include "qwen35moe_stage.h"
 
+#include "qwen35moe_prefill_moe.h"
+#include "qwen35moe_prefill_profile.h"
+
 #include <hip/hip_runtime.h>
 
 #include <algorithm>
 #include <chrono>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <deque>
@@ -131,6 +135,8 @@ struct Qwen35MoeStage::Impl {
   std::unique_ptr<Qwen35GroupedMoeDecode> gmoe;  // the M = 1 on-device MoE (null when no layer qualifies)
   bool grouped_on = false;                      // gmoe is used by the layers that qualify
   int gmoe_rows_cap = 1;                        // verify windows of 2..cap rows take Qwen35GroupedMoeDecode::RunRows
+  std::unique_ptr<Qwen35PrefillMoe> pmoe;       // the on-device MoE of a prefill chunk (2..max_rows rows); null when no layer qualifies
+  bool pmoe_on = false;                         // R4DX_Q35_PREFILL_MOE=0: prefill chunks keep the host-routed MoE (A-B)
   bool rows_moe_on = true;                      // R4DX_Q35_ROWS=0: verify windows keep the host-routed MoE (diagnostics / A-B)
   bool grouped_capture = false;                 // ... also while a capture is installed (tests)
   std::vector<Qwen35MoeLayerRefs> layer_refs;
@@ -157,6 +163,9 @@ struct Qwen35MoeStage::Impl {
   core::DeviceBuffer<float> logits_rows;         // [spec_window, vocab] fp32 (HeadRows)
   core::DeviceBuffer<int32_t> argmax_rows_dev;   // [spec_window]
   core::PinnedBuffer<int32_t> argmax_rows_host;  // [spec_window]
+
+  PrefillProfile pprof;  // R4DX_Q35_PROFILE=3: GPU time per phase of the prefill chunks
+  bool PprofOn(const Qwen35MoeChunk& c) const { return pprof.on() && c.is_prefill; }
 
   // ---- R4DX_Q35_PROFILE=1: per-kind GPU time of the verify chunks (events around each layer's mixer and MoE), printed at destruction --
   bool prof_on = false;
@@ -462,6 +471,15 @@ Qwen35MoeStage::Qwen35MoeStage(const Qwen35MoeStageOptions& options, std::vector
       mode = (env != nullptr && std::strcmp(env, "0") == 0) ? 0 : 1;
     }
     m.grouped_on = mode != 0;
+    // ... and the prefill chunk's: R4DX_Q35_PREFILL_MOE=0 off; R4DX_Q35_PREFILL_SKG="gu,down" the GEMMs' split-group counts (default 1,1).
+    const char* pe = std::getenv("R4DX_Q35_PREFILL_MOE");
+    if (options.max_rows >= 2 && !(pe != nullptr && std::strcmp(pe, "0") == 0)) {
+      int gu_skg = 1, down_skg = 1;
+      if (const char* sk = std::getenv("R4DX_Q35_PREFILL_SKG"); sk != nullptr && sk[0] != 0) std::sscanf(sk, "%d,%d", &gu_skg, &down_skg);
+      m.pmoe = std::make_unique<Qwen35PrefillMoe>(static_cast<int>(cfg.num_experts), static_cast<int>(cfg.num_experts_per_tok), cfg.norm_topk_prob,
+                                                  static_cast<int>(options.max_rows), static_cast<int>(cfg.moe_intermediate_size), gu_skg, down_skg);
+      m.pmoe_on = true;
+    }
   }
 
   // ---- head ---------------------------------------------------------------------------------------------------------
@@ -560,6 +578,7 @@ Qwen35MoeStage::~Qwen35MoeStage() {
                  impl_->prof_phase_ms[2] / n);
     for (hipEvent_t ev : impl_->prof_phase_ev) static_cast<void>(hipEventDestroy(ev));
   }
+  impl_->pprof.Print(impl_->device, impl_->first, impl_->end - 1);
   for (hipEvent_t ev : impl_->prof_ev) static_cast<void>(hipEventDestroy(ev));
   if (impl_->step_prof) EnableStepProfile(false);
   impl_.reset();  // frees on the stage's device
@@ -577,6 +596,11 @@ void Qwen35MoeStage::SetGroupedDecode(bool on, bool with_capture) {
   Impl& m = *impl_;
   m.grouped_on = on && m.gmoe != nullptr;
   m.grouped_capture = with_capture;
+}
+
+void Qwen35MoeStage::SetPrefillMoe(bool on) {
+  Impl& m = *impl_;
+  m.pmoe_on = on && m.pmoe != nullptr;
 }
 
 int64_t Qwen35MoeStage::GroupedDecodeLayers() const {
@@ -621,6 +645,7 @@ void Qwen35MoeStage::StoreResidual(uint16_t* host_rows, int64_t rows) {
 void Qwen35MoeStage::Impl::RunGdn(LayerRt& L, const Qwen35MoeChunk& c) {
   // x = rmsnorm(h); blk = gdn(x); hmid = h + blk
   Norm(h.data(), L.input_ln, x.data(), c.rows);
+  if (PprofOn(c)) pprof.Mark(stream.get(), "gdn.norm");
   CapBf16(L.index, "attn_in", x.data(), c.rows, hidden, c.first_pos);
   Qwen4ExpGdnCall call;
   call.is_prefill = c.is_prefill;
@@ -647,6 +672,11 @@ void Qwen35MoeStage::Impl::RunGdn(LayerRt& L, const Qwen35MoeChunk& c) {
     };
     call.mark = &mark;
   }
+  std::function<void(const char*)> pmark;
+  if (PprofOn(c)) {
+    pmark = [&](const char* name) { pprof.Mark(stream.get(), (std::string("gdn.") + name).c_str()); };
+    call.mark = &pmark;
+  }
   L.gdn->Forward(stream.get(), arena, *L.gdn_states, control, x.data(), blk.data(), c.rows, call);
   if (!marks.empty()) {
     R4DX_HIP_CHECK(hipEventSynchronize(marks.back().second));
@@ -661,6 +691,7 @@ void Qwen35MoeStage::Impl::RunGdn(LayerRt& L, const Qwen35MoeChunk& c) {
   AllReduceBlock(c.rows);  // --tp 2 site A1: out_proj is row-parallel, blk holds this rank's partial sum
   CapBf16(L.index, "attn_out", blk.data(), c.rows, hidden, c.first_pos);
   ResidualAdd(h.data(), blk.data(), hmid.data(), c.rows);
+  if (PprofOn(c)) pprof.Mark(stream.get(), "gdn.resid");
 }
 
 void Qwen35MoeStage::Impl::RunAttention(LayerRt& L, const Qwen35MoeChunk& c) {
@@ -699,6 +730,7 @@ void Qwen35MoeStage::Impl::RunAttention(LayerRt& L, const Qwen35MoeChunk& c) {
                   /*prefill_split_kv=*/c.is_prefill && T > 1, /*attn_slice=*/sliced ? 64 : 0,
                   sliced ? seqused_k_slices.data() : nullptr, /*batch=*/nullptr, decode_sub, seqused_sub.data());
   arena.Reset();
+  if (PprofOn(c)) pprof.Mark(s, "attn.layer");
   // The layer returns h + o_proj(..); the o_proj output alone is hmid - h (not captured separately).
 }
 
@@ -706,6 +738,7 @@ void Qwen35MoeStage::Impl::RunMoe(LayerRt& L, const Qwen35MoeChunk& c) {
   const hipStream_t s = stream.get();
   const Qwen35MoeMoeRefs& e = *L.moe_refs;
   Norm(hmid.data(), L.post_ln, x.data(), c.rows);
+  if (PprofOn(c)) pprof.Mark(s, "moe.norm");
   CapBf16(L.index, "mlp_in", x.data(), c.rows, hidden, c.first_pos);
   if (c.rows == 1 && grouped_on && L.grouped && (!capture || grouped_capture)) {
     gmoe->Run(s, arena, L.gmoe_w, e.trellis, x.data(), blk.data());
@@ -713,6 +746,18 @@ void Qwen35MoeStage::Impl::RunMoe(LayerRt& L, const Qwen35MoeChunk& c) {
     AllReduceBlock(1);
     CapBf16(L.index, "moe_out", blk.data(), 1, hidden, c.first_pos);
     ResidualAdd(hmid.data(), blk.data(), h.data(), 1);
+    return;
+  }
+  // A prefill chunk: all rows through the device-side grouped MoE, no host round trip (Qwen35PrefillMoe).
+  if (c.is_prefill && !c.verify && c.rows >= 2 && pmoe_on && grouped_on && L.grouped && (!capture || grouped_capture)) {
+    std::function<void(const char*)> pm;
+    if (PprofOn(c)) pm = [&](const char* name) { pprof.Mark(s, name); };
+    pmoe->Run(s, arena, L.gmoe_w, e.trellis, x.data(), blk.data(), c.rows, pm ? &pm : nullptr);
+    arena.Reset();
+    AllReduceBlock(c.rows);
+    CapBf16(L.index, "moe_out", blk.data(), c.rows, hidden, c.first_pos);
+    ResidualAdd(hmid.data(), blk.data(), h.data(), c.rows);
+    if (PprofOn(c)) pprof.Mark(s, "moe.resid");
     return;
   }
   // A speculative verify window (2..cap rows): all rows through the M-row grouped kernels, no host sync, each routed expert's weights
@@ -735,7 +780,9 @@ void Qwen35MoeStage::Impl::RunMoe(LayerRt& L, const Qwen35MoeChunk& c) {
                                                                      : e.expert_down[static_cast<size_t>(expert)];
     ApplyLinear(s, expert_arena, *w, xin, y, rows);
   };
-  moe->Forward(s, arena, L.moe_w, x.data(), blk.data(), c.rows, fn);
+  std::function<void(const char*)> pmark;
+  if (PprofOn(c)) pmark = [&](const char* name) { pprof.Mark(s, name); };
+  moe->Forward(s, arena, L.moe_w, x.data(), blk.data(), c.rows, fn, pmark ? &pmark : nullptr);
   arena.Reset();
   AllReduceBlock(c.rows);  // --tp 2 site M: routed + gated shared partials of this rank
   if (capture) {
@@ -744,6 +791,7 @@ void Qwen35MoeStage::Impl::RunMoe(LayerRt& L, const Qwen35MoeChunk& c) {
   }
   CapBf16(L.index, "moe_out", blk.data(), c.rows, hidden, c.first_pos);
   ResidualAdd(hmid.data(), blk.data(), h.data(), c.rows);
+  if (PprofOn(c)) pprof.Mark(s, "moe.resid");
 }
 
 void Qwen35MoeStage::RunLayers(const Qwen35MoeChunk& c) {
@@ -773,6 +821,7 @@ void Qwen35MoeStage::RunLayers(const Qwen35MoeChunk& c) {
   m.arena.Reset();
   if (c.is_prefill) m.CollapseWindow();
   m.SpMark(0);
+  if (m.PprofOn(c)) m.pprof.Begin(m.stream.get());
 
   for (auto& lp : m.layers) {
     LayerRt& L = *lp;
@@ -827,6 +876,7 @@ void Qwen35MoeStage::RunLayers(const Qwen35MoeChunk& c) {
   m.SpMark(1);
   const double enqueue_ms = MsSince(t0);
   if (!is_decode) m.stream.Synchronize();
+  if (m.PprofOn(c)) m.pprof.End(T, MsSince(t0));
   if (m.prof_on && c.verify) {
     m.prof_enqueue_ms += enqueue_ms;
     m.prof_wall_ms += MsSince(t0);

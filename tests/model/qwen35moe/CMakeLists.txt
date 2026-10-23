@@ -56,3 +56,4 @@ target_link_libraries(tool_q35moe_tp_soak PRIVATE r4dx_model r4dx_model_qwen4exp
 # tool_q35moe_dflash: the real-container DFlash2 benchmark / lossless audit (not a ctest: it needs the 52 GB Ornith container and both cards).
 add_executable(tool_q35moe_dflash tool_q35moe_dflash.cpp)
 target_link_libraries(tool_q35moe_dflash PRIVATE r4dx_model r4dx_model_qwen4exp_kernels r4dx_core r4d_core)
+q35moe_add_test(test_model_q35moe_prefill SINGLE_DEVICE)

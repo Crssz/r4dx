@@ -66,8 +66,9 @@ class MoeBlockBase {
 
   // x: device bf16 [rows, hidden]; y: device bf16 [rows, hidden] (disjoint from x). Blocks the calling thread once
   // (the ids' device -> host copy). Throws std::runtime_error on a shape or weight mismatch.
+  // mark (profiling, R4DX_Q35_PROFILE=3): called with a phase name right after that phase's work is enqueued.
   void Forward(hipStream_t stream, core::Arena& arena, const MoeWeights& w, const uint16_t* x, uint16_t* y,
-               int64_t rows, const ExpertLinearFn& run_expert);
+               int64_t rows, const ExpertLinearFn& run_expert, const std::function<void(const char*)>* mark = nullptr);
 
   // The plan of the most recent Forward (expert row counts etc.), for tests and diagnostics.
   const MoePlan& last_plan() const { return plan_; }

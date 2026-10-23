@@ -1,4 +1,4 @@
-﻿// Qwen35GroupedMoeDecode at the REAL expert count (256 experts, top-8, hidden 3072, expert width 1024) on synthetic trellis
+// Qwen35GroupedMoeDecode at the REAL expert count (256 experts, top-8, hidden 3072, expert width 1024) on synthetic trellis
 // weights, against the host-routed MoE (qwen4exp::MoeBlockBase with per-expert ApplyLinear), plus the per-layer decode benchmark.
 //
 // The weights are random trellis words (any bit pattern decodes to some value), random +-1 input signs and small positive output
@@ -19,6 +19,7 @@
 #include <cstring>
 #include <functional>
 #include <map>
+#include <set>
 #include <random>
 #include <set>
 #include <string>
@@ -26,6 +27,7 @@
 
 #include "linear.h"
 #include "qwen35moe_grouped_decode.h"
+#include "qwen35moe_prefill_moe.h"
 #include "quant_linear.h"
 #include "r4dx/core/arena.hpp"
 #include "r4dx/core/device_buffer.hpp"
@@ -407,7 +409,142 @@ int RunTest() {
         Check(worst_m1 <= 0.01, "M-row grouped output differs from the M = 1 grouped kernel beyond bf16 noise (mean/rms " + std::to_string(worst_m1) + ")");
       }
     }
-  }
+    // ---- the large plan (GroupedMoePlanLarge) against a CPU reference, skewed routing -----------------------------------------------
+    {
+      std::mt19937 prng(5);
+      for (int rows : {2, 64, 256, 1000}) {
+        const int n = rows * kTopK;
+        std::vector<int32_t> ids(static_cast<size_t>(n));
+        for (int t = 0; t < rows; ++t) {
+          std::set<int> pick;
+          while (static_cast<int>(pick.size()) < kTopK) {
+            const double u = std::generate_canonical<double, 24>(prng);
+            pick.insert(static_cast<int>(std::pow(u, 2.5) * kE));  // skewed towards low expert ids
+          }
+          int j = 0;
+          for (int e : pick) ids[static_cast<size_t>(t * kTopK + j++)] = e;
+        }
+        core::DeviceBuffer<int32_t> d_ids(ids.size()), d_plan(qwen4exp::kMoePlanInts), d_counts(kE);
+        d_ids.CopyFromHost(ids);
+        d_plan.Zero();
+        R4DX_HIP_CHECK(qwen4exp::GroupedMoePlanLarge(d_ids.data(), d_plan.data(), d_counts.data(), rows, kTopK, kE, s));
+        R4DX_HIP_CHECK(hipStreamSynchronize(s));
+        std::vector<int32_t> plan(static_cast<size_t>(qwen4exp::kMoePlanInts));
+        d_plan.CopyToHost(plan.data(), plan.size());
+        // CPU reference: pairs sorted by (expert, source slot), groups of <= 16 per expert in expert order
+        std::vector<int> order(static_cast<size_t>(n));
+        for (int i = 0; i < n; ++i) order[static_cast<size_t>(i)] = i;
+        std::stable_sort(order.begin(), order.end(), [&](int a, int b) { return ids[static_cast<size_t>(a)] < ids[static_cast<size_t>(b)]; });
+        if (rows == 2) {
+          for (int r = 0; r < n; ++r) {
+            std::printf("   plan pair %2d: expert %3d token %d | src %2d expert %3d -> pos %d\n", r, plan[static_cast<size_t>(qwen4exp::kMoePlanPairExpert + r)], plan[static_cast<size_t>(qwen4exp::kMoePlanPairToken + r)], r,
+                        ids[static_cast<size_t>(r)], plan[static_cast<size_t>(qwen4exp::kMoePlanPosOfSrc + r)]);
+          }
+        }
+        bool ok = true;
+        for (int r = 0; r < n && ok; ++r) {
+          const int p = order[static_cast<size_t>(r)];
+          ok = plan[static_cast<size_t>(qwen4exp::kMoePlanPairExpert + r)] == ids[static_cast<size_t>(p)] &&
+               plan[static_cast<size_t>(qwen4exp::kMoePlanPairToken + r)] == p / kTopK && plan[static_cast<size_t>(qwen4exp::kMoePlanPosOfSrc + p)] == r;
+          if (!ok) {
+            std::printf("   first mismatch at sorted pair %d (source %d): expert %d/%d token %d/%d pos_of_src %d (want %d)\n", r, p, plan[static_cast<size_t>(qwen4exp::kMoePlanPairExpert + r)],
+                        ids[static_cast<size_t>(p)], plan[static_cast<size_t>(qwen4exp::kMoePlanPairToken + r)], p / kTopK, plan[static_cast<size_t>(qwen4exp::kMoePlanPosOfSrc + p)], r);
+          }
+        }
+        int g = 0, max_cnt = 0;
+        for (int r = 0; r < n && ok;) {
+          const int e = ids[static_cast<size_t>(order[static_cast<size_t>(r)])];
+          int cnt = 0;
+          while (r + cnt < n && ids[static_cast<size_t>(order[static_cast<size_t>(r + cnt)])] == e) ++cnt;
+          for (int off = 0; off < cnt; off += 16, ++g) {
+            const int c = std::min(16, cnt - off);
+            max_cnt = std::max(max_cnt, c);
+            ok = ok && plan[static_cast<size_t>(qwen4exp::kMoePlanGrpExpert + g)] == e && plan[static_cast<size_t>(qwen4exp::kMoePlanGrpStart + g)] == r + off &&
+                 plan[static_cast<size_t>(qwen4exp::kMoePlanGrpCount + g)] == c;
+          }
+          r += cnt;
+        }
+        ok = ok && plan[qwen4exp::kMoePlanNGroups] == g && g <= std::min(n, n / 16 + kE);
+        std::printf("large plan, %4d rows (%5d pairs): %d groups (bound %d), device plan %s the CPU reference\n", rows, n, g, std::min(n, n / 16 + kE),
+                    ok ? "equals" : "DIFFERS FROM");
+        Check(ok, "GroupedMoePlanLarge differs from the CPU plan at " + std::to_string(rows) + " rows");
+      }
+    }
+    // ---- the PREFILL MoE (Qwen35PrefillMoe: 2..512 rows, groups of <= 16 pairs, no host round trip) against the host-routed MoE ----
+    {
+      constexpr int kMaxPf = 512;
+      core::DeviceBuffer<uint16_t> xp = Bf16Buffer(static_cast<size_t>(kMaxPf) * kH, rng, 1.0f), ypg(static_cast<size_t>(kMaxPf) * kH),
+          yph(static_cast<size_t>(kMaxPf) * kH);
+      qwen4exp::MoeBlockBase host_pf(mc, kMaxPf);
+      std::vector<uint16_t> ga(static_cast<size_t>(kMaxPf) * kH), ha(static_cast<size_t>(kMaxPf) * kH);
+      const int skg_cfgs[][2] = {{1, 1}, {2, 2}, {4, 4}};
+      for (const auto& cfg : skg_cfgs) {
+        Qwen35PrefillMoe pm(kE, kTopK, /*norm_topk=*/true, kMaxPf, kI, cfg[0], cfg[1]);
+        for (int rows : {2, 7, 33, 64, 256, 512}) {
+          pm.Run(s, arena, weights_of(L[0]), L[0].p, xp.data(), ypg.data(), rows);
+          arena.Reset();
+          host_pf.Forward(s, block_arena, mw, xp.data(), yph.data(), rows, fn);
+          block_arena.Reset();
+          R4DX_HIP_CHECK(hipStreamSynchronize(s));
+          ypg.CopyToHost(ga.data(), static_cast<size_t>(rows) * kH);
+          yph.CopyToHost(ha.data(), static_cast<size_t>(rows) * kH);
+          double worst_row = 0, sum_row = 0;
+          int64_t differing = 0;
+          for (int r = 0; r < rows; ++r) {
+            double sq = 0, sum = 0;
+            for (int d = 0; d < kH; ++d) {
+              const size_t i = static_cast<size_t>(r) * kH + d;
+              const double ref = Bf(ha[i]), got = Bf(ga[i]);
+              if (!std::isfinite(got)) Check(false, "non-finite prefill MoE output");
+              sq += ref * ref;
+              sum += std::fabs(got - ref);
+              if (ga[i] != ha[i]) ++differing;
+            }
+            const double rms = std::sqrt(sq / kH);
+            if (rms > 0) {
+              worst_row = std::max(worst_row, sum / kH / rms);
+              sum_row += sum / kH / rms;
+            }
+          }
+          std::printf("prefill MoE (splits %d/%d) vs host-routed, %3d rows: mean|err|/rms worst row %.5f avg %.6f, %.3f%% of the elements differ\n",
+                      cfg[0], cfg[1], rows, worst_row, sum_row / rows, 100.0 * static_cast<double>(differing) / (static_cast<double>(rows) * kH));
+          Check(worst_row <= 0.01, "prefill MoE differs from the host-routed one beyond bf16 noise (rows " + std::to_string(rows) + ", mean/rms " +
+                                       std::to_string(worst_row) + ")");
+        }
+        // cost of one layer-call at 256 / 512 rows: the weights cycle through the synthetic layers, the input rows are fixed
+        for (int rows : {64, 256, 512}) {
+          for (int i = 0; i < 3; ++i) {
+            pm.Run(s, arena, weights_of(L[static_cast<size_t>(i % layers)]), L[static_cast<size_t>(i % layers)].p, xp.data(), ypg.data(), rows);
+            arena.Reset();
+          }
+          R4DX_HIP_CHECK(hipStreamSynchronize(s));
+          const int reps = 12;
+          const auto t0 = std::chrono::steady_clock::now();
+          for (int i = 0; i < reps; ++i) {
+            pm.Run(s, arena, weights_of(L[static_cast<size_t>(i % layers)]), L[static_cast<size_t>(i % layers)].p, xp.data(), ypg.data(), rows);
+            arena.Reset();
+          }
+          R4DX_HIP_CHECK(hipStreamSynchronize(s));
+          const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count() / reps;
+          std::printf("   prefill MoE (splits %d/%d) %3d rows: %.3f ms per layer-call (%.0f rows/s for the MoE alone)\n", cfg[0], cfg[1], rows, ms,
+                      1000.0 * rows / ms);
+        }
+      }
+      for (int rows : {64, 256, 512}) {
+        host_pf.Forward(s, block_arena, mw, xp.data(), yph.data(), rows, fn);
+        block_arena.Reset();
+        R4DX_HIP_CHECK(hipStreamSynchronize(s));
+        const int reps = 4;
+        const auto t0 = std::chrono::steady_clock::now();
+        for (int i = 0; i < reps; ++i) {
+          host_pf.Forward(s, block_arena, mw, xp.data(), yph.data(), rows, fn);
+          block_arena.Reset();
+        }
+        R4DX_HIP_CHECK(hipStreamSynchronize(s));
+        const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count() / reps;
+        std::printf("   host-routed MoE %3d rows: %.3f ms per layer-call (%.0f rows/s for the MoE alone)\n", rows, ms, 1000.0 * rows / ms);
+      }
+    }  }
 
   // ---- grouped benchmark over `layers` layers --------------------------------------------------------------------------
   {

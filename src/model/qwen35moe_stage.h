@@ -236,6 +236,8 @@ class Qwen35MoeStage {
   void SetGroupedDecode(bool on, bool with_capture = false);
   // How many of this stage's layers take the grouped decode MoE (0 when it is off).
   int64_t GroupedDecodeLayers() const;
+  // Test hook: the device-side prefill MoE (Qwen35PrefillMoe) on / off at run time (R4DX_Q35_PREFILL_MOE sets the start value).
+  void SetPrefillMoe(bool on);
 
   // Wall milliseconds of the stage's last RunLayers / Head call (host clock).
   double LastRunMs() const;

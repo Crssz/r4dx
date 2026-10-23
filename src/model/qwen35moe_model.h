@@ -186,6 +186,7 @@ class Qwen35MoeModel {
   // Test hook: the grouped decode MoE on / off at run time; GroupedDecodeLayers() = how many layers (all stages) take it right now.
   void SetGroupedDecode(bool on, bool with_capture = false);
   int64_t GroupedDecodeLayers() const;
+  void SetPrefillMoe(bool on);  // test hook: the device-side prefill MoE on / off (all stages)
 
   // Layer-isolated forward (tests): Reset()s the sequence, then feeds `token_ids` in chunks through ONLY layer `layer`
   // (global index): each chunk's residual input is the caller's `residual_in` rows [T, hidden] bf16 (HOST; e.g. the HF
@@ -249,6 +250,9 @@ class Qwen35MoeModel {
   // Feeds the first `rows` captured feature rows (positions start_pos ...) to the drafter's ring.
   // Rows at positions below `min_pos` are skipped (a prompt's rows older than the drafter's window).
   void InjectCaptured(int64_t rows, int64_t start_pos, int64_t min_pos = 0);
+  // Prefill with the chunks pipelined across the two stages (qwen35moe_model_pp.cpp); R4DX_Q35_PP=0 turns it off.
+  bool CanPipelinePrefill(size_t chunks) const;
+  std::vector<float> PrefillPipelined(const std::vector<int32_t>& token_ids, const std::vector<int64_t>& plan);
 
   Qwen35MoeModelOptions opt_;
   Qwen35MoeConfig cfg_;
@@ -264,6 +268,7 @@ class Qwen35MoeModel {
 
   core::PinnedBuffer<uint16_t> embed_rows_host_;  // [kChunkRows, hidden]
   core::PinnedBuffer<uint16_t> handoff_host_;     // [kChunkRows, hidden]
+  std::vector<std::unique_ptr<core::PinnedBuffer<uint16_t>>> pp_ring_;  // PrefillPipelined's hand-off slots
 
   // ---- DFlash2 (all on the last stage's device) ----
   std::optional<DflashDraft> dflash_;

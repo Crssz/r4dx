@@ -39,7 +39,10 @@ size_t MoeBlockBase::ArenaBytes(int64_t rows) const {
 }
 
 void MoeBlockBase::Forward(hipStream_t stream, core::Arena& arena, const MoeWeights& w, const uint16_t* x,
-                           uint16_t* y, int64_t rows, const ExpertLinearFn& run_expert) {
+                           uint16_t* y, int64_t rows, const ExpertLinearFn& run_expert, const std::function<void(const char*)>* mark) {
+  const auto phase = [&](const char* name) {
+    if (mark != nullptr) (*mark)(name);
+  };
   if (rows <= 0) return;
   if (rows > max_rows_) {
     Fail("rows " + std::to_string(rows) + " exceeds max_rows " + std::to_string(max_rows_));
@@ -77,12 +80,14 @@ void MoeBlockBase::Forward(hipStream_t stream, core::Arena& arena, const MoeWeig
   R4DX_HIP_CHECK(hipMemcpyAsync(ids_host_.data(), ids, static_cast<size_t>(P) * sizeof(int32_t),
                                 hipMemcpyDeviceToHost, stream));
   R4DX_HIP_CHECK(hipEventRecord(ids_ready_.get(), stream));
+  phase("moe.router");
 
   ApplyBf16Linear(stream, arena, *w.shared_gate_proj, x, sg, rows);
   ApplyBf16Linear(stream, arena, *w.shared_up_proj, x, su, rows);
   Check(q4x_moe_silu_mul_bf16(sg, su, sh, rows, SI, SI, SI, stream), "shared silu_mul");
   ApplyBf16Linear(stream, arena, *w.shared_down_proj, sh, sy, rows);
   ApplyBf16Linear(stream, arena, *w.shared_gate, x, sgl, rows);
+  phase("moe.shared");
 
   R4DX_HIP_CHECK(hipEventSynchronize(ids_ready_.get()));
   // plan_'s vectors are rewritten only here, after this wait: every earlier upload from them has long completed.
@@ -95,20 +100,25 @@ void MoeBlockBase::Forward(hipStream_t stream, core::Arena& arena, const MoeWeig
                                 hipMemcpyHostToDevice, stream));
 
   Check(q4x_moe_gather_rows_bf16(x, d_pair_row, xg, P, H, stream), "gather rows");
+  phase("moe.plan+gather");
   for (int e = 0; e < E; ++e) {
     const int64_t n = plan_.Count(e);
     if (n == 0) continue;
     const int64_t off = plan_.expert_offset[static_cast<size_t>(e)];
     run_expert(e, ExpertLinear::kGateUp, xg + off * H, n, gu + off * 2 * I, arena);
   }
+  phase("moe.gate_up");
   Check(q4x_moe_silu_mul_bf16(gu, gu + I, hh, P, I, 2 * I, 2 * I, stream), "expert silu_mul");
+  phase("moe.silu");
   for (int e = 0; e < E; ++e) {
     const int64_t n = plan_.Count(e);
     if (n == 0) continue;
     const int64_t off = plan_.expert_offset[static_cast<size_t>(e)];
     run_expert(e, ExpertLinear::kDown, hh + off * I, n, yp + off * H, arena);
   }
+  phase("moe.down");
   Check(q4x_moe_combine_bf16(yp, d_row_pairs, d_row_w_idx, weights, sy, sgl, y, rows, k, H, stream), "combine");
+  phase("moe.combine");
 }
 
 }  // namespace r4dx::model::qwen4exp

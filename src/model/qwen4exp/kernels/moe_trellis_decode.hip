@@ -1,4 +1,4 @@
-﻿// src/model/qwen4exp/kernels/moe_trellis_decode.hip
+// src/model/qwen4exp/kernels/moe_trellis_decode.hip
 #include "r4dx/model/qwen4exp/moe_trellis_grouped.h"
 
 #include <hip/hip_runtime.h>
@@ -475,6 +475,75 @@ __global__ __launch_bounds__(256) void MoePlanRowsKernel(const int32_t* __restri
   }
 }
 
+// Large plan (prefill chunks): two launches, each expert's pairs found by scanning the ids, no sort.
+//   1. MoePlanCountKernel, grid = experts: counts[e] = number of pairs routed to e.
+//   2. MoePlanBuildKernel, grid = experts: block e takes the counts of the experts before it (start of its pairs in the sorted order, first
+//      of its groups), then walks the ids in source order with a block scan and writes its pairs; group g of an expert holds sorted pairs
+//      [16 g, 16 g + 16). Block 0 also writes the group total. Sorted order = (expert, source slot), as MoePlanRowsKernel's.
+__global__ __launch_bounds__(256) void MoePlanCountKernel(const int32_t* __restrict__ ids, int32_t* __restrict__ counts, int n) {
+  __shared__ int s_part[8];
+  const int e = static_cast<int>(blockIdx.x), tid = static_cast<int>(threadIdx.x);
+  int c = 0;
+  for (int p = tid; p < n; p += 256) c += ids[p] == e ? 1 : 0;
+  for (int o = 16; o; o >>= 1) c += __shfl_xor(c, o, 32);
+  if ((tid & 31) == 0) s_part[tid >> 5] = c;
+  __syncthreads();
+  if (tid == 0) {
+    int t = 0;
+    for (int i = 0; i < 8; ++i) t += s_part[i];
+    counts[e] = t;
+  }
+}
+
+__global__ __launch_bounds__(256) void MoePlanBuildKernel(const int32_t* __restrict__ ids, const int32_t* __restrict__ counts,
+                                                          int32_t* __restrict__ plan, int n, int top_k, int experts) {
+  __shared__ int s_wave[8];
+  __shared__ int s_red[2];
+  const int e = static_cast<int>(blockIdx.x), tid = static_cast<int>(threadIdx.x), lane = tid & 31, wave = tid >> 5;
+  if (tid == 0) {
+    int start = 0, grp = 0, total = 0;
+    for (int i = 0; i < experts; ++i) {
+      const int ci = counts[i];
+      if (i < e) {
+        start += ci;
+        grp += (ci + 15) / 16;
+      }
+      total += (ci + 15) / 16;
+    }
+    s_red[0] = start;
+    s_red[1] = grp;
+    if (e == 0) plan[mr::kMoePlanNGroups] = total;
+  }
+  __syncthreads();
+  const int start = s_red[0], grp = s_red[1], cnt = counts[e];
+  int run = 0;
+  for (int base = 0; base < n; base += 256) {
+    const int p = base + tid;
+    const bool m = p < n && ids[p] == e;
+    const unsigned mask = static_cast<unsigned>(__builtin_amdgcn_ballot_w32(m));  // wave32 (the 64-bit __ballot is wrong here)
+    const int rank_in_wave = __popc(mask & ((1u << lane) - 1u));
+    if (lane == 0) s_wave[wave] = __popc(mask);
+    __syncthreads();
+    int before = 0, total = 0;
+    for (int w = 0; w < 8; ++w) {
+      if (w < wave) before += s_wave[w];
+      total += s_wave[w];
+    }
+    if (m) {
+      const int r = start + run + before + rank_in_wave;
+      plan[mr::kMoePlanPairExpert + r] = e;
+      plan[mr::kMoePlanPairToken + r] = p / top_k;
+      plan[mr::kMoePlanPosOfSrc + p] = r;
+    }
+    run += total;
+    __syncthreads();
+  }
+  for (int g = tid; g * 16 < cnt; g += 256) {
+    plan[mr::kMoePlanGrpExpert + grp + g] = e;
+    plan[mr::kMoePlanGrpStart + grp + g] = start + 16 * g;
+    plan[mr::kMoePlanGrpCount + grp + g] = min(16, cnt - 16 * g);
+  }
+}
 template <int K>
 __global__ __launch_bounds__(32) void GroupedTrellisInputGateUpRowsKernel(
     const uint16_t* __restrict__ x, const int32_t* __restrict__ plan, const float* __restrict__ all_suh,
@@ -1058,9 +1127,19 @@ hipError_t GroupedMoeDecodeCombine(const uint16_t* yp, const float* weights_sort
 // ------------------------------------------------------------------------------------------------
 // M-row launchers (qwen3_5_moe geometry)
 // ------------------------------------------------------------------------------------------------
+hipError_t GroupedMoePlanLarge(const int32_t* ids, int32_t* plan, int32_t* counts, int rows, int top_k, int experts, void* stream) {
+  if (rows <= 0) return hipSuccess;
+  if (top_k < 1 || top_k > 16 || experts < 1 || experts > 1024 || rows * top_k > kMoePlanMaxPairs) return hipErrorInvalidValue;
+  const int n = rows * top_k;
+  const auto st = static_cast<hipStream_t>(stream);
+  hipLaunchKernelGGL(MoePlanCountKernel, dim3(static_cast<unsigned>(experts)), dim3(256), 0, st, ids, counts, n);
+  hipLaunchKernelGGL(MoePlanBuildKernel, dim3(static_cast<unsigned>(experts)), dim3(256), 0, st, ids, counts, plan, n, top_k, experts);
+  return hipGetLastError();
+}
+
 hipError_t GroupedMoePlanRows(const int32_t* ids, int32_t* plan, int rows, int top_k, void* stream) {
   if (rows <= 0 || top_k <= 0) return hipSuccess;
-  if (rows > kMoeRowsMax || top_k > 16 || rows * top_k > kMoePlanMaxPairs) return hipErrorInvalidValue;
+  if (rows > kMoeRowsMax || top_k > 16 || rows * top_k > kMoePlanDecodePairs) return hipErrorInvalidValue;
   hipLaunchKernelGGL(MoePlanRowsKernel, dim3(1), dim3(256), 0, static_cast<hipStream_t>(stream), ids, plan, rows * top_k, top_k);
   return hipGetLastError();
 }

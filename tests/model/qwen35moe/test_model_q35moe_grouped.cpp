@@ -108,6 +108,7 @@ int RunTest() {
   o.devices = {TestDevice(), TestDevice()};
   o.grouped_decode = 1;
   auto model = Qwen35MoeModel::Load(o);
+  model->SetPrefillMoe(false);  // this test is about the decode MoE: the prompts always prefill host-routed (the prefill MoE has its own test)
   const int64_t layers = model->NumLoadedLayers();
   std::printf("trellis container %s on device %d: %lld layer(s), %lld take the grouped decode MoE\n", path.c_str(), TestDevice(),
               static_cast<long long>(layers), static_cast<long long>(model->GroupedDecodeLayers()));

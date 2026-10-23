@@ -33,7 +33,7 @@ bool Qwen35GroupedMoeDecode::Supported(int64_t hidden, int64_t inter, int64_t sh
 Qwen35GroupedMoeDecode::Qwen35GroupedMoeDecode(int experts, int top_k, bool norm_topk, int max_rows, int inter)
     : experts_(experts), top_k_(top_k), norm_topk_(norm_topk), inter_(inter), max_rows_(max_rows) {
   if (inter != kInter && inter != kTp2Inter) throw std::invalid_argument("Qwen35GroupedMoeDecode: inter must be 1024 (TP=1) or 512 (a --tp 2 rank)");
-  if (max_rows < 1 || max_rows > kMaxRows || max_rows * top_k > qwen4exp::kMoePlanMaxPairs) {
+  if (max_rows < 1 || max_rows > kMaxRows || max_rows * top_k > qwen4exp::kMoePlanDecodePairs) {
     throw std::invalid_argument("Qwen35GroupedMoeDecode: max_rows must be in [1, 16] with max_rows * top_k <= 256");
   }
   const size_t k = static_cast<size_t>(top_k), E = static_cast<size_t>(experts);

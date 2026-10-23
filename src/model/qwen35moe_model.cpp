@@ -518,6 +518,12 @@ std::vector<float> Qwen35MoeModel::Prefill(const std::vector<int32_t>& token_ids
   HeadOut out;
   const Qwen35MoeHeadRequest req{Qwen35MoeHeadRequest::Kind::kLogits, 0.0f};
   const std::vector<int64_t> plan = PlanChunks(static_cast<int64_t>(token_ids.size()));
+  if (CanPipelinePrefill(plan.size())) {
+    std::vector<float> lg = PrefillPipelined(token_ids, plan);
+    at_prefill_end_ = true;
+    last_.total_ms = MsSince(t0);
+    return lg;
+  }
   int64_t off = 0;
   // The drafter only ever attends to the last `sliding_window` positions, so the earlier rows of a long prompt are never injected
   // (a gap, DflashDraft::InjectFeatures -- exact, the window masks those keys for every later query).
@@ -835,6 +841,10 @@ void Qwen35MoeModel::SetCapture(Qwen35MoeCaptureFn fn) {
 
 void Qwen35MoeModel::SetGroupedDecode(bool on, bool with_capture) {
   for (auto& st : stages_) st->SetGroupedDecode(on, with_capture);
+}
+
+void Qwen35MoeModel::SetPrefillMoe(bool on) {
+  for (auto& st : stages_) st->SetPrefillMoe(on);
 }
 
 int64_t Qwen35MoeModel::GroupedDecodeLayers() const {

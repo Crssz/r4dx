@@ -1,4 +1,4 @@
-﻿// src/model/qwen4exp/include/r4dx/model/qwen4exp/moe_trellis_grouped.h
+// src/model/qwen4exp/include/r4dx/model/qwen4exp/moe_trellis_grouped.h
 //
 // Grouped (all selected experts in one launch) trellis decode MoE, M = 1. The kernels are instantiated for exactly one
 // geometry: hidden 2560, expert intermediate 640 (gate_up N 1280, two parts), at most 16 experts per token, at most
@@ -141,7 +141,8 @@ hipError_t GroupedTrellisGemvDownQ35Tp2(int kb, const uint16_t* in_a0, const int
 //   [kMoePlanPosOfSrc + s]              sorted position of source slot s = token * top_k + j (j = router rank)
 //   [kMoePlanGrpExpert/Start/Count + g] group g: expert, first sorted pair, number of pairs (<= 16)
 constexpr int kMoeRowsMax = 16;
-constexpr int kMoePlanMaxPairs = 256;  // rows * top_k
+constexpr int kMoePlanDecodePairs = 256;   // rows * top_k the single-workgroup GroupedMoePlanRows sorts (a verify window)
+constexpr int kMoePlanMaxPairs = 8192;     // rows * top_k the plan arrays hold (GroupedMoePlanLarge: a prefill chunk of up to 1024 rows at top-8)
 constexpr int kMoePlanNGroups = 0;
 constexpr int kMoePlanPairExpert = 16;
 constexpr int kMoePlanPairToken = kMoePlanPairExpert + kMoePlanMaxPairs;
@@ -155,8 +156,12 @@ constexpr int kMoePlanInts = kMoePlanGrpCount + kMoePlanMaxPairs;
 // and the output equals the M = 1 grouped kernel's bit for bit, row by row.
 constexpr int kMoeRowsMaxSkg = 4;
 
-// ids: int32 [rows * top_k] (router order per token) -> plan. rows * top_k <= kMoePlanMaxPairs.
+// ids: int32 [rows * top_k] (router order per token) -> plan. rows * top_k <= kMoePlanDecodePairs.
 hipError_t GroupedMoePlanRows(const int32_t* ids, int32_t* plan, int rows, int top_k, void* stream);
+// The same plan for a PREFILL chunk: rows * top_k <= kMoePlanMaxPairs pairs over up to `experts` (<= 1024) experts, device side, deterministic.
+// A group is at most 16 pairs, so an expert with more is split into consecutive groups (each re-reads the expert's weights): the number of groups
+// is at most min(pairs, pairs / 16 + experts) -- pass that as `max_groups` to the GEMM launchers. `counts` is caller scratch: int32 [experts].
+hipError_t GroupedMoePlanLarge(const int32_t* ids, int32_t* plan, int32_t* counts, int rows, int top_k, int experts, void* stream);
 // x [rows, 3072] bf16 -> A0 / A1 [pairs, 3072] fp16 (row p: the sorted pair p's token transformed with its expert's sign vectors).
 hipError_t GroupedTrellisInputGateUpQ35Rows(const uint16_t* x, const int32_t* plan, const float* all_suh, uint16_t* out_a0,
                                             uint16_t* out_a1, int n_pairs, void* stream);

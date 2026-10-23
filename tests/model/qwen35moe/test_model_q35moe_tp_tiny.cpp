@@ -47,7 +47,7 @@ struct Result {
   std::map<int, std::vector<float>> prefill_logits;  // T -> last-row logits
   std::map<std::string, Captured> caps;               // "run:name"
   std::vector<int32_t> greedy, sampled;
-  std::vector<std::vector<float>> decode_logits;
+  std::vector<std::vector<float>> decode_logits, hostrouted_logits;  // the second: the same steps with the grouped decode MoE switched off
   int64_t grouped_layers = 0;
 };
 
@@ -112,6 +112,17 @@ Result Scenario(Qwen35MoeModel& m) {
       r.decode_logits.push_back(m.DecodeStep(t3));
       t3 = static_cast<int32_t>(ArgMax(r.decode_logits.back().data(), static_cast<int64_t>(r.decode_logits.back().size())));
     }
+  }
+  if (r.grouped_layers > 0) {
+    m.SetGroupedDecode(false);
+    m.Reset();
+    (void)m.Prefill(Ids(70));
+    int32_t t4 = r.greedy[0];
+    for (int i = 0; i < 3; ++i) {
+      r.hostrouted_logits.push_back(m.DecodeStep(t4));
+      t4 = static_cast<int32_t>(ArgMax(r.hostrouted_logits.back().data(), static_cast<int64_t>(r.hostrouted_logits.back().size())));
+    }
+    m.SetGroupedDecode(true);
   }
   m.Reset();
   return r;
@@ -292,6 +303,17 @@ bool RunLayout(const std::string& path, const std::string& layout) {
   Check(two[0].greedy == two[1].greedy, layout + " greedy tokens identical on both ranks");
   Check(two[0].sampled == two[1].sampled, layout + " sampled tokens identical on both ranks");
   Check(two[0].decode_logits == two[1].decode_logits, layout + " decode logits identical on both ranks");
+  if (two[0].grouped_layers > 0) {
+    // the grouped Tp2 kernels against the host-routed per-expert GEMMs at the rank's shapes (same 4 / 4 split-group order as FallbackTuning picks at TP=1)
+    bool exact = two[0].decode_logits.size() == two[0].hostrouted_logits.size();
+    double worst = 0;
+    for (size_t i = 0; i < two[0].decode_logits.size() && i < two[0].hostrouted_logits.size(); ++i) {
+      exact = exact && two[0].decode_logits[i] == two[0].hostrouted_logits[i];
+      worst = std::max(worst, CompareF32(two[0].decode_logits[i].data(), two[0].hostrouted_logits[i].data(), static_cast<int64_t>(two[0].decode_logits[i].size())).mean_norm);
+    }
+    std::printf("TP2 grouped decode MoE vs host-routed MoE: decode logits %s, worst mean/rms %.6f\n", exact ? "bit-identical" : "differ", worst);
+    Check(worst <= 0.01, layout + " TP2 grouped decode MoE equals the host-routed MoE within 0.01 mean/rms (identical expected)");
+  }
 
   // 2. TP=2 against the single-device model
   const Bound layer_bound{0.02, 0.08, 0.05, 0.12};  // measured: moe_out 0.006-0.007, residual_out 0.002-0.004 (mean|err| / rms)

@@ -202,6 +202,16 @@ class Qwen35MoeModel {
   };
   const Timings& LastTimings() const { return last_; }
 
+  // GPU time of the last chunk, hipEvent spans on each stage's stream (the host clock of Timings only sees the enqueue of a decode step):
+  // every stage's layers and the head. EnableStepProfile(true) first; read after the call returned (the head synchronized).
+  void EnableStepProfile(bool on);
+  struct StepGpu {
+    double layers_ms[2] = {0, 0};  // stage 0, stage 1 (a single stage fills [0])
+    double head_ms = 0;
+    double Total() const { return layers_ms[0] + layers_ms[1] + head_ms; }
+  };
+  StepGpu LastStepGpu() const;
+
   // VRAM of each stage's device (hipMemGetInfo is device-wide) next to this process's own DeviceBuffer bytes.
   std::vector<VramReport> Vram() const;
 

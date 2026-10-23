@@ -234,6 +234,12 @@ class Qwen35MoeStage {
   // Wall milliseconds of the stage's last RunLayers / Head call (host clock).
   double LastRunMs() const;
   double LastHeadMs() const;
+  // GPU time (hipEvent spans on the stage's stream, not host time): of the layers of the last RunLayers call and of the last Head call. A decode step
+  // only ENQUEUES its layers, so LastRunMs() is the enqueue time; these are what the GPU spent (the --tp 2 economic gate compares them). Valid once
+  // the call's stream work completed (any later synchronizing call); a getter waits for its end event. Costs two events per call while on.
+  void EnableStepProfile(bool on);
+  double LastLayersGpuMs() const;
+  double LastHeadGpuMs() const;
 
   struct Impl;
 

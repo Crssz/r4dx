@@ -179,6 +179,12 @@ struct Qwen35MoeStage::Impl {
 
   Qwen35MoeCaptureFn capture;
   double last_run_ms = 0, last_head_ms = 0;
+  // EnableStepProfile: hipEvents around the layers of a RunLayers call ([0], [1]) and around a Head call ([2], [3]); the GPU spans, not host time.
+  bool step_prof = false;
+  hipEvent_t sp_ev[4] = {nullptr, nullptr, nullptr, nullptr};
+  void SpMark(int i) {
+    if (step_prof) R4DX_HIP_CHECK(hipEventRecord(sp_ev[i], stream.get()));
+  }
   int64_t last_first_pos = 0;  // first position of the chunk RunLayers ran last (the head's capture rows start there)
 
   void Cap(int64_t layer, const char* suffix, const void* dev, Qwen35MoeCapture::Dtype dt, int64_t rows, int64_t cols,
@@ -546,6 +552,7 @@ Qwen35MoeStage::~Qwen35MoeStage() {
     for (hipEvent_t ev : impl_->prof_phase_ev) static_cast<void>(hipEventDestroy(ev));
   }
   for (hipEvent_t ev : impl_->prof_ev) static_cast<void>(hipEventDestroy(ev));
+  if (impl_->step_prof) EnableStepProfile(false);
   impl_.reset();  // frees on the stage's device
 }
 
@@ -751,6 +758,7 @@ void Qwen35MoeStage::RunLayers(const Qwen35MoeChunk& c) {
   const bool is_decode = (T == 1 && !c.is_prefill && !m.capture);
   m.arena.Reset();
   if (c.is_prefill) m.CollapseWindow();
+  m.SpMark(0);
 
   for (auto& lp : m.layers) {
     LayerRt& L = *lp;
@@ -801,6 +809,7 @@ void Qwen35MoeStage::RunLayers(const Qwen35MoeChunk& c) {
     R4DX_HIP_CHECK(hipMemcpy2DAsync(m.tap_dst + m.taps.front().column * m.hidden, static_cast<size_t>(m.tap_pitch) * 2, m.tap_dev.data(),
                                     width, width, static_cast<size_t>(T), hipMemcpyDeviceToHost, m.stream.get()));
   }
+  m.SpMark(1);
   const double enqueue_ms = MsSince(t0);
   if (!is_decode) m.stream.Synchronize();
   if (m.prof_on && c.verify) {
@@ -832,6 +841,7 @@ Qwen35MoeHeadResult Qwen35MoeStage::Head(int64_t rows, const Qwen35MoeHeadReques
   const QuantLinear& lm = *m.head_refs->lm_head;
   const uint16_t* final_norm = m.head_refs->final_norm;
   m.arena.Reset();
+  m.SpMark(2);
 
   if (m.capture) {
     // every row of the chunk (tests): the final norm, then the lm_head over all of them
@@ -855,6 +865,7 @@ Qwen35MoeHeadResult Qwen35MoeStage::Head(int64_t rows, const Qwen35MoeHeadReques
     case Qwen35MoeHeadRequest::Kind::kLogits: {
       r4dx_model_widen_bf16_to_f32(reinterpret_cast<int64_t>(logits_bf16), reinterpret_cast<int64_t>(m.logits_dev.data()),
                                    m.vocab_local, reinterpret_cast<int64_t>(s));
+      m.SpMark(3);
       m.stream.Synchronize();
       if (m.comm != nullptr) {
         out.logits = m.GatherVocabRow();
@@ -871,6 +882,7 @@ Qwen35MoeHeadResult Qwen35MoeStage::Head(int64_t rows, const Qwen35MoeHeadReques
                                      m.vocab_local, reinterpret_cast<int64_t>(s));
         r4dx_argmax_val_f32(reinterpret_cast<int64_t>(m.logits_dev.data()), reinterpret_cast<int64_t>(m.argmax_pair_dev.data()),
                             reinterpret_cast<int64_t>(m.argmax_pair_dev.data() + 1), m.vocab_local, reinterpret_cast<int64_t>(s));
+        m.SpMark(3);
         m.stream.Synchronize();
         tp::ArgmaxPair mine{};
         static_assert(sizeof(tp::ArgmaxPair) == 2 * sizeof(int32_t), "{idx, value} pair is two 32-bit words");
@@ -883,6 +895,7 @@ Qwen35MoeHeadResult Qwen35MoeStage::Head(int64_t rows, const Qwen35MoeHeadReques
       }
       r4dx_argmax_bf16(reinterpret_cast<int64_t>(logits_bf16), reinterpret_cast<int64_t>(m.argmax_dev.data()), m.vocab,
                        reinterpret_cast<int64_t>(s));
+      m.SpMark(3);
       R4DX_HIP_CHECK(hipMemcpyAsync(m.greedy_host.data(), m.argmax_dev.data(), sizeof(int32_t), hipMemcpyDeviceToHost, s));
       m.stream.Synchronize();
       out.token = m.greedy_host[0];
@@ -896,6 +909,7 @@ Qwen35MoeHeadResult Qwen35MoeStage::Head(int64_t rows, const Qwen35MoeHeadReques
                            reinterpret_cast<int64_t>(m.summary_vals_dev.data()),
                            reinterpret_cast<int64_t>(m.summary_lse_dev.data()), 1, m.vocab_local, req.inv_temperature,
                            reinterpret_cast<int64_t>(s), reinterpret_cast<int64_t>(m.topk_ws.data()));
+      m.SpMark(3);
       m.stream.Synchronize();
       std::vector<int32_t> ids(R4DX_TOPK_LSE_K);
       std::vector<float> vals(R4DX_TOPK_LSE_K);
@@ -974,6 +988,40 @@ void Qwen35MoeStage::RestoreCheckpoint(int64_t /*pos*/) {
 }
 
 // ---- speculative window ----------------------------------------------------------------------------------------------
+
+void Qwen35MoeStage::EnableStepProfile(bool on) {
+  Impl& m = *impl_;
+  Qwen35MoeDeviceScope dev(m.device);
+  if (on && !m.step_prof) {
+    for (hipEvent_t& ev : m.sp_ev) R4DX_HIP_CHECK(hipEventCreate(&ev));
+  } else if (!on && m.step_prof) {
+    for (hipEvent_t& ev : m.sp_ev) {
+      static_cast<void>(hipEventDestroy(ev));
+      ev = nullptr;
+    }
+  }
+  m.step_prof = on;
+}
+
+double Qwen35MoeStage::LastLayersGpuMs() const {
+  Impl& m = *impl_;
+  if (!m.step_prof) Fail("LastLayersGpuMs: EnableStepProfile(true) was not called");
+  Qwen35MoeDeviceScope dev(m.device);
+  R4DX_HIP_CHECK(hipEventSynchronize(m.sp_ev[1]));
+  float ms = 0;
+  R4DX_HIP_CHECK(hipEventElapsedTime(&ms, m.sp_ev[0], m.sp_ev[1]));
+  return ms;
+}
+
+double Qwen35MoeStage::LastHeadGpuMs() const {
+  Impl& m = *impl_;
+  if (!m.step_prof) Fail("LastHeadGpuMs: EnableStepProfile(true) was not called");
+  Qwen35MoeDeviceScope dev(m.device);
+  R4DX_HIP_CHECK(hipEventSynchronize(m.sp_ev[3]));
+  float ms = 0;
+  R4DX_HIP_CHECK(hipEventElapsedTime(&ms, m.sp_ev[2], m.sp_ev[3]));
+  return ms;
+}
 
 int64_t Qwen35MoeStage::SpecWindow() const { return impl_->spec_window; }
 

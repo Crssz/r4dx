@@ -782,6 +782,17 @@ std::string Qwen35MoeModel::RoundStatsLine() const {
   return buf;
 }
 
+void Qwen35MoeModel::EnableStepProfile(bool on) {
+  for (auto& st : stages_) st->EnableStepProfile(on);
+}
+
+Qwen35MoeModel::StepGpu Qwen35MoeModel::LastStepGpu() const {
+  StepGpu g;
+  for (size_t s = 0; s < stages_.size(); ++s) g.layers_ms[std::min<size_t>(s, 1)] += stages_[s]->LastLayersGpuMs();
+  g.head_ms = stages_.back()->LastHeadGpuMs();
+  return g;
+}
+
 void Qwen35MoeModel::SetCapture(Qwen35MoeCaptureFn fn) {
   capture_active_ = static_cast<bool>(fn);
   for (auto& st : stages_) st->SetCapture(fn);

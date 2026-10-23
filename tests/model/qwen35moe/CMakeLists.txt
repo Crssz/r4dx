@@ -37,6 +37,10 @@ target_link_libraries(test_q35moe_tp_shard PRIVATE r4dx_tp_shard r4dx_convert r4
 add_test(NAME test_q35moe_tp_shard COMMAND test_q35moe_tp_shard)
 set_tests_properties(test_q35moe_tp_shard PROPERTIES LABELS "q35moe" ENVIRONMENT "HIP_VISIBLE_DEVICES=-1")
 
+# tool_q35moe_tp_step: the P2 economic gate (layer split vs one TP rank without a peer, GPU-event spans); not a ctest.
+add_executable(tool_q35moe_tp_step tool_q35moe_tp_step.cpp)
+target_link_libraries(tool_q35moe_tp_step PRIVATE r4dx_model r4dx_model_qwen4exp_kernels r4dx_core r4d_core)
+
 # tool_q35moe_dflash: the real-container DFlash2 benchmark / lossless audit (not a ctest: it needs the 52 GB Ornith container and both cards).
 add_executable(tool_q35moe_dflash tool_q35moe_dflash.cpp)
 target_link_libraries(tool_q35moe_dflash PRIVATE r4dx_model r4dx_model_qwen4exp_kernels r4dx_core r4d_core)

@@ -885,57 +885,57 @@ namespace {
 int g_q35_gu_skg = kQ35GuSkg;
 int g_q35_down_skg = kQ35DownSkg;
 
-template <int KB, int SKG>
+template <int INTER, int KB, int SKG>
 hipError_t LaunchGuQ35(const uint16_t* in_a0, const uint16_t* in_a1, const int32_t* ids_sorted, const uint32_t* all_w,
                        const float* all_svh, uint16_t* out_c, float* ws, unsigned* all_tickets, int top_k, hipStream_t st) {
-  constexpr int N = 2 * kQ35Inter;
+  constexpr int N = 2 * INTER;
   const float out_scale = static_cast<float>(1.0 / std::sqrt(128.0));
   const size_t smem = 2 * 128 * 8 * sizeof(float);
   constexpr size_t w_per = static_cast<size_t>(N) * kQ35Hidden * KB / 32;
   constexpr size_t svh_per = N, ws_per = SKG * N, tickets_per = N / 128;
-  hipLaunchKernelGGL((GroupedGemmTrellisM1Kernel<KB, kQ35Hidden, N, kQ35Inter, 2, SKG, 2, w_per, svh_per, ws_per, tickets_per>),
+  hipLaunchKernelGGL((GroupedGemmTrellisM1Kernel<KB, kQ35Hidden, N, INTER, 2, SKG, 2, w_per, svh_per, ws_per, tickets_per>),
                      dim3(N / 128, SKG, static_cast<unsigned>(top_k)), dim3(256), smem, st, (const unsigned short*)in_a0,
                      (const unsigned short*)in_a1, all_w, all_svh, ids_sorted, out_c, ws, all_tickets, out_scale);
   return hipGetLastError();
 }
 
-template <int KB>
+template <int INTER, int KB>
 hipError_t DispatchGuQ35(int skg, const uint16_t* in_a0, const uint16_t* in_a1, const int32_t* ids_sorted, const uint32_t* all_w,
                          const float* all_svh, uint16_t* out_c, float* ws, unsigned* all_tickets, int top_k, hipStream_t st) {
   switch (skg) {
-    case 2: return LaunchGuQ35<KB, 2>(in_a0, in_a1, ids_sorted, all_w, all_svh, out_c, ws, all_tickets, top_k, st);
-    case 3: return LaunchGuQ35<KB, 3>(in_a0, in_a1, ids_sorted, all_w, all_svh, out_c, ws, all_tickets, top_k, st);
-    case 4: return LaunchGuQ35<KB, 4>(in_a0, in_a1, ids_sorted, all_w, all_svh, out_c, ws, all_tickets, top_k, st);
-    case 6: return LaunchGuQ35<KB, 6>(in_a0, in_a1, ids_sorted, all_w, all_svh, out_c, ws, all_tickets, top_k, st);
-    case 8: return LaunchGuQ35<KB, 8>(in_a0, in_a1, ids_sorted, all_w, all_svh, out_c, ws, all_tickets, top_k, st);
-    case 12: return LaunchGuQ35<KB, 12>(in_a0, in_a1, ids_sorted, all_w, all_svh, out_c, ws, all_tickets, top_k, st);
+    case 2: return LaunchGuQ35<INTER, KB, 2>(in_a0, in_a1, ids_sorted, all_w, all_svh, out_c, ws, all_tickets, top_k, st);
+    case 3: return LaunchGuQ35<INTER, KB, 3>(in_a0, in_a1, ids_sorted, all_w, all_svh, out_c, ws, all_tickets, top_k, st);
+    case 4: return LaunchGuQ35<INTER, KB, 4>(in_a0, in_a1, ids_sorted, all_w, all_svh, out_c, ws, all_tickets, top_k, st);
+    case 6: return LaunchGuQ35<INTER, KB, 6>(in_a0, in_a1, ids_sorted, all_w, all_svh, out_c, ws, all_tickets, top_k, st);
+    case 8: return LaunchGuQ35<INTER, KB, 8>(in_a0, in_a1, ids_sorted, all_w, all_svh, out_c, ws, all_tickets, top_k, st);
+    case 12: return LaunchGuQ35<INTER, KB, 12>(in_a0, in_a1, ids_sorted, all_w, all_svh, out_c, ws, all_tickets, top_k, st);
     default: return hipErrorInvalidValue;
   }
 }
 
-template <int KB, int SKG>
+template <int INTER, int KB, int SKG>
 hipError_t LaunchDownQ35(const uint16_t* in_a0, const int32_t* ids_sorted, const uint32_t* all_w_down, const float* all_svh_down,
                          uint16_t* out_yp, float* ws, unsigned* all_tickets_down, int top_k, hipStream_t st) {
   constexpr int N = kQ35Hidden;
   const float out_scale = static_cast<float>(1.0 / std::sqrt(128.0));
   const size_t smem = 2 * 128 * 8 * sizeof(float);
-  constexpr size_t w_per = static_cast<size_t>(N) * kQ35Inter * KB / 32;
+  constexpr size_t w_per = static_cast<size_t>(N) * INTER * KB / 32;
   constexpr size_t svh_per = N, ws_per = SKG * N, tickets_per = N / 128;
-  hipLaunchKernelGGL((GroupedGemmTrellisM1Kernel<KB, kQ35Inter, N, N, 2, SKG, 2, w_per, svh_per, ws_per, tickets_per>),
+  hipLaunchKernelGGL((GroupedGemmTrellisM1Kernel<KB, INTER, N, N, 2, SKG, 2, w_per, svh_per, ws_per, tickets_per>),
                      dim3(N / 128, SKG, static_cast<unsigned>(top_k)), dim3(256), smem, st, (const unsigned short*)in_a0, nullptr,
                      all_w_down, all_svh_down, ids_sorted, out_yp, ws, all_tickets_down, out_scale);
   return hipGetLastError();
 }
 
-template <int KB>
+template <int INTER, int KB>
 hipError_t DispatchDownQ35(int skg, const uint16_t* in_a0, const int32_t* ids_sorted, const uint32_t* all_w_down,
                            const float* all_svh_down, uint16_t* out_yp, float* ws, unsigned* all_tickets_down, int top_k,
                            hipStream_t st) {
   switch (skg) {
-    case 1: return LaunchDownQ35<KB, 1>(in_a0, ids_sorted, all_w_down, all_svh_down, out_yp, ws, all_tickets_down, top_k, st);
-    case 2: return LaunchDownQ35<KB, 2>(in_a0, ids_sorted, all_w_down, all_svh_down, out_yp, ws, all_tickets_down, top_k, st);
-    case 4: return LaunchDownQ35<KB, 4>(in_a0, ids_sorted, all_w_down, all_svh_down, out_yp, ws, all_tickets_down, top_k, st);
-    case 8: return LaunchDownQ35<KB, 8>(in_a0, ids_sorted, all_w_down, all_svh_down, out_yp, ws, all_tickets_down, top_k, st);
+    case 1: return LaunchDownQ35<INTER, KB, 1>(in_a0, ids_sorted, all_w_down, all_svh_down, out_yp, ws, all_tickets_down, top_k, st);
+    case 2: return LaunchDownQ35<INTER, KB, 2>(in_a0, ids_sorted, all_w_down, all_svh_down, out_yp, ws, all_tickets_down, top_k, st);
+    case 4: return LaunchDownQ35<INTER, KB, 4>(in_a0, ids_sorted, all_w_down, all_svh_down, out_yp, ws, all_tickets_down, top_k, st);
+    case 8: return LaunchDownQ35<INTER, KB, 8>(in_a0, ids_sorted, all_w_down, all_svh_down, out_yp, ws, all_tickets_down, top_k, st);
     default: return hipErrorInvalidValue;
   }
 }
@@ -955,8 +955,8 @@ hipError_t GroupedTrellisGemvGateUpQ35(int kb, const uint16_t* in_a0, const uint
                                        unsigned* all_tickets, int top_k, void* stream) {
   if (top_k <= 0) return hipSuccess;
   const auto st = static_cast<hipStream_t>(stream);
-  if (kb == 3) return DispatchGuQ35<3>(g_q35_gu_skg, in_a0, in_a1, ids_sorted, all_w, all_svh, out_c, ws, all_tickets, top_k, st);
-  if (kb == 4) return DispatchGuQ35<4>(g_q35_gu_skg, in_a0, in_a1, ids_sorted, all_w, all_svh, out_c, ws, all_tickets, top_k, st);
+  if (kb == 3) return DispatchGuQ35<kQ35Inter, 3>(g_q35_gu_skg, in_a0, in_a1, ids_sorted, all_w, all_svh, out_c, ws, all_tickets, top_k, st);
+  if (kb == 4) return DispatchGuQ35<kQ35Inter, 4>(g_q35_gu_skg, in_a0, in_a1, ids_sorted, all_w, all_svh, out_c, ws, all_tickets, top_k, st);
   return hipErrorInvalidValue;
 }
 hipError_t GroupedSiluMulTrellisInputDownQ35(const uint16_t* gu, const int32_t* ids_sorted, const float* all_suh_down,
@@ -973,8 +973,56 @@ hipError_t GroupedTrellisGemvDownQ35(int kb, const uint16_t* in_a0, const int32_
                                      int top_k, void* stream) {
   if (top_k <= 0) return hipSuccess;
   const auto st = static_cast<hipStream_t>(stream);
-  if (kb == 3) return DispatchDownQ35<3>(g_q35_down_skg, in_a0, ids_sorted, all_w_down, all_svh_down, out_yp, ws, all_tickets_down, top_k, st);
-  if (kb == 4) return DispatchDownQ35<4>(g_q35_down_skg, in_a0, ids_sorted, all_w_down, all_svh_down, out_yp, ws, all_tickets_down, top_k, st);
+  if (kb == 3) return DispatchDownQ35<kQ35Inter, 3>(g_q35_down_skg, in_a0, ids_sorted, all_w_down, all_svh_down, out_yp, ws, all_tickets_down, top_k, st);
+  if (kb == 4) return DispatchDownQ35<kQ35Inter, 4>(g_q35_down_skg, in_a0, ids_sorted, all_w_down, all_svh_down, out_yp, ws, all_tickets_down, top_k, st);
+  return hipErrorInvalidValue;
+}
+// ------------------------------------------------------------------------------------------------
+// qwen3_5_moe at TP=2 (docs/qwen35moe-tp-design.md 3.4): every expert TP-split, so a rank's expert width is 512: gate_up K 3072 / N 1024
+// (two parts of 512), silu*up + down input transform INTER 512, down K 512 / N 3072. The same kernels, instantiated for INTER 512; the
+// input transform of x (K 3072, both parts' sign vectors replicated), the sort and the combine are the TP=1 launchers unchanged.
+// ------------------------------------------------------------------------------------------------
+namespace {
+constexpr int kQ35Tp2Inter = kGroupedQ35Tp2Inter;
+int g_q35tp2_gu_skg = kGroupedQ35Tp2GuSkg;
+int g_q35tp2_down_skg = kGroupedQ35Tp2DownSkg;
+}  // namespace
+
+hipError_t GroupedQ35Tp2SetSplits(int gate_up_skg, int down_skg) {
+  const bool gu_ok = gate_up_skg == 2 || gate_up_skg == 3 || gate_up_skg == 4 || gate_up_skg == 6 || gate_up_skg == 8 || gate_up_skg == 12;
+  const bool dn_ok = down_skg == 1 || down_skg == 2 || down_skg == 4 || down_skg == 8;
+  if (!gu_ok || !dn_ok) return hipErrorInvalidValue;
+  g_q35tp2_gu_skg = gate_up_skg;
+  g_q35tp2_down_skg = down_skg;
+  return hipSuccess;
+}
+
+hipError_t GroupedTrellisGemvGateUpQ35Tp2(int kb, const uint16_t* in_a0, const uint16_t* in_a1, const int32_t* ids_sorted,
+                                          const uint32_t* all_w, const float* all_svh, uint16_t* out_c, float* ws,
+                                          unsigned* all_tickets, int top_k, void* stream) {
+  if (top_k <= 0) return hipSuccess;
+  const auto st = static_cast<hipStream_t>(stream);
+  if (kb == 3) return DispatchGuQ35<kQ35Tp2Inter, 3>(g_q35tp2_gu_skg, in_a0, in_a1, ids_sorted, all_w, all_svh, out_c, ws, all_tickets, top_k, st);
+  if (kb == 4) return DispatchGuQ35<kQ35Tp2Inter, 4>(g_q35tp2_gu_skg, in_a0, in_a1, ids_sorted, all_w, all_svh, out_c, ws, all_tickets, top_k, st);
+  return hipErrorInvalidValue;
+}
+
+hipError_t GroupedSiluMulTrellisInputDownQ35Tp2(const uint16_t* gu, const int32_t* ids_sorted, const float* all_suh_down,
+                                                uint16_t* out_a0, int top_k, void* stream) {
+  if (top_k <= 0) return hipSuccess;
+  const float scale = static_cast<float>(1.0 / std::sqrt(128.0));
+  hipLaunchKernelGGL((GroupedSiluMulTrellisInputDownKernel<kQ35Tp2Inter, true>), dim3(kQ35Tp2Inter / 128, static_cast<unsigned>(top_k)),
+                     dim3(32), 0, static_cast<hipStream_t>(stream), gu, ids_sorted, all_suh_down, out_a0, scale);
+  return hipGetLastError();
+}
+
+hipError_t GroupedTrellisGemvDownQ35Tp2(int kb, const uint16_t* in_a0, const int32_t* ids_sorted, const uint32_t* all_w_down,
+                                        const float* all_svh_down, uint16_t* out_yp, float* ws, unsigned* all_tickets_down,
+                                        int top_k, void* stream) {
+  if (top_k <= 0) return hipSuccess;
+  const auto st = static_cast<hipStream_t>(stream);
+  if (kb == 3) return DispatchDownQ35<kQ35Tp2Inter, 3>(g_q35tp2_down_skg, in_a0, ids_sorted, all_w_down, all_svh_down, out_yp, ws, all_tickets_down, top_k, st);
+  if (kb == 4) return DispatchDownQ35<kQ35Tp2Inter, 4>(g_q35tp2_down_skg, in_a0, ids_sorted, all_w_down, all_svh_down, out_yp, ws, all_tickets_down, top_k, st);
   return hipErrorInvalidValue;
 }
 hipError_t GroupedMoeDecodeSortRanked(const int32_t* ids_in, int32_t* ids_sorted_out, int32_t* rank_out, int top_k, void* stream) {

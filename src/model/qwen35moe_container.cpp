@@ -475,10 +475,12 @@ void LoadExpertClass(const SafetensorsReader& r, const LinearLoadMeta& meta, Lay
 }  // namespace
 
 Qwen35MoeContainer Qwen35MoeContainer::Load(const std::string& path, const Qwen35MoeLoadOptions& o) {
+  if (o.tp_world != 1) return LoadShard(path, o);
   const core::DirectLoadScope direct_load;  // docs/direct-storage.md
   Qwen35MoeContainer c;
   c.info_ = Inspect(path, o.layout, o.lm_head_layout);
   const Qwen35MoeConfig& cfg = c.info_.config;
+  c.local_config_ = cfg;
   const int64_t last = o.layer_last < 0 ? c.info_.layers_present : o.layer_last;
   if (o.layer_first < 0 || o.layer_first > last || last > c.info_.layers_present) {
     const bool prefix = c.info_.layers_present < cfg.num_hidden_layers;

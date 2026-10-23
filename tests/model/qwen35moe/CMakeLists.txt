@@ -24,6 +24,9 @@ q35moe_add_test(test_model_q35moe_grouped SINGLE_DEVICE)
 q35moe_add_test(test_q35moe_grouped_moe_kernel SINGLE_DEVICE)
 q35moe_add_test(test_model_q35moe_spec SINGLE_DEVICE)
 q35moe_add_test(test_q35moe_dflash2_golden SINGLE_DEVICE)
+# --tp 2 (docs/qwen35moe-tp-design.md P1): two rank models on ONE device (EmulatedComm) against the single-device model, bf16 and trellis tiny containers.
+q35moe_add_test(test_model_q35moe_tp_tiny SINGLE_DEVICE)
+q35moe_add_test(test_q35moe_tp_container SINGLE_DEVICE)
 
 # test_q35moe_tp_shard (docs/qwen35moe-tp-design.md P0 / gate G1): the --tp 2 sharding contract of qwen3_5_moe -- Qwen35MoeConfig::Shard,
 # tp::RuleFor's qwen3_5_moe table, the trellis byte plans, and (when E:\models\r4dx\ornith-1.5-122b-trellis-mix-kv.r4dx exists, read-only)

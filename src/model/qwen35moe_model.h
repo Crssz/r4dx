@@ -43,6 +43,7 @@
 #include "r4dx/core/device_buffer.hpp"
 #include "r4dx/core/pinned_buffer.hpp"
 #include "r4dx/core/stream.hpp"
+#include "r4dx/core/tp_comm.hpp"
 #include "r4dx/kernels/sampler.hpp"
 #include "text_model.h"  // VramReport
 
@@ -81,6 +82,17 @@ struct Qwen35MoeModelOptions {
   // Test hook: a target whose vocabulary is SMALLER than the drafter's (the tiny test container, 4096 vs 248320): the drafter's mask
   // token becomes vocab - 1 and only the first `vocab` rows of its codebooks are read.
   bool dflash_small_vocab = false;
+
+  // ---- tensor parallelism (--tp 2; qwen35moe_tp_model.h drives one of these per rank) --------------------------------------
+  // tp_world > 1: this model is RANK `tp_rank` of the group: ONE stage holding all layers on `tp_device` (no hand-off), loaded sharded
+  // (Qwen35MoeContainer::LoadShard), all-reducing through `tp_comm` (an endpoint of the same world and rank), its head a vocab slice merged
+  // with the other rank. Config() is then the RANK-local config (heads, experts halved; vocab global). `shared_embed_host`: the process's one pinned
+  // copy of text.embed_tokens (never duplicated per rank). A drafter / speculative window is not supported under TP yet.
+  int tp_world = 1;
+  int tp_rank = 0;
+  int tp_device = -1;
+  core::TpComm* tp_comm = nullptr;
+  std::shared_ptr<const core::PinnedBuffer<uint16_t>> shared_embed_host;
 };
 
 class Qwen35MoeModel {
@@ -94,7 +106,12 @@ class Qwen35MoeModel {
   Qwen35MoeModel(const Qwen35MoeModel&) = delete;
   Qwen35MoeModel& operator=(const Qwen35MoeModel&) = delete;
 
-  const Qwen35MoeConfig& Config() const { return cfg_; }
+  const Qwen35MoeConfig& Config() const { return cfg_; }  // the rank-local config under TP
+  const Qwen35MoeConfig& GlobalConfig() const { return global_cfg_; }
+  bool IsTp() const { return opt_.tp_world > 1; }
+  const Qwen35MoeContainer& StageContainer(int stage) const { return *containers_.at(static_cast<size_t>(stage)); }
+  // The pinned host embedding this model reads (the one the facade shares with the other rank).
+  std::shared_ptr<const core::PinnedBuffer<uint16_t>> EmbedHostShared() const { return containers_.front()->EmbedTokensHostShared(); }
   const ModelConfig& GenericConfig() const { return generic_config_; }
   const std::string& ModelId() const { return model_id_; }
   int NumStages() const { return static_cast<int>(stages_.size()); }
@@ -212,6 +229,7 @@ class Qwen35MoeModel {
 
   Qwen35MoeModelOptions opt_;
   Qwen35MoeConfig cfg_;
+  Qwen35MoeConfig global_cfg_;
   ModelConfig generic_config_;
   std::string model_id_;
   int64_t split_ = 0;

@@ -158,7 +158,20 @@ std::unique_ptr<Qwen35MoeModel> Qwen35MoeModel::Load(const Qwen35MoeModelOptions
 
   const Qwen35MoeContainerInfo info =
       Qwen35MoeContainer::Inspect(options.container_path, options.layout, options.lm_head_layout);
-  m.cfg_ = info.config;
+  const bool tp = options.tp_world > 1;
+  if (tp) {
+    if (options.tp_world != 2 || options.tp_rank < 0 || options.tp_rank >= options.tp_world || options.tp_comm == nullptr ||
+        options.tp_comm->World() != options.tp_world || options.tp_comm->Rank() != options.tp_rank || options.tp_device < 0) {
+      throw std::invalid_argument("Qwen35MoeModel::Load: tp_world 2 needs tp_rank in [0, 2), a TpComm endpoint of the same world and rank and a tp_device");
+    }
+    if (options.spec_window > 1 || !options.dflash_container.empty()) {
+      throw std::invalid_argument("Qwen35MoeModel::Load: speculative windows / the DFlash2 drafter are not supported under tensor parallelism yet");
+    }
+  } else if (options.tp_comm != nullptr || options.tp_rank != 0 || options.tp_device >= 0 || options.shared_embed_host) {
+    throw std::invalid_argument("Qwen35MoeModel::Load: tp_comm / tp_rank / tp_device / shared_embed_host are tensor-parallel options (tp_world > 1 only)");
+  }
+  m.global_cfg_ = info.config;
+  m.cfg_ = tp ? Qwen35MoeConfig::Shard(info.config, options.tp_world, options.tp_rank) : info.config;
   m.generic_config_ = info.model_config;
   m.model_id_ = info.model_id;
   const Qwen35MoeConfig& cfg = m.cfg_;
@@ -179,7 +192,12 @@ std::unique_ptr<Qwen35MoeModel> Qwen35MoeModel::Load(const Qwen35MoeModelOptions
   R4DX_HIP_CHECK(hipGetDeviceCount(&visible));
   if (visible < 1) Fail("no HIP device");
   std::vector<int> devices = options.devices;
-  if (devices.empty()) {
+  if (tp) {
+    if (tp && options.tp_device >= visible) {
+      throw std::invalid_argument("Qwen35MoeModel::Load: tp_device " + std::to_string(options.tp_device) + " is not visible");
+    }
+    devices = {options.tp_device, options.tp_device};
+  } else if (devices.empty()) {
     if (const char* e = std::getenv("R4DX_Q35_DEVICES"); e != nullptr && *e != '\0') {
       devices = ParseDevices(e, "R4DX_Q35_DEVICES");
     } else {
@@ -204,7 +222,7 @@ std::unique_ptr<Qwen35MoeModel> Qwen35MoeModel::Load(const Qwen35MoeModelOptions
       split = v;
     }
   }
-  const bool two_stage = devices[0] != devices[1] || split > 0;
+  const bool two_stage = !tp && (devices[0] != devices[1] || split > 0);  // a TP rank is always ONE stage (no hand-off)
   if (two_stage) {
     if (L < 2) Fail("a two-stage split needs at least two layers");
     if (split == 0) {
@@ -288,6 +306,9 @@ std::unique_ptr<Qwen35MoeModel> Qwen35MoeModel::Load(const Qwen35MoeModelOptions
     lo.layer_last = r.last;
     lo.load_embed = r.embed;
     lo.load_head = r.head;
+    lo.tp_world = options.tp_world;
+    lo.tp_rank = options.tp_rank;
+    lo.shared_embed_host = options.shared_embed_host;
     m.containers_.push_back(std::make_unique<Qwen35MoeContainer>(Qwen35MoeContainer::Load(options.container_path, lo)));
   }
   for (size_t s = 0; s < ranges.size(); ++s) {
@@ -305,6 +326,7 @@ std::unique_ptr<Qwen35MoeModel> Qwen35MoeModel::Load(const Qwen35MoeModelOptions
     Qwen35MoeStageOptions so;
     so.device = r.device;
     so.config = cfg;
+    so.tp_comm = options.tp_comm;
     so.max_ctx = options.max_ctx;
     so.max_rows = kChunkRows;
     so.prompt_checkpoint = options.prompt_checkpoint;

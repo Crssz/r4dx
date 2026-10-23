@@ -101,6 +101,32 @@ hipError_t GroupedTrellisGemvDownQ35(int kb, const uint16_t* in_a0, const int32_
                                      const float* all_svh_down, uint16_t* out_yp, float* ws, unsigned* all_tickets_down,
                                      int top_k, void* stream);
 
+// ---- qwen3_5_moe at TP=2 (docs/qwen35moe-tp-design.md 3.4): a rank holds half of every expert (expert width 512, shared width 512), the same
+// kernels instantiated for it: gate_up K 3072 / N 1024 (parts 512 + 512, n_split 512) and down K 512 / N 3072. The input transform of
+// x (GroupedTrellisInputGateUpQ35: K 3072, sign vectors replicated), Sort and Combine are the launchers above, unchanged. Workspaces / tickets:
+//   ws (gate_up) >= top_k * kGroupedQ35Tp2GuWsPerSlot floats, ws (down) >= top_k * kGroupedQ35Tp2DownWsPerSlot (= kGroupedQ35DownWsPerSlot),
+//   all_tickets >= experts * kGroupedQ35Tp2GuTickets u32, all_tickets_down >= experts * kGroupedQ35Tp2DownTickets u32.
+// all_w holds the rank's experts back to back (N * K * kb / 32 words each at the RANK's N, K); all_suh_down is [experts, 512].
+constexpr int kGroupedQ35Tp2Inter = 512;
+constexpr int kGroupedQ35Tp2GuSkg = 4;
+constexpr int kGroupedQ35Tp2DownSkg = 4;
+constexpr int kGroupedQ35Tp2GuWsPerSlot = 12 * 1024;
+constexpr int kGroupedQ35Tp2DownWsPerSlot = 8 * 3072;
+constexpr int kGroupedQ35Tp2GuTickets = 1024 / 128;
+constexpr int kGroupedQ35Tp2DownTickets = 3072 / 128;
+// Benchmark hook (the P2 sweep): the split-group counts of the next TP=2 launches (gate_up 2,3,4,6,8,12; down 1,2,4,8). Process-wide.
+hipError_t GroupedQ35Tp2SetSplits(int gate_up_skg, int down_skg);
+// K 3072, N 1024 (parts 512 + 512) -> out_c [top_k, 1024] bf16.
+hipError_t GroupedTrellisGemvGateUpQ35Tp2(int kb, const uint16_t* in_a0, const uint16_t* in_a1, const int32_t* ids_sorted,
+                                          const uint32_t* all_w, const float* all_svh, uint16_t* out_c, float* ws,
+                                          unsigned* all_tickets, int top_k, void* stream);
+// gu [top_k, 1024] bf16 -> out_a0 [top_k, 512] fp16.
+hipError_t GroupedSiluMulTrellisInputDownQ35Tp2(const uint16_t* gu, const int32_t* ids_sorted, const float* all_suh_down,
+                                                uint16_t* out_a0, int top_k, void* stream);
+// K 512, N 3072 -> out_yp [top_k, 3072] bf16.
+hipError_t GroupedTrellisGemvDownQ35Tp2(int kb, const uint16_t* in_a0, const int32_t* ids_sorted, const uint32_t* all_w_down,
+                                        const float* all_svh_down, uint16_t* out_yp, float* ws, unsigned* all_tickets_down,
+                                        int top_k, void* stream);
 // ---- qwen3_5_moe geometry, M ROWS (a speculative verify window): 2..16 tokens at once, ~top_k * rows (token, expert) pairs over
 // the distinct experts they pick. The M = 1 kernels above run one expert per grid slot and fill one of the 16 rows of every WMMA
 // tile; these put an expert's tokens in the tile's rows (the activation row of lane l is the group's l-th pair), so each routed

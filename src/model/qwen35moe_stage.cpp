@@ -1,4 +1,4 @@
-﻿#include "qwen35moe_stage.h"
+#include "qwen35moe_stage.h"
 
 #include <hip/hip_runtime.h>
 
@@ -9,6 +9,7 @@
 #include <deque>
 #include <stdexcept>
 #include <string>
+#include <type_traits>
 #include <utility>
 
 #include "gdn_state.h"
@@ -25,6 +26,7 @@
 #include "r4dx/model/qwen4exp/common.h"
 #include "r4dx/model/qwen4exp/hc_bf16_gemm.h"
 #include "r4dx/model/qwen4exp/moe_block.h"
+#include "tp/tp_vocab.h"
 
 namespace r4dx::model {
 
@@ -101,6 +103,11 @@ struct Qwen35MoeStage::Impl {
   int device = 0;
   int64_t first = 0, end = 0;
   int64_t hidden = 0, vocab = 0;
+  // --tp 2: this rank's endpoint and its slice of the vocabulary (vocab_local == vocab, vocab_offset == 0 at TP=1)
+  core::TpComm* comm = nullptr;
+  int64_t vocab_local = 0, vocab_offset = 0;
+  core::DeviceBuffer<int32_t> argmax_pair_dev;  // [2]: {local index, value bits} of the local argmax (TP)
+  std::vector<float> gather_shard_host;
 
   core::Stream stream;
   core::Arena arena;          // per-block scratch (reset between blocks)
@@ -237,6 +244,18 @@ struct Qwen35MoeStage::Impl {
     R4DX_HIP_CHECK(hipMemcpyAsync(num_accepted_dev.data(), src, sizeof(int32_t), hipMemcpyHostToDevice, stream.get()));
   }
 
+  // --tp 2: sums blk [rows, hidden] over the ranks in place (bf16 RNE of the two fp32-added partials, bit-identical on both ranks).
+  void AllReduceBlock(int64_t rows) {
+    if (comm != nullptr) comm->AllReduceSumBf16Rows(blk.data(), rows, hidden, stream.get());
+  }
+  // --tp 2: the full fp32 logits row from the ranks' vocab slices (a collective: every rank calls it, in rank order).
+  std::vector<float> GatherVocabRow() {
+    gather_shard_host.resize(static_cast<size_t>(vocab_local));
+    logits_dev.CopyToHost(gather_shard_host.data(), gather_shard_host.size());
+    std::vector<float> full(static_cast<size_t>(vocab));
+    comm->HostAllGather(gather_shard_host.data(), gather_shard_host.size() * sizeof(float), full.data());
+    return full;
+  }
   void RunGdn(LayerRt& L, const Qwen35MoeChunk& c);
   void RunAttention(LayerRt& L, const Qwen35MoeChunk& c);
   void RunMoe(LayerRt& L, const Qwen35MoeChunk& c);
@@ -281,6 +300,17 @@ Qwen35MoeStage::Qwen35MoeStage(const Qwen35MoeStageOptions& options, std::vector
   }
   m.hidden = cfg.hidden_size;
   m.vocab = cfg.vocab_size;
+  m.comm = options.tp_comm;
+  m.vocab_local = cfg.VocabShardSize();
+  m.vocab_offset = cfg.VocabShardBegin();
+  if (cfg.tp_world > 1) {
+    if (m.comm == nullptr || m.comm->World() != cfg.tp_world || m.comm->Rank() != cfg.tp_rank) {
+      Fail("a tensor-parallel stage (config.tp_world > 1) needs a TpComm endpoint of the same world and rank");
+    }
+    if (options.spec_window > 1) Fail("speculative verify windows are not supported under tensor parallelism yet (docs/qwen35moe-tp-design.md P6)");
+  } else if (m.comm != nullptr) {
+    Fail("tp_comm is set but config.tp_world is 1");
+  }
   const int64_t R = options.max_rows;
 
   m.layer_refs = std::move(layers);
@@ -310,6 +340,7 @@ Qwen35MoeStage::Qwen35MoeStage(const Qwen35MoeStageOptions& options, std::vector
   ac.mrope_section_t = static_cast<int>(cfg.mrope_section.at(0));
   ac.mrope_section_h = static_cast<int>(cfg.mrope_section.at(1));
   ac.mrope_section_w = static_cast<int>(cfg.mrope_section.at(2));
+  ac.comm = m.comm;  // the o_proj all-reduce of site A2 (nullptr at TP=1)
 
   GdnGeometry geo;
   geo.hidden = cfg.hidden_size;
@@ -408,7 +439,7 @@ Qwen35MoeStage::Qwen35MoeStage(const Qwen35MoeStageOptions& options, std::vector
                              ? static_cast<int>(std::min<int64_t>(options.spec_window, Qwen35GroupedMoeDecode::kMaxRows))
                              : 1;
     m.gmoe = std::make_unique<Qwen35GroupedMoeDecode>(static_cast<int>(cfg.num_experts), static_cast<int>(cfg.num_experts_per_tok),
-                                                      cfg.norm_topk_prob, rows_cap);
+                                                      cfg.norm_topk_prob, rows_cap, static_cast<int>(cfg.moe_intermediate_size));
     m.gmoe_rows_cap = rows_cap;
     if (const char* e = std::getenv("R4DX_Q35_ROWS"); e != nullptr && std::strcmp(e, "0") == 0) m.rows_moe_on = false;
     int mode = options.grouped_decode;
@@ -422,18 +453,19 @@ Qwen35MoeStage::Qwen35MoeStage(const Qwen35MoeStageOptions& options, std::vector
   // ---- head ---------------------------------------------------------------------------------------------------------
   if (m.head_refs) {
     if (m.head_refs->lm_head == nullptr || m.head_refs->final_norm == nullptr) Fail("the head has no lm_head / final_norm");
-    if (m.head_refs->lm_head->N != m.vocab || m.head_refs->lm_head->K != m.hidden) {
+    if (m.head_refs->lm_head->N != m.vocab_local || m.head_refs->lm_head->K != m.hidden) {
       Fail("lm_head is [" + std::to_string(m.head_refs->lm_head->N) + ", " + std::to_string(m.head_refs->lm_head->K) +
-           "], expected [" + std::to_string(m.vocab) + ", " + std::to_string(m.hidden) + "]");
+           "], expected [" + std::to_string(m.vocab_local) + ", " + std::to_string(m.hidden) + "]");
     }
-    m.logits_dev = core::DeviceBuffer<float>(static_cast<size_t>(m.vocab));
+    m.logits_dev = core::DeviceBuffer<float>(static_cast<size_t>(m.vocab_local));
+    if (m.comm != nullptr) m.argmax_pair_dev = core::DeviceBuffer<int32_t>(2);
     m.argmax_dev = core::DeviceBuffer<int32_t>(1);
     m.greedy_host = core::PinnedBuffer<int32_t>(1);
     m.summary_ids_dev = core::DeviceBuffer<int32_t>(R4DX_TOPK_LSE_K);
     m.summary_vals_dev = core::DeviceBuffer<float>(R4DX_TOPK_LSE_K);
     m.summary_lse_dev = core::DeviceBuffer<float>(1);
     m.topk_ws = core::DeviceBuffer<uint8_t>(static_cast<size_t>(r4dx_topk_lse_workspace_bytes()));
-    bump(Padded(static_cast<size_t>(m.vocab) * 2));
+    bump(Padded(static_cast<size_t>(m.vocab_local) * 2));
     if (options.spec_window > 1) {
       m.logits_rows = core::DeviceBuffer<float>(static_cast<size_t>(options.spec_window * m.vocab));
       m.argmax_rows_dev = core::DeviceBuffer<int32_t>(static_cast<size_t>(options.spec_window));
@@ -542,7 +574,7 @@ void Qwen35MoeStage::SetCapture(Qwen35MoeCaptureFn fn) {
   Qwen35MoeDeviceScope dev(m.device);
   m.capture = std::move(fn);
   if (m.capture && m.head_refs && m.logits_all.size() == 0) {
-    m.logits_all = core::DeviceBuffer<uint16_t>(static_cast<size_t>(m.opt.max_rows * m.vocab));
+    if (m.comm == nullptr) m.logits_all = core::DeviceBuffer<uint16_t>(static_cast<size_t>(m.opt.max_rows * m.vocab));
     m.norm_all = core::DeviceBuffer<uint16_t>(static_cast<size_t>(m.opt.max_rows * m.hidden));
   }
 }
@@ -610,6 +642,7 @@ void Qwen35MoeStage::Impl::RunGdn(LayerRt& L, const Qwen35MoeChunk& c) {
     ++prof_phase_calls;
   }
   arena.Reset();
+  AllReduceBlock(c.rows);  // --tp 2 site A1: out_proj is row-parallel, blk holds this rank's partial sum
   CapBf16(L.index, "attn_out", blk.data(), c.rows, hidden, c.first_pos);
   ResidualAdd(h.data(), blk.data(), hmid.data(), c.rows);
 }
@@ -661,6 +694,7 @@ void Qwen35MoeStage::Impl::RunMoe(LayerRt& L, const Qwen35MoeChunk& c) {
   if (c.rows == 1 && grouped_on && L.grouped && (!capture || grouped_capture)) {
     gmoe->Run(s, arena, L.gmoe_w, e.trellis, x.data(), blk.data());
     arena.Reset();
+    AllReduceBlock(1);
     CapBf16(L.index, "moe_out", blk.data(), 1, hidden, c.first_pos);
     ResidualAdd(hmid.data(), blk.data(), h.data(), 1);
     return;
@@ -670,6 +704,7 @@ void Qwen35MoeStage::Impl::RunMoe(LayerRt& L, const Qwen35MoeChunk& c) {
   if (c.verify && c.rows >= 2 && c.rows <= gmoe_rows_cap && grouped_on && L.grouped && (!capture || grouped_capture) && rows_moe_on) {
     gmoe->RunRows(s, arena, L.gmoe_w, e.trellis, x.data(), blk.data(), c.rows);
     arena.Reset();
+    AllReduceBlock(c.rows);
     CapBf16(L.index, "moe_out", blk.data(), c.rows, hidden, c.first_pos);
     ResidualAdd(hmid.data(), blk.data(), h.data(), c.rows);
     return;
@@ -686,6 +721,7 @@ void Qwen35MoeStage::Impl::RunMoe(LayerRt& L, const Qwen35MoeChunk& c) {
   };
   moe->Forward(s, arena, L.moe_w, x.data(), blk.data(), c.rows, fn);
   arena.Reset();
+  AllReduceBlock(c.rows);  // --tp 2 site M: routed + gated shared partials of this rank
   if (capture) {
     Cap(L.index, "topk_ids", moe->last_ids(), Qwen35MoeCapture::Dtype::kI32, c.rows, cfg.num_experts_per_tok, c.first_pos,
         /*on_host=*/true);
@@ -801,28 +837,50 @@ Qwen35MoeHeadResult Qwen35MoeStage::Head(int64_t rows, const Qwen35MoeHeadReques
     // every row of the chunk (tests): the final norm, then the lm_head over all of them
     m.Norm(m.h.data(), final_norm, m.norm_all.data(), rows);
     m.Cap(-1, "norm_out", m.norm_all.data(), Qwen35MoeCapture::Dtype::kBf16, rows, m.hidden, m.last_first_pos);
-    ApplyLinear(s, m.arena, lm, m.norm_all.data(), m.logits_all.data(), rows);
-    m.arena.Reset();
-    m.Cap(-1, "logits", m.logits_all.data(), Qwen35MoeCapture::Dtype::kBf16, rows, m.vocab, m.last_first_pos);
+    if (m.comm == nullptr) {  // (a rank holds a vocab slice of the logits: the all-rows logits capture is a TP=1 test hook)
+      ApplyLinear(s, m.arena, lm, m.norm_all.data(), m.logits_all.data(), rows);
+      m.arena.Reset();
+      m.Cap(-1, "logits", m.logits_all.data(), Qwen35MoeCapture::Dtype::kBf16, rows, m.vocab, m.last_first_pos);
+    }
   }
 
   // the last row only: the norm and the lm_head are row-independent
   const uint16_t* h_last = m.h.data() + (rows - 1) * m.hidden;
   m.Norm(h_last, final_norm, m.x.data(), 1);
-  uint16_t* logits_bf16 = m.arena.Alloc<uint16_t>(static_cast<size_t>(m.vocab));
+  uint16_t* logits_bf16 = m.arena.Alloc<uint16_t>(static_cast<size_t>(m.vocab_local));  // the rank's vocab slice under TP
   ApplyLinear(s, m.arena, lm, m.x.data(), logits_bf16, 1);
 
   Qwen35MoeHeadResult out;
   switch (req.kind) {
     case Qwen35MoeHeadRequest::Kind::kLogits: {
       r4dx_model_widen_bf16_to_f32(reinterpret_cast<int64_t>(logits_bf16), reinterpret_cast<int64_t>(m.logits_dev.data()),
-                                   m.vocab, reinterpret_cast<int64_t>(s));
+                                   m.vocab_local, reinterpret_cast<int64_t>(s));
       m.stream.Synchronize();
+      if (m.comm != nullptr) {
+        out.logits = m.GatherVocabRow();
+        break;
+      }
       out.logits.resize(static_cast<size_t>(m.vocab));
       m.logits_dev.CopyToHost(out.logits.data(), static_cast<size_t>(m.vocab));
       break;
     }
     case Qwen35MoeHeadRequest::Kind::kArgmax: {
+      if (m.comm != nullptr) {
+        // the rank's argmax over its slice (lowest-index tie-break), merged over the ranks in rank order (tp_vocab.h: exact)
+        r4dx_model_widen_bf16_to_f32(reinterpret_cast<int64_t>(logits_bf16), reinterpret_cast<int64_t>(m.logits_dev.data()),
+                                     m.vocab_local, reinterpret_cast<int64_t>(s));
+        r4dx_argmax_val_f32(reinterpret_cast<int64_t>(m.logits_dev.data()), reinterpret_cast<int64_t>(m.argmax_pair_dev.data()),
+                            reinterpret_cast<int64_t>(m.argmax_pair_dev.data() + 1), m.vocab_local, reinterpret_cast<int64_t>(s));
+        m.stream.Synchronize();
+        tp::ArgmaxPair mine{};
+        static_assert(sizeof(tp::ArgmaxPair) == 2 * sizeof(int32_t), "{idx, value} pair is two 32-bit words");
+        R4DX_HIP_CHECK(hipMemcpy(&mine, m.argmax_pair_dev.data(), sizeof(mine), hipMemcpyDeviceToHost));
+        mine.idx += static_cast<int32_t>(m.vocab_offset);
+        std::vector<tp::ArgmaxPair> all(static_cast<size_t>(m.comm->World()));
+        m.comm->HostAllGather(&mine, sizeof(mine), all.data());
+        out.token = tp::MergeArgmax(all.data(), m.comm->World());
+        break;
+      }
       r4dx_argmax_bf16(reinterpret_cast<int64_t>(logits_bf16), reinterpret_cast<int64_t>(m.argmax_dev.data()), m.vocab,
                        reinterpret_cast<int64_t>(s));
       R4DX_HIP_CHECK(hipMemcpyAsync(m.greedy_host.data(), m.argmax_dev.data(), sizeof(int32_t), hipMemcpyDeviceToHost, s));
@@ -833,10 +891,10 @@ Qwen35MoeHeadResult Qwen35MoeStage::Head(int64_t rows, const Qwen35MoeHeadReques
     case Qwen35MoeHeadRequest::Kind::kSummary: {
       if (!(req.inv_temperature > 0.0f)) Fail("Head: kSummary needs inv_temperature > 0");
       r4dx_model_widen_bf16_to_f32(reinterpret_cast<int64_t>(logits_bf16), reinterpret_cast<int64_t>(m.logits_dev.data()),
-                                   m.vocab, reinterpret_cast<int64_t>(s));
+                                   m.vocab_local, reinterpret_cast<int64_t>(s));
       r4dx_topk_lse_f32_ws(reinterpret_cast<int64_t>(m.logits_dev.data()), reinterpret_cast<int64_t>(m.summary_ids_dev.data()),
                            reinterpret_cast<int64_t>(m.summary_vals_dev.data()),
-                           reinterpret_cast<int64_t>(m.summary_lse_dev.data()), 1, m.vocab, req.inv_temperature,
+                           reinterpret_cast<int64_t>(m.summary_lse_dev.data()), 1, m.vocab_local, req.inv_temperature,
                            reinterpret_cast<int64_t>(s), reinterpret_cast<int64_t>(m.topk_ws.data()));
       m.stream.Synchronize();
       std::vector<int32_t> ids(R4DX_TOPK_LSE_K);
@@ -847,12 +905,18 @@ Qwen35MoeHeadResult Qwen35MoeStage::Head(int64_t rows, const Qwen35MoeHeadReques
       m.summary_lse_dev.CopyToHost(&lse, 1);
       kernels::RowSummary& sm = out.summary;
       sm.k = R4DX_TOPK_LSE_K;
-      sm.vocab = m.vocab;
+      sm.vocab = m.vocab_local;
       sm.inv_temperature = req.inv_temperature;
       sm.lse = lse;
       for (int j = 0; j < R4DX_TOPK_LSE_K; ++j) {
-        sm.ids[j] = ids[static_cast<size_t>(j)];
+        sm.ids[j] = ids[static_cast<size_t>(j)] + static_cast<int32_t>(m.vocab_offset);
         sm.vals[j] = vals[static_cast<size_t>(j)];
+      }
+      if (m.comm != nullptr) {
+        static_assert(std::is_trivially_copyable_v<kernels::RowSummary>, "row summaries cross the host exchange as raw bytes");
+        std::vector<kernels::RowSummary> all(static_cast<size_t>(m.comm->World()));
+        m.comm->HostAllGather(&sm, sizeof(kernels::RowSummary), all.data());
+        sm = tp::MergeRowSummaries(all.data(), m.comm->World(), m.vocab);
       }
       break;
     }
@@ -866,6 +930,7 @@ std::vector<float> Qwen35MoeStage::LastLogitsRow() {
   Impl& m = *impl_;
   Qwen35MoeDeviceScope dev(m.device);
   if (!m.head_refs) Fail("LastLogitsRow: this stage has no head");
+  if (m.comm != nullptr) return m.GatherVocabRow();
   std::vector<float> row(static_cast<size_t>(m.vocab));
   m.logits_dev.CopyToHost(row.data(), row.size());
   return row;

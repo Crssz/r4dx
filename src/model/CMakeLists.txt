@@ -166,6 +166,8 @@ set(R4DX_MODEL_SOURCES
   qwen4exp_local_text_model.cpp
   # qwen3_5_moe (Ornith-1.5-122B, docs/qwen35moe-plan.md M3): the layer-range weight loader.
   qwen35moe_container.cpp
+  # --tp 2 (docs/qwen35moe-tp-design.md): the sharded loader, kept out of the TP=1 file.
+  qwen35moe_container_tp.cpp
   # ... and its per-device stage (kernel side: it must not see qwen4exp_weights.h), the two-stage model (container side) and
   # the TextModel wrapper + LoadQwen35MoeTextModel.
   qwen35moe_stage.cpp

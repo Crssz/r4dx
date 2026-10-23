@@ -1,4 +1,4 @@
-﻿// Qwen35GroupedMoeDecode -- the qwen3_5_moe sparse MoE block for ONE decode token (M = 1) entirely on the device, no host
+// Qwen35GroupedMoeDecode -- the qwen3_5_moe sparse MoE block for ONE decode token (M = 1) entirely on the device, no host
 // synchronization (docs/qwen35moe-plan.md section 7; the qwen4_exp counterpart is RunMoeGroupedDecode in qwen4exp_stage.cpp):
 //
 //   router GEMM (bf16) -> route (softmax, top-k, norm) -> shared expert (bf16 GEMVs, sigmoid gate logit) -> sort the k ids
@@ -50,6 +50,7 @@ class Qwen35GroupedMoeDecode {
  public:
   static constexpr int kHidden = 3072;
   static constexpr int kInter = 1024;  // routed and shared
+  static constexpr int kTp2Inter = 512;  // the same, per rank under --tp 2 (every expert and the shared expert split in two)
 
   // True when the geometry and the pointers match what the kernels are instantiated for.
   static bool Supported(int64_t hidden, int64_t inter, int64_t shared_inter, int64_t experts, int64_t top_k,
@@ -60,7 +61,9 @@ class Qwen35GroupedMoeDecode {
 
   // Allocates the scratch on the calling thread's current device and zeroes the split-group tickets (synchronizing).
   // max_rows > 1 also sizes the M-row scratch of RunRows (about 90 MB at 16 rows, top-8).
-  Qwen35GroupedMoeDecode(int experts, int top_k, bool norm_topk, int max_rows = 1);
+  // inter: the routed and shared expert width this instance serves: kInter (TP=1) or kTp2Inter (a --tp 2 rank; M = 1 only: the M-row kernels
+  // are not instantiated for it).
+  Qwen35GroupedMoeDecode(int experts, int top_k, bool norm_topk, int max_rows = 1, int inter = kInter);
 
   // The M-row MoE of a speculative verify window: x / y device bf16 [rows, hidden] (2 <= rows <= max_rows; rows == 1 is Run), the same
   // block as Run for every row -- router, route, shared expert, then the routed experts of ALL rows grouped by expert: each distinct
@@ -85,6 +88,7 @@ class Qwen35GroupedMoeDecode {
   void RunShared(hipStream_t s, core::Arena& arena, const Qwen35GroupedMoeWeights& w, const uint16_t* x);
   int experts_, top_k_;
   bool norm_topk_;
+  int inter_ = kInter;
   core::DeviceBuffer<uint16_t> logits_;
   core::DeviceBuffer<int32_t> ids_, ids_sorted_, rank_;
   core::DeviceBuffer<float> weights_;

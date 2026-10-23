@@ -34,6 +34,7 @@
 #include "qwen35moe_grouped_decode.h"
 #include "qwen4exp_gdn.h"
 #include "quant_linear.h"
+#include "r4dx/core/tp_comm.hpp"
 #include "r4dx/kernels/summary_sampler.hpp"
 
 namespace r4dx::model {
@@ -92,7 +93,13 @@ struct Qwen35MoeHeadRefs {
 
 struct Qwen35MoeStageOptions {
   int device = 0;
+  // The stage's config: the global one, or under tensor parallelism the RANK'S (Qwen35MoeConfig::Shard: heads, GDN heads and expert widths halved,
+  // vocab_size global). Every shape the stage builds (GDN geometry, AttnConfig, MoeConfig) follows from it.
   Qwen35MoeConfig config;
+  // --tp 2 (docs/qwen35moe-tp-design.md): this rank's communicator (config.tp_world / tp_rank must agree). The stage all-reduces the bf16
+  // [rows, hidden] output of each row-parallel site -- the GDN out_proj, the attention o_proj (inside AttentionLayer) and the MoE combine -- before
+  // the residual add, and merges its vocab slice of the head with the other rank (greedy pair, row summary, full row; HostAllGather). nullptr = TP=1.
+  core::TpComm* tp_comm = nullptr;
   int64_t max_ctx = 0;       // KV capacity in tokens
   int64_t max_rows = 256;    // rows per chunk (<= 256)
   bool prompt_checkpoint = false;

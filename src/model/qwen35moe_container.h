@@ -108,6 +108,12 @@ struct Qwen35MoeLoadOptions {
   int64_t layer_last = -1;
   bool load_embed = false;  // text.embed_tokens into pinned host memory
   bool load_head = false;   // text.final_norm + lm_head onto the device
+  // Tensor parallelism (docs/qwen35moe-tp-design.md; src/model/qwen35moe_container_tp.cpp): tp_world > 1 loads THIS rank's slice of every
+  // tensor (tp::RuleFor, exact byte runs of the one container -- no per-rank file) over the layer range, the final norm, the vocab slice
+  // of lm_head and, with load_embed, the (replicated) embedding -- or `shared_embed_host`, the process's one pinned copy, when set.
+  int tp_world = 1;
+  int tp_rank = 0;
+  std::shared_ptr<const core::PinnedBuffer<uint16_t>> shared_embed_host;
 };
 
 class Qwen35MoeContainer {
@@ -126,6 +132,8 @@ class Qwen35MoeContainer {
   const Qwen35MoeContainerInfo& Info() const { return info_; }
   const Qwen35MoeConfig& Config() const { return info_.config; }
   const ModelConfig& GenericConfig() const { return info_.model_config; }
+  // The config the loaded weights have: Config() (global) at TP=1, Qwen35MoeConfig::Shard(Config(), tp_world, tp_rank) under TP.
+  const Qwen35MoeConfig& LocalConfig() const { return local_config_; }
   const std::string& ModelId() const { return info_.model_id; }
   int Device() const { return device_; }
 
@@ -153,6 +161,8 @@ class Qwen35MoeContainer {
 
  private:
   Qwen35MoeContainer() = default;
+  static Qwen35MoeContainer LoadShard(const std::string& path, const Qwen35MoeLoadOptions& o);  // qwen35moe_container_tp.cpp
+  Qwen35MoeConfig local_config_;
   template <class Fn>
   void ForEachLinear(Fn&& fn);
   template <class Fn>

@@ -174,6 +174,7 @@ set(R4DX_MODEL_SOURCES
   qwen35moe_stage.cpp
   qwen35moe_grouped_decode.cpp
   qwen35moe_model.cpp
+  qwen35moe_vision.cpp
   qwen35moe_local_text_model.cpp
 )
 # r4dx_model_tptest: the SAME sources compiled with R4DX_TP_TESTING, which adds the tensor-parallel

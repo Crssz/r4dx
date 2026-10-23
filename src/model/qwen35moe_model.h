@@ -38,6 +38,7 @@
 #include "qwen35moe_config.h"
 #include "qwen35moe_container.h"
 #include "qwen35moe_stage.h"
+#include "qwen35moe_vision.h"
 #include "quant_linear.h"
 #include "r4dx/core/arena.hpp"
 #include "r4dx/core/device_buffer.hpp"
@@ -82,6 +83,14 @@ struct Qwen35MoeModelOptions {
   // Test hook: a target whose vocabulary is SMALLER than the drafter's (the tiny test container, 4096 vs 248320): the drafter's mask
   // token becomes vocab - 1 and only the first `vocab` rows of its codebooks are read.
   bool dflash_small_vocab = false;
+
+  // ---- vision (docs/qwen35moe-vision.md) ---------------------------------------------------------------------------------
+  // The vision tower (`vision.*` tensors of the container, ~0.85 GiB bf16): 0 = never load it, -1 = load it iff the container has it
+  // (the CLI / server `--vision auto`), 1 = load it and throw when the container has none. It lives on `vision_device` (-1 =
+  // R4DX_Q35_VISION_DEVICE, else the LAST stage's device: the headless card, the desktop card's headroom is spoken for). Not supported
+  // under tensor parallelism yet (auto resolves to off there, on throws).
+  int vision = 0;
+  int vision_device = -1;
 
   // ---- tensor parallelism (--tp 2; qwen35moe_tp_model.h drives one of these per rank) --------------------------------------
   // tp_world > 1: this model is RANK `tp_rank` of the group: ONE stage holding all layers on `tp_device` (no hand-off), loaded sharded
@@ -141,6 +150,23 @@ class Qwen35MoeModel {
   std::vector<float> DecodeStep(int32_t token_id);
   int32_t DecodeStepGreedy(int32_t token_id);
   int32_t DecodeStepSampled(int32_t token_id, const kernels::SampleParams& params, std::mt19937_64& rng);
+
+  // ---- vision ------------------------------------------------------------------------------------------------------------
+  bool HasVision() const { return vision_ != nullptr; }
+  int64_t ImageTokenId() const;     // config.json's image_token_id (-1 without a tower)
+  int64_t VisionMergeSize() const;  // vision_config.spatial_merge_size (2 without a tower)
+  const Qwen35MoeVision* Vision() const { return vision_.get(); }
+  // Tower forward: `rows` = bf16 [merged tokens, hidden] on the HOST, one image's rows after another in `grids` order.
+  void EncodeImages(const float* pixel_values, int64_t total_patches, const std::vector<vision::GridThw>& grids,
+                    std::vector<uint16_t>* rows, vision::VisionEncodeStats* stats = nullptr);
+  // Prefill with images: `images[i].offset` is the first placeholder token (config.json's image_token_id) of image i inside THIS
+  // call's `token_ids`, `.tokens` its merged token count, `.grid` its patch grid and `.embeds` its host rows (`embeds_on_host`).
+  // The rows overwrite the embedding gather of the placeholder positions; the attention layers rope the call (and every later
+  // token of the conversation) with the 3-axis mrope positions of Qwen3_5Model.get_rope_index; the GDN layers take the spliced rows
+  // in order, they have no positions. Continues the sequence at PositionCount() like Prefill.
+  std::vector<float> PrefillMultimodal(const std::vector<int32_t>& token_ids, const std::vector<ImageSpan>& images);
+  // Every later token roped at (its sequence index + this): 0 until an image has been prefilled.
+  int64_t MropeDelta() const { return mrope_delta_; }
 
   // ---- speculative decoding (Qwen35MoeModelOptions::spec_window > 1) -------------------------------------------------------
   int64_t SpecWindow() const { return opt_.spec_window; }
@@ -278,6 +304,22 @@ class Qwen35MoeModel {
   std::function<std::vector<int32_t>(int32_t, int64_t)> draft_override_;
   int64_t verified_rows_ = 0;
   RoundStats round_stats_;
+
+  // ---- vision state ----
+  std::unique_ptr<Qwen35MoeVision> vision_;
+  // 3-axis rope bookkeeping, as Model's: a conversation that has seen an image ropes every token at (sequence index + mrope_delta_) on
+  // all three axes, except the block of the PrefillMultimodal call being fed, whose explicit [3, N] rows are mrope_block_ (axis-major).
+  bool mrope_active_ = false;
+  int64_t mrope_delta_ = 0;
+  std::vector<int32_t> mrope_block_;
+  int64_t mrope_block_base_ = 0;
+  std::vector<ImageSpan> mrope_block_images_;
+  bool ckpt_mrope_active_ = false;
+  int64_t ckpt_mrope_delta_ = 0;
+  std::vector<int32_t> rope_rows_scratch_;  // [3, rows] of the chunk being run
+  void RopeRowsHost(int64_t start, int64_t rows, std::vector<int32_t>* out3) const;
+  // Overwrites the placeholder rows of [start, start + rows) in embed_rows_host_ with the block's image rows.
+  void SpliceImageRows(int64_t start, int64_t rows);
 
   int64_t pos_ = 0;
   bool at_prefill_end_ = false;

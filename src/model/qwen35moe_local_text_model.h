@@ -30,9 +30,9 @@ class Qwen35MoeLocalTextModel final : public TextModel {
 
   const ModelConfig& Config() const override { return m_->GenericConfig(); }
   const std::string& ModelId() const override { return m_->ModelId(); }
-  int64_t ImageTokenId() const override { return -1; }
-  int64_t VisionMergeSize() const override { return 2; }  // the default of a model without a vision tower
-  bool HasVision() const override { return false; }
+  int64_t ImageTokenId() const override { return m_->ImageTokenId(); }
+  int64_t VisionMergeSize() const override { return m_->VisionMergeSize(); }  // 2 for a model without a vision tower
+  bool HasVision() const override { return m_->HasVision(); }
   bool MtpEnabled() const override { return false; }
   bool MtpUsingReducedVocabDraft() const override { return false; }
   bool DflashEnabled() const override { return m_->DflashEnabled(); }

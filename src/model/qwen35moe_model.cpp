@@ -17,6 +17,7 @@
 #include <memory>
 #include <optional>
 
+#include "position_ids.h"  // src/vision: BuildMropePositionIds (docs/vision.md)
 #include "quant_linear.h"
 #include "r4dx/core/device_buffer.hpp"
 #include "r4dx/core/error.hpp"
@@ -348,6 +349,33 @@ std::unique_ptr<Qwen35MoeModel> Qwen35MoeModel::Load(const Qwen35MoeModelOptions
   m.embed_rows_host_ = core::PinnedBuffer<uint16_t>(R * static_cast<size_t>(cfg.hidden_size));
   if (m.stages_.size() > 1) m.handoff_host_ = core::PinnedBuffer<uint16_t>(R * static_cast<size_t>(cfg.hidden_size));
 
+  // ---- the vision tower (docs/qwen35moe-vision.md) --------------------------------------------------------------------
+  if (options.vision > 0 && tp) {
+    throw std::invalid_argument("Qwen35MoeModel::Load: --vision on is not supported under --tp 2 yet (use the layer split, or --vision off)");
+  }
+  if (options.vision != 0 && !tp) {
+    const bool has = Qwen35MoeVision::ContainerHasVision(options.container_path);
+    if (options.vision > 0 && !has) {
+      throw std::invalid_argument("Qwen35MoeModel::Load: --vision on, but " + options.container_path +
+                                  " carries no vision.* tensors (convert with r4dx-convert --vision on)");
+    }
+    if (has) {
+      int vdev = options.vision_device;
+      if (vdev < 0) {
+        if (const char* e = std::getenv("R4DX_Q35_VISION_DEVICE"); e != nullptr && *e != '\0') {
+          vdev = std::atoi(e);
+        } else {
+          vdev = m.stages_.back()->Device();
+        }
+      }
+      if (vdev < 0 || vdev >= visible) throw std::invalid_argument("Qwen35MoeModel::Load: vision device " + std::to_string(vdev) + " is not visible");
+      m.vision_ = Qwen35MoeVision::Load(options.container_path, vdev, cfg.hidden_size);
+      std::fprintf(stderr, "[r4dx::model::Qwen35MoeModel] vision tower on device %d, %.3f GiB weights (image token %lld, merge %lld)\n", vdev,
+                   static_cast<double>(m.vision_->WeightBytes()) / (1024.0 * 1024.0 * 1024.0),
+                   static_cast<long long>(m.vision_->ImageTokenId()), static_cast<long long>(m.vision_->MergeSize()));
+    }
+  }
+
   // ---- the DFlash2 drafter -----------------------------------------------------------------------------------------
   if (dc) {
     const int64_t hidden = cfg.hidden_size;
@@ -428,6 +456,7 @@ void Qwen35MoeModel::RunChunk(const int32_t* tokens, int64_t rows, bool is_prefi
       }
       std::copy_n(table + static_cast<int64_t>(id) * hidden, hidden, embed_rows_host_.data() + t * hidden);
     }
+    if (!mrope_block_images_.empty()) SpliceImageRows(pos_, rows);  // PrefillMultimodal: image rows replace the placeholder embeddings
   }
   last_.embed_ms += MsSince(t_start);
 
@@ -438,6 +467,10 @@ void Qwen35MoeModel::RunChunk(const int32_t* tokens, int64_t rows, bool is_prefi
   chunk.verify = verify_out != nullptr;
   chunk.gdn_prefill_recurrent = gdn_recurrent_;
   if (iso != nullptr) chunk.only_layer = iso->layer;
+  if (mrope_active_ && iso == nullptr) {  // a conversation that has seen an image: explicit 3-axis rope rows for every chunk
+    RopeRowsHost(pos_, rows, &rope_rows_scratch_);
+    chunk.rope_pos3 = rope_rows_scratch_.data();
+  }
 
   if (iso == nullptr) {
     const auto t_load = Clock::now();
@@ -536,6 +569,122 @@ std::vector<float> Qwen35MoeModel::Prefill(const std::vector<int32_t>& token_ids
   return std::move(out.logits);
 }
 
+// ---- vision (docs/qwen35moe-vision.md) --------------------------------------------------------------------------------------
+
+int64_t Qwen35MoeModel::ImageTokenId() const { return vision_ ? vision_->ImageTokenId() : -1; }
+int64_t Qwen35MoeModel::VisionMergeSize() const { return vision_ ? vision_->MergeSize() : 2; }
+
+void Qwen35MoeModel::EncodeImages(const float* pixel_values, int64_t total_patches, const std::vector<vision::GridThw>& grids,
+                                  std::vector<uint16_t>* rows, vision::VisionEncodeStats* stats) {
+  if (!vision_) {
+    throw std::runtime_error("Qwen35MoeModel::EncodeImages: this model has no vision tower (the container carries no vision.* tensors, "
+                             "or it was loaded with --vision off, or under --tp 2)");
+  }
+  vision_->Encode(pixel_values, total_patches, grids, rows, stats);
+}
+
+// Model::RopePositionsHost's rule: inside the block the PrefillMultimodal call feeds, the block's own explicit rows; everywhere else a
+// token at sequence index s ropes at s + mrope_delta_ on all three axes.
+void Qwen35MoeModel::RopeRowsHost(int64_t start, int64_t rows, std::vector<int32_t>* out3) const {
+  out3->assign(static_cast<size_t>(3 * rows), 0);
+  const int64_t n_block = static_cast<int64_t>(mrope_block_.size() / 3);
+  for (int64_t t = 0; t < rows; ++t) {
+    const int64_t s = start + t;
+    const int64_t in_block = s - mrope_block_base_;
+    if (n_block > 0 && in_block >= 0 && in_block < n_block) {
+      for (int axis = 0; axis < 3; ++axis) {
+        (*out3)[static_cast<size_t>(axis * rows + t)] = mrope_block_[static_cast<size_t>(axis * n_block + in_block)];
+      }
+    } else {
+      const int32_t p = static_cast<int32_t>(s + mrope_delta_);
+      (*out3)[static_cast<size_t>(t)] = p;
+      (*out3)[static_cast<size_t>(rows + t)] = p;
+      (*out3)[static_cast<size_t>(2 * rows + t)] = p;
+    }
+  }
+}
+
+void Qwen35MoeModel::SpliceImageRows(int64_t start, int64_t rows) {
+  const int64_t hidden = cfg_.hidden_size;
+  for (const ImageSpan& sp : mrope_block_images_) {
+    const int64_t s0 = mrope_block_base_ + sp.offset;  // absolute sequence index of the span's first row
+    const int64_t lo = std::max(s0, start);
+    const int64_t hi = std::min(s0 + sp.tokens, start + rows);
+    if (lo >= hi) continue;
+    std::copy_n(sp.embeds + (lo - s0) * hidden, (hi - lo) * hidden, embed_rows_host_.data() + (lo - start) * hidden);
+  }
+}
+
+std::vector<float> Qwen35MoeModel::PrefillMultimodal(const std::vector<int32_t>& token_ids, const std::vector<ImageSpan>& images) {
+  if (token_ids.empty()) throw std::runtime_error("Qwen35MoeModel::PrefillMultimodal: token_ids is empty");
+  // No images: a plain Prefill, which already ropes through the conversation's mrope delta once an image has been seen.
+  if (images.empty()) return Prefill(token_ids);
+  if (!HasVision()) {
+    throw std::runtime_error("Qwen35MoeModel::PrefillMultimodal: image spans supplied but this model has no vision tower loaded "
+                             "(--vision off, --tp 2, or a container with no vision.* tensors)");
+  }
+  const int64_t seq_len = static_cast<int64_t>(token_ids.size());
+  const int merge_size = static_cast<int>(VisionMergeSize());
+  const int32_t image_token_id = static_cast<int32_t>(ImageTokenId());
+  // The mm_token_type_ids the position walk needs come from the SPANS (they are the contract: grid + rows); the tokens under each span
+  // must really be the placeholder id, which catches a caller whose offsets drifted from its own rendered prompt.
+  std::vector<uint8_t> mm_ids(static_cast<size_t>(seq_len), vision::kMmTokenTypeText);
+  std::vector<vision::GridThw> grids;
+  int64_t prev_end = 0;
+  for (const ImageSpan& sp : images) {
+    if (sp.offset < prev_end || sp.tokens <= 0 || sp.offset + sp.tokens > seq_len) {
+      throw std::runtime_error("Qwen35MoeModel::PrefillMultimodal: image spans must be sorted, non-overlapping and inside token_ids; got offset=" +
+                               std::to_string(sp.offset) + " tokens=" + std::to_string(sp.tokens) + " against a " +
+                               std::to_string(seq_len) + "-token prompt");
+    }
+    if (sp.embeds == nullptr) {
+      throw std::runtime_error("Qwen35MoeModel::PrefillMultimodal: image span at offset " + std::to_string(sp.offset) + " has no embeddings");
+    }
+    if (!sp.embeds_on_host) {
+      throw std::runtime_error("Qwen35MoeModel::PrefillMultimodal: image rows must be HOST rows (the embedding gather is a host gather)");
+    }
+    if (sp.grid.MergedTokenCount(merge_size) != sp.tokens) {
+      throw std::runtime_error("Qwen35MoeModel::PrefillMultimodal: image span at offset " + std::to_string(sp.offset) + " claims " +
+                               std::to_string(sp.tokens) + " tokens but its grid merges to " +
+                               std::to_string(sp.grid.MergedTokenCount(merge_size)));
+    }
+    for (int64_t i = sp.offset; i < sp.offset + sp.tokens; ++i) {
+      if (token_ids[static_cast<size_t>(i)] != image_token_id) {
+        throw std::runtime_error("Qwen35MoeModel::PrefillMultimodal: token at index " + std::to_string(i) +
+                                 " is inside an image span but is not the image placeholder id " + std::to_string(image_token_id) +
+                                 " (got " + std::to_string(token_ids[static_cast<size_t>(i)]) + ")");
+      }
+      mm_ids[static_cast<size_t>(i)] = vision::kMmTokenTypeImage;
+    }
+    grids.push_back(sp.grid);
+    prev_end = sp.offset + sp.tokens;
+  }
+  if (pos_ + seq_len > opt_.max_ctx) {
+    Fail("position " + std::to_string(pos_ + seq_len) + " exceeds max_ctx " + std::to_string(opt_.max_ctx));
+  }
+  // This block's 3-axis rows, and the delta every later token ropes at.
+  const vision::MropePositions mp =
+      vision::BuildMropePositionIds(mm_ids, grids, merge_size, /*seq_start=*/pos_, /*mrope_start=*/pos_ + mrope_delta_);
+  mrope_block_ = mp.position_ids;
+  mrope_block_base_ = pos_;
+  mrope_block_images_ = images;
+  mrope_active_ = true;
+  // Cleared on EVERY exit: a stale block table would rope a later call's tokens from this call's rows.
+  struct BlockGuard {
+    Qwen35MoeModel* m;
+    ~BlockGuard() {
+      m->mrope_block_.clear();
+      m->mrope_block_images_.clear();
+      m->mrope_block_base_ = 0;
+    }
+  } guard{this};
+  std::vector<float> logits = Prefill(token_ids);
+  // Only now: until the last chunk landed the block's explicit rows were what every chunk read.
+  mrope_delta_ = mp.mrope_position_delta;
+  if (dflash_) dflash_->SetRopeDelta(mrope_delta_);  // the drafter ropes its blocks on the temporal axis at index + delta
+  return logits;
+}
+
 std::vector<float> Qwen35MoeModel::DecodeStep(int32_t token_id) {
   const auto t0 = Clock::now();
   last_ = Timings{};
@@ -602,7 +751,15 @@ void Qwen35MoeModel::Reset() {
   at_prefill_end_ = false;
   ckpt_pos_ = -1;
   verified_rows_ = 0;
-  if (dflash_) dflash_->Reset();  // host-only counters: the ring's bytes are overwritten before they are read again
+  mrope_active_ = false;
+  mrope_delta_ = 0;
+  mrope_block_.clear();
+  mrope_block_images_.clear();
+  mrope_block_base_ = 0;
+  if (dflash_) {
+    dflash_->Reset();  // host-only counters: the ring's bytes are overwritten before they are read again
+    dflash_->SetRopeDelta(0);
+  }
   last_ = Timings{};
 }
 
@@ -617,6 +774,8 @@ void Qwen35MoeModel::SaveCheckpoint() {
   }
   for (auto& st : stages_) st->SaveCheckpoint();
   ckpt_pos_ = pos_;
+  ckpt_mrope_active_ = mrope_active_;
+  ckpt_mrope_delta_ = mrope_delta_;
 }
 
 void Qwen35MoeModel::RestoreCheckpoint() {
@@ -626,6 +785,9 @@ void Qwen35MoeModel::RestoreCheckpoint() {
   if (ckpt_pos_ < 0) throw std::runtime_error("Qwen35MoeModel::RestoreCheckpoint: no checkpoint since Load()/Reset()");
   for (auto& st : stages_) st->RestoreCheckpoint(ckpt_pos_);
   pos_ = ckpt_pos_;
+  mrope_active_ = ckpt_mrope_active_;
+  mrope_delta_ = ckpt_mrope_delta_;
+  if (dflash_) dflash_->SetRopeDelta(mrope_delta_);
   at_prefill_end_ = true;  // the restored state IS a post-prefill state
   verified_rows_ = 0;
   if (dflash_ && dflash_->InjectedCount() > pos_) dflash_->Rewind(pos_);

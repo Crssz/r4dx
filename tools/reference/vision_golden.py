@@ -1,4 +1,4 @@
-"""tools/reference/vision_golden.py
+﻿"""tools/reference/vision_golden.py
 
 Builds the Qwen3_5 vision tower (`Qwen3_5VisionModel`) straight from the reference `transformers`
 install's `modeling_qwen3_5.py` -- real weights (`model.visual.*`, all 333 tensors present in the
@@ -515,6 +515,9 @@ def main() -> int:
     # "Why the block-26 disagreement is not an r4dx error". Output is written to --out-dir exactly
     # as usual, so point it at a scratch directory when comparing.
     ap.add_argument("--attn-impl", default="eager", choices=["eager", "sdpa"])
+    # qwen3_5_moe (Ornith-1.5-122B): the same tower under the Qwen3_5Moe* class names (line-for-line identical source, only
+    # out_hidden_size differs). The golden then carries the Ornith tower's outputs (merger output 3072 wide).
+    ap.add_argument("--moe", action="store_true", help="use transformers' qwen3_5_moe classes (Ornith-1.5-122B)")
     # Limits the run to the named cases (default: all three). Only useful with --attn-impl or when
     # iterating on one case; the committed golden is always a full run.
     ap.add_argument("--cases", default="", help="comma-separated subset of case names")
@@ -525,9 +528,17 @@ def main() -> int:
 
     args.out_dir.mkdir(parents=True, exist_ok=True)
 
-    import transformers.models.qwen3_5.modeling_qwen3_5 as m
     from transformers import AutoImageProcessor
-    from transformers.models.qwen3_5.configuration_qwen3_5 import Qwen3_5Config
+
+    if args.moe:
+        import transformers.models.qwen3_5_moe.modeling_qwen3_5_moe as m
+        from transformers.models.qwen3_5_moe.configuration_qwen3_5_moe import Qwen3_5MoeConfig as Qwen3_5Config
+
+        m.Qwen3_5VisionModel = m.Qwen3_5MoeVisionModel
+        m.Qwen3_5VisionRotaryEmbedding = m.Qwen3_5MoeVisionRotaryEmbedding
+    else:
+        import transformers.models.qwen3_5.modeling_qwen3_5 as m
+        from transformers.models.qwen3_5.configuration_qwen3_5 import Qwen3_5Config
 
     full_config = Qwen3_5Config.from_pretrained(str(args.model_dir))
     vision_config = full_config.vision_config

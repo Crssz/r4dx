@@ -21,15 +21,17 @@ void Qwen35MoeLocalTextModel::SetDflashInjectionEnabled(bool enabled) {
   m_->SetDflashInjectionEnabled(enabled);
 }
 
-void Qwen35MoeLocalTextModel::EncodeImages(const float*, int64_t, const std::vector<vision::GridThw>&, ImageRows*,
-                                           vision::VisionEncodeStats*) {
-  Unsupported("vision", "the vision tower is plan milestone M6");
+void Qwen35MoeLocalTextModel::EncodeImages(const float* pixel_values, int64_t total_patches,
+                                           const std::vector<vision::GridThw>& grids, ImageRows* out,
+                                           vision::VisionEncodeStats* stats) {
+  // HOST rows: the model's embedding gather is a host gather, so the splice is a memcpy and the tower may sit on any card.
+  m_->EncodeImages(pixel_values, total_patches, grids, &out->host, stats);
+  out->SetFilled(/*on_host=*/true, static_cast<int64_t>(out->host.size()) / m_->Config().hidden_size);
 }
 
 std::vector<float> Qwen35MoeLocalTextModel::PrefillMultimodal(const std::vector<int32_t>& token_ids,
                                                               const std::vector<ImageSpan>& images) {
-  if (!images.empty()) Unsupported("vision", "the vision tower is plan milestone M6");
-  return m_->Prefill(token_ids);  // no images: a plain Prefill
+  return m_->PrefillMultimodal(token_ids, images);
 }
 
 std::vector<int32_t> Qwen35MoeLocalTextModel::DecodeStepMtpGreedy(int32_t, int64_t) {
@@ -77,10 +79,6 @@ Qwen35MoeModelOptions MakeQwen35MoeModelOptions(const ModelOptions& opts) {
   if (!opts.dflash_container.empty() && opts.mtp_draft_k > 0) {
     throw std::invalid_argument("LoadTextModel: --dflash and --mtp are exclusive");
   }
-  if (opts.vision == ModelOptions::VisionMode::kOn) {
-    throw std::invalid_argument("LoadTextModel: --vision on is not available for qwen3_5_moe yet (plan milestone M6); "
-                                "use --vision off or auto");
-  }
   if (opts.layer_limit >= 0) {
     throw std::invalid_argument("LoadTextModel: layer_limit is not supported for qwen3_5_moe (the container is loaded whole)");
   }
@@ -97,6 +95,8 @@ Qwen35MoeModelOptions MakeQwen35MoeModelOptions(const ModelOptions& opts) {
   o.prompt_checkpoint = opts.prompt_checkpoint;
   o.dflash_container = opts.dflash_container;
   o.dflash_draft_k = opts.dflash_draft_k;
+  // --vision auto|on|off (docs/qwen35moe-vision.md): the tower is loaded iff the container has one (auto), always (on, throws without), never (off).
+  o.vision = opts.vision == ModelOptions::VisionMode::kOn ? 1 : opts.vision == ModelOptions::VisionMode::kOff ? 0 : -1;
   // devices / split: Qwen35MoeModel::Load reads R4DX_Q35_DEVICES / R4DX_Q35_SPLIT (ModelOptions has no field for them)
   return o;
 }

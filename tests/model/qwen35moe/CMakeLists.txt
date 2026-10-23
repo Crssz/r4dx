@@ -43,6 +43,10 @@ set_tests_properties(test_q35moe_tp_shard PROPERTIES LABELS "q35moe" ENVIRONMENT
 add_executable(tool_q35moe_tp_step tool_q35moe_tp_step.cpp)
 target_link_libraries(tool_q35moe_tp_step PRIVATE r4dx_model r4dx_model_qwen4exp_kernels r4dx_core r4d_core)
 
+# tool_q35moe_tp_e2e: layer split vs real --tp 2 through the TextModel interface in one process (G7'; both cards; not a ctest).
+add_executable(tool_q35moe_tp_e2e tool_q35moe_tp_e2e.cpp)
+target_link_libraries(tool_q35moe_tp_e2e PRIVATE r4dx_model r4dx_model_qwen4exp_kernels r4dx_core r4d_core)
+
 # tool_q35moe_dflash: the real-container DFlash2 benchmark / lossless audit (not a ctest: it needs the 52 GB Ornith container and both cards).
 add_executable(tool_q35moe_dflash tool_q35moe_dflash.cpp)
 target_link_libraries(tool_q35moe_dflash PRIVATE r4dx_model r4dx_model_qwen4exp_kernels r4dx_core r4d_core)

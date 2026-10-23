@@ -293,6 +293,10 @@ double DirectStorageLoader::read_seconds() const { return impl_->total_seconds; 
 
 namespace {
 thread_local std::unique_ptr<DirectStorageLoader> t_loader;
+// Creating and destroying a loader (a D3D12 device, a DirectStorage queue, imported buffers) from two rank threads at once crashed inside
+// dstoragecore.dll (a short --tp 2 load of a tiny container: one rank's scope ended while the other was still starting). The loaders' READS stay
+// concurrent; only their creation and destruction take turns.
+std::mutex g_lifecycle_mu;
 
 bool Disabled() {
   char v[16] = {};
@@ -304,6 +308,7 @@ bool Disabled() {
 DirectLoadScope::DirectLoadScope() {
   if (t_loader || Disabled()) return;
   std::string why;
+  std::lock_guard<std::mutex> lifecycle(g_lifecycle_mu);
   t_loader = DirectStorageLoader::Create(&why);
   if (!t_loader) {
     std::fprintf(stderr, "r4dx: DirectStorage unavailable (%s) -- loading through the memory mapping\n", why.c_str());
@@ -320,6 +325,7 @@ DirectLoadScope::~DirectLoadScope() {
     std::fprintf(stderr, "r4dx: DirectStorage read %.2f GiB straight to VRAM in %.2f s (%.2f GB/s)\n", gib, s,
                  s > 0 ? gib * 1.073741824 / s : 0.0);
   }
+  std::lock_guard<std::mutex> lifecycle(g_lifecycle_mu);
   t_loader.reset();
 }
 

@@ -336,9 +336,11 @@ std::unique_ptr<Qwen35MoeTpModel> Qwen35MoeTpModel::Load(const ModelOptions& opt
            CmdKind::kPlain, kNoStall);
   }
   for (const auto& s : m->ranks_) s->facade_comm = s->Comm();
+  std::fprintf(stderr, "[r4dx-tp] comm group ready (%s)\n", ModeName(tp.mode));
 
   // 8a. The ONE pinned copy of text.embed_tokens both ranks read (2.4 GiB: never duplicated), allocated on rank 0's thread.
   m->Run({0}, [&](RankSlot&) { shared_embed = Qwen35MoeContainer::LoadEmbeddingHost(g.container_path); }, CmdKind::kPlain, kNoStall);
+  std::fprintf(stderr, "[r4dx-tp] text.embed_tokens: %.2f GiB pinned, shared by both ranks\n", static_cast<double>(shared_embed->bytes()) / kGiB);
 
   // 8. Every rank's Qwen35MoeModel, loaded in parallel (no collectives yet).
   m->Run(m->AllSlots(),
@@ -352,6 +354,7 @@ std::unique_ptr<Qwen35MoeTpModel> Qwen35MoeTpModel::Load(const ModelOptions& opt
            ro.tp_max_inflight_units = tp.max_inflight_units;
            ro.shared_embed_host = shared_embed;
            s.model = Qwen35MoeModel::Load(ro);
+           std::fprintf(stderr, "[r4dx-tp] rank %d: model loaded\n", s.rank);
          },
          CmdKind::kPlain, kNoStall);
 

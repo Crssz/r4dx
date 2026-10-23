@@ -126,6 +126,10 @@ class Qwen35MoeContainer {
   // Inspect(), then the upload of the requested range onto `o.device`.
   static Qwen35MoeContainer Load(const std::string& path, const Qwen35MoeLoadOptions& o = Qwen35MoeLoadOptions());
 
+  // text.embed_tokens of `path` in one pinned host buffer: the process's ONE copy a --tp 2 group shares (Qwen35MoeLoadOptions::shared_embed_host).
+  // Allocates pinned memory, so the calling thread needs a HIP context (any device).
+  static std::shared_ptr<const core::PinnedBuffer<uint16_t>> LoadEmbeddingHost(const std::string& path);
+
   Qwen35MoeContainer(Qwen35MoeContainer&&) = default;
   Qwen35MoeContainer& operator=(Qwen35MoeContainer&&) = default;
 

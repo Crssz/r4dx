@@ -1295,10 +1295,7 @@ std::unique_ptr<TextModel> LoadTextModel(const ModelOptions& opts, const TpOptio
       throw std::invalid_argument("LoadTextModel: --pp 2 does not support qwen3_5_moe (it splits its layers over the two "
                                   "cards itself; R4DX_Q35_DEVICES / R4DX_Q35_SPLIT)");
     }
-    if (tp.world != 1) {
-      throw std::invalid_argument("LoadTextModel: --tp " + std::to_string(tp.world) +
-                                  " does not support qwen3_5_moe yet (it splits its layers over the two cards itself)");
-    }
+    // --tp 2 is Qwen35MoeTpModel (LoadQwen35MoeTextModel dispatches on tp.world); --pp 2 stays refused above.
     return LoadQwen35MoeTextModel(opts, tp);
   }
   if (arch == Arch::kGemma4) {

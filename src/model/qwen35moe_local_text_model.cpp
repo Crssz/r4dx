@@ -4,6 +4,7 @@
 #include <string>
 
 #include "model.h"  // ModelOptions
+#include "qwen35moe_tp_model.h"
 
 namespace r4dx::model {
 
@@ -84,7 +85,7 @@ Qwen35MoeModelOptions MakeQwen35MoeModelOptions(const ModelOptions& opts) {
     throw std::invalid_argument("LoadTextModel: layer_limit is not supported for qwen3_5_moe (the container is loaded whole)");
   }
   if (opts.tp.world != 1) {
-    throw std::invalid_argument("LoadTextModel: a tensor-parallel rank is not supported for qwen3_5_moe");
+    throw std::invalid_argument("LoadTextModel: ModelOptions::tp must be default for qwen3_5_moe -- Qwen35MoeTpModel fills in every rank's options itself");
   }
   if (opts.stage_only.role != stage::Role::kOff) {
     throw std::invalid_argument("LoadTextModel: stage-only loads (hybrid mode) are not supported for qwen3_5_moe");
@@ -101,10 +102,11 @@ Qwen35MoeModelOptions MakeQwen35MoeModelOptions(const ModelOptions& opts) {
 }
 
 std::unique_ptr<TextModel> LoadQwen35MoeTextModel(const ModelOptions& opts, const TpOptions& tp) {
+  // --tp 2 (docs/qwen35moe-tp-design.md P3): tensor parallelism over the two cards, opt-in; the default (--tp 1) stays the layer split inside
+  // Qwen35MoeModel. The weights of both modes together do not fit, so the user picks one at load.
+  if (tp.world == 2) return Qwen35MoeTpModel::Load(opts, tp);
   if (tp.world != 1) {
-    throw std::invalid_argument("LoadTextModel: --tp " + std::to_string(tp.world) +
-                                " is not supported for qwen3_5_moe yet: its two cards are a layer split inside the model, "
-                                "not tensor parallelism");
+    throw std::invalid_argument("LoadTextModel: --tp " + std::to_string(tp.world) + " is not supported for qwen3_5_moe (1 = the layer split, 2 = tensor parallel)");
   }
   const TpOptions d;
   if (tp.mode != d.mode || !tp.devices.empty() || tp.noop_rank != d.noop_rank || tp.ar_timeout_ms != d.ar_timeout_ms ||

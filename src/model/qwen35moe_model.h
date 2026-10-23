@@ -93,6 +93,8 @@ struct Qwen35MoeModelOptions {
   int tp_device = -1;
   core::TpComm* tp_comm = nullptr;
   std::shared_ptr<const core::PinnedBuffer<uint16_t>> shared_embed_host;
+  int tp_submit_layers = 0;        // Qwen35MoeStageOptions::tp_submit_layers / tp_max_inflight_units (bounded prefill submission on the desktop card)
+  int tp_max_inflight_units = 0;
 };
 
 class Qwen35MoeModel {
@@ -201,6 +203,14 @@ class Qwen35MoeModel {
     int64_t chunks = 0;
   };
   const Timings& LastTimings() const { return last_; }
+
+  // ---- tensor parallelism -------------------------------------------------------------------------------------------------
+  // The first use of every path on this rank, run by the facade as ONE collective command at load (a lockstep sequence on both ranks): a full 256-row
+  // prefill chunk (the sliced all-reduces, the per-expert GEMM shapes), a 64-row chunk, then a greedy, a sampled (row-summary merge) and a full-logits
+  // decode step, so no first-use launch or merge lands inside a request. Leaves the model Reset().
+  void TpWarmup();
+  static int64_t WarmupPositions() { return kChunkRows + 64 + 3; }
+  tp::SubmitBounder::Stats TpSubmitStats() const { return stages_.front()->SubmitStats(); }
 
   // GPU time of the last chunk, hipEvent spans on each stage's stream (the host clock of Timings only sees the enqueue of a decode step):
   // every stage's layers and the head. EnableStepProfile(true) first; read after the call returned (the head synchronized).

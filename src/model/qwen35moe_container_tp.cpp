@@ -260,6 +260,14 @@ void LoadExpertClassSharded(const SafetensorsReader& r, const LinearLoadMeta& me
 
 }  // namespace
 
+std::shared_ptr<const core::PinnedBuffer<uint16_t>> Qwen35MoeContainer::LoadEmbeddingHost(const std::string& path) {
+  SafetensorsReader reader(Utf8ToWide(path));
+  const int64_t n = ElemCountBySize(reader, "text.embed_tokens", 2);
+  auto buf = std::make_shared<core::PinnedBuffer<uint16_t>>(static_cast<size_t>(n), hipHostMallocPortable);
+  std::memcpy(buf->data(), reader.Data("text.embed_tokens"), static_cast<size_t>(n) * 2);
+  return buf;
+}
+
 Qwen35MoeContainer Qwen35MoeContainer::LoadShard(const std::string& path, const Qwen35MoeLoadOptions& o) {
   const core::DirectLoadScope direct_load;
   if (o.tp_world != 2 && o.tp_world != 1) throw std::invalid_argument(kWho + "tp_world must be 1 or 2");

@@ -108,6 +108,8 @@ struct Qwen35MoeStage::Impl {
   int64_t vocab_local = 0, vocab_offset = 0;
   core::DeviceBuffer<int32_t> argmax_pair_dev;  // [2]: {local index, value bits} of the local argmax (TP)
   std::vector<float> gather_shard_host;
+  tp::SubmitBounder submit;  // inert unless TP with tp_submit_layers > 0
+  int64_t submit_layers = 0;
 
   core::Stream stream;
   core::Arena arena;          // per-block scratch (reset between blocks)
@@ -314,6 +316,13 @@ Qwen35MoeStage::Qwen35MoeStage(const Qwen35MoeStageOptions& options, std::vector
       Fail("a tensor-parallel stage (config.tp_world > 1) needs a TpComm endpoint of the same world and rank");
     }
     if (options.spec_window > 1) Fail("speculative verify windows are not supported under tensor parallelism yet (docs/qwen35moe-tp-design.md P6)");
+    if (options.tp_submit_layers < 0 || options.tp_submit_layers > 64 || options.tp_max_inflight_units < 0 || options.tp_max_inflight_units > 64) {
+      Fail("tp_submit_layers and tp_max_inflight_units must be in [0, 64]");
+    }
+    if (options.tp_submit_layers > 0) {
+      m.submit = tp::SubmitBounder(options.tp_max_inflight_units);  // its events live on this (the stage's) device
+      m.submit_layers = options.tp_submit_layers;
+    }
   } else if (m.comm != nullptr) {
     Fail("tp_comm is set but config.tp_world is 1");
   }
@@ -756,6 +765,11 @@ void Qwen35MoeStage::RunLayers(const Qwen35MoeChunk& c) {
   }
   if (m.spec_window > 1 && !c.is_prefill && !c.verify && T != 1) Fail("RunLayers: a speculative stage decodes one row (or verifies)");
   const bool is_decode = (T == 1 && !c.is_prefill && !m.capture);
+  // Bounded prefill submission under TP, cut the same way on both ranks (lockstep): a 256-row chunk is four 64-row chunks' worth of work per layer.
+  const bool bounded = m.comm != nullptr && c.is_prefill && m.submit.Active();
+  int64_t unit_layers = bounded ? tp::UnitLayersForContext(m.submit_layers, c.first_pos + T) : 0;
+  if (bounded && T > 64) unit_layers = std::max<int64_t>(1, unit_layers * 64 / T);
+  if (bounded) m.submit.Reset();
   m.arena.Reset();
   if (c.is_prefill) m.CollapseWindow();
   m.SpMark(0);
@@ -763,6 +777,7 @@ void Qwen35MoeStage::RunLayers(const Qwen35MoeChunk& c) {
   for (auto& lp : m.layers) {
     LayerRt& L = *lp;
     if (c.only_layer >= 0 && L.index != c.only_layer) continue;
+    if (bounded && L.index > m.first && (L.index - m.first) % unit_layers == 0) m.submit.EndUnit(m.stream.get());
     for (size_t ti = 0; ti < m.taps.size(); ++ti) {
       const Qwen35MoeFeatureTap& tap = m.taps[ti];
       if (tap.layer != L.index || m.tap_dst == nullptr) continue;
@@ -962,6 +977,7 @@ void Qwen35MoeStage::Reset() {
   m.arena.Reset();
   m.expert_arena.Reset();
   m.ResetSpec();
+  m.submit.Reset();
 }
 
 void Qwen35MoeStage::SaveCheckpoint() {
@@ -1002,6 +1018,8 @@ void Qwen35MoeStage::EnableStepProfile(bool on) {
   }
   m.step_prof = on;
 }
+
+tp::SubmitBounder::Stats Qwen35MoeStage::SubmitStats() const { return impl_->submit.GetStats(); }
 
 double Qwen35MoeStage::LastLayersGpuMs() const {
   Impl& m = *impl_;

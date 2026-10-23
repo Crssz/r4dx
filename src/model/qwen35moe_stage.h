@@ -36,6 +36,7 @@
 #include "quant_linear.h"
 #include "r4dx/core/tp_comm.hpp"
 #include "r4dx/kernels/summary_sampler.hpp"
+#include "tp/tp_submit.h"
 
 namespace r4dx::model {
 
@@ -100,6 +101,11 @@ struct Qwen35MoeStageOptions {
   // [rows, hidden] output of each row-parallel site -- the GDN out_proj, the attention o_proj (inside AttentionLayer) and the MoE combine -- before
   // the residual add, and merges its vocab slice of the head with the other rank (greedy pair, row summary, full row; HostAllGather). nullptr = TP=1.
   core::TpComm* tp_comm = nullptr;
+  // Bounded GPU submission of a TP prefill chunk (tp/tp_submit.h; TpOptions::submit_layers / max_inflight_units): the desktop card cannot preempt
+  // compute, so a chunk is cut into units of UnitLayersForContext layers, each submitted (and waited for, K == 1) before the next is enqueued.
+  // 0 = off. Decode steps and verify windows are never cut. Ignored without tp_comm.
+  int tp_submit_layers = 0;
+  int tp_max_inflight_units = 0;
   int64_t max_ctx = 0;       // KV capacity in tokens
   int64_t max_rows = 256;    // rows per chunk (<= 256)
   bool prompt_checkpoint = false;
@@ -238,6 +244,7 @@ class Qwen35MoeStage {
   // only ENQUEUES its layers, so LastRunMs() is the enqueue time; these are what the GPU spent (the --tp 2 economic gate compares them). Valid once
   // the call's stream work completed (any later synchronizing call); a getter waits for its end event. Costs two events per call while on.
   void EnableStepProfile(bool on);
+  tp::SubmitBounder::Stats SubmitStats() const;
   double LastLayersGpuMs() const;
   double LastHeadGpuMs() const;
 

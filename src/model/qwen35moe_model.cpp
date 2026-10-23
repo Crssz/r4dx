@@ -327,6 +327,8 @@ std::unique_ptr<Qwen35MoeModel> Qwen35MoeModel::Load(const Qwen35MoeModelOptions
     so.device = r.device;
     so.config = cfg;
     so.tp_comm = options.tp_comm;
+    so.tp_submit_layers = options.tp_submit_layers;
+    so.tp_max_inflight_units = options.tp_max_inflight_units;
     so.max_ctx = options.max_ctx;
     so.max_rows = kChunkRows;
     so.prompt_checkpoint = options.prompt_checkpoint;
@@ -780,6 +782,29 @@ std::string Qwen35MoeModel::RoundStatsLine() const {
                 static_cast<long long>(r.rounds), static_cast<double>(r.tokens) / n, r.total_ms / n, r.draft_ms / n, r.verify_ms / n,
                 r.stage_ms[0] / n, r.stage_ms[1] / n, r.handoff_ms / n, r.head_ms / n, r.inject_ms / n);
   return buf;
+}
+
+void Qwen35MoeModel::TpWarmup() {
+  if (!IsTp()) throw std::logic_error("Qwen35MoeModel::TpWarmup: only a tensor-parallel rank (tp_world > 1) warms up");
+  if (opt_.max_ctx < WarmupPositions()) {
+    throw std::invalid_argument("Qwen35MoeModel::TpWarmup: max_ctx " + std::to_string(opt_.max_ctx) + " < " + std::to_string(WarmupPositions()) +
+                                " warm-up positions");
+  }
+  const auto ids = [&](int64_t n) {
+    std::vector<int32_t> v(static_cast<size_t>(n));
+    for (int64_t i = 0; i < n; ++i) v[static_cast<size_t>(i)] = static_cast<int32_t>((i * 7919 + 13) % cfg_.vocab_size);
+    return v;
+  };
+  Reset();
+  (void)Prefill(ids(kChunkRows));  // the M = 256 GEMMs, the sliced all-reduces, every expert shape of the host-routed MoE
+  Reset();
+  (void)Prefill(ids(64));
+  (void)DecodeStepGreedy(0);
+  kernels::SampleParams sp;  // temperature 1: the summary path and its merge
+  std::mt19937_64 rng(0x7e57);
+  (void)DecodeStepSampled(1, sp, rng);
+  (void)DecodeStep(2);  // the full-row gather
+  Reset();
 }
 
 void Qwen35MoeModel::EnableStepProfile(bool on) {

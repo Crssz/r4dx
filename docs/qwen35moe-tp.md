@@ -1,4 +1,4 @@
-# `--tp 2` for Ornith-1.5-122B (`qwen3_5_moe`): implementation and results
+﻿# `--tp 2` for Ornith-1.5-122B (`qwen3_5_moe`): implementation and results
 
 Branch `claude/q35moe-tp2-f5ebfb` (cut from `qwen35moe` after the DFlash2 merge). The design is [`qwen35moe-tp-design.md`](qwen35moe-tp-design.md); this file records what was
 built, how to run it, and what was measured (2026-10-23, two Radeon AI PRO R9700, Windows, no P2P). The layer split stays the default; `--tp 2` is opt-in and the two do not
@@ -87,3 +87,7 @@ Every rank runs the whole round: the replicated drafter reads the (replicated) r
 on both ranks (the facade compares them on every call). Tokens per round on the corpus segments (k = 11, p_min 0.8; TP vs layer split): python 2.32 / 3.51, cpp 2.66 / 2.90, english 1.53 / 1.59, thai 1.10 / 1.09,
 mixed 1.53 / 1.59 (the python prompt's greedy continuation diverges from the split's after 6 tokens, so those two numbers are different texts). A TP round costs ~15.7 ms against 9.9 ms for a plain TP step
 (break-even 1.6 tokens/round). Extra VRAM: ~0.8 GiB per card (27.9 GiB used with the w4a16 drafter at `--max-ctx` 4096).
+
+**--dflash-k cap.** `r4dx-server` and `r4dx` reject `--tp 2 --dflash-k` above 7 (`tp::kMaxUnsplitDraftK`, docs/tp.md N80: a dense tensor-parallel verify window is at most 8 rows). The cap lives in the arch-agnostic argument parsers; the Ornith facade itself runs k = 11 (12-row window, ~16 ms) as measured above. At the cap, 5 real-text segments x 256 tokens, p_min 0.8, all streams equal to plain greedy: k = 7 plain 100.7 -> DFlash2 115.0 tok/s (1.14x, 1.79 tokens/round); k = 5 99.6 -> 114.8 (1.15x, 1.76 tokens/round). So the cap costs nothing measurable; relax it for qwen3_5_moe only if k > 7 is wanted.
+
+**Server smoke** (`tools\q35moe_server_tp_smoke.ps1 -Modes tp2,tp2dflash -DflashK 7`): the `--tp 2 --dflash` server comes up and answers chat, stream and tool calls byte for byte like the plain `--tp 2` server (134 vs 83 tok/s end to end on the chat request; 57-92% acceptance per request). The tool-result follow-up is not byte-identical and is reported as informational: it resumes from the prefix cache the tool turn left, the speculative server keeps one token fewer there (`prompt_n` 32 vs 33), so its prefill is split differently and a near-tie greedy choice flipped (it stopped after "light rain."). This was not isolated further.

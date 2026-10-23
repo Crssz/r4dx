@@ -14,7 +14,8 @@ fit together (26 GiB of weights per card each), so the mode is chosen at load.
 | **G4'** (P3) | Rung 4 KL(truth\|\|TP2) <= KL(layer split) + 0.004, top-1 >= 88.0% | 0.12364 vs 0.12361, top-1 88.61% vs 88.20% (real mode; 18,454 rows) |
 | **G6'** (P3) | real == emulation | the real container cannot be emulated (two 26 GiB ranks on one 32 GiB card): two real-mode dumps are SHA-256 equal (17 files); tiny model real == emulate bit for bit (bf16, trellis) |
 | **G7'** (P3) | decode >= 1.35 x the layer split, same session | 9.19 ms vs 14.67 ms per token = **1.60x** (108.7 vs 68.2 tok/s); prefill of 512 tokens 1.10x |
-| G8' (P5) | soak 5 min, then 60 min, 0 aborts / divergences / TDRs | 5 min PASS (45 iterations, 5 canaries equal, 1.24 M all-reduces); 60 min: see the end of this file |
+| G8' (P5) | soak 5 min, then 60 min, 0 aborts / divergences / TDRs | 5 min PASS (45 iterations, 5 canaries equal, 1.24 M all-reduces); with DFlash2 modes PASS (47 iterations); the 60-minute run waits for the owner's go-ahead |
+| P6 | DFlash2 under TP | lossless: every stream equal to plain greedy (tiny rank pair, and 5 real-text segments x 256 tokens on the real container); 5 segments, k = 11, p_min 0.8: **plain TP 100.6 -> DFlash2 116.7 tok/s (1.83 tokens/round)**; the layer split goes 64.3 -> 85.4 tok/s (2.14 tokens/round) |
 
 ## What was built
 
@@ -27,7 +28,9 @@ fit together (26 GiB of weights per card each), so the mode is chosen at load.
 | `src/model/qwen35moe_container_tp.cpp` | `Qwen35MoeContainer::LoadShard`: every rank gathers its slice of the one container (mixers through `ShardLoader`, experts into the stacked buffers at the rank's size), `LoadEmbeddingHost` (the one pinned embedding both ranks share) |
 | `src/model/qwen35moe_stage.{h,cpp}` | `tp_comm`: all-reduce after the GDN out_proj, inside `AttentionLayer` (`AttnConfig::comm`), after the MoE combine; vocab-slice head merged over the ranks (greedy pair, row summary, full row); `SubmitBounder` units for TP prefill chunks; `EnableStepProfile` (GPU event spans) |
 | `src/model/qwen35moe_model.{h,cpp}` | `tp_world` / `tp_rank` / `tp_device` / `tp_comm` / `shared_embed_host` options (ONE stage, no hand-off), `TpWarmup` |
-| `src/model/qwen4exp/kernels/moe_trellis_decode.hip`, `moe_trellis_grouped.h`, `qwen35moe_grouped_decode.*` | grouped decode MoE for expert width 512 (`GroupedTrellisGemvGateUpQ35Tp2`, `GroupedSiluMulTrellisInputDownQ35Tp2`, `GroupedTrellisGemvDownQ35Tp2`, `GroupedQ35Tp2SetSplits`); the TP=1 launchers are the same templates with `INTER = 1024` |
+| `src/model/qwen4exp/kernels/moe_trellis_decode.hip`, `moe_trellis_grouped.h`, `qwen35moe_grouped_decode.*` | grouped decode MoE for expert width 512 (`GroupedTrellisGemvGateUpQ35Tp2`, `GroupedSiluMulTrellisInputDownQ35Tp2`, `GroupedTrellisGemvDownQ35Tp2`, `GroupedQ35Tp2SetSplits`, and for P6 the `...Tp2Rows` M-row variants); the TP=1 launchers are the same templates with `INTER = 1024` |
+| `src/model/qwen35moe_stage.cpp` (P6) | spec windows under TP: `HeadRows` argmax over the vocab slice + `tp::MergeArgmaxRows`; `LastHeadRowsLogits` gathers the slices |
+| `src/model/qwen35moe_model.cpp` (P6) | the DFlash2 drafter REPLICATED on each rank (`vocab_offset` / `global_vocab` / `comm` / the process's one host copy of the codebooks); `TpWarmup` runs 3 rounds |
 | `src/model/qwen35moe_tp_model.{h,cpp}` | `Qwen35MoeTpModel`: the `TextModel` facade (copy-adapt of `Lfm2TpModel`): rank threads, real / emulate / noop, error state machine, recovery, fault injection, stats |
 | `src/model/qwen35moe_local_text_model.cpp`, `tp_model.cpp` | `LoadTextModel`: `--tp 2` dispatches to the facade; `--tp 2 --pp 2` stays refused for qwen3_5_moe |
 | `src/core/direct_storage.cpp` | loader creation / destruction under a process-wide mutex (see "Findings") |
@@ -73,4 +76,14 @@ Real mode: rank 0 = HIP device 1 (headless), rank 1 = device 0 (the desktop card
 ## Not done
 
 * P4 per-rank tuning rows for the prefill shapes (`gemm_tuning_table_trellis_tp2.inc`): the rank shapes run `FallbackTuning` (correct, untuned); the prefill is launch-bound, so the expected gain is small.
-* P6 DFlash2 under TP (see below when started).
+* The 60-minute dual-GPU soak (G8'): dual-GPU sustained load has reset the display on this machine; run `tools\tp\q35moe_soak.ps1 --minutes 60 --max-ctx 8192 --json build\logs\q35moe_soak_60min.jsonl [--dflash <drafter> --dflash-k 11]` with the owner's go-ahead.
+* DFlash2 policy: the drafter spends a round even where acceptance is ~1 token/round (Thai prose: 0.77x of plain TP, the layer split 0.82x); an adaptive `k` / skip rule is the DFlash2 track's.
+
+## DFlash2 under TP (P6)
+
+Every rank runs the whole round: the replicated drafter reads the (replicated) residual taps, computes its logits through the rank's lm_head slice and merges the per-rank top-16 with the other rank
+(`DflashDraft::MergeTop16AcrossRanks`, exact), so both ranks draft identical tokens; the verify window of 1 + k rows goes through the M-row grouped MoE at expert width 512, the write-once GDN window state
+(32 value heads per rank) and the decode attention kernel four rows per launch; the per-row argmax over the vocab slices is merged on the host (`MergeArgmaxRows`). Accept / commit are then identical
+on both ranks (the facade compares them on every call). Tokens per round on the corpus segments (k = 11, p_min 0.8; TP vs layer split): python 2.32 / 3.51, cpp 2.66 / 2.90, english 1.53 / 1.59, thai 1.10 / 1.09,
+mixed 1.53 / 1.59 (the python prompt's greedy continuation diverges from the split's after 6 tokens, so those two numbers are different texts). A TP round costs ~15.7 ms against 9.9 ms for a plain TP step
+(break-even 1.6 tokens/round). Extra VRAM: ~0.8 GiB per card (27.9 GiB used with the w4a16 drafter at `--max-ctx` 4096).

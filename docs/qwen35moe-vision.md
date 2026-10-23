@@ -1,4 +1,4 @@
-# Image input for Ornith-1.5-122B (`qwen3_5_moe`)
+﻿# Image input for Ornith-1.5-122B (`qwen3_5_moe`)
 
 Written 2026-10-23, branch `q35moe-vision` (from `qwen35moe` at `0d8b2e1`). Everything below was built and measured on this machine; numbers are
 quoted from the runs named next to them. Plan item: `docs/qwen35moe-plan.md` M6 / section 9 P3.
@@ -122,8 +122,7 @@ Images are the two in the model repo's own `assets/` (no download).
 
 ### Regressions
 
-`ctest -L q35moe` (11 tests): 10 pass. `test_model_q35moe_tp_facade` has one failing check, `--dflash under --tp 2 is refused by name`: the test still expects the
-refusal that DFlash2-under-TP (P6) removed; it is independent of this branch (no vision code is on that path) and left alone.
+`ctest -L q35moe` (11 tests): 10 passed when this was written; the one failing check (`test_model_q35moe_tp_facade`, "`--dflash under --tp 2` is refused by name") was a stale test, independent of vision, and was fixed afterwards in `c86649c`.
 
 ## Limits and follow-ups
 

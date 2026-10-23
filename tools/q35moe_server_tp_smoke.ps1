@@ -14,7 +14,7 @@
   returns a get_weather call for Paris and the follow-up (the call's result sent back) returns prose. The texts of both servers are written side by side.
 
   -Fault <rank>:<n>:<kind> (tp2 only; R4DX_TP_FAULT, docs/tp.md 9.1): rank <rank> stalls (kind 1) or throws (kind 0) at its <n>-th all-reduce after warm-up. The
-  reference request runs first (the fault is pending), request A (a long generation) crosses the armed all-reduce (200 or 500 both accepted), request B =
+  reference request runs first (the fault is pending: 12 tokens ~ 1300 all-reduces at 96 per forward), request A (a long generation) crosses the armed all-reduce (200 or 500 both accepted), request B =
   the reference prompt again must return 200 with text equal to the reference, through a recovered group.
 #>
 param(
@@ -29,6 +29,7 @@ param(
     [int]$TimeoutMinutes = 240
 )
 $ErrorActionPreference = "Stop"
+$Modes = @($Modes | ForEach-Object { $_ -split ",\s*" })  # (powershell -File passes "split,tp2" as one string)
 Set-Location (Split-Path -Parent $PSScriptRoot)
 Import-Module (Join-Path (Get-Location) "tools\tp\tdr_watch.psm1") -Force
 if ($OutDir -eq "") { $OutDir = Join-Path $env:TEMP "q35moe_server_tp_smoke" }
@@ -66,12 +67,12 @@ function Run-Server([string]$Tag, [string[]]$Extra, [bool]$Tp, [string]$FaultSpe
         Write-Host ("[{0}] ready after {1:N0} s" -f $Tag, ((Get-Date) - $start).TotalSeconds)
 
         if ($FaultSpec -ne "") {
-            $ref = Text-Of (Post-Json (Chat-Body $Prompt 40))
+            $ref = Text-Of (Post-Json (Chat-Body $Prompt 12))
             Write-Host "[$Tag] reference: $ref"
             $a_status = "200"
             try { $null = Post-Json (Chat-Body "Write a long story about a lighthouse keeper." 400) } catch { $a_status = "$($_.Exception.Response.StatusCode.value__)" }
             Write-Host "[$Tag] request A (crosses the armed all-reduce): HTTP $a_status"
-            $b = Text-Of (Post-Json (Chat-Body $Prompt 40))
+            $b = Text-Of (Post-Json (Chat-Body $Prompt 12))
             $same = $b -ceq $ref
             Write-Host "[$Tag] request B (after the fault): equal to the reference: $same"
             if (-not $same) { $res.ok = $false; $res.why += "request B differs from the reference after the fault" }

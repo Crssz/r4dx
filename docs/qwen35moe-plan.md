@@ -1,4 +1,4 @@
-# Ornith-1.5-122B (`qwen3_5_moe`) support for r4dx -- design and task plan
+﻿# Ornith-1.5-122B (`qwen3_5_moe`) support for r4dx -- design and task plan
 
 Written 2026-10-20. Design only: nothing here has been built or run on a GPU yet. Items tagged **VERIFY** come
 from the HF `config.json` / model card and must be checked against the downloaded safetensors index and a golden.
@@ -314,7 +314,7 @@ No task-accuracy benchmark has been run: KL measures drift, not accuracy.
 MTP is probably dropped in favour of DFlash2 (drafter downloaded to `E:\models\r4dx\Ornith-1.5-122B-DFlash2`).
 
 **Open items, in priority order (estimates):** P1 accuracy benchmark + 32k needle test (3-4 h); P2 prefill speed, grouped prefill MoE GEMM (6-12 h); P3 vision tower (done 2026-10-23, docs/qwen35moe-vision.md);
-P4 w8a16 for class p (3-4 h, only if P1 shows a real loss); P5 DFlash2 (DONE 2026-10-23, section 6); P6 `--tp 2` (design done, `docs/qwen35moe-tp-design.md`: 70-95 h in seven phases, ~1.5x plain decode, trellis slices exactly, no re-quantization; IMPLEMENTED 2026-10-23 on branch `claude/q35moe-tp2-f5ebfb`, `docs/qwen35moe-tp.md`: decode 9.19 ms vs 14.67 ms per token = 1.60x, KL unchanged, DFlash2 under TP not yet); P7 MTP (0.5-1.5 days, dropped in favour of DFlash2 unless asked); P8 K5 / host-RAM expert tier;
+P4 w8a16 for class p (3-4 h, only if P1 shows a real loss); P5 DFlash2 (DONE 2026-10-23, section 6); P6 `--tp 2` (design done, `docs/qwen35moe-tp-design.md`: 70-95 h in seven phases, ~1.5x plain decode, trellis slices exactly, no re-quantization; IMPLEMENTED 2026-10-23 on branch `claude/q35moe-tp2-f5ebfb`, `docs/qwen35moe-tp.md`: decode 9.19 ms vs 14.67 ms per token = 1.60x, KL unchanged; DFlash2 under TP implemented, lossless, 116.7 vs 85.4 tok/s layer-split DFlash2 on the corpus mean = 1.37x, `--dflash-k` <= 7 under `--tp 2` in the shared parsers); P7 MTP (0.5-1.5 days, dropped in favour of DFlash2 unless asked); P8 K5 / host-RAM expert tier;
 P9 qwen4exp regression check with its real container (the shared kernel code was edited; only a synthetic test ran).
 
 **Operational notes.** The 48-layer quantization stalled three times (singular refit solve, a zero-Hessian expert, pruned-channel blow-up in `regularize`) and once more on an unexplained

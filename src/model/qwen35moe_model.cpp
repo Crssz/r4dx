@@ -134,11 +134,11 @@ Qwen35MoeLayerRefs LayerRefs(const Qwen35MoeContainer& c, int64_t i) {
 
 }  // namespace
 
-std::vector<int64_t> Qwen35MoeModel::PlanChunks(int64_t rows) {
+std::vector<int64_t> Qwen35MoeModel::PlanChunks(int64_t rows, int64_t chunk) {
   std::vector<int64_t> out;
-  while (rows >= kChunkRows) {
-    out.push_back(kChunkRows);
-    rows -= kChunkRows;
+  while (rows >= chunk) {
+    out.push_back(chunk);
+    rows -= chunk;
   }
   if (rows >= 64) {
     out.push_back(rows / 64 * 64);
@@ -159,6 +159,17 @@ std::unique_ptr<Qwen35MoeModel> Qwen35MoeModel::Load(const Qwen35MoeModelOptions
   const Qwen35MoeContainerInfo info =
       Qwen35MoeContainer::Inspect(options.container_path, options.layout, options.lm_head_layout);
   const bool tp = options.tp_world > 1;
+  if (!tp && options.dflash_container.empty()) {
+    m.chunk_rows_ = kSuperChunkRows;  // a prompt of at least kSuperChunkRows rows prefills in super-chunks (see Prefill)
+    if (const char* e = std::getenv("R4DX_Q35_CHUNK"); e != nullptr && e[0] != 0) {
+      const long long v = std::atoll(e);
+      if (v == 256 || v == 512 || v == 768 || v == 1024) {
+        m.chunk_rows_ = v;
+      } else {
+        std::fprintf(stderr, "r4dx: R4DX_Q35_CHUNK='%s' is not 256 / 512 / 768 / 1024; using %lld\n", e, static_cast<long long>(kChunkRows));
+      }
+    }
+  }
   if (tp) {
     if (options.tp_world != 2 || options.tp_rank < 0 || options.tp_rank >= options.tp_world || options.tp_comm == nullptr ||
         options.tp_comm->World() != options.tp_world || options.tp_comm->Rank() != options.tp_rank || options.tp_device < 0) {
@@ -327,7 +338,7 @@ std::unique_ptr<Qwen35MoeModel> Qwen35MoeModel::Load(const Qwen35MoeModelOptions
     so.tp_submit_layers = options.tp_submit_layers;
     so.tp_max_inflight_units = options.tp_max_inflight_units;
     so.max_ctx = options.max_ctx;
-    so.max_rows = kChunkRows;
+    so.max_rows = m.chunk_rows_;
     so.prompt_checkpoint = options.prompt_checkpoint;
     so.grouped_decode = options.grouped_decode;
     so.spec_window = window;
@@ -344,7 +355,7 @@ std::unique_ptr<Qwen35MoeModel> Qwen35MoeModel::Load(const Qwen35MoeModelOptions
   }
 
   // ---- host buffers -----------------------------------------------------------------------------------------------
-  const size_t R = static_cast<size_t>(kChunkRows);
+  const size_t R = static_cast<size_t>(m.chunk_rows_);
   m.embed_rows_host_ = core::PinnedBuffer<uint16_t>(R * static_cast<size_t>(cfg.hidden_size));
   if (m.stages_.size() > 1) m.handoff_host_ = core::PinnedBuffer<uint16_t>(R * static_cast<size_t>(cfg.hidden_size));
 
@@ -404,8 +415,8 @@ Qwen35MoeModel::~Qwen35MoeModel() {
 
 void Qwen35MoeModel::RunChunk(const int32_t* tokens, int64_t rows, bool is_prefill, const Qwen35MoeHeadRequest* head,
                               HeadOut* out, const IsolatedLayer* iso, std::vector<int32_t>* verify_out) {
-  if (rows < 1 || rows > kChunkRows || (rows > 64 && rows % 64 != 0)) {
-    Fail("a chunk is 1..64 rows or a multiple of 64 up to " + std::to_string(kChunkRows) + " (got " + std::to_string(rows) + ")");
+  if (rows < 1 || rows > chunk_rows_ || (rows > 64 && rows % 64 != 0)) {
+    Fail("a chunk is 1..64 rows or a multiple of 64 up to " + std::to_string(chunk_rows_) + " (got " + std::to_string(rows) + ")");
   }
   if (verify_out != nullptr && (is_prefill || head != nullptr || iso != nullptr || rows > opt_.spec_window)) {
     Fail("a verify window is 1.." + std::to_string(opt_.spec_window) + " rows of a decode-kind chunk with no head request");
@@ -517,7 +528,8 @@ std::vector<float> Qwen35MoeModel::Prefill(const std::vector<int32_t>& token_ids
   at_prefill_end_ = false;
   HeadOut out;
   const Qwen35MoeHeadRequest req{Qwen35MoeHeadRequest::Kind::kLogits, 0.0f};
-  const std::vector<int64_t> plan = PlanChunks(static_cast<int64_t>(token_ids.size()));
+  const std::vector<int64_t> plan = PlanChunks(static_cast<int64_t>(token_ids.size()),
+                                                         capture_active_ || static_cast<int64_t>(token_ids.size()) < kSuperChunkRows ? kChunkRows : chunk_rows_);
   if (CanPipelinePrefill(plan.size())) {
     std::vector<float> lg = PrefillPipelined(token_ids, plan);
     at_prefill_end_ = true;

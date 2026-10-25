@@ -53,7 +53,7 @@ class PrefillProfile {
     marks_.emplace_back(name, ev);
   }
   // After the stream has been synchronized: folds this chunk's phases into the totals.
-  void End(int64_t rows, double wall_ms) {
+  void End(int64_t rows, double wall_ms, double enqueue_ms = 0) {
     if (!on_ || marks_.size() < 2) return;
     for (size_t i = 1; i < marks_.size(); ++i) {
       float ms = 0;
@@ -66,14 +66,15 @@ class PrefillProfile {
     ++chunks_;
     rows_ += rows;
     wall_ms_ += wall_ms;
+    enqueue_ms_ += enqueue_ms;
   }
   void Print(int device, int64_t first, int64_t last) const {
     if (!on_ || chunks_ == 0) return;
     std::vector<std::pair<std::string, Entry>> v(phases_.begin(), phases_.end());
     std::sort(v.begin(), v.end(), [](const auto& a, const auto& b) { return a.second.ms > b.second.ms; });
-    std::fprintf(stderr, "[Qwen35MoeStage dev %d, layers %lld-%lld] prefill profile: %lld chunk(s), %lld rows, GPU span %.1f ms, host wall %.1f ms (%.0f rows/s)\n",
+    std::fprintf(stderr, "[Qwen35MoeStage dev %d, layers %lld-%lld] prefill profile: %lld chunk(s), %lld rows, GPU span %.1f ms, host wall %.1f ms of which %.1f ms enqueueing (%.0f rows/s)\n",
                  device, static_cast<long long>(first), static_cast<long long>(last), static_cast<long long>(chunks_),
-                 static_cast<long long>(rows_), total_gpu_ms_, wall_ms_, wall_ms_ > 0 ? 1000.0 * static_cast<double>(rows_) / wall_ms_ : 0.0);
+                 static_cast<long long>(rows_), total_gpu_ms_, wall_ms_, enqueue_ms_, wall_ms_ > 0 ? 1000.0 * static_cast<double>(rows_) / wall_ms_ : 0.0);
     for (const auto& p : v) {
       std::fprintf(stderr, "    %-18s %9.1f ms %5.1f%%  (%lld calls, %.3f ms each)\n", p.first.c_str(), p.second.ms,
                    total_gpu_ms_ > 0 ? 100.0 * p.second.ms / total_gpu_ms_ : 0.0, static_cast<long long>(p.second.calls),
@@ -91,7 +92,7 @@ class PrefillProfile {
   std::vector<std::pair<std::string, hipEvent_t>> marks_;
   std::map<std::string, Entry> phases_;
   int64_t chunks_ = 0, rows_ = 0;
-  double total_gpu_ms_ = 0, wall_ms_ = 0;
+  double total_gpu_ms_ = 0, wall_ms_ = 0, enqueue_ms_ = 0;
 };
 
 }  // namespace r4dx::model

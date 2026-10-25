@@ -164,6 +164,11 @@ struct Qwen35MoeStage::Impl {
   core::DeviceBuffer<int32_t> argmax_rows_dev;   // [spec_window]
   core::PinnedBuffer<int32_t> argmax_rows_host;  // [spec_window]
 
+  // A prefill super-chunk of more than 256 rows (R4DX_Q35_CHUNK): the mixers (GDN, attention) run on consecutive <= 256-row slices of it, each layer, and the
+  // MoE on all the rows at once. row_off is the first row of the slice RunGdn / RunAttention work on.
+  int64_t row_off = 0;
+  uint16_t* Rows(core::DeviceBuffer<uint16_t>& b) { return b.data() + row_off * hidden; }
+
   PrefillProfile pprof;  // R4DX_Q35_PROFILE=3: GPU time per phase of the prefill chunks
   bool PprofOn(const Qwen35MoeChunk& c) const { return pprof.on() && c.is_prefill; }
 
@@ -297,8 +302,8 @@ Qwen35MoeStage::Qwen35MoeStage(const Qwen35MoeStageOptions& options, std::vector
   m.device = options.device;
   const Qwen35MoeConfig& cfg = m.cfg;
   if (layers.empty()) Fail("no layers");
-  if (options.max_rows < 1 || options.max_rows > 256 || (options.max_rows > 64 && options.max_rows % 64 != 0)) {
-    Fail("max_rows must be in [1, 64] or a multiple of 64 up to 256");
+  if (options.max_rows < 1 || options.max_rows > 1024 || (options.max_rows > 64 && options.max_rows % 64 != 0)) {
+    Fail("max_rows must be in [1, 64] or a multiple of 64 up to 1024 (more than 256: the mixers run on 256-row slices)");
   }
   if (options.max_ctx < 1) Fail("max_ctx must be >= 1");
   if (options.spec_window < 1 || options.spec_window > std::min<int64_t>(options.max_rows, 64)) {
@@ -396,7 +401,7 @@ Qwen35MoeStage::Qwen35MoeStage(const Qwen35MoeStageOptions& options, std::vector
           /*write_once=*/options.spec_window > 1);
       L->gdn_states->ZeroAll(m.stream);
       if (options.prompt_checkpoint) L->gdn_states->AllocateCheckpoint();
-      bump(L->gdn->ArenaBytes(R));
+      bump(L->gdn->ArenaBytes(std::min<int64_t>(R, 256)));
     } else {
       const Qwen35MoeAttnRefs& a = r.attn;
       for (const QuantLinear* q : {a.qg, a.k, a.v, a.o}) {
@@ -533,7 +538,7 @@ Qwen35MoeStage::Qwen35MoeStage(const Qwen35MoeStageOptions& options, std::vector
   m.verify_sub = std::max<int>(1, static_cast<int>(64 / (cfg.num_attention_heads / cfg.num_key_value_heads)));
   if (const char* e = std::getenv("R4DX_Q35_VERIFY_SUB"); e != nullptr && e[0] != 0) m.verify_sub = std::atoi(e);
   m.positions_host = core::PinnedBuffer<int32_t>(static_cast<size_t>(R));
-  m.seqused_host = core::PinnedBuffer<int32_t>(1);
+  m.seqused_host = core::PinnedBuffer<int32_t>(static_cast<size_t>(std::max<int64_t>(1, (R + 255) / 256)));  // one per 256-row mixer slice
   m.slices_host = core::PinnedBuffer<int32_t>(static_cast<size_t>(std::max<int64_t>(1, R / 64)));
   // Prewarm GDN control cache so it never calls hipMalloc mid-run
   m.control.Prewarm(std::min<int64_t>(m.opt.max_rows, 256), 0, 1);
@@ -644,9 +649,9 @@ void Qwen35MoeStage::StoreResidual(uint16_t* host_rows, int64_t rows) {
 
 void Qwen35MoeStage::Impl::RunGdn(LayerRt& L, const Qwen35MoeChunk& c) {
   // x = rmsnorm(h); blk = gdn(x); hmid = h + blk
-  Norm(h.data(), L.input_ln, x.data(), c.rows);
+  Norm(Rows(h), L.input_ln, Rows(x), c.rows);
   if (PprofOn(c)) pprof.Mark(stream.get(), "gdn.norm");
-  CapBf16(L.index, "attn_in", x.data(), c.rows, hidden, c.first_pos);
+  CapBf16(L.index, "attn_in", Rows(x), c.rows, hidden, c.first_pos);
   Qwen4ExpGdnCall call;
   call.is_prefill = c.is_prefill;
   call.has_init = c.first_pos > 0;
@@ -677,7 +682,7 @@ void Qwen35MoeStage::Impl::RunGdn(LayerRt& L, const Qwen35MoeChunk& c) {
     pmark = [&](const char* name) { pprof.Mark(stream.get(), (std::string("gdn.") + name).c_str()); };
     call.mark = &pmark;
   }
-  L.gdn->Forward(stream.get(), arena, *L.gdn_states, control, x.data(), blk.data(), c.rows, call);
+  L.gdn->Forward(stream.get(), arena, *L.gdn_states, control, Rows(x), Rows(blk), c.rows, call);
   if (!marks.empty()) {
     R4DX_HIP_CHECK(hipEventSynchronize(marks.back().second));
     for (size_t i = 1; i < marks.size(); ++i) {
@@ -688,9 +693,9 @@ void Qwen35MoeStage::Impl::RunGdn(LayerRt& L, const Qwen35MoeChunk& c) {
     ++prof_phase_calls;
   }
   arena.Reset();
-  AllReduceBlock(c.rows);  // --tp 2 site A1: out_proj is row-parallel, blk holds this rank's partial sum
-  CapBf16(L.index, "attn_out", blk.data(), c.rows, hidden, c.first_pos);
-  ResidualAdd(h.data(), blk.data(), hmid.data(), c.rows);
+  AllReduceBlock(c.rows);  // --tp 2 site A1: out_proj is row-parallel, blk holds this rank's partial sum (TP: row_off is 0)
+  CapBf16(L.index, "attn_out", Rows(blk), c.rows, hidden, c.first_pos);
+  ResidualAdd(Rows(h), Rows(blk), Rows(hmid), c.rows);
   if (PprofOn(c)) pprof.Mark(stream.get(), "gdn.resid");
 }
 
@@ -699,18 +704,21 @@ void Qwen35MoeStage::Impl::RunAttention(LayerRt& L, const Qwen35MoeChunk& c) {
   const int64_t T = c.rows;
   const hipStream_t s = stream.get();
   const bool sliced = T > 64;
+  // (the host staging is per slice of a super-chunk: the copies are asynchronous and the next slice must not overwrite what they read)
+  int32_t* pos_h = positions_host.data() + row_off;
+  int32_t* used_h = seqused_host.data() + row_off / 256;
+  int32_t* slices_h = slices_host.data() + row_off / 64;
   if (capture) {  // capture only: the layer re-derives this norm itself
-    Norm(h.data(), L.input_ln, x.data(), T);
-    CapBf16(L.index, "attn_in", x.data(), T, hidden, c.first_pos);
+    Norm(Rows(h), L.input_ln, Rows(x), T);
+    CapBf16(L.index, "attn_in", Rows(x), T, hidden, c.first_pos);
   }
-  for (int64_t t = 0; t < T; ++t) positions_host[static_cast<size_t>(t)] = static_cast<int32_t>(c.first_pos + t);
-  seqused_host[0] = static_cast<int32_t>(c.first_pos + T);
-  R4DX_HIP_CHECK(hipMemcpyAsync(positions.data(), positions_host.data(), static_cast<size_t>(T) * 4, hipMemcpyHostToDevice, s));
-  R4DX_HIP_CHECK(hipMemcpyAsync(seqused_k.data(), seqused_host.data(), 4, hipMemcpyHostToDevice, s));
+  for (int64_t t = 0; t < T; ++t) pos_h[t] = static_cast<int32_t>(c.first_pos + t);
+  used_h[0] = static_cast<int32_t>(c.first_pos + T);
+  R4DX_HIP_CHECK(hipMemcpyAsync(positions.data(), pos_h, static_cast<size_t>(T) * 4, hipMemcpyHostToDevice, s));
+  R4DX_HIP_CHECK(hipMemcpyAsync(seqused_k.data(), used_h, 4, hipMemcpyHostToDevice, s));
   if (sliced) {
-    for (int64_t j = 0; j < T / 64; ++j) slices_host[static_cast<size_t>(j)] = static_cast<int32_t>(c.first_pos + 64 * (j + 1));
-    R4DX_HIP_CHECK(hipMemcpyAsync(seqused_k_slices.data(), slices_host.data(), static_cast<size_t>(T / 64) * 4,
-                                  hipMemcpyHostToDevice, s));
+    for (int64_t j = 0; j < T / 64; ++j) slices_h[j] = static_cast<int32_t>(c.first_pos + 64 * (j + 1));
+    R4DX_HIP_CHECK(hipMemcpyAsync(seqused_k_slices.data(), slices_h, static_cast<size_t>(T / 64) * 4, hipMemcpyHostToDevice, s));
   }
   // A verify window runs the DECODE attention kernel `verify_sub` rows at a time (see AttentionLayer::Forward), so each row's result is
   // the plain decode step's bit for bit; the prefill kernel it would otherwise take for more than 4 rows rounds differently.
@@ -723,7 +731,7 @@ void Qwen35MoeStage::Impl::RunAttention(LayerRt& L, const Qwen35MoeChunk& c) {
     R4DX_HIP_CHECK(hipMemcpyAsync(seqused_sub.data(), sub_host.data(), static_cast<size_t>((T + decode_sub - 1) / decode_sub) * 4,
                                   hipMemcpyHostToDevice, s));
   }
-  L.attn->Forward(arena, h.data(), hmid.data(), L.attn_w, *L.kv, static_cast<int>(T), static_cast<int>(c.first_pos),
+  L.attn->Forward(arena, Rows(h), Rows(hmid), L.attn_w, *L.kv, static_cast<int>(T), static_cast<int>(c.first_pos),
                   positions.data(), seqused_k.data(), s, /*x_normed_in=*/nullptr, /*next_norm_weight=*/nullptr,
                   /*x_normed_out=*/nullptr, /*prof=*/nullptr, /*x_normed_pre_epilogue=*/0, /*x_normed_pre_data=*/nullptr,
                   /*next_epilogue=*/0, /*next_epilogue_out=*/nullptr, /*rope_pos3=*/nullptr,
@@ -814,6 +822,9 @@ void Qwen35MoeStage::RunLayers(const Qwen35MoeChunk& c) {
   }
   if (m.spec_window > 1 && !c.is_prefill && !c.verify && T != 1) Fail("RunLayers: a speculative stage decodes one row (or verifies)");
   const bool is_decode = (T == 1 && !c.is_prefill && !m.capture);
+  if (T > 256 && (!c.is_prefill || c.verify || m.capture || m.comm != nullptr || c.only_layer >= 0)) {
+    Fail("RunLayers: more than 256 rows is a plain prefill super-chunk (no capture, no verify, no --tp 2, no single layer)");
+  }
   // A 256-row prefill chunk: the trellis linears (attention projections, GDN in_proj_qkv / in_proj_z / out_proj) run libr4d's M = 256 GEMM, one launch
   // that reads each weight once instead of four 64-row slices that read it four times -- bit-identical to the slices (docs/trellis-m256.md).
   // R4DX_Q35_M256=0 keeps the slices. The scope is thread-local, so it is opened here, on the thread that runs the layers.
@@ -854,10 +865,27 @@ void Qwen35MoeStage::RunLayers(const Qwen35MoeChunk& c) {
     const bool prof = m.prof_on && c.verify;
     const size_t li = static_cast<size_t>(L.index - m.first);
     if (prof) R4DX_HIP_CHECK(hipEventRecord(m.prof_ev[3 * li], m.stream.get()));
-    if (L.full) {
-      m.RunAttention(L, c);
+    if (T <= 256) {
+      if (L.full) {
+        m.RunAttention(L, c);
+      } else {
+        m.RunGdn(L, c);
+      }
     } else {
-      m.RunGdn(L, c);
+      // a super-chunk: the mixer on consecutive slices of <= 256 rows (each sees the state / KV the slice before it left), the MoE below on all rows
+      for (int64_t off = 0; off < T; off += 256) {
+        Qwen35MoeChunk cj = c;
+        cj.rows = std::min<int64_t>(256, T - off);
+        cj.first_pos = c.first_pos + off;
+        m.row_off = off;
+        const ScopedTrellisM256 slice_scope(m256_enabled && cj.rows == kTrellisM256Rows);
+        if (L.full) {
+          m.RunAttention(L, cj);
+        } else {
+          m.RunGdn(L, cj);
+        }
+      }
+      m.row_off = 0;
     }
     if (prof) R4DX_HIP_CHECK(hipEventRecord(m.prof_ev[3 * li + 1], m.stream.get()));
     m.CapBf16(L.index, "residual_attn", m.hmid.data(), T, m.hidden, c.first_pos);
@@ -885,7 +913,7 @@ void Qwen35MoeStage::RunLayers(const Qwen35MoeChunk& c) {
   m.SpMark(1);
   const double enqueue_ms = MsSince(t0);
   if (!is_decode) m.stream.Synchronize();
-  if (m.PprofOn(c)) m.pprof.End(T, MsSince(t0));
+  if (m.PprofOn(c)) m.pprof.End(T, MsSince(t0), enqueue_ms);
   if (m.prof_on && c.verify) {
     m.prof_enqueue_ms += enqueue_ms;
     m.prof_wall_ms += MsSince(t0);

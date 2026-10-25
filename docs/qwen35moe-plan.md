@@ -260,26 +260,75 @@ continuations are identical token for token (49 of 49) with zero teacher-forced 
 layer-level `moe_out` over 280 real single-row calls differs in 8 of 860k elements (largest 0.5% of the row rms). 256-expert synthetic layer:
 grouped vs host-routed max|err|/rms 0.0005 (4-bit), 0.0000 (3-bit gate_up). Decode of the 4-layer tiny model: 2.5-3.9 ms -> 1.3-1.7 ms per token.
 Not covered: no real-dimension trellis container exists yet (`q35moe-real4` is bf16, so the grouped path does not apply to it).
-## 8. Prefill speed (planned, not started)
+## 8. Prefill speed (measured 2026-10-23, branch `q35moe-prefill`)
 
-Expected today: ~150-300 tok/s (pipeline split), ~200-400 with `--tp 2`; an 8k prompt takes ~27-55 s to the first token, 32k ~2-2.5 min.
-Scaled from the qwen4exp measurements (230-450 tok/s, ~5 TFLOPS useful, against the dense 27B's ~1000 tok/s / ~54 TFLOPS on the same cards).
-Nothing was profiled; the causes are inferred:
+**Result (real container, layer split, one run per cell, same session, interleaved; greedy `--temperature 0`, 16 tokens):**
 
-1. Host-routed MoE: a router-id D2H copy and host sync per layer, then per-expert GEMMs, ~25,000 launches per 256-row chunk (~0.25-0.5 s of the
-   observed ~0.57 s per chunk).
-2. Skinny expert GEMMs: ~8 rows per expert in a 256-row chunk against 64-row tiles (`r4d_gemm_trellis_nt_m64`).
-3. The trellis decode to fp16 is not amortised over few rows.
-4. Nearly all 256 experts are read in every layer, so each chunk streams ~52 GB (floor ~0.11 s, ~2000 tok/s).
-5. The pipeline split keeps one card idle at a time; the chunk cap is 256 rows.
+| prompt tokens | base (host-routed MoE, 256-row chunks, no overlap) | (a) device-side prefill MoE | (a)+(c) chunks pipelined over the two cards | (a)+(c)+256-row GEMM scope | **final: + 1024-row super-chunks** | speedup |
+|---:|---:|---:|---:|---:|---:|---:|
+| 534 | 557 tok/s | 952* | 1488 | 1727 | **1726** | 3.1x |
+| 1992 | 662 | 1206 | 1964 | 1931 | **2485** | 3.8x |
+| 7436 | 662 | 1206 | 2023 | 2312 | **3082** | 4.7x |
+| 36403 | 619 | 1108 | 1927 | 2189 | **3071** | 5.0x |
 
-Work items (after the quantized container; guess: 500-900 tok/s afterwards, practical ceiling ~1500):
-a. Grouped prefill MoE GEMM: sort rows by expert, one launch per layer, dense tiles (probably the biggest gain).
-b. Larger chunks (512-1024 rows) so each expert sees more rows and weights are streamed less often; check the activation VRAM.
-c. fp8 / int8 MoE prefill path (already the M6 "prefill int8 path").
-d. Overlap chunks across both cards (`docs/pp-prefill.md`, not ported to this model) and/or `--tp 2`.
-e. Profile first: add an `R4DX_Q35_PROFILE` timing breakdown for prefill (per-layer MoE / GDN / attention) before changing kernels.
+(*) one cell of the matrix died with HIP error 719 while uploading the container (before any kernel ran; 4 of ~35 loads did, see below); the value is
+from an earlier identical-configuration run. Decode is unchanged by all of it (57-65 tok/s in every cell). The same four prompts measured earlier in a slower
+machine state gave 329 / 394 / 402 / 469 tok/s for the base: **the display card (device 0) is intermittently 1.5-3x slower on attention and the GDN scan**
+(`attn.layer` 6 ms against 1.1-1.9 ms on device 1, `gdn.scan` 1.2 against 0.08 ms; the same code ran at 1.4k and 2.4k tok/s on different minutes; an idle
+attention micro-benchmark is identical on both cards), so compare only cells of one session. `R4DX_Q35_DEVICES=1,0` (stage 0 on device 1) gave
++18% in one run when device 0 was in its slow state; not made the default.
 
+**What was built** (all in `src/model`, kernels in `qwen4exp/kernels/moe_trellis_decode.hip`):
+
+* `R4DX_Q35_PROFILE=3` (`qwen35moe_prefill_profile.h`): per-phase GPU time of every prefill chunk, per stage, printed at exit (events between phases, no sync).
+  The baseline profile (7436 tokens): the MoE was 77% (device 0) / 88% (device 1) of the GPU time: expert gate_up GEMMs 23-26%, the host round trip (router ids to
+  the host, plan, gather) 17-23%, down GEMMs 15-16%, silu/norm/residual/router/shared ~6% each; GDN projections + scan 12% / 4%, attention 0.5-2%.
+* **(a) `Qwen35PrefillMoe`** (`qwen35moe_prefill_moe.*`, `GroupedMoePlanLarge`): router + route + shared expert for all rows, then a two-kernel device-side plan
+  (counts per expert, then every expert's pairs in source order, cut into groups of <= 16 pairs, several groups per expert), the gate_up input transform per pair, the
+  grouped trellis GEMM of the DFlash2 verify window (a group's pairs fill the WMMA tile, so an expert's weights are decoded and streamed once per group), silu*up fused
+  with the down transform, the down GEMM, the router-order combine. 14 launches per layer instead of ~500, no host sync. Synthetic 256-expert layer: 2.39 ms per
+  256-row call against 6.73 ms host-routed (512 rows: 3.28 against 7.85 ms; 64 rows: 1.89 against 5.25). `R4DX_Q35_PREFILL_MOE=0` keeps the old path;
+  `R4DX_Q35_PREFILL_SKG="gu,down"` picks the GEMMs' split-group counts (default 1,1; 4,4 is 7% slower and bit-identical to the host path for experts with <= 16 rows).
+* **(c) `Qwen35MoeModel::PrefillPipelined`** (`qwen35moe_model_pp.cpp`): stage 1 runs chunk i on a worker thread while stage 0 runs chunk i + 1; the residual crosses
+  through a 2-slot ring of pinned buffers. No numeric change (real container: KL(old || new) = 0.000000, 2560 rows). `R4DX_Q35_PP=0` off; used when
+  there are >= 2 chunks, two stages, no drafter, no capture.
+* **256-row GEMM scope**: `RunLayers` opens `ScopedTrellisM256` for 256-row prefill chunks (the trellis linears of the mixers read each weight once instead of four times;
+  bit-identical to the 64-row slices, `docs/trellis-m256.md`). Device 1's GPU span of the 7.4k prompt fell 14%; device 0 (display card) did not move. `R4DX_Q35_M256=0` off.
+* **(b) super-chunks**: a prompt of >= 1024 tokens prefills in chunks of 1024 rows: per layer the mixers (GDN, attention) run on consecutive 256-row slices of the
+  chunk, the MoE on all 1024 rows, so each expert's weights are streamed once per 1024 rows (the MoE is weight-streaming bound: ~1.2 GB per layer). Per layer on
+  device 1 the MoE took 8.4 ms per 1024 rows as four 256-row chunks, 4.7 ms as one super-chunk (-44%). Extra VRAM 0.29 GiB. Shorter prompts keep 256-row chunks
+  (they pipeline); `R4DX_Q35_CHUNK=256|512|768|1024` overrides; fixed at 256 with a drafter and under `--tp 2`. 512-row chunks gave 2.2k / 2.75k tok/s at 2k / 32k
+  against 2.5k / 3.07k for 1024.
+
+**Equivalence and quality** (the gates asked for):
+
+* Layer by layer on the real container (`tool_q35moe_prefill_cmp`, first 512 tokens of a held-out text, each layer alone over the same residual): the new MoE's
+  `moe_out` differs from the host-routed one in 0.6-2.8% of the elements by one bf16 step (mean|err|/rms 1e-5 .. 4e-5, max 0.03-0.2 of the row rms on single
+  elements), the router's top-8 sets are identical in all rows of all 48 layers. The host path itself is not bit-reproducible by any other summation order
+  (experts with > 16 rows use a different split-group count).
+* Quality against the fp32 truth (`tools/prefill/kl_vs_truth.py`, `tool_teacher_forced_logprobs --tail-rows 128`, 17 held-out segments, 2176 scored rows, the
+  prefix prefilled by the path under test): KL(truth || new) - KL(truth || old) = **+0.0006 +- 0.0012** (pooled; split-group 1,1) and +0.0021 +- 0.0018 (4,4, which
+  is the same numerics as the old path for most experts: the spread is sampling noise); per group english -0.0025 +- 0.0042, thai -0.0084 +- 0.0037, code +0.0010 +- 0.0019,
+  tool -0.0019 +- 0.0050, long (10k) +0.0074 +- 0.0094; top-1(truth) 90.35% -> 90.72%. KL(old || new) itself is 0.022 with 92.7% top-1 agreement, i.e. the size of this
+  model's own bf16 noise (KL(truth || stock HF bf16) = 0.046): rounding-different but equally accurate. Pipelining, the 256-row GEMM scope and 512/1024-row super-chunks
+  are bit-identical to the 256-row chunks: KL 0.000000 over 2560 real rows (6 long segments), tiny-model logits and greedy continuations equal, also for a warm second call.
+* Greedy text on the real container: the four prompts give the same first 16 tokens in all configurations from (a) on (p512 and p7k also equal the base; for p2k and p32k
+  the base differs from the first or second token, a near-tie of the kind the 92.7% top-1 agreement implies).
+* Tests (tiny trellis container, device 1): `test_model_q35moe_prefill` (layer level, whole prompt, 512/1024-row super-chunks equal 256-row chunks, warm second call),
+  `test_q35moe_grouped_moe_kernel` (large plan against a CPU plan; 256-expert synthetic layer vs host-routed at 2..512 rows), plus tiny, grouped, spec, dflash2 golden,
+  tp_tiny, tp_container, tp_spec and tp_shard all pass. `test_model_q35moe_tp_facade` fails one check that is stale on the `qwen35moe` tip (it still expects
+  `--dflash under --tp 2 is refused ... P6`, but P6 shipped); not touched by this branch.
+
+**Where the time goes now** (7.4k tokens, final configuration, per layer-chunk on device 1): MoE gate_up + down GEMMs ~63% of the GPU time (they stream the
+experts' ~1.2 GB per layer: at ~600 GB/s that is the floor, ~2 ms per layer per chunk), GDN projections 10%, attention 11%, shared expert 5%, the rest <10%.
+What is left: (1) the MoE bytes themselves (a lower-rate expert quantization or fp8 weights is the only way below the streaming floor; 2048-row chunks would
+halve the per-row cost again but the pipeline then has only 3-4 chunks at 7k tokens); (2) the display card's intermittent slowness, which makes device 0 the
+pipeline bottleneck; (3) `--tp 2` prefill runs the same stage code (`Qwen35PrefillMoe` with the rank's 512-wide experts, 256-row chunks; see the spot check below); (4) int8 prefill GEMMs for the mixers' linears (lossy; the dense 27B
+ships them) were not tried.
+
+**Original estimates (2026-10-21), kept for the record:** the host-routed MoE (router ids to the host, per-expert GEMMs, ~25,000 launches per 256-row chunk, ~8 rows per
+expert against 64-row tiles) was expected to cost ~0.25-0.5 s of a ~0.57 s chunk, with a streaming floor of ~0.11 s per chunk (~2000 tok/s); the measured
+baseline was 330-660 tok/s and the final path 1.7-3.1k tok/s.
 ## 9. Status 2026-10-22: what shipped, measured numbers, decisions
 
 **Usable model.** `E:\models\r4dx\ornith-1.5-122b-trellis-mix-kv.r4dx` (56.5 GB file; calibrated fp8 KV; same trellis bytes as `ornith-1.5-122b-trellis-mix.r4dx`).

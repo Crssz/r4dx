@@ -152,6 +152,61 @@ int RunTest() {
     Check(toks[0][0] == toks[1][0], "T" + std::to_string(T) + ": the first token differs");
   }
   model->SetPrefillMoe(true);
+
+  // ---- 3. super-chunks (R4DX_Q35_CHUNK): the MoE on 512 / 1024 rows at once, the mixers on 256-row slices --------------------------------
+  // Every row's MoE is independent of the other rows (the grouped GEMMs give a row the same bits whatever it is grouped with), so a prompt
+  // prefilled in 1024-row super-chunks must equal the same prompt in 256-row chunks bit for bit: logits, and the greedy continuation.
+  {
+    std::vector<int32_t> big;
+    {
+      const Golden g(300, GoldenPath(300));
+      for (int rep = 0; big.size() < 2200; ++rep) {
+        for (size_t i = 0; i < g.ids().size() && big.size() < 2200; ++i) big.push_back(g.ids()[(i * (3 + 2 * rep) + rep) % g.ids().size()]);
+      }
+    }
+    std::vector<float> ref_logits;
+    std::vector<int32_t> ref_toks;
+    {
+      model->SetGroupedDecode(true, false);
+      model->SetPrefillMoe(true);
+      model->Reset();
+      ref_logits = model->Prefill(big);
+      int32_t tok = static_cast<int32_t>(ArgMax(ref_logits.data(), static_cast<int64_t>(ref_logits.size())));
+      for (int i = 0; i < 12; ++i) {
+        tok = model->DecodeStepGreedy(tok);
+        ref_toks.push_back(tok);
+      }
+    }
+    // a warm second call (positions continue, GDN state and KV carry over): 700 tokens, then the other 1500
+    const std::vector<int32_t> part1(big.begin(), big.begin() + 700), part2(big.begin() + 700, big.end());
+    model->Reset();
+    model->Prefill(part1);
+    const std::vector<float> ref_warm = model->Prefill(part2);
+    for (const char* chunk : {"512", "1024"}) {
+      _putenv_s("R4DX_Q35_CHUNK", chunk);
+      auto m2 = Qwen35MoeModel::Load(o);
+      _putenv_s("R4DX_Q35_CHUNK", "");
+      Check(m2->ChunkRows() == std::atoll(chunk), std::string("R4DX_Q35_CHUNK=") + chunk + " was not honoured");
+      m2->Reset();
+      const std::vector<float> lg = m2->Prefill(big);
+      int32_t tok = static_cast<int32_t>(ArgMax(lg.data(), static_cast<int64_t>(lg.size())));
+      std::vector<int32_t> toks;
+      for (int i = 0; i < 12; ++i) {
+        tok = m2->DecodeStepGreedy(tok);
+        toks.push_back(tok);
+      }
+      m2->Reset();
+      m2->Prefill(part1);
+      const bool same_warm = m2->Prefill(part2) == ref_warm;
+      Check(same_warm, std::string("chunk ") + chunk + ": a second (warm) Prefill call differs from the 256-row chunks'");
+      std::printf("   chunk %s: warm second call %s\n", chunk, same_warm ? "equal" : "DIFFERS");
+      const bool same_logits = lg == ref_logits;
+      std::printf("   chunk %s, %zu-token prompt: last-row logits %s the 256-row chunks', continuation %s\n", chunk, big.size(),
+                  same_logits ? "equal" : "DIFFER FROM", toks == ref_toks ? "equal" : "DIFFERS");
+      Check(same_logits, std::string("chunk ") + chunk + ": the last-row logits differ from the 256-row chunks'");
+      Check(toks == ref_toks, std::string("chunk ") + chunk + ": the greedy continuation differs");
+    }
+  }
   std::printf("\n%s (%d failure(s))\n", g_failures == 0 ? "PASS" : "FAIL", g_failures);
   return g_failures == 0 ? 0 : 1;
 }

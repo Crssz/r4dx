@@ -36,7 +36,7 @@ std::vector<float> Qwen35MoeModel::PrefillPipelined(const std::vector<int32_t>& 
   if (static_cast<int>(pp_ring_.size()) < kSlots) {
     pp_ring_.clear();
     for (int i = 0; i < kSlots; ++i) {
-      pp_ring_.push_back(std::make_unique<core::PinnedBuffer<uint16_t>>(static_cast<size_t>(kChunkRows * hidden)));
+      pp_ring_.push_back(std::make_unique<core::PinnedBuffer<uint16_t>>(static_cast<size_t>(chunk_rows_ * hidden)));
     }
   }
 

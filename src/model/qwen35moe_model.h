@@ -102,6 +102,9 @@ struct Qwen35MoeModelOptions {
 class Qwen35MoeModel {
  public:
   static constexpr int64_t kChunkRows = 256;
+  // The default super-chunk (see ChunkRows()): 1024 rows. A prompt shorter than this prefills in kChunkRows chunks (they pipeline across the two
+  // stages; one 512-row super-chunk of a 534-token prompt would not).
+  static constexpr int64_t kSuperChunkRows = 1024;
 
   // Loads the container (one range per stage), builds the stages, zeroes the state. Prints one line per stage to stderr.
   static std::unique_ptr<Qwen35MoeModel> Load(const Qwen35MoeModelOptions& options);
@@ -230,7 +233,12 @@ class Qwen35MoeModel {
   std::vector<VramReport> Vram() const;
 
   // The chunk sizes a `rows`-row call is split into (the rule in the file comment). Public for the unit test.
-  static std::vector<int64_t> PlanChunks(int64_t rows);
+  // chunk: the chunk size of the prompt prefill (default kChunkRows; the model's own is ChunkRows()).
+  static std::vector<int64_t> PlanChunks(int64_t rows, int64_t chunk = kChunkRows);
+  // The prefill chunk size of a long prompt: kSuperChunkRows (1024; R4DX_Q35_CHUNK = 256 / 512 / 768 / 1024 overrides) -- a super-chunk: the mixers run on
+  // 256-row slices, the MoE on all of its rows, so each expert's weights are streamed once per chunk (docs/qwen35moe-plan.md 8). Fixed to
+  // kChunkRows with a drafter or under --tp 2.
+  int64_t ChunkRows() const { return chunk_rows_; }
 
  private:
   Qwen35MoeModel() = default;
@@ -266,7 +274,8 @@ class Qwen35MoeModel {
   std::vector<std::unique_ptr<Qwen35MoeStage>> stages_;
   bool gdn_recurrent_ = false;
 
-  core::PinnedBuffer<uint16_t> embed_rows_host_;  // [kChunkRows, hidden]
+  int64_t chunk_rows_ = kChunkRows;
+  core::PinnedBuffer<uint16_t> embed_rows_host_;  // [chunk_rows_, hidden]
   core::PinnedBuffer<uint16_t> handoff_host_;     // [kChunkRows, hidden]
   std::vector<std::unique_ptr<core::PinnedBuffer<uint16_t>>> pp_ring_;  // PrefillPipelined's hand-off slots
 

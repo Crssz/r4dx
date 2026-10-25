@@ -147,6 +147,9 @@ void r4d_attn_prefill_kernel(const typename R4DKernelArgs<(WIN || EXT) != 0>::ty
     constexpr float PSHIFT = D::SHIFT;
     constexpr float PGROW  = D::GROW;
     static_assert(!KWIDE || KITEMS % NTHR == 0, "the wide K fetch covers the tile in whole passes");
+    // Row r serves query r / GQA: a workgroup must hold whole queries, or the rows of its last partial query
+    // would be stored again by the next workgroup, here short of their last key (r4d_attn_paged_h128_gqa7.hip).
+    static_assert(ROWS % GQA == 0, "NWARPS * 16 must be a multiple of GQA");
     static_assert(DSPLIT == 1 || SPLIT == 0, "DSPLIT is a variant of the unsplit kernel only");
     static_assert(!(WIN || EXT) || (SPLIT == 0 && DSPLIT == 1), "WIN / EXT are the plain kernel only");
     static_assert(DGW * DSPLIT == DGA && NKD * DSPLIT == NKS && NKD % PFV == 0,

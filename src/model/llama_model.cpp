@@ -107,6 +107,7 @@ LlamaModel LlamaModel::Load(const LlamaModelOptions& opts) {
   m.ids_host_ = core::PinnedBuffer<int32_t>(static_cast<size_t>(rows));
   m.ids_dev_ = core::DeviceBuffer<int32_t>(static_cast<size_t>(rows));
   m.positions_dev_ = core::DeviceBuffer<int32_t>(static_cast<size_t>(rows));
+  m.seqused_dev_ = core::DeviceBuffer<int32_t>(1);
   m.buf_h_ = core::DeviceBuffer<uint16_t>(static_cast<size_t>(rows * hidden));
   m.logits_dev_ = core::DeviceBuffer<float>(static_cast<size_t>(m.vocab_local_));
   m.argmax_dev_ = core::DeviceBuffer<int32_t>(1);
@@ -141,8 +142,9 @@ LlamaModel LlamaModel::Load(const LlamaModelOptions& opts) {
   }
   m.stream_.Synchronize();
   std::cerr << "[r4dx::model::LlamaModel] " << layers << " layers, max_ctx " << m.max_ctx_
-            << ", KV bf16 = " << (static_cast<double>(m.kv_bytes_) / (1024.0 * 1024.0 * 1024.0))
-            << " GiB, attention reference kernel (head_dim " << hd << ", GQA " << cfg.Gqa() << "), residual bf16"
+            << ", KV bf16 = " << (static_cast<double>(m.kv_bytes_) / (1024.0 * 1024.0 * 1024.0)) << " GiB, attention "
+            << ((hd == 128 && cfg.Gqa() == 7 && !attention::LlamaAttnForceRef()) ? "r4d h128_gqa7" : "reference kernel")
+            << " (head_dim " << hd << ", GQA " << cfg.Gqa() << "), residual bf16"
             << (m.container_.HasTrellis() ? ", trellis body" : "") << ", logit mask "
             << (m.real_vocab_ > 0 ? ">= " + std::to_string(m.real_vocab_) : std::string("off"));
   if (is_tp) std::cerr << ", TP rank " << opts.tp_rank << "/" << opts.tp_world << " (vocab shard " << m.vocab_local_ << ")";
@@ -182,6 +184,8 @@ void LlamaModel::UploadPositions(int64_t start_pos, int64_t T) {
   std::vector<int32_t> h(static_cast<size_t>(T));
   for (int64_t t = 0; t < T; ++t) h[static_cast<size_t>(t)] = static_cast<int32_t>(start_pos + t);
   positions_dev_.CopyFromHost(h.data(), h.size());
+  const int32_t seqused = static_cast<int32_t>(start_pos + T);
+  seqused_dev_.CopyFromHost(&seqused, 1);
 }
 
 void LlamaModel::MaskPaddingLogits(float* logits_local, int64_t rows, int64_t row_stride) {
@@ -226,7 +230,8 @@ void LlamaModel::RunLayer(int64_t i, uint16_t* h, int64_t T, int64_t start_pos, 
   aw.v = &lw.attn.v;
   aw.o = &lw.attn.o;
   attn_[static_cast<size_t>(i)].Forward(arena_, x, sub, aw, kv_[static_cast<size_t>(i)], static_cast<int>(T),
-                                        static_cast<int>(start_pos), positions_dev_.data(), s_raw, prof, comm_);
+                                        static_cast<int>(start_pos), positions_dev_.data(), seqused_dev_.data(), s_raw,
+                                        prof, comm_);
   take(dbg ? &dbg->attn_out : nullptr, sub);
   if (dbg == nullptr) {
     ProfiledCall(prof, s_raw, "layer.post_attn_norm", [&] {

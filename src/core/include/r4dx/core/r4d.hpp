@@ -146,6 +146,22 @@ inline void AttnDecodeH64Bf16Kv(const Args& a, hipStream_t stream) {
 }
 inline int64_t AttnDecodeH64ScratchBytes(const Args& a) { return r4d_attn_decode_h64_gqa4_scratch_bytes(&a); }
 
+// ---- attention: head_dim 128, gqa 7, bf16 KV (the dense Llama family; r4d_attn_paged_h128_gqa7.hip) ----
+// The h64_gqa4 contract at head_dim 128 / gqa 7: decode q_len <= 9.
+inline void AttnPrefillH128Bf16Kv(const Args& a, hipStream_t stream) {
+  R4DX_R4D_CHECK("attn_prefill_h128_gqa7_bf16kv", r4d_attn_prefill_h128_gqa7_bf16kv(&a, stream));
+}
+inline void AttnPrefillSplitKvH128Bf16Kv(const Args& a, hipStream_t stream) {
+  R4DX_R4D_CHECK("attn_prefill_splitkv_h128_gqa7_bf16kv", r4d_attn_prefill_splitkv_h128_gqa7_bf16kv(&a, stream));
+}
+inline int64_t AttnPrefillSplitKvH128ScratchBytes(const Args& a) {
+  return r4d_attn_prefill_splitkv_h128_gqa7_scratch_bytes(&a);
+}
+inline void AttnDecodeH128Bf16Kv(const Args& a, hipStream_t stream) {
+  R4DX_R4D_CHECK("attn_decode_h128_gqa7_bf16kv", r4d_attn_decode_h128_gqa7_bf16kv(&a, stream));
+}
+inline int64_t AttnDecodeH128ScratchBytes(const Args& a) { return r4d_attn_decode_h128_gqa7_scratch_bytes(&a); }
+
 // Every attention geometry the build serves (r4d_attn_dims reports the gqa6 one only), for validating
 // a model's layer types against all of them at load.
 inline std::vector<R4DAttnGeom> GetAttnGeoms() {

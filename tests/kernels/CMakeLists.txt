@@ -211,6 +211,13 @@ add_executable(test_attn_h256_gqa16 test_attn_h256_gqa16.cpp)
 target_link_libraries(test_attn_h256_gqa16 PRIVATE r4dx_model_attention r4dx_core r4dx_kernels r4d_core)
 add_test(NAME test_attn_h256_gqa16 COMMAND test_attn_h256_gqa16)
 set_tests_properties(test_attn_h256_gqa16 PROPERTIES ENVIRONMENT "HIP_VISIBLE_DEVICES=1")
+# libr4d's head_dim 128 / gqa 7 bf16-KV attention (docs/nanbeige-plan.md 3.3, task N5-1; `ctest -R attn_h128_gqa7`): decode,
+# prefill and split-KV prefill against the stage-0 reference kernel on the same bf16 cache, at TP=1 (56 / 8 heads) and a TP=2
+# rank's shapes (28 / 4), plus the entry points' negative return codes.
+add_executable(test_attn_h128_gqa7 test_attn_h128_gqa7.cpp)
+target_link_libraries(test_attn_h128_gqa7 PRIVATE r4dx_model_attention r4dx_core r4dx_kernels r4d_core)
+add_test(NAME test_attn_h128_gqa7 COMMAND test_attn_h128_gqa7)
+set_tests_properties(test_attn_h128_gqa7 PROPERTIES ENVIRONMENT "HIP_VISIBLE_DEVICES=1")
 # tool_attn_h64_bench: the same kernels vs the reference kernel, time and KV GB/s at 2k / 8k / 32k / 128k (not a ctest):
 # $env:HIP_VISIBLE_DEVICES='1'; build\win-hip\tests\kernels\tool_attn_h64_bench.exe
 add_executable(tool_attn_h64_bench tool_attn_h64_bench.cpp)

@@ -132,6 +132,16 @@ int  r4d_attn_prefill_splitkv_h64_gqa4_bf16kv(const R4DArgs* a, hipStream_t stre
 int64_t r4d_attn_prefill_splitkv_h64_gqa4_scratch_bytes(const R4DArgs* a);
 int  r4d_attn_decode_h64_gqa4_bf16kv         (const R4DArgs* a, hipStream_t stream);
 int64_t r4d_attn_decode_h64_gqa4_scratch_bytes(const R4DArgs* a);
+// ---- attention: head_dim 128, gqa 7, bf16 KV (r4d_attn_paged_h128_gqa7.hip) -------------------------
+// The same kernels as the gqa6 family, compiled for head_dim 128 with 7 queries per KV head and a bf16
+// paged cache (the dense Llama family: Nanbeige4.3-33B, 56 q / 8 kv heads). The family's contract as for
+// h64_gqa4. Prefill: 32 query rows per workgroup (14 warps x 16 rows / gqa 7), 64-key tiles. Decode: at most
+// 64 query rows (q_len <= 9). Same return codes as h64_gqa4.
+int  r4d_attn_prefill_h128_gqa7_bf16kv        (const R4DArgs* a, hipStream_t stream);
+int  r4d_attn_prefill_splitkv_h128_gqa7_bf16kv(const R4DArgs* a, hipStream_t stream);
+int64_t r4d_attn_prefill_splitkv_h128_gqa7_scratch_bytes(const R4DArgs* a);
+int  r4d_attn_decode_h128_gqa7_bf16kv         (const R4DArgs* a, hipStream_t stream);
+int64_t r4d_attn_decode_h128_gqa7_scratch_bytes(const R4DArgs* a);
 // ---- attention: head_dim 256, gqa 16, fp8 KV (r4d_attn_paged_h256_gqa16.hip) -------------------------
 // The same kernels as the gqa6 family, compiled for head_dim 256 with 16 queries per KV head (the full-attention
 // layers of the Qwen3.5 MoE family: 32 q heads / 2 KV heads). Everything else is the gqa6 contract: paged block 16,

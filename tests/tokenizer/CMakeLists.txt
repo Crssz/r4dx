@@ -61,6 +61,22 @@ add_test(NAME tokenizer_golden_lfm2
                                   --model-dir ${R4DX_LFM2_TOKENIZER_DIR})
 set_tests_properties(tokenizer_golden_lfm2 PROPERTIES SKIP_RETURN_CODE 77)
 
+# Nanbeige4.3-33B (the Llama `legacy: false` SentencePiece shape: Metaspace prepend "first" + byte_fallback BPE + a
+# Strip decoder; chat template with <think> and XML / JSON tool calls): golden_nanbeige.json from
+# tools/tok_ref/gen_golden_nanbeige.py. The model dir is the -tok directory (chat_template.jinja extracted from
+# tokenizer_config.json, docs/nanbeige-plan.md 5.2). Override with R4DX_NANBEIGE_TOKENIZER_DIR.
+if(DEFINED ENV{R4DX_NANBEIGE_TOKENIZER_DIR})
+  set(_r4dx_nanbeige_tok_default "$ENV{R4DX_NANBEIGE_TOKENIZER_DIR}")
+else()
+  set(_r4dx_nanbeige_tok_default "${R4DX_MODELS_ROOT}/Nanbeige/Nanbeige4.3-33B-tok")
+endif()
+set(R4DX_NANBEIGE_TOKENIZER_DIR "${_r4dx_nanbeige_tok_default}" CACHE PATH
+    "Directory containing the Nanbeige4.3-33B tokenizer.json/tokenizer_config.json/chat_template.jinja/generation_config.json")
+add_test(NAME tokenizer_golden_nanbeige
+         COMMAND tokenizer_golden --golden ${CMAKE_CURRENT_SOURCE_DIR}/golden_nanbeige.json
+                                  --model-dir ${R4DX_NANBEIGE_TOKENIZER_DIR})
+set_tests_properties(tokenizer_golden_nanbeige PROPERTIES SKIP_RETURN_CODE 77)
+
 if(NOT EXISTS "${R4DX_TOKENIZER_MODEL_DIR}/tokenizer.json")
   message(WARNING "tests/tokenizer: ${R4DX_TOKENIZER_MODEL_DIR}/tokenizer.json not found; "
                    "'tokenizer_golden' is registered but will report SKIPPED at run time. Set "

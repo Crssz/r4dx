@@ -2256,8 +2256,16 @@ private:
 
       auto value = parseValue();
 
-      while (it != end && consumeSpaces() && peekSymbols({ "[", "." })) {
-        if (!consumeToken("[").empty()) {
+      // r4dx local patch (third_party/VERSIONS.md, docs/nanbeige-plan.md 5.2): a call is one more postfix operator of the
+      // loop, so a call result can be subscripted / have a method called on it (`f(x).startswith(...)`, the Nanbeige
+      // chat template). Every chain the original grammar accepted (`[` / `.` links, then at most one trailing call)
+      // parses to the same tree.
+      while (it != end && consumeSpaces() && peekSymbols({ "[", ".", "(" })) {
+        if (peekSymbols({ "(" })) {
+          auto location = get_location();
+          auto callParams = parseCallArgs();
+          value = std::make_shared<CallExpr>(location, std::move(value), std::move(callParams));
+        } else if (!consumeToken("[").empty()) {
           std::shared_ptr<Expression> index;
           auto slice_loc = get_location();
           std::shared_ptr<Expression> start, end, step;
@@ -2303,12 +2311,6 @@ private:
             }
         }
         consumeSpaces();
-      }
-
-      if (peekSymbols({ "(" })) {
-        auto location = get_location();
-        auto callParams = parseCallArgs();
-        value = std::make_shared<CallExpr>(location, std::move(value), std::move(callParams));
       }
       return value;
     }

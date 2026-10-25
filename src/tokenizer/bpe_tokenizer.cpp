@@ -202,6 +202,11 @@ struct Tokenizer::Impl {
     TokenId space_tok = kNoToken;
     // k newlines (k = 1..31) -> id of that one vocab token; empty unless all 31 exist.
     std::vector<TokenId> newline_run_tok;
+    // The Llama `legacy: false` shape (validate_spm): Metaspace(prepend_scheme "first") prepends one U+2581 to the
+    // input's first fragment unless it already starts with a space; the decoder's trailing Strip(" ", 1, 0) drops one
+    // leading space of the whole decoded text. Both false for the Gemma shape.
+    bool spm_prepend_first = false;
+    bool spm_strip_leading = false;
     // (left_id, right_id) -> (rank, merged_id), open addressing, power-of-two capacity.
     struct PairEntry {
         uint64_t key;
@@ -758,8 +763,70 @@ void validate_pretokenizer(const json& root, const Tokenizer::Options& options) 
     // are deliberately not checked; the pre-tokenizer's own flag is checked above.
 }
 
-// Throws unless tokenizer.json is exactly the Gemma-style shape documented above spm_encode_chunk.
-void validate_spm(const json& root) {
+// The two byte_fallback shapes this backend reads.
+struct SpmVariant {
+    bool prepend_first = false;  // Metaspace(prepend_scheme "first")
+    bool strip_leading = false;  // decoder ... + Strip(" ", 1, 0)
+};
+
+// The Llama `legacy: false` shape (Nanbeige4.3-33B, docs/nanbeige-plan.md 5.1): no normalizer, pre-tokenizer
+// Metaspace(U+2581, prepend_scheme "first", split false), decoder Sequence[Replace(U+2581 -> " "), ByteFallback, Fuse,
+// Strip(" ", 1, 0)], a post-processor that inserts at most the BOS in front (r4dx never inserts it: the dialect's
+// bos_on_raw_prompt does). `split false` + no normalizer is the Gemma shape's encoding (every space is U+2581, the
+// whole fragment is one BPE word) plus the prepend; `normalized: true` on an added token is inert without a normalizer.
+// Returns false when `root` is not this shape (the caller then checks the Gemma shape); throws on a near miss.
+bool is_llama_metaspace_spm(const json& root) {
+    if (root.contains("normalizer") && !root["normalizer"].is_null()) return false;
+    if (!root.contains("pre_tokenizer") || !root["pre_tokenizer"].is_object() ||
+        root["pre_tokenizer"].value("type", "") != "Metaspace") {
+        return false;
+    }
+    auto fail = [](const std::string& what) {
+        throw std::runtime_error("Tokenizer: byte_fallback tokenizer.json with a Metaspace pre-tokenizer is not the "
+                                 "supported Llama shape: " + what);
+    };
+    const json& pt = root["pre_tokenizer"];
+    if (pt.value("replacement", "") != kSpaceMark) fail("Metaspace.replacement is not U+2581");
+    if (pt.value("prepend_scheme", "") != "first") fail("Metaspace.prepend_scheme is not \"first\"");
+    if (pt.value("split", true)) fail("Metaspace.split is true");
+    if (!root.contains("decoder") || root["decoder"].value("type", "") != "Sequence" ||
+        !root["decoder"].contains("decoders") || root["decoder"]["decoders"].size() != 4) {
+        fail("decoder is not Sequence[Replace, ByteFallback, Fuse, Strip]");
+    }
+    const json& d = root["decoder"]["decoders"];
+    if (d[0].value("type", "") != "Replace" || d[0].value("content", "") != " " || !d[0].contains("pattern") ||
+        d[0]["pattern"].value("String", "") != kSpaceMark || d[1].value("type", "") != "ByteFallback" ||
+        d[2].value("type", "") != "Fuse" || d[3].value("type", "") != "Strip" || d[3].value("content", "") != " " ||
+        d[3].value("start", -1) != 1 || d[3].value("stop", -1) != 0) {
+        fail("decoder is not Sequence[Replace(U+2581 -> \" \"), ByteFallback, Fuse, Strip(\" \", 1, 0)]");
+    }
+    if (root.contains("post_processor") && !root["post_processor"].is_null()) {
+        const json& pp = root["post_processor"];
+        if (pp.value("type", "") != "TemplateProcessing") fail("post_processor is not TemplateProcessing");
+        // Only a leading special token per sequence (the BOS): an EOS appended after the text would change every
+        // encode in a way the dialect's BOS switch cannot express.
+        for (const char* key : {"single", "pair"}) {
+            if (!pp.contains(key)) continue;
+            bool seen_sequence = false;
+            for (const auto& piece : pp[key]) {
+                if (piece.contains("Sequence")) seen_sequence = true;
+                if (piece.contains("SpecialToken") && seen_sequence && std::string(key) == "single") {
+                    fail("post_processor appends a special token after the text");
+                }
+            }
+        }
+    }
+    for (const auto& entry : root.value("added_tokens", json::array())) {
+        if (entry.value("lstrip", false) || entry.value("rstrip", false) || entry.value("single_word", false)) {
+            fail("added token " + entry.value("content", std::string()) + " has lstrip/rstrip/single_word set");
+        }
+    }
+    return true;
+}
+
+// Throws unless tokenizer.json is exactly the Gemma-style shape documented above spm_encode_chunk, or the Llama
+// Metaspace shape (is_llama_metaspace_spm); returns which.
+SpmVariant validate_spm(const json& root) {
     auto fail = [](const std::string& what) {
         throw std::runtime_error("Tokenizer: byte_fallback tokenizer.json is not the supported SPM-style shape: " + what);
     };
@@ -773,6 +840,7 @@ void validate_spm(const json& root) {
         }
     }
     if (model.contains("dropout") && !model["dropout"].is_null()) fail("model.dropout is set");
+    if (is_llama_metaspace_spm(root)) return SpmVariant{true, true};
 
     if (!root.contains("normalizer") || root["normalizer"].is_null() ||
         root["normalizer"].value("type", "") != "Replace" ||
@@ -817,6 +885,7 @@ void validate_spm(const json& root) {
             fail("added token " + entry.value("content", std::string()) + " has normalized/lstrip/rstrip/single_word set");
         }
     }
+    return SpmVariant{};
 }
 
 // Builds the kSpmByteFallback lookup tables from the already-populated vocab / merge JSON.
@@ -967,8 +1036,10 @@ Tokenizer::Impl load_impl(const std::string& tokenizer_json_path, const std::str
     // else must be the Qwen-style byte-level regex shape.
     const bool spm = root["model"].value("byte_fallback", false);
     if (spm) {
-        validate_spm(root);
+        const SpmVariant v = validate_spm(root);
         impl.kind = TokenizerKind::kSpmByteFallback;
+        impl.spm_prepend_first = v.prepend_first;
+        impl.spm_strip_leading = v.strip_leading;
     } else {
         validate_pretokenizer(root, options);
     }
@@ -1178,7 +1249,16 @@ std::vector<TokenId> Tokenizer::encode(std::string_view text, bool parse_special
         }
         if (frag.text.empty()) continue;
         if (spm) {
-            spm_encode_text(*impl_, frag.text, out);
+            // Metaspace(prepend_scheme "first"): only the fragment at offset 0 of the input gets the U+2581, and only
+            // when it does not already start with one (a leading ' ' becomes it).
+            const bool at_start = frag.text.data() == text.data();
+            if (impl_->spm_prepend_first && at_start && frag.text[0] != ' ' &&
+                frag.text.compare(0, 3, kSpaceMark) != 0) {
+                const std::string prefixed = " " + std::string(frag.text);
+                spm_encode_text(*impl_, prefixed, out);
+            } else {
+                spm_encode_text(*impl_, frag.text, out);
+            }
             continue;
         }
         const std::string chunk(frag.text);
@@ -1191,7 +1271,11 @@ std::vector<TokenId> Tokenizer::encode(std::string_view text, bool parse_special
 
 std::string Tokenizer::decode(const std::vector<TokenId>& ids, bool skip_special_tokens) const {
     if (!impl_) throw std::runtime_error("Tokenizer::decode: tokenizer not loaded");
-    if (impl_->kind == TokenizerKind::kSpmByteFallback) return spm_decode(*impl_, ids, skip_special_tokens);
+    if (impl_->kind == TokenizerKind::kSpmByteFallback) {
+        std::string s = spm_decode(*impl_, ids, skip_special_tokens);
+        if (impl_->spm_strip_leading && !s.empty() && s[0] == ' ') s.erase(0, 1);  // Strip(" ", 1, 0)
+        return s;
+    }
     std::string out;
     for (const TokenId id : ids) {
         if (id < 0 || static_cast<size_t>(id) >= impl_->id_to_token.size()) continue;  // ignore invalid ids
@@ -1209,6 +1293,15 @@ struct Tokenizer::StreamDecoder::Impl {
     const Tokenizer::Impl* tok = nullptr;
     bool skip_special = true;
     std::string buffer;  // Qwen: undecoded UTF-8 tail; SPM: pending `<0xNN>` byte run
+    bool emitted_any = false;  // SPM Strip(" ", 1, 0): only the stream's very first character can be stripped
+
+    // The decoder's Strip(" ", 1, 0) on a stream: drops one leading space of the first non-empty piece.
+    std::string StripStart(std::string piece) {
+        if (emitted_any || piece.empty()) return piece;
+        emitted_any = true;
+        if (tok->spm_strip_leading && piece[0] == ' ') piece.erase(0, 1);
+        return piece;
+    }
 };
 
 Tokenizer::StreamDecoder::StreamDecoder() : impl_(std::make_unique<Impl>()) {}
@@ -1224,11 +1317,11 @@ std::string Tokenizer::StreamDecoder::push(TokenId id) {
     if (s.tok->kind == TokenizerKind::kSpmByteFallback) {
         if (s.tok->byte_of[id] >= 0) {
             s.buffer.push_back(static_cast<char>(s.tok->byte_of[id]));
-            return spm_drain_run(s.buffer, /*final=*/false);
+            return s.StripStart(spm_drain_run(s.buffer, /*final=*/false));
         }
         std::string emitted = spm_drain_run(s.buffer, /*final=*/true);  // a held tail can never complete now
         emitted += s.tok->decoded_piece[id];
-        return emitted;
+        return s.StripStart(std::move(emitted));
     }
 
     s.buffer += s.tok->id_is_added[id] ? s.tok->id_to_token[id] : decode_merge_vocab_piece(s.tok->id_to_token[id]);
@@ -1242,7 +1335,7 @@ std::string Tokenizer::StreamDecoder::push(TokenId id) {
 
 std::string Tokenizer::StreamDecoder::flush() {
     Impl& s = *impl_;
-    if (s.tok && s.tok->kind == TokenizerKind::kSpmByteFallback) return spm_drain_run(s.buffer, /*final=*/true);
+    if (s.tok && s.tok->kind == TokenizerKind::kSpmByteFallback) return s.StripStart(spm_drain_run(s.buffer, /*final=*/true));
     std::string rest = std::move(s.buffer);
     s.buffer.clear();
     return rest;

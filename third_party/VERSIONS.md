@@ -67,3 +67,9 @@ re-run the build + tests.
      `tokenizer_golden_gemma` after merging.
   Related: LFM2 needs `ChatTemplateOptions{.apply_polyfills = false}` (minja's caps probe misreads the
   template exactly as it does for Gemma's; the polyfills would turn `tool_calls` into JSON content).
+- **minja.hpp, Nanbeige4.3 patch (1 local change, needed by Nanbeige/Nanbeige4.3-33B's chat template;
+  covered by the `tokenizer_golden_nanbeige` chat cases):** *a call is a postfix operator of the loop*
+  (`Parser::parseValueExpression`). Upstream parsed `[` / `.` links and then at most ONE trailing call, so
+  a call result could not be subscripted or have a method called on it: `visible_text(c).startswith(...)`
+  threw "Expected comma in tuple". The call is now one more link of the postfix loop; every chain the old
+  grammar accepted parses to the same tree, so the Qwen / Gemma / LFM2 goldens are unaffected.

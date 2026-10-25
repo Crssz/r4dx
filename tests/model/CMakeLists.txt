@@ -591,6 +591,16 @@ add_test(NAME test_tp_shard COMMAND test_tp_shard)
 add_executable(test_llama_config test_llama_config.cpp)
 target_link_libraries(test_llama_config PRIVATE r4dx_model_arch)
 add_test(NAME test_llama_config COMMAND test_llama_config)
+# test_llama_container (docs/nanbeige-plan.md N1-5): the CPU half of the LlamaContainer loader (llama_container_info.h)
+# on tiny bf16 / w8a16 containers converted by r4dx-convert (when built), header edits, tp::RuleFor's Llama table and
+# the TP=2 byte plans on the real geometry, and the real Nanbeige w8a16 header (SKIP when absent). CPU-only.
+add_executable(test_llama_container test_llama_container.cpp)
+target_link_libraries(test_llama_container PRIVATE r4dx_tp_shard r4dx_convert r4dx_core)
+if(TARGET r4dx-convert)
+  target_compile_definitions(test_llama_container PRIVATE R4DX_CONVERT_EXE="$<TARGET_FILE:r4dx-convert>")
+  add_dependencies(test_llama_container r4dx-convert)
+endif()
+add_test(NAME test_llama_container COMMAND test_llama_container)
 
 add_executable(test_lfm2_config test_lfm2_config.cpp)
 target_link_libraries(test_lfm2_config PRIVATE r4dx_model_arch)

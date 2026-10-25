@@ -225,6 +225,27 @@ bool LookupLfm2LayerRule(const std::string& s, const ModelConfig& g, int64_t lay
   return true;
 }
 
+// Dense Llama (docs/nanbeige-plan.md 3.4): every layer is full attention + a SwiGLU MLP. q / k / v column-parallel by
+// head, o row-parallel, gate|up two-segment column split, down row-parallel; the norms replicated.
+bool LookupLlamaLayerRule(const std::string& s, const ModelConfig& g, ShardRule* rule) {
+  if (s == "input_norm" || s == "post_attn_norm") {
+    *rule = Replicate();
+  } else if (s == "attn.q") {
+    *rule = Rows({g.num_attention_heads * g.head_dim});
+  } else if (s == "attn.k" || s == "attn.v") {
+    *rule = Rows({g.num_key_value_heads * g.head_dim});
+  } else if (s == "attn.o") {
+    *rule = Cols(g.num_attention_heads * g.head_dim);
+  } else if (s == "mlp.gate_up") {
+    *rule = Rows({g.intermediate_size, g.intermediate_size});
+  } else if (s == "mlp.down") {
+    *rule = Cols(g.intermediate_size);
+  } else {
+    return false;
+  }
+  return true;
+}
+
 // qwen3_5_moe (Ornith-1.5-122B, docs/qwen35moe-tp-design.md 1.3, 2.2, 3): the per-layer table, keyed by the suffix after
 // `text.layers.{i}.`. `g` is Qwen35MoeConfig::ToModelConfig() of the UNSHARDED config. The mixers are the dense Qwen3.5's
 // (LookupLayerRule: GDN and gated attention); every layer's FFN is the MoE, never a dense mlp:
@@ -397,6 +418,10 @@ ShardRule RuleFor(const std::string& base, const ModelConfig& global) {
       if (!LookupLfm2LayerRule(base.substr(q + 1), global, layer, &rule)) unknown();
       return rule;
     }
+    if (global.arch == Arch::kLlama) {
+      if (!LookupLlamaLayerRule(base.substr(q + 1), global, &rule)) unknown();
+      return rule;
+    }
     LayerKind kind;
     const bool known = global.arch == Arch::kQwen35Moe ? LookupQwen35MoeLayerRule(base.substr(q + 1), global, &rule, &kind)
                                                        : LookupLayerRule(base.substr(q + 1), global, &rule, &kind);
@@ -414,6 +439,10 @@ ShardRule RuleFor(const std::string& base, const ModelConfig& global) {
   if (global.arch == Arch::kLfm2Moe && (StartsWith(base, "mtp.") || StartsWith(base, "rotation."))) unknown();
   // qwen3_5_moe has no MTP head (ToModelConfig: mtp_num_hidden_layers 0) and no quant2 rotation either.
   if (global.arch == Arch::kQwen35Moe && (StartsWith(base, "mtp.") || StartsWith(base, "rotation."))) unknown();
+  // Neither has the dense Llama; nor vision / dflash prefixes (no tower, no drafter yet).
+  if (global.arch == Arch::kLlama && (StartsWith(base, "mtp.") || StartsWith(base, "rotation.") ||
+                                      StartsWith(base, "vision.") || StartsWith(base, "dflash.")))
+    unknown();
 
   if (StartsWith(base, "mtp.")) {
     // The MTP head is one full-attention decoder layer (sharded exactly like a body attention

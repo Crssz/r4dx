@@ -6,6 +6,12 @@ the precedent for a side model family behind `TextModel`. Where it says MUST, do
 **UNVERIFIED** is inferred, or read from a web summary rather than the file itself; the task named next to it settles it
 before the code that depends on it is written. Section 11 lists every UNVERIFIED item, section 10 the open questions.
 
+> **Scope change (user, 2026-10-26): trellis is out.** The shipping format is w8a16 at `--tp 2` only. Section 7, the N4
+> tasks and N5-5 are kept below as a record and are NOT planned work; decision 2's trellis half, the trellis rows of
+> sections 2.2 / 8 and the trellis gate (6.3) no longer apply. The loader keeps its generic trellis path (it costs
+> nothing), untested for this arch. The same day the user approved running every remaining task, GPU work included,
+> without asking first.
+
 ## Summary
 
 `Nanbeige/Nanbeige4.3-33B` is a plain dense Llama: `LlamaForCausalLM`, 52 layers, every layer full-attention GQA
@@ -319,7 +325,7 @@ asserted). Cost: about 66 GB of weight reads plus about 2 x 33 B x 10k tokens = 
 - **TP identity:** trellis TP=1 vs w8a16 TP=2 is not an identity check (different weights). Within a format: w8a16 TP=2 run
   twice must give the same bytes, and `nanbeige-l8` bf16 TP=1 vs TP=2 mean KL <= 3 x noise (the LFM2 rule).
 
-## 7. Trellis pipeline (TP=1)
+## 7. Trellis pipeline (TP=1) -- OUT OF SCOPE (2026-10-26)
 
 Reuse: `trellis_quant.py`, `hessian_capture.py`, `arch_table.py`, `lfm2_mix.py` (copied to `llama_mix.py` without the expert
 groups), `trellis_import.hpp`, `tools/quant2/trellis_convert.ps1` patterns. A `tools/nanbeige/trellis_pipeline.ps1` with stage
@@ -431,7 +437,7 @@ GPU workload, including every `tests/kernels/*` test). **[CPU-heavy]** is a long
 | N3-4 | `tools/server/smoke.ps1 -Dialect nanbeige` (reasoning split, thinking off, Chinese, XML tool call round trip, streaming) | [GPU] |
 | N3-5 | `docs/nanbeige.md` (run, numbers, limits), README "Other models" row | [CPU] |
 
-### N4: trellis on one card
+### N4: trellis on one card -- OUT OF SCOPE (2026-10-26)
 
 | Task | What | Kind |
 |---|---|---|
@@ -451,7 +457,7 @@ GPU workload, including every `tests/kernels/*` test). **[CPU-heavy]** is a long
 | N5-2 | fp8 KV: the `KVP 0` instantiation, a `kv_calibrate` port for this arch, `--kv-calib` in the converter, KL A/B (doubles the context of both formats) |
 | N5-3 | Fused `qkv` linear (launch count), only if a decode profile shows launch-bound layers |
 | N5-4 | Embedding table in pinned host memory (gather over PCIe: 14 KB per decode token): frees 2.2 GiB per card |
-| N5-5 | Trellis at TP=2 (about 10 GiB per rank; decode estimate about 50 tok/s); needs TP=2 trellis tuning rows |
+| N5-5 | OUT OF SCOPE (2026-10-26). Trellis at TP=2 (about 10 GiB per rank; decode estimate about 50 tok/s); needs TP=2 trellis tuning rows |
 | N5-6 | int8 prefill GEMM (the Qwen path's) for this arch, if prefill matters; KL A/B like docs/int8-prefill.md |
 
 ## 10. Open questions (for the user; none block N0)

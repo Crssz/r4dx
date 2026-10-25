@@ -132,8 +132,9 @@ set(R4DX_MODEL_SOURCES
   lfm2_layers.cpp
   lfm2_model.cpp
   lfm2_tp_model.cpp
-  # Dense Llama (docs/nanbeige-plan.md N1-5): the container loader.
+  # Dense Llama (docs/nanbeige-plan.md N1-5 / N1-6): the container loader and the engine.
   llama_container.cpp
+  llama_model.cpp
   gdn_layer.cpp
   mlp.cpp
   final_lm_head.cpp

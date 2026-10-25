@@ -470,7 +470,7 @@ GPU workload, including every `tests/kernels/*` test). **[CPU-heavy]** is a long
 
 | Fact | Settled by |
 |---|---|
-| ~~Safetensors names match section 4; `lm_head.weight` present; no extra tensors~~ VERIFIED (N0-2, 2026-10-25): 471 tensors = 52 x 9 + embed / norm / lm_head, all BF16, shapes as section 2.2, names as `make_tiny_llama.py`, no `inv_freq`; shard 1's own header still to read | N0-2 |
+| ~~Safetensors names match section 4; `lm_head.weight` present; no extra tensors~~ VERIFIED (N0-2, 2026-10-25): 471 tensors = 52 x 9 + embed / norm / lm_head, all BF16, shapes as section 2.2, names as `make_tiny_llama.py`, no `inv_freq`; all 14 shards header-consistent and the HF sizes, shard 1 SHA-256 equal to its LFS hash | N0-2 |
 | Stock transformers loads it without `trust_remote_code`; 4.51.1 vs 5.18.0 numerics equal for this config | N0-3 |
 | ~~`tokenizer.json` shape and added-token flags~~ VERIFIED (N0-4): section 5.1 | N0-4 |
 | Norm weights and activations need no fp32 residual | N0-5, N2-3 |

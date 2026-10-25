@@ -272,7 +272,7 @@ struct CliUsageError : std::runtime_error {
 inline std::string CliUsageText(const char* argv0) {
   return std::string("usage: ") + argv0 +
          " --model <container.r4dx> --layout {w4a16|bf16|trellis|w8a16} "
-         "(--prompt \"...\" | --prompt-file <path> | --chat) [--tokenizer-dir <dir>] [--dialect {auto|qwen35|gemma4|lfm2|qwen4_exp}] [--system \"...\"] "
+         "(--prompt \"...\" | --prompt-file <path> | --chat) [--tokenizer-dir <dir>] [--dialect {auto|qwen35|gemma4|lfm2|qwen4_exp|nanbeige}] [--system \"...\"] "
          "[--think {on|off}] [--max-tokens N] [--temperature F] [--top-k N] [--top-p F] "
          "[--min-p F] [--seed N] [--max-ctx N] [--extended-ctx] [--stats] [--profile] [--profile-token N] "
          "[--profile-prefill] [--mtp N] [--mtp-head-layout {bf16|layout}] "
@@ -477,8 +477,8 @@ inline CliArgs ParseArgs(int argc, char** argv) {
   if (a.min_p < 0.0f || a.min_p > 1.0f) throw CliUsageError("--min-p must be in [0, 1]");
   if (a.max_ctx <= 0) throw CliUsageError("--max-ctx must be > 0");
   if (a.dialect != "auto" && a.dialect != "qwen35" && a.dialect != "gemma4" && a.dialect != "lfm2" &&
-      a.dialect != "qwen4_exp") {
-    throw CliUsageError("--dialect must be 'auto', 'qwen35', 'gemma4', 'lfm2' or 'qwen4_exp'");
+      a.dialect != "qwen4_exp" && a.dialect != "nanbeige") {
+    throw CliUsageError("--dialect must be 'auto', 'qwen35', 'gemma4', 'lfm2', 'qwen4_exp' or 'nanbeige'");
   }
   if (a.layers == 0 || a.layers < -1) throw CliUsageError("--layers must be -1 (every layer) or > 0");
   if (a.top_k < 0) throw CliUsageError("--top-k must be >= 0");

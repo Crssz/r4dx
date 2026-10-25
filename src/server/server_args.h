@@ -398,8 +398,8 @@ inline ServerArgs ParseServerArgs(int argc, char** argv) {
   if (a.port <= 0 || a.port > 65535) throw ServerUsageError("--port must be in 1..65535");
   if (a.max_ctx <= 0) throw ServerUsageError("--max-ctx must be > 0");
   if (a.dialect != "auto" && a.dialect != "qwen35" && a.dialect != "gemma4" && a.dialect != "lfm2" &&
-      a.dialect != "qwen4_exp") {
-    throw ServerUsageError("--dialect must be 'auto', 'qwen35', 'gemma4', 'lfm2' or 'qwen4_exp'");
+      a.dialect != "qwen4_exp" && a.dialect != "nanbeige") {
+    throw ServerUsageError("--dialect must be 'auto', 'qwen35', 'gemma4', 'lfm2', 'qwen4_exp' or 'nanbeige'");
   }
   if (a.request_log_tokens && a.request_log.empty()) {
     throw ServerUsageError("--request-log-tokens needs --request-log <path> (it adds fields to that file)");

@@ -331,6 +331,41 @@ void TestQwen4Exp() {
   fs::remove_all(root);
 }
 
+// Nanbeige4.3-33B (docs/nanbeige-plan.md 5.3): Qwen's text surface under its own name, its own EOS / BOS / tokenizer
+// directory, and the dense llama arch's only dialect.
+void TestNanbeige() {
+  const auto& n = NanbeigeDialect();
+  const auto& q = Qwen35Dialect();
+  CHECK(n.kind == DialectKind::kNanbeige && std::string(n.name) == "nanbeige");
+  CHECK(n.reasoning.close == q.reasoning.close && n.reasoning.open == q.reasoning.open &&
+        n.prompt_reasoning_open == "<think>\n" && n.tool_open == "<tool_call>" && n.tool_close == "</tool_call>");
+  CHECK(!n.chat_template_polyfills && n.bos_on_raw_prompt && !n.has_reasoning_effort && !n.forces_thinking);
+  CHECK(n.eos_ids == std::vector<int32_t>{166101});
+  CHECK(n.default_tokenizer_dir.find("Nanbeige4.3-33B-tok") != std::string::npos);
+  CHECK(&DialectFor(DialectKind::kNanbeige) == &n);
+  DialectKind k = DialectKind::kQwen35;
+  CHECK(ParseDialectName("nanbeige", &k) && k == DialectKind::kNanbeige);
+  // Detection: LlamaTokenizer + <|im_start|> BOS; either alone is not Nanbeige.
+  CHECK(DetectDialect(R"({"tokenizer_class": "LlamaTokenizer", "bos_token": "<|im_start|>"})", false) == DialectKind::kNanbeige);
+  CHECK(DetectDialect(R"({"tokenizer_class": "LlamaTokenizer", "bos_token": "<s>"})", false) == DialectKind::kQwen35);
+  CHECK(DetectDialect(R"({"tokenizer_class": "Qwen2Tokenizer", "bos_token": "<|im_start|>"})", false) == DialectKind::kQwen35);
+  CHECK(DetectDialect(R"({"tokenizer_class": "GemmaTokenizer", "bos_token": "<|im_start|>"})", false) == DialectKind::kGemma4);
+  CHECK(ResolveDialectKindForArch(std::nullopt, "", "llama") == DialectKind::kNanbeige);
+  CHECK(ResolveDialectKindForArch(std::nullopt, "", "qwen3_5") == DialectKind::kQwen35);
+  // Prompt state: the Qwen rules.
+  CHECK(n.ReasoningStart(true, "...<|im_start|>assistant\n<think>\n") == Start::kInReasoning);
+  CHECK(n.ReasoningStart(false, "...<|im_start|>assistant\n<think>\n\n</think>\n\n") == Start::kAnswer);
+  CHECK(n.CheckpointSuffix(true, "x<think>\n") == "<think>\n");
+  // Arch cross-check: nanbeige <-> llama only.
+  CHECK(CheckDialectAgainstArch(n, "llama").empty());
+  CHECK(!CheckDialectAgainstArch(n, "qwen3_5").empty() && !CheckDialectAgainstArch(n, "lfm2_moe").empty());
+  const std::string err = CheckDialectAgainstArch(q, "llama");
+  CHECK(err.find("--dialect nanbeige") != std::string::npos);
+  CHECK(!CheckDialectAgainstArch(Gemma4Dialect(), "llama").empty() && !CheckDialectAgainstArch(Lfm2Dialect(), "llama").empty());
+  // The other dialects are unchanged on their own archs.
+  CHECK(CheckDialectAgainstArch(q, "qwen3_5").empty() && CheckDialectAgainstArch(Lfm2Dialect(), "lfm2_moe").empty());
+}
+
 }  // namespace
 
 int main() {
@@ -345,6 +380,7 @@ int main() {
   TestArchCheck();
   TestPromptState();
   TestQwen4Exp();
+  TestNanbeige();
   if (g_failures != 0) {
     std::fprintf(stderr, "%d failure(s)\n", g_failures);
     return 1;

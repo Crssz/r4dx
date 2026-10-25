@@ -90,6 +90,20 @@ ModelDialect MakeLfm2() {
   return d;
 }
 
+ModelDialect MakeNanbeige() {
+  // Qwen's text surface (docs/nanbeige-plan.md 5.3; read from the template, N0-6): the generation prompt ends
+  // "<think>\n" (thinking on) or "<think>\n\n</think>\n\n" (off), tool calls are "<tool_call>" XML.
+  ModelDialect d = MakeQwen35();
+  d.kind = DialectKind::kNanbeige;
+  d.name = "nanbeige";
+  d.chat_template_polyfills = false;  // tests/tokenizer/golden_nanbeige.json renders exactly without them
+  d.bos_on_raw_prompt = true;         // the tokenizer's post-processor prepends <|im_start|> to a raw prompt
+  d.has_reasoning_effort = false;     // the template reads enable_thinking / preserve_thinking / tool_call_format
+  d.eos_ids = {166101};               // generation_config.json: <|im_end|>
+  d.default_tokenizer_dir = r4dx::ModelsPath("Nanbeige/Nanbeige4.3-33B-tok");
+  return d;
+}
+
 }  // namespace
 
 const ModelDialect& Qwen35Dialect() {
@@ -112,6 +126,11 @@ const ModelDialect& Qwen4ExpDialect() {
   return d;
 }
 
+const ModelDialect& NanbeigeDialect() {
+  static const ModelDialect d = MakeNanbeige();
+  return d;
+}
+
 const ModelDialect& DialectFor(DialectKind kind) {
   switch (kind) {
     case DialectKind::kGemma4:
@@ -120,6 +139,8 @@ const ModelDialect& DialectFor(DialectKind kind) {
       return Lfm2Dialect();
     case DialectKind::kQwen4Exp:
       return Qwen4ExpDialect();
+    case DialectKind::kNanbeige:
+      return NanbeigeDialect();
     case DialectKind::kQwen35:
       break;
   }
@@ -143,12 +164,16 @@ bool ParseDialectName(std::string_view s, DialectKind* out) {
     if (out) *out = DialectKind::kQwen4Exp;
     return true;
   }
+  if (s == "nanbeige") {
+    if (out) *out = DialectKind::kNanbeige;
+    return true;
+  }
   return false;
 }
 
 DialectKind DetectDialect(std::string_view tokenizer_config_json, bool has_turn_token, bool has_tool_call_token) {
   bool gemma = has_turn_token;
-  bool lfm2_bos = false;
+  bool lfm2_bos = false, nanbeige = false;
   const nlohmann::json j = nlohmann::json::parse(tokenizer_config_json.begin(), tokenizer_config_json.end(),
                                                  nullptr, /*allow_exceptions=*/false);
   if (j.is_object()) {
@@ -156,9 +181,12 @@ DialectKind DetectDialect(std::string_view tokenizer_config_json, bool has_turn_
     if (it != j.end() && it->is_string() && it->get<std::string>() == "GemmaTokenizer") gemma = true;
     auto bos = j.find("bos_token");
     if (bos != j.end() && bos->is_string() && bos->get<std::string>() == "<|startoftext|>") lfm2_bos = true;
+    nanbeige = it != j.end() && it->is_string() && it->get<std::string>() == "LlamaTokenizer" && bos != j.end() &&
+               bos->is_string() && bos->get<std::string>() == "<|im_start|>";
   }
   if (gemma) return DialectKind::kGemma4;
   if (lfm2_bos && has_tool_call_token) return DialectKind::kLfm2;
+  if (nanbeige) return DialectKind::kNanbeige;
   return DialectKind::kQwen35;
 }
 
@@ -191,6 +219,7 @@ DialectKind ResolveDialectKindForArch(std::optional<DialectKind> requested, cons
   const bool container_is_lfm2 = ArchNameIsLfm2(container_arch);
   const DialectKind qwen_kind = container_arch == "qwen4_exp" ? DialectKind::kQwen4Exp : DialectKind::kQwen35;
   if (tokenizer_dir.empty()) {
+    if (container_arch == "llama") return DialectKind::kNanbeige;
     return container_is_gemma ? DialectKind::kGemma4 : container_is_lfm2 ? DialectKind::kLfm2 : qwen_kind;
   }
   const std::string config = ReadFileIfPresent(JoinPath(tokenizer_dir, "tokenizer_config.json"));
@@ -265,6 +294,14 @@ std::string CheckDialectAgainstArch(const ModelDialect& d, std::string_view mode
   if ((d.kind == DialectKind::kQwen35 || d.kind == DialectKind::kQwen4Exp) && arch_is_lfm2) {
     return std::string("dialect ") + d.name + " does not match model architecture '" + std::string(model_arch) +
            "' (pass --dialect lfm2)";
+  }
+  // Nanbeige is the dense llama arch's dialect and nothing else's: its EOS ids and BOS are this tokenizer's.
+  const bool arch_is_llama = model_arch == "llama";
+  if (d.kind == DialectKind::kNanbeige && !arch_is_llama) {
+    return std::string("dialect nanbeige does not match model architecture '") + std::string(model_arch) + "'";
+  }
+  if (d.kind != DialectKind::kNanbeige && arch_is_llama) {
+    return std::string("dialect ") + d.name + " does not match model architecture 'llama' (pass --dialect nanbeige)";
   }
   return "";
 }

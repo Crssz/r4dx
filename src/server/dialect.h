@@ -21,7 +21,7 @@
 
 namespace r4dx::server {
 
-enum class DialectKind { kQwen35, kGemma4, kLfm2, kQwen4Exp };
+enum class DialectKind { kQwen35, kGemma4, kLfm2, kQwen4Exp, kNanbeige };
 
 // The historical tokenizer directory (server_args.h / src/cli/cli_args.h defaults), <R4DX_MODELS_ROOT>\Huihui-Qwen3.8-27B-abliterated (root default E:\models): what an empty
 // --tokenizer-dir resolves to for the Qwen dialect, whose ModelDialect::default_tokenizer_dir is empty.
@@ -95,9 +95,15 @@ const ModelDialect& Lfm2Dialect();
 // <function=..><parameter=..> bodies, reasoning_effort, EOS = the tokenizer directory's generation_config.json
 // (the Swift checkpoint's is [248046, 248044], identical to the 27B's), default tokenizer directory = the 27B's.
 const ModelDialect& Qwen4ExpDialect();
+// Nanbeige4.3-33B (the dense `llama` arch, docs/nanbeige-plan.md 5.3): Qwen's text surface ("<think>\n" opened in the
+// prompt, "</think>" closes; "<tool_call>" with <function=..><parameter=..> bodies, the Qwen XML parser), EOS
+// <|im_end|> (166101), no reasoning_effort, no polyfills (the template is rendered as written: its golden passes
+// without them), BOS <|im_start|> on raw prompts (the tokenizer's post-processor; chat prompts carry it as text),
+// default tokenizer directory <R4DX_MODELS_ROOT>\Nanbeige\Nanbeige4.3-33B-tok (chat_template.jinja extracted there).
+const ModelDialect& NanbeigeDialect();
 const ModelDialect& DialectFor(DialectKind kind);
 
-// "qwen35" / "gemma4" / "lfm2" / "qwen4_exp" (case-sensitive). Returns false for anything else (including "auto").
+// "qwen35" / "gemma4" / "lfm2" / "qwen4_exp" / "nanbeige" (case-sensitive). Returns false for anything else (including "auto").
 bool ParseDialectName(std::string_view s, DialectKind* out);
 
 // `--dialect auto`: Gemma iff tokenizer_config.json says `tokenizer_class == "GemmaTokenizer"` or
@@ -107,6 +113,7 @@ bool ParseDialectName(std::string_view s, DialectKind* out);
 // LFM2.5 (`has_tool_call_token`: the vocab contains "<|tool_call_start|>"): tokenizer_config.json has
 // `bos_token == "<|startoftext|>"` AND the vocab has that tool token (checked after Gemma, so a Gemma
 // config still wins). The default for `has_tool_call_token` keeps every existing two-argument call as is.
+// Nanbeige: tokenizer_config.json has `tokenizer_class == "LlamaTokenizer"` AND `bos_token == "<|im_start|>"`.
 DialectKind DetectDialect(std::string_view tokenizer_config_json, bool has_turn_token,
                           bool has_tool_call_token = false);
 
@@ -122,6 +129,7 @@ DialectKind ResolveDialectKind(std::optional<DialectKind> requested, const std::
 // container_is_lfm2, ArchNameIsLfm2). Same rules, plus: a "qwen4_exp"
 // container resolves to kQwen4Exp whenever the tokenizer (or its absence) does not say Gemma. A Gemma
 // tokenizer on a qwen4_exp container still resolves to kGemma4, which CheckDialectAgainstArch then refuses.
+// A "llama" container with no tokenizer dir resolves to kNanbeige (the only llama checkpoint r4dx serves).
 DialectKind ResolveDialectKindForArch(std::optional<DialectKind> requested, const std::string& tokenizer_dir,
                                       std::string_view container_arch);
 

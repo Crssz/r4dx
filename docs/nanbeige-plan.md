@@ -12,6 +12,13 @@ before the code that depends on it is written. Section 11 lists every UNVERIFIED
 > nothing), untested for this arch. The same day the user approved running every remaining task, GPU work included,
 > without asking first.
 
+> **Status 2026-10-26: N0-N3 done.** N2-3 KL gate PASS (ALL KL 0.00118 vs limit 0.00615, top-1 98.45 vs noise 98.71),
+> N2-4 greedy smoke PASS (495 / 505 top-1, 10 near-ties < 0.25), N2-5 speed recorded (decode 31.2 / 30.0 / 26.2 tok/s and
+> prefill 624 / 616 / 581 tok/s at 2k / 8k / 32k), N0-5 survey (norm weights <= 5.25; residual max |h| about 32k, bf16 is
+> enough). N5-1's attention half shipped early: the libr4d `h128_gqa7` kernels. Measured numbers and commands:
+> [nanbeige.md](nanbeige.md). Left: N5-2 (fp8 KV) and the optional N5-3 / N5-4 / N5-6; prefill would need a large-M w8a16
+> GEMM (not in the N5 list).
+
 ## Summary
 
 `Nanbeige/Nanbeige4.3-33B` is a plain dense Llama: `LlamaForCausalLM`, 52 layers, every layer full-attention GQA

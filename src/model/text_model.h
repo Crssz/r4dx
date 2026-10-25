@@ -251,6 +251,11 @@ std::unique_ptr<TextModel> LoadGemmaTextModel(const ModelOptions& opts, const Tp
 // Lfm2TpModel. L1-1 ships a placeholder that throws std::runtime_error until L1-8 / L1-10 replace it.
 std::unique_ptr<TextModel> LoadLfm2TextModel(const ModelOptions& opts, const TpOptions& tp);
 
+// The dense Llama branch of LoadTextModel (arch.h: DetectArch(opts.container_path) == kLlama). Defined in
+// llama_local_text_model.cpp (docs/nanbeige-plan.md 3.1): tp.world == 1 -> LlamaLocalTextModel, tp.world == 2 ->
+// LlamaTpModel. TextModel::Config().arch is Arch::kLlama for what it returns.
+std::unique_ptr<TextModel> LoadLlamaTextModel(const ModelOptions& opts, const TpOptions& tp);
+
 // The qwen4_exp branch of LoadTextModel (arch.h: DetectArch(opts.container_path) == kQwen4Exp). Defined in
 // qwen4exp_local_text_model.cpp: tp.world must be 1 (the two cards are the model's own layer split, plan 4.11 item 4;
 // R4DX_Q4_DEVICES / R4DX_Q4_SPLIT choose them). TextModel::Config().arch is Arch::kQwen4Exp for what it returns.

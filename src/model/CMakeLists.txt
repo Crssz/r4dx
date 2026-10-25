@@ -132,9 +132,12 @@ set(R4DX_MODEL_SOURCES
   lfm2_layers.cpp
   lfm2_model.cpp
   lfm2_tp_model.cpp
-  # Dense Llama (docs/nanbeige-plan.md N1-5 / N1-6): the container loader and the engine.
+  # Dense Llama (docs/nanbeige-plan.md N1-5..N1-8): the container loader, the engine, the TP=1 TextModel + the
+  # LoadLlamaTextModel dispatch, and the TP=2 facade.
   llama_container.cpp
   llama_model.cpp
+  llama_local_text_model.cpp
+  llama_tp_model.cpp
   gdn_layer.cpp
   mlp.cpp
   final_lm_head.cpp

@@ -143,8 +143,9 @@ void Engine::LoadAndStart() {
     }
   }
   const bool container_is_lfm2 = ArchNameIsLfm2(container_arch_name);
-  // LFM2's /v1/models meta.n_ctx_train comes from its own config.json (131072), not the Qwen constant (262144).
-  if (container_is_lfm2 && container_meta.is_object() && container_meta.contains("model_config")) {
+  const bool container_is_llama = container_arch_name == "llama";
+  // LFM2's / Llama's /v1/models meta.n_ctx_train comes from its own config.json, not the Qwen constant (262144).
+  if ((container_is_lfm2 || container_is_llama) && container_meta.is_object() && container_meta.contains("model_config")) {
     const nlohmann::json& mc = container_meta.at("model_config");
     const nlohmann::json& tc = (mc.is_object() && mc.contains("text_config")) ? mc.at("text_config") : mc;
     if (tc.is_object() && tc.contains("max_position_embeddings") && tc.at("max_position_embeddings").is_number_integer()) {
@@ -158,9 +159,10 @@ void Engine::LoadAndStart() {
   dialect_ = &DialectFor(kind);
   // Batched decode (docs/batch-decode.md) is Qwen3.5-only: refuse an LFM2 container before the multi-GB load (the
   // generic BatchSlots() check after the load below would catch it too, later).
-  if (container_is_lfm2 && opts_.model_opts.batch_slots > 0) {
-    throw std::invalid_argument("--batch " + std::to_string(opts_.model_opts.batch_slots) +
-                                ": LFM2 does not support batched decode (drop --batch; docs/batch-decode.md)");
+  if ((container_is_lfm2 || container_is_llama) && opts_.model_opts.batch_slots > 0) {
+    throw std::invalid_argument("--batch " + std::to_string(opts_.model_opts.batch_slots) + ": " +
+                                (container_is_lfm2 ? "LFM2" : "Llama") +
+                                " does not support batched decode (drop --batch; docs/batch-decode.md)");
   }
   // The dialect's own generation_config sampling defaults (LFM2 only; Qwen/Gemma carry none): they replace
   // a --default-* value only where the operator did not pass that flag. A request's own fields still win

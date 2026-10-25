@@ -13,8 +13,9 @@ post_attention_layernorm, self_attn.{q,k,v,o}_proj, mlp.{gate,up,down}_proj. All
 
 Dimensions keep every TP=2 rule of LlamaConfig::Shard legal (row-parallel K % 256 per rank, rows % 16) at the REAL
 model's attention geometry: head_dim 128 and GQA 7 (28 q heads / 4 kv heads -> 14 / 2 per rank, o_proj K 1792 per
-rank = 7 x 256), so the N5 h128_gqa7 kernel can be tested on it. hidden 512 is deliberately != heads x head_dim
-(3584): the config's explicit head_dim key must be honoured. intermediate 512, vocab 512, 3 layers.
+rank = 7 x 256), so the N5 h128_gqa7 kernel can be tested on it. hidden 1792 is deliberately != heads x head_dim
+(3584): the config's explicit head_dim key must be honoured (transformers 5 still requires hidden % heads == 0:
+1792 = 28 x 64; and 1792 = 14 x 128 keeps every K whole w8a16 groups). intermediate 512, vocab 512, 3 layers.
 """
 import argparse
 import json
@@ -23,7 +24,7 @@ import struct
 from array import array
 from pathlib import Path
 
-HIDDEN, HEADS, KV, HEAD_DIM = 512, 28, 4, 128
+HIDDEN, HEADS, KV, HEAD_DIM = 1792, 28, 4, 128
 FFN, VOCAB, LAYERS = 512, 512, 3
 
 

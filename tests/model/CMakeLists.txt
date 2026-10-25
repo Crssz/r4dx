@@ -628,6 +628,13 @@ target_link_libraries(test_lfm2_layers PRIVATE r4dx_model r4dx_convert r4dx_core
 target_compile_definitions(test_lfm2_layers PRIVATE R4DX_LFM2_GOLDEN_DIR="${CMAKE_SOURCE_DIR}/tools/reference/golden_out/lfm2")
 add_test(NAME lfm2_layer_golden COMMAND test_lfm2_layers)
 set_tests_properties(lfm2_layer_golden PROPERTIES ENVIRONMENT "HIP_VISIBLE_DEVICES=1" SKIP_RETURN_CODE 77)
+#   llama_tiny_e2e      test_llama_tiny_e2e.cpp (docs/nanbeige-plan.md N1-11): the dense Llama stack on its tiny fixture
+#                       (R4DX_LLAMA_TINY_DIR) vs stock-HF logits, bf16 and w8a16, TP=1 / TP=2 emulate (real with
+#                       R4DX_LLAMA_TINY_TP_REAL=1), determinism, checkpoint / restore, greedy / sampled, a layer's debug taps
+add_executable(test_llama_tiny_e2e test_llama_tiny_e2e.cpp)
+target_link_libraries(test_llama_tiny_e2e PRIVATE r4dx_model r4dx_convert r4dx_core r4d_core)
+add_test(NAME llama_tiny_e2e COMMAND test_llama_tiny_e2e)
+set_tests_properties(llama_tiny_e2e PROPERTIES ENVIRONMENT "HIP_VISIBLE_DEVICES=1" SKIP_RETURN_CODE 77)
 add_executable(test_lfm2_tiny_e2e test_lfm2_tiny_e2e.cpp)
 target_link_libraries(test_lfm2_tiny_e2e PRIVATE r4dx_model r4dx_convert r4dx_core r4d_core)
 add_test(NAME lfm2_tiny_e2e COMMAND test_lfm2_tiny_e2e)

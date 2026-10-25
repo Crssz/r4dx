@@ -325,7 +325,7 @@ void TestDetectArch() {
 
   Check(DetectArchFromMetadata(json{{"model_arch", "gemma4_unified"}}) == Arch::kGemma4, "metadata: model_arch gemma4_unified");
   Check(DetectArchFromMetadata(json{{"model_arch", "qwen3_5"}}) == Arch::kQwen35, "metadata: model_arch qwen3_5");
-  Check(Throws([&] { DetectArchFromMetadata(json{{"model_arch", "llama"}}); }, "unknown __metadata__.model_arch"),
+  Check(Throws([&] { DetectArchFromMetadata(json{{"model_arch", "mistral"}}); }, "unknown __metadata__.model_arch"),
         "metadata: unknown model_arch throws, not Qwen");
   Check(DetectArchFromMetadata(json{{"model_config", RealModelConfig()}}) == Arch::kGemma4,
         "metadata: model_config.model_type gemma4_unified, no model_arch key");

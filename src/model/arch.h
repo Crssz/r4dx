@@ -24,6 +24,7 @@ enum class Arch {
   kLfm2Moe,   // lfm2_moe (LFM2.5-24B-A2B): ShortConv + attention, dense then 64-expert MoE FFN, tied head
   kQwen4Exp,  // qwen4_exp (Qwen3.8-Flash-Next): GDN + QSA, 512-expert MoE, hyper-connections, PLE
   kQwen35Moe, // qwen3_5_moe (Ornith-1.5-122B): the Qwen3.5 GDN + full-attention hybrid with a 256-expert top-8 MoE FFN
+  kLlama,     // llama (Nanbeige4.3-33B): dense, every layer full GQA attention + SwiGLU MLP, untied head
 };
 
 // Stable on-disk / log spelling: `__metadata__.model_arch` for Gemma, LFM2 and qwen4_exp, "qwen3_5"
@@ -41,16 +42,19 @@ inline const char* ArchName(Arch a) {
       return "qwen4_exp";
     case Arch::kQwen35Moe:
       return "qwen3_5_moe";
+    case Arch::kLlama:
+      return "llama";
   }
   return "qwen3_5";  // unreachable: every enumerator is handled above
 }
 
 // The arch a `__metadata__` object describes:
-//   1. `model_arch` present: "gemma4_unified" -> kGemma4, "qwen4_exp" -> kQwen4Exp, "qwen3_5" ->
+//   1. `model_arch` present: "gemma4_unified" -> kGemma4, "qwen4_exp" -> kQwen4Exp, "llama" -> kLlama, "qwen3_5" ->
 //      kQwen35, anything else throws std::runtime_error (an unknown family must not be loaded as Qwen);
 //   2. otherwise `model_config.model_type` / `model_config.architectures` naming Gemma 4
 //      ("gemma4_unified", "Gemma4UnifiedForConditionalGeneration") -> kGemma4, or naming qwen4_exp
-//      ("qwen4_exp", "Qwen4ExpForConditionalGeneration") -> kQwen4Exp;
+//      ("qwen4_exp", "Qwen4ExpForConditionalGeneration") -> kQwen4Exp, or naming Llama ("llama",
+//      "LlamaForCausalLM") -> kLlama;
 //   3. otherwise kQwen35: every container written before `model_arch` existed (and the selftest
 //      containers, which have no model_config at all).
 Arch DetectArchFromMetadata(const nlohmann::json& metadata);
@@ -75,6 +79,9 @@ bool Qwen4ExpDefaultsToTrellis(const std::string& container_path);
 //   * kQwen35 and kQwen4Exp: `requested` unchanged -- the callers' own default (262144, which is
 //     also qwen4_exp's max_position_embeddings) and every explicit value behave exactly as before
 //     this function existed; the file is not read;
+//   * kLlama: LlamaConfig::ResolveMaxCtx on the container's model_config: the default is min(32768,
+//     max_position_embeddings) (KV, not the rope, is the limit: docs/nanbeige-plan.md 2.2), an explicit value larger
+//     than max_position_embeddings throws; `extended_ctx` does not change that;
 //   * kLfm2Moe: Lfm2Config::ResolveMaxCtx on the container's (flat) model_config: the default is the config's
 //     max_position_embeddings (131072), an explicit larger value throws std::invalid_argument (no rope
 //     scaling exists beyond it, so there is no extended-context opt-in; `extended_ctx` does not change that);

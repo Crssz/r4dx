@@ -586,6 +586,12 @@ add_test(NAME test_tp_shard COMMAND test_tp_shard)
 #   test_lfm2_tp_shard   tp::RuleFor's lfm2_moe table over all 40 layers x 64 experts vs Lfm2Config::Shard, the byte plans, the TP=2 algebra
 #   test_lfm2_container  the CPU half of the Lfm2Container loader (lfm2_container_info.h) on a tiny container converted by r4dx-convert
 #                        (when built), header edits, and the real lfm2-l6.r4dx header (SKIP when absent)
+# test_llama_config (docs/nanbeige-plan.md N1-1 / N1-2): LlamaConfig::FromJson on the Nanbeige4.3-33B config (every
+# refusal, both rope spellings), LlamaConfig::Shard at TP=2, DetectArch / ResolveContainerMaxCtx for llama. CPU-only.
+add_executable(test_llama_config test_llama_config.cpp)
+target_link_libraries(test_llama_config PRIVATE r4dx_model_arch)
+add_test(NAME test_llama_config COMMAND test_llama_config)
+
 add_executable(test_lfm2_config test_lfm2_config.cpp)
 target_link_libraries(test_lfm2_config PRIVATE r4dx_model_arch)
 add_test(NAME test_lfm2_config COMMAND test_lfm2_config)

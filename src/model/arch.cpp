@@ -2,6 +2,7 @@
 
 #include "gemma_config.h"
 #include "lfm2_config.h"
+#include "llama_config.h"
 
 #include <cstdint>
 #include <fstream>
@@ -36,6 +37,12 @@ bool IsQwen35MoeName(const nlohmann::json& v) {
   return s == "qwen3_5_moe" || s == "Qwen3_5MoeForConditionalGeneration" || s == "Qwen3_5MoeForCausalLM";
 }
 
+bool IsLlamaName(const nlohmann::json& v) {
+  if (!v.is_string()) return false;
+  const std::string s = v.get<std::string>();
+  return s == "llama" || s == "LlamaForCausalLM";
+}
+
 }  // namespace
 
 Arch DetectArchFromMetadata(const nlohmann::json& metadata) {
@@ -47,9 +54,11 @@ Arch DetectArchFromMetadata(const nlohmann::json& metadata) {
     if (s == ArchName(Arch::kLfm2Moe)) return Arch::kLfm2Moe;
     if (s == ArchName(Arch::kQwen4Exp)) return Arch::kQwen4Exp;
     if (s == ArchName(Arch::kQwen35Moe)) return Arch::kQwen35Moe;
+    if (s == ArchName(Arch::kLlama)) return Arch::kLlama;
     if (s == ArchName(Arch::kQwen35)) return Arch::kQwen35;
     throw std::runtime_error("r4dx::model::DetectArch: unknown __metadata__.model_arch " + a.dump() +
-                             " (this build knows 'gemma4_unified', 'lfm2_moe', 'qwen4_exp', 'qwen3_5_moe' and 'qwen3_5')");
+                             " (this build knows 'gemma4_unified', 'lfm2_moe', 'qwen4_exp', 'qwen3_5_moe', 'llama' and "
+                             "'qwen3_5')");
   }
   if (metadata.contains("model_config") && metadata.at("model_config").is_object()) {
     const nlohmann::json& mc = metadata.at("model_config");
@@ -57,6 +66,7 @@ Arch DetectArchFromMetadata(const nlohmann::json& metadata) {
     if (mc.contains("model_type") && IsLfm2Name(mc.at("model_type"))) return Arch::kLfm2Moe;
     if (mc.contains("model_type") && IsQwen4ExpName(mc.at("model_type"))) return Arch::kQwen4Exp;
     if (mc.contains("model_type") && IsQwen35MoeName(mc.at("model_type"))) return Arch::kQwen35Moe;
+    if (mc.contains("model_type") && IsLlamaName(mc.at("model_type"))) return Arch::kLlama;
     if (mc.contains("architectures") && mc.at("architectures").is_array()) {
       for (const auto& a : mc.at("architectures")) {
         if (IsGemma4Name(a)) return Arch::kGemma4;
@@ -66,6 +76,8 @@ Arch DetectArchFromMetadata(const nlohmann::json& metadata) {
         if (IsQwen4ExpName(a)) return Arch::kQwen4Exp;
       for (const auto& a : mc.at("architectures"))
         if (IsQwen35MoeName(a)) return Arch::kQwen35Moe;
+      for (const auto& a : mc.at("architectures"))
+        if (IsLlamaName(a)) return Arch::kLlama;
     }
   }
   return Arch::kQwen35;
@@ -111,7 +123,14 @@ int64_t ResolveContainerMaxCtx(const std::string& container_path, Arch arch, boo
                                " has no __metadata__.model_config (needed for the LFM2 context default)");
     return Lfm2Config::FromModelConfig(meta.at("model_config")).ResolveMaxCtx(requested_given ? requested : 0);
   }
-  // kQwen35, kQwen4Exp and kQwen35Moe keep the caller's value (arch.h); only Gemma (and LFM2 above) derive a default.
+  if (arch == Arch::kLlama) {
+    const nlohmann::json meta = ReadContainerMetadata(container_path);
+    if (!meta.is_object() || !meta.contains("model_config"))
+      throw std::runtime_error("ResolveContainerMaxCtx: " + container_path +
+                               " has no __metadata__.model_config (needed for the Llama context default)");
+    return LlamaConfig::FromModelConfig(meta.at("model_config")).ResolveMaxCtx(requested_given ? requested : 0);
+  }
+  // kQwen35, kQwen4Exp and kQwen35Moe keep the caller's value (arch.h); only Gemma (and LFM2, Llama above) derive a default.
   if (arch != Arch::kGemma4) return requested;
   const nlohmann::json meta = ReadContainerMetadata(container_path);
   if (!meta.is_object() || !meta.contains("model_config"))

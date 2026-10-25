@@ -1312,6 +1312,12 @@ std::unique_ptr<TextModel> LoadTextModel(const ModelOptions& opts, const TpOptio
     }
     return LoadLfm2TextModel(opts, tp);
   }
+  if (arch == Arch::kLlama) {
+    // Detected so that a Llama container can never fall through to the Qwen loader below; the engine itself is
+    // docs/nanbeige-plan.md N1-6..N1-8.
+    throw std::invalid_argument("LoadTextModel: " + opts.container_path +
+                                " is a llama container, and this build has no Llama engine yet (docs/nanbeige-plan.md N1)");
+  }
   if (pp_on) {
     // `--tp 2 --pp 2` is the hybrid serving mode (docs/pp-tp2-hybrid.md): the TP=2 group with the PP-2 prefill stages next to its ranks.
     // `--hybrid off` / R4DX_HYBRID=0 leaves plain --tp 2 (TpModel::Load says so).

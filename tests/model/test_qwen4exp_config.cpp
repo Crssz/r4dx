@@ -356,7 +356,7 @@ void TestDetectArch() {
         "metadata: model_arch and model_config agree");
 
   // Unknown model_arch still throws and names the known ones.
-  Check(Throws([&] { DetectArchFromMetadata(json{{"model_arch", "llama"}}); }, "unknown __metadata__.model_arch"),
+  Check(Throws([&] { DetectArchFromMetadata(json{{"model_arch", "mistral"}}); }, "unknown __metadata__.model_arch"),
         "metadata: unknown model_arch throws, not Qwen");
   Check(Throws([&] { DetectArchFromMetadata(json{{"model_arch", "qwen4"}}); }, "'qwen4_exp'"),
         "metadata: the unknown-arch error lists qwen4_exp");

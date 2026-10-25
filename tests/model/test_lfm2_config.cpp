@@ -231,7 +231,7 @@ void TestArch() {
   Check(DetectArchFromMetadata(json{{"model_arch", "lfm2_moe"}}) == Arch::kLfm2Moe, "metadata: model_arch lfm2_moe");
   Check(DetectArchFromMetadata(json{{"model_arch", "gemma4_unified"}}) == Arch::kGemma4 && DetectArchFromMetadata(json{{"model_arch", "qwen3_5"}}) == Arch::kQwen35,
         "metadata: gemma4_unified / qwen3_5 unchanged");
-  Check(Throws([&] { DetectArchFromMetadata(json{{"model_arch", "llama"}}); }, "lfm2_moe"), "metadata: an unknown model_arch throws, naming lfm2_moe among the known");
+  Check(Throws([&] { DetectArchFromMetadata(json{{"model_arch", "mistral"}}); }, "lfm2_moe"), "metadata: an unknown model_arch throws, naming lfm2_moe among the known");
   Check(DetectArchFromMetadata(json{{"model_config", RealConfig()}}) == Arch::kLfm2Moe, "metadata: flat model_config.model_type lfm2_moe, no model_arch key");
   Check(DetectArchFromMetadata(json{{"model_config", {{"architectures", {"Lfm2MoeForCausalLM"}}}}}) == Arch::kLfm2Moe,
         "metadata: model_config.architectures names Lfm2MoeForCausalLM");

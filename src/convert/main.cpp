@@ -1863,9 +1863,9 @@ int RunConvert(const AppArgs& args) {
     throw std::runtime_error("--plan-only applies to qwen4_exp and qwen3_5_moe checkpoints only");
   r4dx_convert::qwen35moe::TextShape mshape;
   if (is_q35moe) {
-    if (args.vision == 1 || args.mtp == 1)
-      throw std::runtime_error("--vision on / --mtp on: the qwen3_5_moe branch converts the text model only "
-                               "(model.visual.* and mtp.* are skipped; docs/qwen35moe-plan.md M6)");
+    if (args.mtp == 1)
+      throw std::runtime_error("--mtp on: the qwen3_5_moe branch does not convert the MTP head yet "
+                               "(mtp.* is skipped; docs/qwen35moe-plan.md M6). --vision on copies model.visual.* bf16");
     if (!args.draft_vocab_ids.empty())
       throw std::runtime_error("--draft-vocab-ids needs the MTP head, which the qwen3_5_moe branch does not convert");
     if (r4dx_convert::ParseRotationKind(args.rotate) != r4dx_convert::RotationKind::kNone)
@@ -1933,8 +1933,9 @@ int RunConvert(const AppArgs& args) {
     if (refused != nullptr) throw std::runtime_error(std::string("r4dx-convert (lfm2_moe): ") + refused + " is not supported");
   }
   const bool do_audio = is_gemma && args.audio == 1;
-  const bool do_vision = (is_lfm2 || is_q35moe)  ? false
-                         : (is_gemma || is_qwen4) ? (args.vision == 1)
+  // qwen3_5_moe: the tower is opt-in (--vision on), default off, so a container converted without the flag is byte-identical to before.
+  const bool do_vision = is_lfm2                      ? false
+                         : (is_gemma || is_qwen4 || is_q35moe) ? (args.vision == 1)
                                                   : (args.vision >= 0 ? (args.vision == 1) : full_run);
   const bool do_mtp = (is_gemma || is_lfm2 || is_qwen4 || is_q35moe) ? false : (args.mtp >= 0 ? (args.mtp == 1) : full_run);
 
@@ -3067,7 +3068,9 @@ int RunConvert(const AppArgs& args) {
   if (is_q35moe) {
     metadata["r4dx_convert_run"]["arch"] = r4dx_convert::qwen35moe::kModelArch;
     metadata["r4dx_convert_run"]["fused_experts_source"] = fused_expert_tensors;
-    metadata["r4dx_convert_run"]["skipped"] = {"vision.* (model.visual.*): text only", "mtp.*: not converted yet"};
+    metadata["r4dx_convert_run"]["skipped"] =
+        do_vision ? nlohmann::json{"mtp.*: not converted yet"}
+                  : nlohmann::json{"vision.* (model.visual.*): text only", "mtp.*: not converted yet"};
   }
   if (is_qwen4) {
     metadata["r4dx_convert_run"]["arch"] = r4dx_convert::qwen4exp::kModelArch;

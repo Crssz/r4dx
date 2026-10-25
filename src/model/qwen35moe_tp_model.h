@@ -23,7 +23,7 @@
 // MoE under TP: both ranks compute the router from identical bits, so they pick identical experts; each rank's readback of the ids (prefill)
 // is its own, the decode step runs the on-device grouped kernels (expert width 512), and both end in the one all-reduce of the combined partial.
 //
-// Not supported yet: speculative decoding / the DFlash2 drafter under TP (P6), MTP, vision, profiling. `--tp 2 --pp 2` is refused by
+// DFlash2 under TP is supported (P6; --dflash-k <= 7 is enforced by the CLI / server parsers). Not supported: MTP, vision, profiling. `--tp 2 --pp 2` is refused by
 // LoadTextModel. Thread safety: like TpModel, one facade thread issues every call.#pragma once
 
 #include <array>

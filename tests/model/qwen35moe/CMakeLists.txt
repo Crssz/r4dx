@@ -62,3 +62,6 @@ q35moe_add_test(test_model_q35moe_prefill SINGLE_DEVICE)
 add_executable(tool_q35moe_prefill_cmp tool_q35moe_prefill_cmp.cpp)
 target_link_libraries(tool_q35moe_prefill_cmp PRIVATE r4dx_model r4dx_model_qwen4exp_kernels r4dx_core r4d_core)
 target_include_directories(tool_q35moe_prefill_cmp PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
+
+# Ornith image input (docs/qwen35moe-vision.md): the tiny container with the REAL vision tower against the HF goldens of tools/reference/qwen35moe/tiny_vision.py.
+q35moe_add_test(test_model_q35moe_vision SINGLE_DEVICE)

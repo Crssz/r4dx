@@ -150,6 +150,10 @@ struct Qwen35MoeChunk {
   // GDN layers of a prefill chunk take the recurrent decode kernels token by token instead of the chunked scan
   // (Qwen4ExpGdnCall::prefill_recurrent): the slow reference path. Ignored for a decode step.
   bool gdn_prefill_recurrent = false;
+  // Vision (docs/qwen35moe-vision.md): HOST int32 [3, rows] (the t row, then h, then w) of this chunk's 3-axis mrope ROPE positions,
+  // which a conversation that has seen an image makes differ from the KV positions (first_pos + t). Null = text only: the attention
+  // layers rope at first_pos + t. The pointer must stay valid until RunLayers returns (it is copied into stage-owned memory).
+  const int32_t* rope_pos3 = nullptr;
   // Test hook (layer-isolated runs): >= 0 runs ONLY the layer with this global index over the loaded residual, leaving the
   // other layers' state untouched. -1 = every layer of the stage.
   int64_t only_layer = -1;

@@ -127,6 +127,9 @@ struct Qwen35MoeStage::Impl {
   core::DeviceBuffer<int32_t> seqused_k; // [1]
   core::DeviceBuffer<int32_t> seqused_k_slices;  // [max_rows / 64]
   core::DeviceBuffer<int32_t> seqused_sub;       // [max_rows] verify windows: the causal context of each decode sub-launch
+  core::DeviceBuffer<int32_t> rope3_dev;         // [3 * max_rows] vision: the chunk's mrope rope positions (t, h, w rows); allocated at first use
+  core::PinnedBuffer<int32_t> rope3_host;        // [3 * max_rows] its pinned staging
+  const int32_t* chunk_rope3 = nullptr;          // device pointer for the chunk RunLayers is running (null: text positions)
   int verify_sub = 4;                            // rows per decode-kernel launch of a verify window's attention (0: the prefill kernel)
   core::PinnedBuffer<int32_t> positions_host, seqused_host, slices_host, sub_host;
 
@@ -734,7 +737,7 @@ void Qwen35MoeStage::Impl::RunAttention(LayerRt& L, const Qwen35MoeChunk& c) {
   L.attn->Forward(arena, Rows(h), Rows(hmid), L.attn_w, *L.kv, static_cast<int>(T), static_cast<int>(c.first_pos),
                   positions.data(), seqused_k.data(), s, /*x_normed_in=*/nullptr, /*next_norm_weight=*/nullptr,
                   /*x_normed_out=*/nullptr, /*prof=*/nullptr, /*x_normed_pre_epilogue=*/0, /*x_normed_pre_data=*/nullptr,
-                  /*next_epilogue=*/0, /*next_epilogue_out=*/nullptr, /*rope_pos3=*/nullptr,
+                  /*next_epilogue=*/0, /*next_epilogue_out=*/nullptr, /*rope_pos3=*/chunk_rope3,
                   /*prefill_split_kv=*/c.is_prefill && T > 1, /*attn_slice=*/sliced ? 64 : 0,
                   sliced ? seqused_k_slices.data() : nullptr, /*batch=*/nullptr, decode_sub, seqused_sub.data());
   arena.Reset();
@@ -822,7 +825,7 @@ void Qwen35MoeStage::RunLayers(const Qwen35MoeChunk& c) {
   }
   if (m.spec_window > 1 && !c.is_prefill && !c.verify && T != 1) Fail("RunLayers: a speculative stage decodes one row (or verifies)");
   const bool is_decode = (T == 1 && !c.is_prefill && !m.capture);
-  if (T > 256 && (!c.is_prefill || c.verify || m.capture || m.comm != nullptr || c.only_layer >= 0)) {
+  if (T > 256 && (!c.is_prefill || c.verify || m.capture || m.comm != nullptr || c.only_layer >= 0 || c.rope_pos3 != nullptr)) {
     Fail("RunLayers: more than 256 rows is a plain prefill super-chunk (no capture, no verify, no --tp 2, no single layer)");
   }
   // A 256-row prefill chunk: the trellis linears (attention projections, GDN in_proj_qkv / in_proj_z / out_proj) run libr4d's M = 256 GEMM, one launch
@@ -841,6 +844,18 @@ void Qwen35MoeStage::RunLayers(const Qwen35MoeChunk& c) {
   m.arena.Reset();
   if (c.is_prefill) m.CollapseWindow();
   m.SpMark(0);
+  // Vision: the chunk's explicit 3-axis rope rows go to the device once, for the attention layers (the GDN layers have no positions).
+  m.chunk_rope3 = nullptr;
+  if (c.rope_pos3 != nullptr) {
+    if (m.rope3_dev.size() == 0) {
+      m.rope3_dev = core::DeviceBuffer<int32_t>(static_cast<size_t>(3 * m.opt.max_rows));
+      m.rope3_host = core::PinnedBuffer<int32_t>(static_cast<size_t>(3 * m.opt.max_rows));
+    }
+    std::copy_n(c.rope_pos3, 3 * T, m.rope3_host.data());
+    R4DX_HIP_CHECK(hipMemcpyAsync(m.rope3_dev.data(), m.rope3_host.data(), static_cast<size_t>(3 * T) * 4, hipMemcpyHostToDevice,
+                                  m.stream.get()));
+    m.chunk_rope3 = m.rope3_dev.data();
+  }
   if (m.PprofOn(c)) m.pprof.Begin(m.stream.get());
 
   for (auto& lp : m.layers) {

@@ -1,5 +1,7 @@
 # Vision tower
 
+> The same tower serves Ornith-1.5-122B (`qwen3_5_moe`, out_hidden_size 3072): [qwen35moe-vision.md](qwen35moe-vision.md) has the text-side differences.
+
 Status as of 2026-09-21: **the tower runs on the GPU.** The host half (`src/vision/{image_decode,
 preprocess,position_ids,vision_index}`) produces `pixel_values`, the pos-embed interpolation taps,
 the vision rope positions and `cu_seqlens`, all bit-exact against the real `transformers`

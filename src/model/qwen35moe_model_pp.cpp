@@ -25,7 +25,8 @@ double MsSince(Clock::time_point t0) { return std::chrono::duration<double, std:
 }  // namespace
 
 bool Qwen35MoeModel::CanPipelinePrefill(size_t chunks) const {
-  if (chunks < 2 || stages_.size() != 2 || dflash_.has_value() || capture_active_) return false;
+  // (an image in the prompt, or a conversation that has seen one, needs RunChunk's embedding splice and explicit 3-axis rope rows per chunk)
+  if (chunks < 2 || stages_.size() != 2 || dflash_.has_value() || capture_active_ || mrope_active_ || !mrope_block_images_.empty()) return false;
   const char* e = std::getenv("R4DX_Q35_PP");
   return !(e != nullptr && e[0] == '0');
 }

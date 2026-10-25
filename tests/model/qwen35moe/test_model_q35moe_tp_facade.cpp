@@ -1,7 +1,7 @@
 // Qwen35MoeTpModel (the --tp 2 TextModel) through LoadTextModel, on the tiny qwen3_5_moe containers (docs/qwen35moe-tp-design.md P3).
 //
-//   * dispatch: a tiny container + TpOptions{world 2} is a Qwen35MoeTpModel (TpWorld() 2, arch kQwen35Moe); --pp 2, --dflash and a partial layer load are
-//     refused by name; the layer split (world 1) is untouched;
+//   * dispatch: a tiny container + TpOptions{world 2} is a Qwen35MoeTpModel (TpWorld() 2, arch kQwen35Moe); --pp 2 and a partial layer load are refused by
+//     name (--dflash is implemented, P6); the layer split (world 1) is untouched;
 //   * emulate mode (two ranks on ONE device) against the layer-split model: prefill logits at T = 1 / 7 / 70 / 300, full-row decode logits, 24 greedy and 8 sampled
 //     steps -- close (the facade compares the ranks' results on every call, so rank divergence would already have thrown);
 //   * checkpoint / restore, Reset determinism (the same feed after Reset() gives identical bytes), PositionCount bookkeeping;
@@ -231,7 +231,16 @@ int main() {
         ModelOptions df = o;
         df.dflash_container = "x.r4dx";
         df.dflash_draft_k = 4;
-        Check(Throws([&] { (void)r4dx::model::LoadTextModel(df, TpOpts(TpOptions::Mode::kEmulate)); }, "P6"), "--dflash under --tp 2 is refused by name");
+        // DFlash2 under --tp 2 is implemented (P6): a missing drafter container fails on the drafter, not on a "not supported" refusal. The only
+        // remaining --dflash-k limit (7) lives in the shared parsers and is tested in tests/cli/test_args.cpp.
+        std::string dflash_err;
+        try {
+          (void)r4dx::model::LoadTextModel(df, TpOpts(TpOptions::Mode::kEmulate));
+        } catch (const std::exception& e) {
+          dflash_err = e.what();
+        }
+        Check(!dflash_err.empty() && dflash_err.find("not supported") == std::string::npos && dflash_err.find("P6") == std::string::npos,
+              "--dflash under --tp 2 is not refused by name (a missing drafter container fails on the drafter)");
         ModelOptions lim = o;
         lim.layer_limit = 2;
         Check(Throws([&] { (void)r4dx::model::LoadTextModel(lim, TpOpts(TpOptions::Mode::kEmulate)); }, "layer_limit"), "a partial layer load under --tp 2 is refused");

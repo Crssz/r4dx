@@ -45,7 +45,17 @@ namespace {
 // at 128 -- tests/model/test_container_path.h). The vision.* tensors this test reads are bf16 and
 // group-independent, so either container would do numerically; the group-matched one is what the
 // server/CLI defaults would load next to it.
-const char* kContainerPath = r4dx_test::ProductionTargetPath();
+// R4DX_VISION_CONTAINER names another container (any one that carries the 333 vision.* tensors, e.g. the Ornith tiny-vision one or
+// ornith-1.5-122b-trellis-mix-kv-vision.r4dx; pair it with R4DX_VISION_GOLDEN_DIR from `vision_golden.py --moe`).
+const char* ContainerPathFromEnv() {
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+  const char* e = std::getenv("R4DX_VISION_CONTAINER");
+#pragma clang diagnostic pop
+  static const std::string path = (e != nullptr && e[0] != '\0') ? std::string(e) : std::string(r4dx_test::ProductionTargetPath());
+  return path.c_str();
+}
+const char* kContainerPath = ContainerPathFromEnv();
 
 // R4DX_VISION_GOLDEN_DIR overrides where the golden tensors are read from. Used to diff this
 // implementation against a SECOND reference run -- `vision_golden.py --attn-impl sdpa` into a

@@ -89,6 +89,19 @@ if(TARGET r4dx-convert)
 endif()
 add_test(NAME convert_lfm2_layout COMMAND convert_lfm2_layout)
 
+# Llama converter branch (src/convert/llama_layout.{hpp,cpp}, docs/nanbeige-plan.md N1-4): the layout over the
+# real-geometry 471-tensor header (and the real Nanbeige4.3-33B header bytes when present) through a recording kit,
+# and -- when r4dx-convert is built -- the exe on a tiny synthetic llama checkpoint (flat config without layer_types,
+# untied head, single-file and sharded): exact tensor set / shapes / bytes, w8a16 bytes, w4a16, --layers, every
+# refusal. CPU-only; writes a few tens of MB under %TEMP% and removes them.
+add_executable(convert_llama_layout test_llama_layout.cpp)
+target_link_libraries(convert_llama_layout PRIVATE r4dx_convert_llama)
+if(TARGET r4dx-convert)
+  target_compile_definitions(convert_llama_layout PRIVATE R4DX_CONVERT_EXE="$<TARGET_FILE:r4dx-convert>")
+  add_dependencies(convert_llama_layout r4dx-convert)
+endif()
+add_test(NAME convert_llama_layout COMMAND convert_llama_layout)
+
 # --trellis-from on lfm2_moe (docs/lfm2-plan.md L3-2): tiny per-expert checkpoint + synthetic oracle directories, all in C++
 # (no Python, no GPU). SKIPs (77) without r4dx-convert.
 add_executable(convert_lfm2_trellis test_lfm2_trellis.cpp)

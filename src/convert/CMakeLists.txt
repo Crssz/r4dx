@@ -23,6 +23,12 @@ add_library(r4dx_convert_lfm2 STATIC lfm2_layout.cpp)
 target_include_directories(r4dx_convert_lfm2 PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(r4dx_convert_lfm2 PUBLIC r4dx_convert)
 
+# r4dx_convert_llama: the dense Llama branch's tensor layout (llama_layout.hpp -- names, shape checks, coverage audit;
+# docs/nanbeige-plan.md 4). Same shape as r4dx_convert_lfm2; tests/convert/test_llama_layout.cpp drives it.
+add_library(r4dx_convert_llama STATIC llama_layout.cpp)
+target_include_directories(r4dx_convert_llama PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
+target_link_libraries(r4dx_convert_llama PUBLIC r4dx_convert)
+
 # r4dx_convert_qwen4exp: the qwen4_exp branch -- its tensor layout, coverage audit, per-(layer, class)
 # trellis KB rule and n-gram sidecar record (qwen4exp_layout.hpp), and the virtual AWQ source that
 # presents compressed-tensors pack-quantized linears as bf16 `<b>.weight` tensors (awq_source.hpp).
@@ -40,5 +46,5 @@ target_link_libraries(r4dx_convert_qwen35moe PUBLIC r4dx_convert r4dx_convert_qw
 
 if(R4DX_BUILD_CONVERT)
   add_executable(r4dx-convert main.cpp)
-  target_link_libraries(r4dx-convert PRIVATE r4dx_convert r4dx_convert_gemma r4dx_convert_lfm2 r4dx_convert_qwen4exp r4dx_convert_qwen35moe)
+  target_link_libraries(r4dx-convert PRIVATE r4dx_convert r4dx_convert_gemma r4dx_convert_lfm2 r4dx_convert_llama r4dx_convert_qwen4exp r4dx_convert_qwen35moe)
 endif()

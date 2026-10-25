@@ -282,6 +282,7 @@
 
 #include "gemma_layout.hpp"
 #include "lfm2_layout.hpp"
+#include "llama_layout.hpp"
 #include "awq_source.hpp"
 #include "fused_experts_source.hpp"
 #include "qwen35moe_layout.hpp"
@@ -1842,13 +1843,17 @@ int RunConvert(const AppArgs& args) {
   const nlohmann::json config = nlohmann::json::parse(config_text);
   // LFM2 (lfm2_layout.hpp): config.json is FLAT (no text_config) and the LFM branch below registers its own tensors.
   const bool is_lfm2 = config.value("model_type", std::string()) == r4dx_convert::lfm2::kModelArch;
-  const nlohmann::json& text_cfg = is_lfm2 ? config : config.at("text_config");
+  // Dense Llama (llama_layout.hpp, docs/nanbeige-plan.md 4): flat config.json, no layer_types (every layer is full
+  // attention), its own branch below.
+  const bool is_llama = config.value("model_type", std::string()) == r4dx_convert::llama::kModelArch;
+  const nlohmann::json& text_cfg = (is_lfm2 || is_llama) ? config : config.at("text_config");
 
   const int hidden = text_cfg.at("hidden_size").get<int>();
   const int num_layers_total = text_cfg.at("num_hidden_layers").get<int>();
   const int kv_heads = text_cfg.at("num_key_value_heads").get<int>();
   const std::vector<std::string> layer_types =
-      text_cfg.at("layer_types").get<std::vector<std::string>>();
+      is_llama ? std::vector<std::string>(static_cast<size_t>(num_layers_total), "full_attention")
+               : text_cfg.at("layer_types").get<std::vector<std::string>>();
   const int layers = args.layers > 0 ? std::min(args.layers, num_layers_total) : num_layers_total;
   const bool full_run = (layers == num_layers_total);
   // Gemma 4 (gemma_layout.hpp): the Gemma branch below registers its own tensors; the Qwen code that
@@ -1932,12 +1937,31 @@ int RunConvert(const AppArgs& args) {
                                                           : nullptr;
     if (refused != nullptr) throw std::runtime_error(std::string("r4dx-convert (lfm2_moe): ") + refused + " is not supported");
   }
+  r4dx_convert::llama::TextShape llshape;
+  if (is_llama) {
+    // The Llama layout is the plain bf16 / w4a16 / w8a16 body plus --trellis-from (docs/nanbeige-plan.md 4); fp8 KV
+    // calibration is N5-2, everything else belongs to another family. Refused rather than half-applied.
+    const char* refused = args.vision == 1       ? "--vision on (a llama checkpoint has no vision tower)"
+                          : args.mtp == 1        ? "--mtp on (a llama checkpoint has no MTP head)"
+                          : !args.kv_calib.empty() ? "--kv-calib (the Llama KV cache is bf16 until N5-2: no descale tensors)"
+                          : r4dx_convert::ParseRotationKind(args.rotate) != r4dx_convert::RotationKind::kNone
+                              ? "--rotate (the Llama trellis is unrotated)"
+                          : (args.record_reuse_guard || !args.reuse_from.empty())
+                              ? "--record-reuse-guard / --reuse-tensors-from (the guard reads the Qwen checkpoint layout)"
+                          : !args.draft_vocab_ids.empty() ? "--draft-vocab-ids (the reduced-vocab head is an MTP feature)"
+                          : (config.contains("quantization_config") && config.at("quantization_config").is_object())
+                              ? "a quantization_config (only a bf16 checkpoint is converted)"
+                              : nullptr;
+    if (refused != nullptr) throw std::runtime_error(std::string("r4dx-convert (llama): ") + refused + " is not supported");
+    llshape = r4dx_convert::llama::ParseConfig(config);  // the strict checks, before any shard is opened
+  }
   const bool do_audio = is_gemma && args.audio == 1;
   // qwen3_5_moe: the tower is opt-in (--vision on), default off, so a container converted without the flag is byte-identical to before.
-  const bool do_vision = is_lfm2                      ? false
+  const bool do_vision = (is_lfm2 || is_llama)        ? false
                          : (is_gemma || is_qwen4 || is_q35moe) ? (args.vision == 1)
                                                   : (args.vision >= 0 ? (args.vision == 1) : full_run);
-  const bool do_mtp = (is_gemma || is_lfm2 || is_qwen4 || is_q35moe) ? false : (args.mtp >= 0 ? (args.mtp == 1) : full_run);
+  const bool do_mtp =
+      (is_gemma || is_lfm2 || is_llama || is_qwen4 || is_q35moe) ? false : (args.mtp >= 0 ? (args.mtp == 1) : full_run);
 
   LayoutSet layouts = ParseLayoutList(args.layouts_spec, /*bf16_default_on=*/true);
   // The head follows the body's quantized layout by default (docs/w8a16.md 5.2: "the head is w8a16 by
@@ -1973,6 +1997,7 @@ int RunConvert(const AppArgs& args) {
     std::cout << "[r4dx-convert] arch=" << r4dx_convert::gemma::kModelArch
               << " audio=" << (do_audio ? "on" : "off") << "\n";
   if (is_lfm2) std::cout << "[r4dx-convert] arch=" << r4dx_convert::lfm2::kModelArch << "\n";
+  if (is_llama) std::cout << "[r4dx-convert] arch=" << r4dx_convert::llama::kModelArch << "\n";
   if (is_q35moe) std::cout << "[r4dx-convert] arch=" << r4dx_convert::qwen35moe::kModelArch << "\n";
   if (is_qwen4)
     std::cout << "[r4dx-convert] arch=" << r4dx_convert::qwen4exp::kModelArch << " ngram-sidecar=" << ngram.path
@@ -2507,6 +2532,31 @@ int RunConvert(const AppArgs& args) {
     }
   }
 
+  // ---- Llama branch (llama_layout.cpp): the dense text stack, the embedding, the final norm and the untied head,
+  // through the same closures ----------------------------------------------------------------------------------
+  if (is_llama) {
+    namespace ll = r4dx_convert::llama;
+    ll::Kit kit;
+    kit.all_names = [&model]() { return model.AllNames(); };
+    kit.has = [&model](const std::string& n) { return model.Has(n); };
+    kit.shape = [&model](const std::string& n) { return model.Meta(n).shape; };
+    kit.add_bf16 = add_bf16;
+    kit.add_linear = [&](const std::vector<std::string>& hf_names, const std::string& base, bool head) {
+      add_linear(hf_names, base, head ? lm_head_layouts : layouts);
+    };
+    const std::set<std::string> consumed = ll::AddTextStack(kit, llshape, layers);
+    // The coverage audit: nothing in the checkpoint may be silently left out of the container.
+    const std::vector<std::string> unconsumed = ll::UnconsumedTensors(model.AllNames(), consumed, layers);
+    if (!unconsumed.empty()) {
+      std::string msg = "r4dx-convert (llama): " + std::to_string(unconsumed.size()) +
+                        " checkpoint tensor(s) are not converted and not allow-listed (a mis-guessed tensor "
+                        "name, or a tensor this converter does not know):";
+      for (size_t k = 0; k < unconsumed.size() && k < 20; ++k) msg += "\n  " + unconsumed[k];
+      if (unconsumed.size() > 20) msg += "\n  ... and " + std::to_string(unconsumed.size() - 20) + " more";
+      throw std::runtime_error(msg);
+    }
+  }
+
   // ---- qwen4_exp branch (qwen4exp_layout.cpp): the whole text stack, through the closures above ---------
   if (is_qwen4) {
     namespace qw = r4dx_convert::qwen4exp;
@@ -2584,7 +2634,7 @@ int RunConvert(const AppArgs& args) {
     if (trellis.Enabled()) r4dx_convert::qwen4exp::CheckExpertKbUniform(trellis_kb);
   }
 
-  for (int i = 0; i < ((is_gemma || is_lfm2 || is_qwen4 || is_q35moe) ? 0 : layers); ++i) {
+  for (int i = 0; i < ((is_gemma || is_lfm2 || is_llama || is_qwen4 || is_q35moe) ? 0 : layers); ++i) {
     const std::string hf = "model.language_model.layers." + std::to_string(i) + ".";
     const std::string base = "text.layers." + std::to_string(i) + ".";
     // --rotate folds (all kNone without it): input_layernorm's (1 + w) goes into this layer's token
@@ -2641,7 +2691,7 @@ int RunConvert(const AppArgs& args) {
   // Everything from here on is outside the rotated stack and is never folded: the runtime applies
   // x Q after the embedding gather and x Q^T before final_norm (docs/quant2.md section 3).
   // (the Gemma / LFM2 / qwen4_exp branches above registered these; LFM2's head comes from the tied embedding)
-  if (!is_gemma && !is_lfm2 && !is_qwen4 && !is_q35moe) {
+  if (!is_gemma && !is_lfm2 && !is_llama && !is_qwen4 && !is_q35moe) {
     add_bf16("model.language_model.embed_tokens.weight", "text.embed_tokens");
     add_bf16("model.language_model.norm.weight", "text.final_norm");
     add_linear({"lm_head.weight"}, "lm_head", lm_head_layouts);
@@ -2940,6 +2990,23 @@ int RunConvert(const AppArgs& args) {
         {"lm_head", "w4a16|bf16 (as requested by --layouts / --lm-head), the tied embedding written untied"},
     };
   }
+  // Llama: the same keys as LFM2 (docs/nanbeige-plan.md 4); written ONLY for llama, so every other container keeps its
+  // header byte for byte.
+  if (is_llama) {
+    namespace fs = std::filesystem;
+    fs::path in = fs::u8path(args.input).lexically_normal();
+    if (!in.has_filename()) in = in.parent_path();
+    metadata["model_id"] = in.filename().u8string();  // e.g. Nanbeige4.3-33B
+    metadata["model_arch"] = r4dx_convert::llama::kModelArch;
+    metadata["norm_kind"] = "plain";
+    metadata["quant_summary"] = {
+        {"text.layers.*.attn.q|k|v|o", "w8a16|w4a16|bf16 (as requested by --layouts; pick at load time)"},
+        {"text.layers.*.mlp.gate_up|down", "w8a16|w4a16|bf16 (gate_up = gate_proj rows then up_proj rows)"},
+        {"text.layers.*.input_norm|post_attn_norm, text.final_norm", "bf16 raw plain weights (x * w, not 1 + w)"},
+        {"text.embed_tokens", "bf16 [vocab, hidden], no scale"},
+        {"lm_head", "w8a16|w4a16|bf16 (as requested by --lm-head), untied"},
+    };
+  }
   // --trellis-from: the body's summary lines say what the body now is (the four entries above
   // describe the multi-layout body, which a trellis container does not have), and
   // __metadata__.quant.trellis is what the loader parses (docs/trellis-kernel.md 2.3, 2.5). Only
@@ -3065,6 +3132,7 @@ int RunConvert(const AppArgs& args) {
     metadata["r4dx_convert_run"]["audio"] = do_audio;
   }
   if (is_lfm2) metadata["r4dx_convert_run"]["arch"] = r4dx_convert::lfm2::kModelArch;
+  if (is_llama) metadata["r4dx_convert_run"]["arch"] = r4dx_convert::llama::kModelArch;
   if (is_q35moe) {
     metadata["r4dx_convert_run"]["arch"] = r4dx_convert::qwen35moe::kModelArch;
     metadata["r4dx_convert_run"]["fused_experts_source"] = fused_expert_tensors;

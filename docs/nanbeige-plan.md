@@ -197,24 +197,42 @@ streams tensors, it never holds the checkpoint).
 `LlamaTokenizer` is SentencePiece BPE with byte fallback. r4dx's `kSpmByteFallback` backend (`bpe_tokenizer.cpp`, the
 Gemma shape) accepts exactly: normalizer `Replace(" " -> U+2581)`, no pre-tokenizer or `Split(" ", MergedWithPrevious)`,
 decoder `Sequence[Replace, ByteFallback, Fuse]`, no special tokens inserted by the post-processor, no added token with
-`normalized`/`lstrip`/`rstrip`. A Llama-family `tokenizer.json` usually differs on three points (**UNVERIFIED** until N0-4
-reads the head of the file):
+`normalized`/`lstrip`/`rstrip`.
 
-1. normalizer `Sequence[Prepend(U+2581), Replace(" " -> U+2581)]` (the legacy SPM "dummy prefix"), or a `Metaspace`
-   pre-tokenizer with `prepend_scheme` instead (the `legacy: false` shape);
-2. decoder `Sequence[Replace, ByteFallback, Fuse, Strip(" ", 1, 0)]` (drops the dummy prefix's space on decode);
-3. post-processor `TemplateProcessing` inserting BOS (here `<|im_start|>`, because `add_bos_token` is true).
+**N0-4 (2026-10-25, read from the downloaded `tokenizer.json`; `tokenizer_config.json` says `legacy: false`):** the
+`legacy: false` shape, so the dummy prefix is NOT the legacy one:
 
-Work (N3-1): extend `validate_spm` / `spm_encode_chunk` / `spm_decode` with the shape N0-4 finds, as a second SPM variant
-(the Gemma shape stays byte-identical, pinned by its golden). The legacy dummy prefix interacts with special tokens (HF
-`legacy=True` prepends U+2581 to the text after a special token too); the golden set MUST cover text right after
-`<|im_start|>`, `<think>` and `<tool_call>`. Validation like LFM2: `tools/tok_ref/gen_golden_nanbeige.py` ->
+| Part | Nanbeige | Gemma backend today |
+|---|---|---|
+| normalizer | `null` | `Replace(" " -> U+2581)` |
+| pre-tokenizer | `Metaspace(replacement U+2581, prepend_scheme "first", split false)` | none / `Split(" ", MergedWithPrevious)` |
+| model | BPE, `byte_fallback` true, `fuse_unk` true, `unk_token` `<unk>`, 166100 vocab, 296888 merges, no `ignore_merges` / dropout / prefixes | same flags |
+| decoder | `Sequence[Replace(U+2581 -> " "), ByteFallback, Fuse, Strip(" ", 1, 0)]` | the first three |
+| post-processor | `TemplateProcessing`: `<|im_start|>` (166100) before every sequence | none inserting a special token |
+| added tokens | 10: `<unk>` 0, `<s>` 1, `</s>` 2, `<|im_start|>` 166100, `<|im_end|>` 166101, `<|endoftext|>` 166102 (special); `<think>` 166103, `</think>` 166104, `<tool_call>` 166105, `</tool_call>` 166106 (NOT special); ids 0-2 and 166103-166106 have `normalized: true` | `normalized` refused |
+
+What HF does with it (probed with transformers 5.18.0, CPU): `split false` + no normalizer means every space becomes
+U+2581 and the whole text between added tokens is one BPE word, exactly as the Gemma path; `prepend_scheme "first"` adds
+U+2581 ONLY at the start of the input (`"Hello world"` -> `▁Hello ▁world`, but `"<|im_start|>user\n"` -> `<|im_start|> user
+<0x0A>`: no prefix after an added token). `normalized: true` on the added tokens is inert because the normalizer is null.
+Decode strips one leading space of the WHOLE decoded string, so decoding token by token loses spaces
+(`decode([▁Hello])` + `decode([▁there])` = `"Hello" "there"`): r4dx's streaming decode MUST apply the Strip only at the
+start of what it decodes as one piece, and the server's reply decode must match HF's `decode(generated_ids)` (which strips
+a leading space of the reply). Raw `tokenizers` ids equal `AutoTokenizer` ids on every probe.
+
+Work (N3-1): a second SPM variant in `validate_spm` / `spm_encode_chunk` / `spm_decode` for exactly this shape: accept a
+null normalizer with the `Metaspace(first, split false)` pre-tokenizer (equivalent to the Gemma replace, plus U+2581 at
+input offset 0 only), the trailing `Strip(" ", 1, 0)` decoder, `normalized: true` added tokens when the normalizer is null,
+and a post-processor that inserts only the BOS (r4dx never adds it; the dialect does). The Gemma shape stays byte-identical,
+pinned by its golden. The golden set MUST cover text right after `<|im_start|>`, `<think>` and `<tool_call>`, input starting
+with a space, and piecewise vs whole decode. Validation like LFM2: `tools/tok_ref/gen_golden_nanbeige.py` ->
 `tests/tokenizer/golden_nanbeige.json` (English, Chinese, code, JSON, Thai, emoji, digit runs, whitespace runs, `\r\n`,
 special tokens both ways, a 20 KB line, chat cases), raw `tokenizers` ids == `AutoTokenizer` ids asserted over the KL corpus.
 
-BOS: chat prompts render `<|im_start|>` as text and are encoded with `parse_special = true` and no added BOS (HF
-`apply_chat_template` tokenizes with `add_special_tokens=False`). Raw `/v1/completions` prompts: HF would prepend
-`<|im_start|>`; the dialect's `bos_on_raw_prompt = true` matches HF (open question 4).
+BOS: the template renders `<|im_start|>` as text and HF's `apply_chat_template(tokenize=True)` equals `encode(render,
+add_special_tokens=False)` (probed, thinking on and off): chat prompts are encoded with `parse_special = true` and no added
+BOS. Raw `/v1/completions` prompts: HF prepends `<|im_start|>` (the post-processor); the dialect's `bos_on_raw_prompt = true`
+matches HF (open question 4).
 
 ### 5.2 Chat template
 
@@ -226,15 +244,34 @@ and `tool_call_format` xml / json; any minja gap gets a small patch in `third_pa
 `third_party/VERSIONS.md` (the Gemma M1-8 precedent). Whether polyfills stay on (Qwen) or off (Gemma, LFM2) is decided by
 that render.
 
+**N0-6 (2026-10-25, partly):** `E:\models\Nanbeige\Nanbeige4.3-33B-tok\` written (`tokenizer.json`, `tokenizer.model`,
+`tokenizer_config.json`, `special_tokens_map.json`, `added_tokens.json`, `generation_config.json`, and `chat_template.jinja`
+= the `chat_template` string verbatim, 8003 chars, SHA-256 `f2b1e2a1be25d277e8c903a2aa4d69ca5fd8a0fcb37d4792088e72426df5b91c`).
+Read from the template (HF-rendered for one user turn, thinking on and off):
+- generation prompt `<|im_start|>assistant\n<think>\n`; with `enable_thinking=false` `<|im_start|>assistant\n<think>\n\n</think>\n\n`
+  (the Qwen strings exactly);
+- no system message -> a default Chinese system prompt is injected (the model's identity); with `tools` the system turn is a
+  Chinese tool-use instruction + `# Tools` + one `tojson` line per tool + the XML (default) or JSON call format;
+- assistant history always renders `<think>\n{reasoning}\n</think>\n\n{content}`; reasoning comes from `reasoning_content`
+  or is split out of `content` at `</think>`. It is DROPPED (`<think>\n\n</think>\n\n`) only when `preserve_thinking` is
+  defined AND false, for turns before the last user query: **the default keeps all history reasoning** (opposite of the
+  card's "False for chat" advice);
+- tool calls: XML `<tool_call>\n<function=NAME>\n<parameter=K>\nV\n</parameter>\n</function>\n</tool_call>`, arguments read
+  with `|items` (a mapping: the server must pass parsed arguments, not the OpenAI JSON string) and string values unquoted;
+  tool results render as a `user` turn holding `\n<tool_response>\n...\n</tool_response>` per result;
+- constructs to check in minja (N3-3): `namespace`, `messages[::-1]`, `loop.previtem` / `loop.nextitem`, `|items`,
+  `|tojson|safe`, `.startswith` / `.endswith` / `.split` / `.rstrip('\n')` / `.lstrip('\n')`, `is mapping` / `is iterable`,
+  `raise_exception`, `replace` filters.
+
 ### 5.3 Dialect, thinking, tools
 
 `DialectKind::kNanbeige`, `MakeNanbeige()` = `MakeQwen35()` with its own name, `eos_ids` from `generation_config.json`
-(`[166101]`, plus `<|endoftext|>` 166102 if the template or the card ends turns with it, N0-6), and the prompt-side reasoning
-opener the template's generation prompt actually emits (Qwen's is `"<think>\n"`; UNVERIFIED here). The card's serving flags
+(`[166101]`; the template ends every turn with `<|im_end|>` and never emits `<|endoftext|>`), and the prompt-side reasoning
+opener `"<think>\n"` (N0-6: identical to Qwen's, thinking-off prompt `"<think>\n\n</think>\n\n"`). The card's serving flags
 (`--reasoning-parser qwen3 --tool-call-parser qwen3_coder`) say the surface is Qwen's: `<think>` / `</think>` reasoning and
 the `<tool_call><function=NAME><parameter=...>` XML that `tool_call_parser.cpp` already parses. `enable_thinking` maps to the
 template kwarg as for Qwen; `preserve_thinking` and `tool_call_format` become request extension fields passed to the template
-(defaults: off, xml). `--dialect auto`: `tokenizer_config.json` naming `LlamaTokenizer` with bos `<|im_start|>`, cross-checked
+(defaults: left undefined, which the template treats as "keep reasoning" and "xml"). `--dialect auto`: `tokenizer_config.json` naming `LlamaTokenizer` with bos `<|im_start|>`, cross-checked
 against the container arch (`CheckDialectAgainstArch` gains `llama`). No repetition penalty is needed (the card gives none).
 
 ## 6. Reference tooling, goldens, KL gate
@@ -433,11 +470,11 @@ GPU workload, including every `tests/kernels/*` test). **[CPU-heavy]** is a long
 
 | Fact | Settled by |
 |---|---|
-| Safetensors names match section 4; `lm_head.weight` present; no extra tensors | N0-2 |
+| ~~Safetensors names match section 4; `lm_head.weight` present; no extra tensors~~ VERIFIED (N0-2, 2026-10-25): 471 tensors = 52 x 9 + embed / norm / lm_head, all BF16, shapes as section 2.2, names as `make_tiny_llama.py`, no `inv_freq`; shard 1's own header still to read | N0-2 |
 | Stock transformers loads it without `trust_remote_code`; 4.51.1 vs 5.18.0 numerics equal for this config | N0-3 |
-| `tokenizer.json` normalizer / pre-tokenizer / decoder / post-processor shape and added-token flags | N0-4 |
+| ~~`tokenizer.json` shape and added-token flags~~ VERIFIED (N0-4): section 5.1 | N0-4 |
 | Norm weights and activations need no fp32 residual | N0-5, N2-3 |
-| Template renders in minja; generation-prompt reasoning opener; eos list; polyfill choice | N0-6 |
+| Template renders in minja; polyfill choice (opener and eos VERIFIED, N0-6: section 5.2) | N0-6, N3-3 |
 | fp32 truth wall time (tens of minutes estimated) | N0-8 |
 | The gqa6 prefill template masks rows past `BLOCK_Q x GQA` on store; `O_KWIDE` valid at head_dim 128 bf16 | N5-1 |
 | All-reduce cost about 0.9 ms per token at TP=2 | N2-5 |

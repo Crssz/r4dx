@@ -123,6 +123,7 @@ Which mode to use:
 |---|---|---|---|
 | Qwen3.8-27B (Huihui) | trellis mix4.5m, about 17 GiB | one GPU, `--pp 2`, `--tp 2`, hybrid, MTP / DFlash2 | default, tables above |
 | LFM2.5-24B-A2B (`lfm2_moe`, 2.45 B active) | bf16, 48.5 GB | `--tp 2` only (about 25.8 GiB per card), about 60 tok/s decode; KL gate PASS vs HF-bf16 (ALL 0.00993 vs 0.01248, top-1 96.83 %) | bf16 works; **trellis hybrid on one card** (`--layout trellis`, 18.89 GB: K5 experts, bf16 non-expert and layers 2-5 experts; KL gate PASS, ALL +.0055 over bf16, **72.7 tok/s** decode); **w8a16 on one card or two** (`--layout w8a16`, 24.9 GB; KL gate PASS, ALL +.0033 over bf16, **171.2 tok/s** decode at TP=1; `--tp 2` about 12.2 GiB buffers per card, gate PASS ALL +.0025, **208.9 tok/s** decode, prefill 2x; [docs/w8a16.md](docs/w8a16.md)); device-indexed grouped MoE decode (L4-2) on bf16 and w8a16; always thinks, Pythonic tool calls ([docs/lfm2.md](docs/lfm2.md)) |
+| Nanbeige4.3-33B (`llama`, dense, 33.1 B) | w8a16 g128, 34.8 GB | `--tp 2` only (about 17.3 GiB weights per card), about 30 tok/s decode | works end to end (CLI, server, thinking, Chinese, XML tool calls); KL gate vs an fp32 CPU truth in [docs/nanbeige.md](docs/nanbeige.md) |
 
 ## Requirements
 
@@ -206,6 +207,7 @@ docs/           design notes and measurements
 | Server and vision | [docs/server.md](docs/server.md), [docs/vision.md](docs/vision.md) |
 | Tensor parallelism | [docs/tp.md](docs/tp.md) |
 | Qwen3.8-Flash-Next (`qwen4_exp`, experimental) | [docs/qwen4exp.md](docs/qwen4exp.md), [docs/qwen4exp-plan.md](docs/qwen4exp-plan.md) |
+| Nanbeige4.3-33B (dense Llama, w8a16 TP=2) | [docs/nanbeige.md](docs/nanbeige.md), [docs/nanbeige-plan.md](docs/nanbeige-plan.md) |
 | Performance and validation | [docs/perf.md](docs/perf.md), [docs/prefill.md](docs/prefill.md), [docs/validation.md](docs/validation.md) |
 | Pipeline-parallel 2-GPU prefill (`--pp 2`, validated) | [docs/pp-prefill.md](docs/pp-prefill.md) |
 | Hybrid 2-GPU mode (`--tp 2 --pp 2`: PP prefill + TP decode) | [docs/pp-tp2-hybrid.md](docs/pp-tp2-hybrid.md) |

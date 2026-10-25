@@ -1,4 +1,4 @@
-﻿# Ornith-1.5-122B (`qwen3_5_moe`) support for r4dx -- design and task plan
+# Ornith-1.5-122B (`qwen3_5_moe`) support for r4dx -- design and task plan
 
 Written 2026-10-20. Design only: nothing here has been built or run on a GPU yet. Items tagged **VERIFY** come
 from the HF `config.json` / model card and must be checked against the downloaded safetensors index and a golden.
@@ -271,13 +271,31 @@ Not covered: no real-dimension trellis container exists yet (`q35moe-real4` is b
 | 7436 | 662 | 1206 | 2023 | 2312 | **3082** | 4.7x |
 | 36403 | 619 | 1108 | 1927 | 2189 | **3071** | 5.0x |
 
-(*) one cell of the matrix died with HIP error 719 while uploading the container (before any kernel ran; 4 of ~35 loads did, see below); the value is
+(*) one cell of the matrix died with HIP error 719 while uploading the container (before any kernel ran; 6 of ~60 loads did over the two sessions); the value is
 from an earlier identical-configuration run. Decode is unchanged by all of it (57-65 tok/s in every cell). The same four prompts measured earlier in a slower
 machine state gave 329 / 394 / 402 / 469 tok/s for the base: **the display card (device 0) is intermittently 1.5-3x slower on attention and the GDN scan**
 (`attn.layer` 6 ms against 1.1-1.9 ms on device 1, `gdn.scan` 1.2 against 0.08 ms; the same code ran at 1.4k and 2.4k tok/s on different minutes; an idle
 attention micro-benchmark is identical on both cards), so compare only cells of one session. `R4DX_Q35_DEVICES=1,0` (stage 0 on device 1) gave
 +18% in one run when device 0 was in its slow state; not made the default.
 
+**Second session (2026-10-25, merged branch incl. vision, display card in its slow state the whole time; same script, one run per cell):**
+
+| prompt tokens | base | (a) | (a)+(c) | (a)+(c)+GEMM scope | final | final / base |
+|---:|---:|---:|---:|---:|---:|---:|
+| 534 | 461 | 840 | 1522 | 1261 | 1251 | 2.7x |
+| 1992 | 502 | 1022 | 1401 | 1251 | 1619 | 3.2x |
+| 7436 | 473 | 767 | (load error) | 1169 | 1535 | 3.2x |
+| 36403 | (load error) | 716 | 902 | 992 | 1264 | -- (2.0x over (a)) |
+
+The cells of this session are noisy (the (a)+(c) value at 534 tokens is above the later steps; the machine changed state during the run), only the ratios inside a
+row are meaningful; the first table is the cleaner one. Decode in the 60 cells: 50-65 tok/s.
+
+**Spot checks after the merge** (real container, 2026-10-25): `--tp 2` (real mode), 1992-token prompt: prefill 557 / 562 / 543 tok/s with `R4DX_Q35_PREFILL_MOE=0` against
+1625 / 1625 / 1654 with it on (**2.9-3.0x**; the rank's 512-wide experts go through the same `Qwen35PrefillMoe`); `--tp 2` decode 98 tok/s in the one run made in the fast state,
+58-61 tok/s in the other four, independent of the switch (the TP ranks run in lockstep, so the slow display card sets the pace). DFlash2 (`tool_q35moe_dflash`, 534-token prompt, k = 7,
+96 tokens): plain 62.0 -> 65.3 tok/s, DFlash2 60.2 -> 64.0 tok/s, token streams identical to plain in both, verify-vs-decode noise 0.000, 0 flips. Layer-split decode:
+unchanged (the decode path is not touched; 57-65 tok/s in the cells above). Tiny gates after the merge: tiny, prefill, grouped, kernel, spec, dflash2 golden, tp_tiny, tp_container,
+tp_spec, tp_facade, tp_shard and vision all pass.
 **What was built** (all in `src/model`, kernels in `qwen4exp/kernels/moe_trellis_decode.hip`):
 
 * `R4DX_Q35_PROFILE=3` (`qwen35moe_prefill_profile.h`): per-phase GPU time of every prefill chunk, per stage, printed at exit (events between phases, no sync).

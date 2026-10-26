@@ -440,6 +440,9 @@ struct AppArgs {
   int64_t dflash_layer_offset = 1;  // stored target_layers = target_layer_ids + this (z-lab: hidden_states[id + 1])
   bool dflash_layer_offset_set = false;
   double dflash_embed_scale = 0.0;  // <= 0: the checkpoint's input_embedding_scale (1.0 when absent)
+  // --dflash-keep-bf16 a,b: HF linears whose name ends in one of these stay bf16 in a w4a16 container
+  // (docs/nanbeige-dflash.md: Nanbeige4.3's activations overflow the w4a16 kernel's f16 activations).
+  std::vector<std::string> dflash_keep_bf16;
 
   // How the 4-bit quantizers choose their (scale, zero) values -- the on-disk BYTE LAYOUT is
   // identical either way (src/convert/include/r4dx_convert/quant_search.hpp). "rtn" (default) is
@@ -586,6 +589,12 @@ AppArgs ParseArgs(int argc, char** argv) {
         throw std::runtime_error("--dflash-embed-scale must be a finite number > 0, got '" + v + "'");
       a.dflash_embed_scale = s;
     }
+    else if (arg == "--dflash-keep-bf16") {
+      std::stringstream ss(next(i));
+      for (std::string s; std::getline(ss, s, ',');) {
+        if (!s.empty()) a.dflash_keep_bf16.push_back(s);
+      }
+    }
     else if (arg == "--quant") a.quant = next(i);
     else if (arg == "--imatrix") a.imatrix = next(i);
     else if (arg == "--keep-bf16") a.keep_bf16 = next(i);
@@ -683,8 +692,8 @@ AppArgs ParseArgs(int argc, char** argv) {
   const bool dflash_mode = !a.dflash_gguf.empty() || !a.dflash_hf.empty();
   if (!a.dflash_gguf.empty() && !a.dflash_hf.empty())
     throw std::runtime_error("--dflash-gguf and --dflash-hf are mutually exclusive");
-  if (a.dflash_hf.empty() && (a.dflash_layer_offset_set || a.dflash_embed_scale > 0.0))
-    throw std::runtime_error("--dflash-target-layer-offset / --dflash-embed-scale need --dflash-hf");
+  if (a.dflash_hf.empty() && (a.dflash_layer_offset_set || a.dflash_embed_scale > 0.0 || !a.dflash_keep_bf16.empty()))
+    throw std::runtime_error("--dflash-target-layer-offset / --dflash-embed-scale / --dflash-keep-bf16 need --dflash-hf");
   // --trellis-from (docs/trellis-kernel.md 3.3 step 6): an import of oracle bits into the Qwen
   // body. The selftest and the drafter have no body to import into; a reuse has nothing to reuse
   // (an import is I/O-bound) and its guard does not cover the oracle files (refused in v1, 3.4).
@@ -3640,6 +3649,7 @@ int RunDflashHfConvert(const AppArgs& args) {
   o.layout = args.dflash_layout_set ? args.dflash_layout : "bf16";
   o.target_layer_offset = args.dflash_layer_offset;
   o.embed_scale = args.dflash_embed_scale;
+  o.keep_bf16 = args.dflash_keep_bf16;
   o.threads = ResolveThreads(args.threads);
   o.quant.mode = ParseQuantMode(args.quant);
   o.quant_metadata = BuildQuantMetadata();

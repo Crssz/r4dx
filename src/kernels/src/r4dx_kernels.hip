@@ -1415,7 +1415,12 @@ __global__ __launch_bounds__(kAttnThreads) void DflashAttnKernel(
     float scale, int causal_block) {
   const int t = blockIdx.x;
   const int kvh = blockIdx.y;
-  const int ratio = heads_q / heads_kv;
+  // GQA ratios above 4 (Nanbeige4.3's drafter: 28/4 = 7) split a kv-head's q-heads over blockIdx.z in groups of at most
+  // kAttnMaxRatio: group z serves q-heads [z*4, min(full, z*4+4)) of this kv-head and re-reads its K/V. Ratio <= 4 is one
+  // group, z == 0, exactly the pre-split kernel.
+  const int full_ratio = heads_q / heads_kv;
+  const int r0 = static_cast<int>(blockIdx.z) * kAttnMaxRatio;
+  const int ratio = min(kAttnMaxRatio, full_ratio - r0);
   const int tid = threadIdx.x;
   const int lane = tid & 31;
   const int wave = tid >> 5;
@@ -1440,7 +1445,7 @@ __global__ __launch_bounds__(kAttnThreads) void DflashAttnKernel(
 
   if (tid < head_dim) {
     for (int r = 0; r < ratio; ++r) {
-      const int hq = kvh * ratio + r;
+      const int hq = kvh * full_ratio + r0 + r;
       s_q[r][tid] = __bfloat162float(
           q[(static_cast<int64_t>(t) * heads_q + hq) * head_dim + tid]);
     }
@@ -1529,7 +1534,7 @@ __global__ __launch_bounds__(kAttnThreads) void DflashAttnKernel(
       float acc = 0.0f;
 #pragma unroll
       for (int g = 0; g < kAttnKeyGroups; ++g) acc += s_part[g][r][d];
-      const int hq = kvh * ratio + r;
+      const int hq = kvh * full_ratio + r0 + r;
       out[(static_cast<int64_t>(t) * heads_q + hq) * head_dim + d] = __float2bfloat16(acc / s_l[r]);
     }
   }
@@ -2107,11 +2112,12 @@ void r4dx_dflash_attn_causal_bf16(int64_t q, int64_t k_block, int64_t v_block, i
         "r4dx_dflash_attn_bf16: head_dim must be a positive multiple of 32 and <= 128, got " +
         std::to_string(head_dim));
   }
-  if (heads_q <= 0 || (heads_q % heads_kv) != 0 || (heads_q / heads_kv) > kAttnMaxRatio) {
+  if (heads_q <= 0 || (heads_q % heads_kv) != 0 || (heads_q / heads_kv) > 4 * kAttnMaxRatio) {
     throw std::runtime_error(
-        "r4dx_dflash_attn_bf16: heads_q must be a multiple of heads_kv with ratio <= 4, got " +
+        "r4dx_dflash_attn_bf16: heads_q must be a multiple of heads_kv with ratio <= 16, got " +
         std::to_string(heads_q) + "/" + std::to_string(heads_kv));
   }
+  const unsigned groups = static_cast<unsigned>((heads_q / heads_kv + kAttnMaxRatio - 1) / kAttnMaxRatio);
   if (window <= 0 || window > kAttnMaxKeys - kAttnMaxT) {
     throw std::runtime_error("r4dx_dflash_attn_bf16: window must be in [1, 2048], got " +
                               std::to_string(window));
@@ -2137,7 +2143,7 @@ void r4dx_dflash_attn_causal_bf16(int64_t q, int64_t k_block, int64_t v_block, i
   }
   CountLaunches(1);
   hipLaunchKernelGGL(DflashAttnKernel,
-                     dim3(static_cast<unsigned>(T), static_cast<unsigned>(heads_kv)),
+                     dim3(static_cast<unsigned>(T), static_cast<unsigned>(heads_kv), groups),
                      dim3(kAttnThreads), 0, (hipStream_t)stream, (const __hip_bfloat16*)q,
                      (const __hip_bfloat16*)k_block, (const __hip_bfloat16*)v_block,
                      (const __hip_bfloat16*)k_store, (const __hip_bfloat16*)v_store,

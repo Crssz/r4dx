@@ -24,6 +24,10 @@ q35moe_add_test(test_model_q35moe_grouped SINGLE_DEVICE)
 q35moe_add_test(test_q35moe_grouped_moe_kernel SINGLE_DEVICE)
 q35moe_add_test(test_model_q35moe_spec SINGLE_DEVICE)
 q35moe_add_test(test_q35moe_dflash2_golden SINGLE_DEVICE)
+# The same golden check for the Nanbeige4.3 drafter (docs/nanbeige-dflash.md: block 8, GQA 7, selector top-32).
+add_test(NAME nanbeige_dflash2_golden COMMAND test_q35moe_dflash2_golden)
+set_tests_properties(nanbeige_dflash2_golden PROPERTIES LABELS "nanbeige" SKIP_RETURN_CODE 77 ENVIRONMENT
+  "HIP_VISIBLE_DEVICES=1;R4DX_Q35MOE_DFLASH=E:/models/r4dx/nanbeige/nanbeige43-dflash2-bf16.r4dx;R4DX_Q35MOE_DFLASH_GOLDEN=E:/models/r4dx/nanbeige/dflash2-golden")
 # --tp 2 (docs/qwen35moe-tp-design.md P1): two rank models on ONE device (EmulatedComm) against the single-device model, bf16 and trellis tiny containers.
 q35moe_add_test(test_model_q35moe_tp_tiny SINGLE_DEVICE)
 q35moe_add_test(test_q35moe_tp_container SINGLE_DEVICE)

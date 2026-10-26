@@ -1,0 +1,1 @@
+Explain how a hash map handles collisions, with a short Python example.

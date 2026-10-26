@@ -145,8 +145,17 @@ std::unique_ptr<LlamaTpModel> LlamaTpModel::Load(const ModelOptions& opts, const
                                   "rank's options itself");
     }
   }
-  // The Llama option mapping (MTP / DFlash / --vision on refused) -- the same one TP=1 runs.
+  // The Llama option mapping (MTP / --vision on refused) -- the same one TP=1 runs.
   LlamaModelOptions g = MakeLlamaModelOptions(opts);
+  // DFlash: the drafter is replicated per rank (its top-k merged across the vocab shards, docs/tp.md 8.2); the verify
+  // window is unsplit, so k + 1 <= 8 rows (tp_submit.h kMaxUnsplitDraftK).
+  if (!g.dflash_container.empty() && g.dflash_draft_k > tp::kMaxUnsplitDraftK) {
+    throw std::invalid_argument("LlamaTpModel::Load: dflash_draft_k must be at most " +
+                                std::to_string(tp::kMaxUnsplitDraftK) + " under tensor parallelism, got " +
+                                std::to_string(g.dflash_draft_k));
+  }
+  // One host copy of the selector codebooks (2 x vocab x rank bf16) for both ranks.
+  if (!g.dflash_container.empty()) g.dflash_codebooks = DflashDraft::LoadHostCodebooks(g.dflash_container);
   // docs/nanbeige-plan.md L3-8: trellis is TP=1 only -- refused here, on the facade thread, before any device is touched.
   RefuseLlamaTrellisTp(g.container_path, g.layout, g.layer_limit, "LlamaTpModel::Load");
   const int64_t warmup_positions = LlamaModel::WarmupPositions(g);
@@ -241,6 +250,7 @@ std::unique_ptr<LlamaTpModel> LlamaTpModel::Load(const ModelOptions& opts, const
   struct Caps {
     std::string id;
     int64_t layers = 0, vocab = 0, hidden = 0;
+    bool dflash = false;
   };
   std::vector<Caps> caps(static_cast<size_t>(n_slots));
   ModelConfig rank0_global_config;
@@ -397,18 +407,21 @@ std::unique_ptr<LlamaTpModel> LlamaTpModel::Load(const ModelOptions& opts, const
            c.layers = mm.GetContainer().NumLoadedLayers();
            c.vocab = mm.Config().vocab_size;
            c.hidden = mm.Config().hidden_size;
+           c.dflash = mm.DflashEnabled();
            if (s.index == 0) rank0_global_config = mm.GetContainer().GenericConfig();
          },
          CmdKind::kPlain, kNoStall);
   m->global_config_ = rank0_global_config;
   for (size_t i = 1; i < caps.size(); ++i) {
     const Caps &a = caps[0], &b = caps[i];
-    if (a.id != b.id || a.layers != b.layers || a.vocab != b.vocab || a.hidden != b.hidden) {
+    if (a.id != b.id || a.layers != b.layers || a.vocab != b.vocab || a.hidden != b.hidden || a.dflash != b.dflash) {
       throw core::TpDivergenceError("LlamaTpModel::Load: the ranks disagree on the loaded model's identity");
     }
   }
   m->model_id_ = caps[0].id;
   m->num_loaded_layers_ = caps[0].layers;
+  m->dflash_enabled_ = caps[0].dflash;
+  m->dflash_injection_ = true;  // the LlamaModel default
   m->cached_position_ = 0;
   m->cached_fallback_rows_ = 0;
 
@@ -765,12 +778,40 @@ std::vector<int32_t> LlamaTpModel::DecodeStepMtpGreedy(int32_t, int64_t) {
 std::vector<int32_t> LlamaTpModel::DecodeStepMtpSampled(int32_t, int64_t, const kernels::SampleParams&, std::mt19937_64&) {
   throw std::runtime_error("LlamaTpModel: MTP is not available for Llama (the checkpoint has no MTP head)");
 }
-std::vector<int32_t> LlamaTpModel::DecodeStepDflashGreedy(int32_t, int64_t, float, int64_t, int64_t*) {
-  throw std::runtime_error("LlamaTpModel: DFlash is not available for Llama (no drafter)");
+std::vector<int32_t> LlamaTpModel::DecodeStepDflashGreedy(int32_t token_id, int64_t k, float p_min, int64_t n_min,
+                                                          int64_t* walk_len_out) {
+  RequireReady();
+  if (!dflash_enabled_) throw std::runtime_error("LlamaTpModel::DecodeStepDflash{Greedy,Sampled}: DFlash is not enabled on this model");
+  auto walks = std::make_shared<std::vector<int64_t>>(ranks_.size(), 0);
+  std::vector<std::vector<int32_t>> r = RunCollective([token_id, k, p_min, n_min, walks](LlamaModel& m, int slot) {
+    return m.DecodeStepDflashGreedy(token_id, k, p_min, n_min, &(*walks)[static_cast<size_t>(slot)]);
+  });
+  RequireAllEqual(r, "DecodeStepDflashGreedy round");
+  RequireAllEqual(*walks, "DecodeStepDflashGreedy walk_len");
+  if (walk_len_out != nullptr) *walk_len_out = (*walks)[0];
+  return std::move(r[0]);
 }
-std::vector<int32_t> LlamaTpModel::DecodeStepDflashSampled(int32_t, int64_t, float, int64_t, const kernels::SampleParams&,
-                                                          std::mt19937_64&, int64_t*) {
-  throw std::runtime_error("LlamaTpModel: DFlash is not available for Llama (no drafter)");
+
+std::vector<int32_t> LlamaTpModel::DecodeStepDflashSampled(int32_t token_id, int64_t k, float p_min, int64_t n_min,
+                                                           const kernels::SampleParams& params, std::mt19937_64& rng,
+                                                           int64_t* walk_len_out) {
+  RequireReady();
+  if (!dflash_enabled_) throw std::runtime_error("LlamaTpModel::DecodeStepDflash{Greedy,Sampled}: DFlash is not enabled on this model");
+  // Every rank draws from its own copy of the caller's generator (sample-and-match, one draw per emitted token); the copies
+  // must end in the same state.
+  auto rngs = std::make_shared<std::vector<std::mt19937_64>>(ranks_.size(), rng);
+  auto walks = std::make_shared<std::vector<int64_t>>(ranks_.size(), 0);
+  std::vector<std::vector<int32_t>> r =
+      RunCollective([token_id, k, p_min, n_min, params, rngs, walks](LlamaModel& m, int slot) {
+        return m.DecodeStepDflashSampled(token_id, k, p_min, n_min, params, (*rngs)[static_cast<size_t>(slot)],
+                                         &(*walks)[static_cast<size_t>(slot)]);
+      });
+  RequireAllEqual(r, "DecodeStepDflashSampled round");
+  RequireAllEqual(*walks, "DecodeStepDflashSampled walk_len");
+  RequireRngsEqual(*rngs, "DecodeStepDflashSampled");
+  rng = (*rngs)[0];
+  if (walk_len_out != nullptr) *walk_len_out = (*walks)[0];
+  return std::move(r[0]);
 }
 
 StepProfile LlamaTpModel::DecodeStepProfiled(int32_t) {

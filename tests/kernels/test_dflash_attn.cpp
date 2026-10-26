@@ -66,7 +66,7 @@ std::vector<float> AttnRef(const std::vector<uint16_t>& q, const std::vector<uin
                            const std::vector<uint16_t>& k_store,
                            const std::vector<uint16_t>& v_store, int T, int n_injected,
                            int store_begin, int window, int slots, double scale,
-                           bool causal = false) {
+                           bool causal = false, int kHeadsQ = ::kHeadsQ, int kHeadsKv = ::kHeadsKv) {
   const int ratio = kHeadsQ / kHeadsKv;
   std::vector<float> out(static_cast<size_t>(T) * kHeadsQ * kHeadDim);
   std::vector<double> scores;
@@ -222,6 +222,44 @@ int main() {
     }
   }
 
+  // ---- 1c. GQA ratio 7 (Nanbeige4.3's drafter: 28 q-heads / 4 kv-heads): two q-head groups per kv-head ----
+  {
+    constexpr int kHq = 28, kHkv = 4;
+    std::mt19937 rng(131);
+    const std::vector<uint16_t> k_store =
+        RandomBf16(static_cast<size_t>(kSlots) * kHkv * kHeadDim, &rng, -1.5f, 1.5f);
+    const std::vector<uint16_t> v_store =
+        RandomBf16(static_cast<size_t>(kSlots) * kHkv * kHeadDim, &rng, -1.5f, 1.5f);
+    DeviceBuffer<uint16_t> ks_d(k_store.size()), vs_d(v_store.size());
+    ks_d.CopyFromHost(k_store);
+    vs_d.CopyFromHost(v_store);
+    std::printf("[1c] GQA 28/4 (ratio 7) sweep\n");
+    for (int n : {0, 40, 2047, 2100, 5000}) {
+      for (int T : {1, 8}) {
+        const std::vector<uint16_t> q = RandomBf16(static_cast<size_t>(T) * kHq * kHeadDim, &rng, -1.5f, 1.5f);
+        const std::vector<uint16_t> kb = RandomBf16(static_cast<size_t>(T) * kHkv * kHeadDim, &rng, -1.5f, 1.5f);
+        const std::vector<uint16_t> vb = RandomBf16(static_cast<size_t>(T) * kHkv * kHeadDim, &rng, -1.5f, 1.5f);
+        const std::vector<float> ref =
+            AttnRef(q, kb, vb, k_store, v_store, T, n, 0, kWindow, kSlots, scale, false, kHq, kHkv);
+        DeviceBuffer<uint16_t> q_d(q.size()), kb_d(kb.size()), vb_d(vb.size());
+        DeviceBuffer<uint16_t> out_d(static_cast<size_t>(T) * kHq * kHeadDim);
+        q_d.CopyFromHost(q);
+        kb_d.CopyFromHost(kb);
+        vb_d.CopyFromHost(vb);
+        r4dx_dflash_attn_bf16(reinterpret_cast<int64_t>(q_d.data()), reinterpret_cast<int64_t>(kb_d.data()),
+                              reinterpret_cast<int64_t>(vb_d.data()), reinterpret_cast<int64_t>(ks_d.data()),
+                              reinterpret_cast<int64_t>(vs_d.data()), reinterpret_cast<int64_t>(out_d.data()), T, kHq,
+                              kHkv, kHeadDim, n, 0, kWindow, kSlots, scale, 0);
+        R4DX_HIP_CHECK(hipDeviceSynchronize());
+        const ErrStats s = CompareToRef(out_d.CopyToHost(), ref);
+        const bool pass = s.norm_rel < 4e-3 && s.max_abs < 2e-2;
+        std::printf("  n=%-5d T=%d gqa7  max_abs=%.3e norm_rel=%.3e  %s\n", n, T, s.max_abs, s.norm_rel,
+                    pass ? "PASS" : "FAIL");
+        ok = ok && pass;
+      }
+    }
+  }
+
   // ---- 1b. Cold-ring gap: store_begin > 0, with the invisible slots filled with junk ----
   // Junk = 1e4, not NaN: a NaN would poison the softmax and be caught by literally any comparison,
   // including one that reads the slot and then correctly masks it. A large FINITE value is the
@@ -305,7 +343,7 @@ int main() {
         {"T=17 (> block size 16)", 17, 32, 8, 128, 0, 0, 2048, 2048},
         {"head_dim=160 (> 128)", 8, 32, 8, 160, 0, 0, 2048, 2048},
         {"head_dim=100 (not a multiple of 32)", 8, 32, 8, 100, 0, 0, 2048, 2048},
-        {"heads_q/heads_kv = 8 (> 4)", 8, 64, 8, 128, 0, 0, 2048, 2048},
+        {"heads_q/heads_kv = 32 (> 16)", 8, 64, 2, 128, 0, 0, 2048, 2048},
         {"window=2049 (> 2048)", 8, 32, 8, 128, 0, 0, 2049, 4096},
         {"slots < window", 8, 32, 8, 128, 0, 0, 2048, 1024},
         {"store_begin=-1 (< 0)", 8, 32, 8, 128, 40, -1, 2048, 2048},

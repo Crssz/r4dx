@@ -126,14 +126,15 @@ inline kernels::RowSummary MergeRowSummaries(const kernels::RowSummary* per_rank
 // Per-row top-16 of the full row from the per-rank top-16s (docs/tp.md 8.2, H7). Inputs are laid
 // out [world][rows][16], each rank's row sorted descending under the total order above (exactly
 // r4dx_topk16_f32's output, ids made global); outputs are [rows][16].
-inline void MergeTop16(const int32_t* ids, const float* vals, int world, int rows,
-                       int32_t* out_ids, float* out_vals) {
-  constexpr int kTop = 16;
+// MergeTopK is the same merge at any per-row list length (the DFlash2 selector's top_k: 16, or 32 for Nanbeige4.3).
+inline void MergeTopK(const int32_t* ids, const float* vals, int world, int rows, int kTop,
+                      int32_t* out_ids, float* out_vals) {
   constexpr int kMaxWorld = 8;
   if (world < 1 || world > kMaxWorld) {
-    throw std::invalid_argument("tp::MergeTop16: world " + std::to_string(world) +
+    throw std::invalid_argument("tp::MergeTopK: world " + std::to_string(world) +
                                 " outside [1, 8]");
   }
+  if (kTop < 1) throw std::invalid_argument("tp::MergeTopK: k must be >= 1");
   const size_t rank_stride = static_cast<size_t>(rows) * kTop;
   for (int row = 0; row < rows; ++row) {
     int pos[kMaxWorld] = {};
@@ -153,6 +154,11 @@ inline void MergeTop16(const int32_t* ids, const float* vals, int world, int row
       ++pos[best];
     }
   }
+}
+
+inline void MergeTop16(const int32_t* ids, const float* vals, int world, int rows,
+                       int32_t* out_ids, float* out_vals) {
+  MergeTopK(ids, vals, world, rows, 16, out_ids, out_vals);
 }
 
 }  // namespace r4dx::model::tp

@@ -74,6 +74,7 @@ int main() try {
   const nlohmann::json man = nlohmann::json::parse(std::ifstream(gdir / "manifest.json"));
   const int64_t V = man.at("vocab"), H = man.at("hidden"), B = man.at("block"), taps = man.at("taps"), n_ctx = man.at("n_ctx");
   const int32_t anchor = man.at("anchor");
+  const int64_t K = man.value("top_k", 16);  // the selector top-k: 16 (Ornith), 32 (Nanbeige4.3)
   const bool w4 = DflashDraftWeights::Open(drafter).Config().layout == "w4a16";
 
   DflashDraftOptions o;
@@ -133,11 +134,11 @@ int main() try {
   int64_t top1_same = 0, overlap = 0;
   double unary_err = 0, unary_ref = 0;
   for (int64_t t = 1; t < B; ++t) {
-    std::set<int32_t> ref(want_cand.begin() + (t - 1) * 16, want_cand.begin() + t * 16);
-    for (int j = 0; j < 16; ++j) overlap += ref.count(trace.cand[static_cast<size_t>(t * 16 + j)]);
-    top1_same += trace.cand[static_cast<size_t>(t * 16)] == want_cand[static_cast<size_t>((t - 1) * 16)] ? 1 : 0;
-    for (int j = 0; j < 16; ++j) {
-      const double a = trace.unary[static_cast<size_t>(t * 16 + j)], b = want_unary[static_cast<size_t>((t - 1) * 16 + j)];
+    std::set<int32_t> ref(want_cand.begin() + (t - 1) * K, want_cand.begin() + t * K);
+    for (int64_t j = 0; j < K; ++j) overlap += ref.count(trace.cand[static_cast<size_t>(t * K + j)]);
+    top1_same += trace.cand[static_cast<size_t>(t * K)] == want_cand[static_cast<size_t>((t - 1) * K)] ? 1 : 0;
+    for (int64_t j = 0; j < K; ++j) {
+      const double a = trace.unary[static_cast<size_t>(t * K + j)], b = want_unary[static_cast<size_t>((t - 1) * K + j)];
       unary_err += (a - b) * (a - b);
       unary_ref += b * b;
     }
@@ -148,8 +149,8 @@ int main() try {
     path_same += res.tokens[i] == want_path[i] ? 1 : 0;
     if (still && res.tokens[i] == want_path[i]) ++prefix; else still = false;
   }
-  std::printf("%s drafter: final normed hidden RelL2 %.3e | top-16 overlap %lld of %lld, top-1 same %lld of %lld, logit RelL2 %.3e | path equal %lld of %zu (prefix %lld)\n",
-              w4 ? "w4a16" : "bf16", rel, static_cast<long long>(overlap), static_cast<long long>((B - 1) * 16),
+  std::printf("%s drafter: final normed hidden RelL2 %.3e | top-k overlap %lld of %lld, top-1 same %lld of %lld, logit RelL2 %.3e | path equal %lld of %zu (prefix %lld)\n",
+              w4 ? "w4a16" : "bf16", rel, static_cast<long long>(overlap), static_cast<long long>((B - 1) * K),
               static_cast<long long>(top1_same), static_cast<long long>(B - 1), std::sqrt(unary_err / unary_ref),
               static_cast<long long>(path_same), want_path.size(), static_cast<long long>(prefix));
   Check(res.tokens.size() == static_cast<size_t>(B - 1), "the walk drafts block - 1 tokens");
@@ -158,9 +159,10 @@ int main() try {
   // reported only: its 4-bit linears move this random-feature input far more than that (measured 0.79).
   if (!w4) {
     Check(rel <= 0.09, "final normed hidden state differs from the HF model beyond bf16 noise (RelL2 " + std::to_string(rel) + ")");
-    Check(overlap * 10 >= (B - 1) * 16 * 9, "top-16 candidates barely overlap the HF model's");
+    Check(overlap * 10 >= (B - 1) * K * 9, "top-k candidates barely overlap the HF model's");
     Check(top1_same * 10 >= (B - 1) * 8, "top-1 candidates differ from the HF model's");
-    Check(path_same >= 10, "the selector's greedy path differs from the HF model's (" + std::to_string(path_same) + " of 15 equal)");
+    Check(path_same * 3 >= (B - 1) * 2, "the selector's greedy path differs from the HF model's (" + std::to_string(path_same) + " of " +
+                                            std::to_string(B - 1) + " equal)");
   }
   std::printf("%s (%d failure(s))\n", g_failures == 0 ? "PASS" : "FAIL", g_failures);
   return g_failures == 0 ? 0 : 1;

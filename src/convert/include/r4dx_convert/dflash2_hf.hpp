@@ -235,6 +235,10 @@ struct DflashHfOptions {
   std::string layout = "bf16";  // bf16 | w4a16
   int64_t target_layer_offset = 1;
   double embed_scale = 0.0;  // <= 0: the checkpoint's input_embedding_scale (1.0 when absent)
+  // w4a16 only: HF linear names (without ".weight") ending in one of these stay bf16 (the runtime loads a linear by the
+  // tensors it finds), e.g. {"fc", "down_proj"}: Nanbeige4.3's activations overflow the w4a16 GEMM's f16 activations
+  // (NaN drafts, docs/nanbeige-dflash.md).
+  std::vector<std::string> keep_bf16;
   int threads = 1;
   QuantOptions quant;
   // The container's `__metadata__.quant` block (src/convert/main.cpp's BuildQuantMetadata()); the
@@ -281,12 +285,22 @@ inline void ConvertDflashHf(const DflashHfOptions& o) {
     }
     consumed.insert(hf);
   };
+  LayoutSet bf16_only;
+  bf16_only.bf16 = true;
+  auto keep_bf16 = [&](const std::string& hf) {
+    const std::string stem = hf.size() > 7 && hf.compare(hf.size() - 7, 7, ".weight") == 0 ? hf.substr(0, hf.size() - 7) : hf;
+    for (const std::string& k : o.keep_bf16) {
+      if (stem.size() >= k.size() && stem.compare(stem.size() - k.size(), k.size(), k) == 0) return true;
+    }
+    return false;
+  };
   auto linear = [&](const std::string& hf, const std::string& base, int64_t N, int64_t K) {
     check_shape(hf, {N, K});
-    PlanLinearLayouts(writer, base, static_cast<int>(N), static_cast<int>(K), layouts);
-    emit.push_back([&, hf, base, N, K] {
+    const LayoutSet ls = keep_bf16(hf) ? bf16_only : layouts;
+    PlanLinearLayouts(writer, base, static_cast<int>(N), static_cast<int>(K), ls);
+    emit.push_back([&, hf, base, N, K, ls] {
       std::vector<float> w = ReadTensorAsFloat(src, hf);
-      EmitLinearLayouts(writer, base, w, static_cast<int>(N), static_cast<int>(K), layouts, o.threads, o.quant);
+      EmitLinearLayouts(writer, base, w, static_cast<int>(N), static_cast<int>(K), ls, o.threads, o.quant);
     });
   };
   auto norm = [&](const std::string& hf, const std::string& name, int64_t n) {

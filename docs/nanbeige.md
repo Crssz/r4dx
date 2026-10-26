@@ -44,7 +44,11 @@ r4dx-cli --model E:\models\r4dx\nanbeige\nanbeige43-33b-w8a16-g128.r4dx --layout
 r4dx-server --model E:\models\r4dx\nanbeige\nanbeige43-33b-w8a16-g128.r4dx --layout w8a16 --tp 2 --max-ctx 32768 --port 8080
 ```
 
-- `--tp 2` is required (17.3 GiB of weights per card). `--pp 2`, `--batch`, `--mtp`, `--dflash` and images are refused.
+- `--tp 2` is required (17.3 GiB of weights per card). `--pp 2`, `--batch`, `--mtp` and images are refused.
+- `--dflash <drafter> --dflash-k 4`: DFlash2 speculative decoding with the converted ProCreations/Nanbeige4.3-33B-DFlash2
+  drafter, lossless (the target confirms every token; `R4DX_LLAMA_VERIFY_ATTN=rows` makes it byte-identical to plain
+  decode), 1.05-2.0x decode depending on the text, 1.2x at 8k-32k of context:
+  [nanbeige-dflash.md](nanbeige-dflash.md).
 - `--max-ctx` defaults to 32768 (KV is bf16, 104 KiB per token per card); anything up to 524288 is accepted if it fits.
 - `--dialect auto` picks `nanbeige` from the container (`model_arch: llama`) or the tokenizer (`LlamaTokenizer` with the
   `<|im_start|>` bos); `--dialect nanbeige` forces it.
@@ -148,12 +152,14 @@ $env:R4DX_LLAMA_KV = 'fp8'; r4dx-server --model <kv8 container> ...
 | `test_dialect` | CPU: the nanbeige dialect |
 | `llama_tiny_e2e` | GPU: the stack on a tiny checkpoint vs HF, bf16 / w8a16, TP=1 / TP=2 |
 | `test_attn_h128_gqa7` | GPU: the head_dim 128 / GQA 7 attention kernels (bf16 and fp8 KV) vs the reference kernel |
-| `tools\nanbeige\smoke_server.ps1` | both GPUs: the server end to end |
+| `tools\nanbeige\smoke_server.ps1` | both GPUs: the server end to end (`-Dflash <drafter>`: through DFlash rounds) |
+| `nanbeige_dflash2_golden`, `test_dflash_attn` [1c] | GPU: the DFlash2 drafter vs the HF model; its GQA-7 attention |
+| `tools\nanbeige\dflash_ab.ps1` | both GPUs: plain vs DFlash greedy, identity + speed on fixed prompts |
 
 ## Known limits
 
 - KV is bf16 by default (208 KiB per token, 104 KiB per card). fp8 KV exists but **fails the KL gate** and is opt-in
   only (N5-2, below).
-- No speculative decoding (no drafter), no batched decode, no `--pp 2`.
+- No MTP, no batched decode, no `--pp 2`. Speculative decoding: DFlash2 only ([nanbeige-dflash.md](nanbeige-dflash.md)).
 - A DirectStorage load crashed once (an access violation inside `dstoragecore.dll`) while a long CPU job was reading the same
   drive; `R4DX_DIRECT_STORAGE=0` loads through the memory mapping instead.

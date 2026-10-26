@@ -156,6 +156,9 @@ std::vector<uint16_t> ReadHostBf16(const DflashDraftWeights& w, const std::strin
 // `<base>.{layout}.*` tensor names (docs/container-format.md "DFlash2 draft container").
 QuantLinear LoadQuantLinear(const DflashDraftWeights& w, const std::string& base, Layout layout,
                             int64_t N, int64_t K) {
+  // A w4a16 container may keep single linears in bf16 (`r4dx-convert --dflash-hf --dflash-keep-bf16 ...`: on Nanbeige4.3
+  // some activations overflow the w4a16 kernel's f16 activations).
+  if (layout == Layout::kW4a16 && w.HasTensor(base + ".bf16.w") && !w.HasTensor(base + ".w4a16.wq")) layout = Layout::kBf16;
   QuantLinear q;
   q.layout = layout;
   q.N = N;
@@ -227,8 +230,10 @@ DflashDraft DflashDraft::Load(const DflashDraftOptions& opts) {
     // compiles (docs/dflash2.md section 6b) -- fail loudly rather than compute the wrong conv.
     throw std::runtime_error("DflashDraft: only conv_kernel_size=2 / conv_group_size=16 is built");
   }
-  if (c.selector_top_k != 16) {
-    throw std::runtime_error("DflashDraft: only selector_top_k=16 is built (r4dx_topk16_f32)");
+  if (c.selector_top_k != 16 && c.selector_top_k != 32) {
+    // 16: r4dx_topk16_f32. 32 (Nanbeige4.3 DFlash2): the first half of r4dx_topk_lse_f32_ws's exact sorted top-64.
+    throw std::runtime_error("DflashDraft: only selector_top_k 16 or 32 is built, got " +
+                             std::to_string(c.selector_top_k));
   }
   // The block is 8 (Qwen DFlash2) or 16 (Gemma 4, DFlash v1): the attention kernel serves T <= 16 and the conv
   // kernel needs a power-of-two block (its `t & (block - 1)` shift mask).
@@ -346,6 +351,12 @@ DflashDraft DflashDraft::Load(const DflashDraftOptions& opts) {
   d.sel_stage_bytes_ = AlignUp(d.sel_off_gate_ + B * rank * 2, 16);
   d.sel_stage_dev_ = core::DeviceBuffer<uint8_t>(static_cast<size_t>(d.sel_stage_bytes_));
   d.sel_stage_host_ = core::PinnedBuffer<uint8_t>(static_cast<size_t>(d.sel_stage_bytes_));
+  if (topk == 32) {
+    d.top64_ids_dev_ = core::DeviceBuffer<int32_t>(Bs * R4DX_TOPK_LSE_K);
+    d.top64_vals_dev_ = core::DeviceBuffer<float>(Bs * R4DX_TOPK_LSE_K);
+    d.top64_lse_dev_ = core::DeviceBuffer<float>(Bs);
+    d.top64_ws_dev_ = core::DeviceBuffer<uint8_t>(static_cast<size_t>(r4dx_topk_lse_workspace_bytes()));
+  }
 
   return d;
 }
@@ -637,10 +648,25 @@ DflashDraftResult DflashDraft::DraftRound(core::Stream& stream, core::Arena& are
   lm_head(stream, arena, xf_.data(), logits_dev_.data(), B);
 
   uint8_t* stage = sel_stage_dev_.data();
-  r4dx_topk16_f32(reinterpret_cast<int64_t>(logits_dev_.data()),
-                  reinterpret_cast<int64_t>(stage + sel_off_cand_),
-                  reinterpret_cast<int64_t>(stage + sel_off_unary_), static_cast<int>(B),
-                  lm_head_vocab_, s);
+  if (topk == 16) {
+    r4dx_topk16_f32(reinterpret_cast<int64_t>(logits_dev_.data()),
+                    reinterpret_cast<int64_t>(stage + sel_off_cand_),
+                    reinterpret_cast<int64_t>(stage + sel_off_unary_), static_cast<int>(B),
+                    lm_head_vocab_, s);
+  } else {
+    // Top-32: ranks 1..32 of the exact sorted top-64 (same total order as r4dx_topk16_f32, so the TP merge below and
+    // the walk see exactly what a top-32 kernel would give). The logsumexp output is a by-product, unused.
+    r4dx_topk_lse_f32_ws(reinterpret_cast<int64_t>(logits_dev_.data()),
+                         reinterpret_cast<int64_t>(top64_ids_dev_.data()),
+                         reinterpret_cast<int64_t>(top64_vals_dev_.data()),
+                         reinterpret_cast<int64_t>(top64_lse_dev_.data()), static_cast<int>(B), lm_head_vocab_,
+                         /*inv_temperature=*/1.0f, s, reinterpret_cast<int64_t>(top64_ws_dev_.data()));
+    const size_t row = static_cast<size_t>(topk) * 4;
+    R4DX_HIP_CHECK(hipMemcpy2DAsync(stage + sel_off_cand_, row, top64_ids_dev_.data(), R4DX_TOPK_LSE_K * 4, row,
+                                    static_cast<size_t>(B), hipMemcpyDeviceToDevice, stream.get()));
+    R4DX_HIP_CHECK(hipMemcpy2DAsync(stage + sel_off_unary_, row, top64_vals_dev_.data(), R4DX_TOPK_LSE_K * 4, row,
+                                    static_cast<size_t>(B), hipMemcpyDeviceToDevice, stream.get()));
+  }
   ApplyLinear(stream, arena, selector_hidden_, xf_.data(),
               reinterpret_cast<uint16_t*>(stage + sel_off_gate_), B);
 
@@ -705,7 +731,7 @@ void DflashDraft::MergeTop16AcrossRanks() {
   // v > v' || (v == v' && i < i')". With the ids made global (rank r's are all below rank r+1's),
   // every member of the full row's top-16 is in its own shard's top-16, so the rank-order merge
   // under the same order IS the full row's top-16, values bit for bit (tp_vocab.h).
-  constexpr int64_t kTop = 16;  // selector_top_k, checked at Load
+  const int64_t kTop = cfg_.selector_top_k;  // 16 or 32, checked at Load
   const int64_t B = cfg_.block_size;
   const int world = comm_->World();
   const size_t n = static_cast<size_t>(B * kTop);
@@ -734,8 +760,8 @@ void DflashDraft::MergeTop16AcrossRanks() {
   }
   merged_cand_.resize(n);
   merged_unary_.resize(n);
-  tp::MergeTop16(top16_ids_all_.data(), top16_vals_all_.data(), world, static_cast<int>(B),
-                 merged_cand_.data(), merged_unary_.data());
+  tp::MergeTopK(top16_ids_all_.data(), top16_vals_all_.data(), world, static_cast<int>(B), static_cast<int>(kTop),
+                merged_cand_.data(), merged_unary_.data());
 }
 
 #ifdef R4DX_TP_TESTING

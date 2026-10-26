@@ -1,5 +1,5 @@
 // r4dx::model::LlamaTpModel -- the tensor-parallel (`--tp 2`) TextModel of a llama container (docs/nanbeige-plan.md 3.4,
-// task N1-7). A copy-adapt of Lfm2TpModel (itself GemmaTpModel's; both untouched) specialised to LlamaModel and stripped of vision / audio / DFlash: one rank thread per rank, each owning that
+// task N1-7). A copy-adapt of Lfm2TpModel (itself GemmaTpModel's; both untouched) specialised to LlamaModel and stripped of vision / audio (DFlash2 as GemmaTpModel: the drafter replicated per rank, its top-k and the verify rows merged across the vocab shards): one rank thread per rank, each owning that
 // rank's LlamaModel, TpComm endpoint and every device buffer they allocate; the facade never computes and never calls HIP
 // after load -- every call is broadcast to the rank threads as one command, the results are compared, and every failure
 // goes through the same error state machine:
@@ -65,7 +65,7 @@ class LlamaTpModel final : public TextModel, public TpDiagnostics {
   bool HasVision() const override { return false; }
   bool MtpEnabled() const override { return false; }
   bool MtpUsingReducedVocabDraft() const override { return false; }
-  bool DflashEnabled() const override { return false; }
+  bool DflashEnabled() const override { return dflash_enabled_; }
   int64_t SampledFallbackRows() const override { return cached_fallback_rows_; }
   int64_t PositionCount() const override { return cached_position_; }
   int64_t NumLoadedLayers() const override { return num_loaded_layers_; }
@@ -74,7 +74,8 @@ class LlamaTpModel final : public TextModel, public TpDiagnostics {
 
   // ---- sequence state -------------------------------------------------------------------------
   void Reset() override;
-  void SetDflashInjectionEnabled(bool) override {}  // no drafter
+  // Host-only policy, applied to every rank at the start of each collective command (as GemmaTpModel).
+  void SetDflashInjectionEnabled(bool enabled) override { dflash_injection_ = enabled; }
   void SaveCheckpoint() override;     // each rank records its position (KV is positional; needs ModelOptions::prompt_checkpoint)
   void RestoreCheckpoint() override;
 
@@ -164,6 +165,7 @@ class LlamaTpModel final : public TextModel, public TpDiagnostics {
     std::decay_t<Fn> fn;
     std::vector<Slot> out;
     int64_t pos0 = 0, fallback0 = 0;
+    bool inject = true;  // the facade's DFlash injection policy at the time the command was posted
     auto Take() {
       std::vector<std::conditional_t<std::is_void_v<R>, char, R>> v;
       v.reserve(out.size());
@@ -179,9 +181,11 @@ class LlamaTpModel final : public TextModel, public TpDiagnostics {
     using St = CmdState<Fn>;
     RequireReady();
     auto st = std::make_shared<St>(std::forward<Fn>(fn), ranks_.size());
+    st->inject = dflash_injection_;
     RunGuarded(AllSlots(),
                [st](RankSlot& s) {
                  core::TpCollectiveScope scope;
+                 s.model->SetDflashInjectionEnabled(st->inject);
                  if constexpr (std::is_void_v<typename St::R>) {
                    st->fn(*s.model, s.index);
                  } else {
@@ -238,6 +242,8 @@ class LlamaTpModel final : public TextModel, public TpDiagnostics {
   int64_t num_loaded_layers_ = 0;
   int64_t cached_position_ = 0;
   int64_t cached_fallback_rows_ = 0;
+  bool dflash_enabled_ = false;    // every rank loaded the drafter (cached at load)
+  bool dflash_injection_ = true;   // the LlamaModel default
   mutable std::vector<VramReport> cached_vram_;
 };
 

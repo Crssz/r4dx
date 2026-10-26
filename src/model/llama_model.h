@@ -1,7 +1,7 @@
 // r4dx::model::LlamaModel -- the single-device dense Llama (`llama`, Nanbeige4.3-33B) text engine (docs/nanbeige-plan.md
 // 3.1-3.3, task N1-6), and one tensor-parallel rank of it (N1-7; LlamaTpModel drives two). A separate class from Model,
-// GemmaModel and Lfm2Model on purpose: every layer is full GQA attention + a SwiGLU MLP, one sequence, no speculation,
-// no vision. Its public surface is Lfm2Model's minus the ShortConv / MoE debug hooks, so LlamaTpModel is a copy-adapt
+// GemmaModel and Lfm2Model on purpose: every layer is full GQA attention + a SwiGLU MLP, one sequence, no vision.
+// Speculation: an optional DFlash2 drafter (docs/nanbeige-dflash.md), wired as GemmaModel's. Its public surface is Lfm2Model's minus the ShortConv / MoE debug hooks, so LlamaTpModel is a copy-adapt
 // of Lfm2TpModel.
 //
 // Per decoder layer (bf16 residual stream, docs/nanbeige-plan.md 3.2):
@@ -23,6 +23,7 @@
 #include <string>
 #include <vector>
 
+#include "dflash_draft.h"
 #include "llama_container.h"
 #include "model_types.h"
 #include "r4dx/core/arena.hpp"
@@ -55,6 +56,13 @@ struct LlamaModelOptions {
   core::TpComm* tp_comm = nullptr;
   int tp_submit_layers = 0;
   int tp_max_inflight_units = 0;
+  // DFlash2 drafter (docs/nanbeige-dflash.md; ProCreations/Nanbeige4.3-33B-DFlash2 converted with `r4dx-convert
+  // --dflash-hf`). Non-empty: load it, capture the target residual at its `target_layers` and inject every committed row.
+  // `dflash_draft_k` in [1, block_size - 1].
+  std::string dflash_container;
+  int64_t dflash_draft_k = 0;
+  // TP only: the process's one host copy of the selector codebooks (DflashDraft::LoadHostCodebooks), shared by the ranks.
+  std::shared_ptr<const DflashHostCodebooks> dflash_codebooks;
 };
 
 // What DebugLayerForward reports besides the layer output (host copies; device synchronized).
@@ -103,6 +111,28 @@ class LlamaModel {
   StepProfile DecodeStepProfiled(int32_t token_id);
   StepProfile PrefillProfiled(const std::vector<int32_t>& token_ids);
 
+  // ---- DFlash2 speculative decode (docs/nanbeige-dflash.md) --------------------------------------------------------
+  // KV is positional, so a verify window needs no rollback: its rejected rows are overwritten by whatever is fed next.
+  // Only PositionCount() and the drafter's frontier need care, and both advance only on commit.
+  bool DflashEnabled() const { return dflash_.has_value(); }
+  int64_t DflashDraftK() const { return dflash_draft_k_; }
+  const DflashDraft& Drafter() const { return dflash_.value(); }
+  // Off: the feature capture's injection is skipped (a request that never drafts); the next injection then opens a gap
+  // in the drafter's ring (DflashDraft::InjectFeatures), correct but cold.
+  void SetDflashInjectionEnabled(bool enabled) { dflash_injection_enabled_ = enabled; }
+  // One round: draft up to `k` tokens after `token_id` (the last committed token, NOT yet fed), verify [token_id, drafts]
+  // in one window, commit the longest prefix the target confirms plus the correction / bonus token, inject the committed
+  // rows into the drafter. Greedy: confirmation is the target's argmax. Sampled (temperature > 0): sample-and-match --
+  // each verify row draws one token from the target's own distribution (one rng draw per emitted token, like plain
+  // DecodeStepSampled) and a draft is accepted iff it equals that draw, so the output is distributed exactly as plain
+  // sampled decode. Under TP every rank runs the same round (replicated drafter, merged vocab shards) and returns the
+  // same tokens. `walk_len_out`: tokens the selector walk drafted.
+  std::vector<int32_t> DecodeStepDflashGreedy(int32_t token_id, int64_t k, float p_min, int64_t n_min,
+                                              int64_t* walk_len_out = nullptr);
+  std::vector<int32_t> DecodeStepDflashSampled(int32_t token_id, int64_t k, float p_min, int64_t n_min,
+                                               const kernels::SampleParams& params, std::mt19937_64& rng,
+                                               int64_t* walk_len_out = nullptr);
+
   // ---- rung-3 test hook (tests/model/test_llama_layers.cpp; TP=1 only) ---------------------------------------------
   // Decoder layer `layer` alone on `x_rows` ([T, hidden] bf16 host, T <= prefill_chunk) at absolute position
   // `start_pos`: the layer's own KV continues from earlier calls. Returns the layer output. Does not touch
@@ -116,8 +146,23 @@ class LlamaModel {
     float inv_temperature = 1.0f;
     kernels::RowSummary* out = nullptr;
   };
+  // A verify window (`verify` non-null, 1..8 rows): final norm + lm_head on EVERY row, then per row the argmax
+  // (verify->argmax) or, with verify->inv_temperature > 0, the top-64 + logsumexp summary (verify->summaries). pos_ is NOT
+  // advanced and nothing is injected.
+  struct VerifyRequest {
+    float inv_temperature = 0.0f;  // 0: greedy (argmax)
+    std::vector<int32_t>* argmax = nullptr;
+    std::vector<kernels::RowSummary>* summaries = nullptr;
+  };
   std::vector<float> RunChunk(const std::vector<int32_t>& token_ids, bool want_logits, int32_t* greedy_out,
-                              const SummaryRequest* summary_out, SpanAccumulator* prof, bool is_prefill = false);
+                              const SummaryRequest* summary_out, SpanAccumulator* prof, bool is_prefill = false,
+                              const VerifyRequest* verify = nullptr);
+  std::vector<int32_t> DecodeStepDflashImpl(int32_t token_id, int64_t k, float p_min, int64_t n_min,
+                                            const kernels::SampleParams* params, std::mt19937_64* rng,
+                                            int64_t* walk_len_out);
+  void InjectDflashRows(int64_t rows, int64_t start_pos);  // features_dev_ rows [0, rows) -> the drafter
+  void MergeVerifyPairs(int64_t rows, std::vector<int32_t>* out);
+  void ReadVerifyLogitsRow(int64_t row, std::vector<float>* full);  // the full (TP: gathered) fp32 row of the last window
   void RunLayer(int64_t i, uint16_t* h, int64_t T, int64_t start_pos, SpanAccumulator* prof,
                 LlamaLayerDebug* dbg = nullptr);
   void UploadPositions(int64_t start_pos, int64_t T);
@@ -160,6 +205,25 @@ class LlamaModel {
   core::DeviceBuffer<int32_t> argmax_dev_, summary_ids_dev_;
   core::DeviceBuffer<float> summary_vals_dev_, summary_lse_dev_;
   std::vector<float> sampled_row_scratch_;
+
+  // ---- DFlash2 ----
+  std::optional<DflashDraft> dflash_;
+  int64_t dflash_draft_k_ = 0;
+  bool dflash_injection_enabled_ = true;
+  float dflash_embed_scale_ = 1.0f;
+  std::vector<int64_t> feature_layers_;            // layer-INPUT indices captured (the residual entering layer L)
+  core::DeviceBuffer<uint16_t> features_dev_;      // [rows, n_layers * hidden] bf16, rows of the last chunk
+  int64_t feature_rows_ = 0;
+  core::DeviceBuffer<float> verify_logits_dev_;    // [8, vocab_local_] fp32
+  core::DeviceBuffer<int32_t> verify_argmax_dev_;  // [8] (TP=1)
+  core::DeviceBuffer<int32_t> verify_pair_dev_;    // [8, 2] {local idx, value bits} (TP)
+  core::DeviceBuffer<int32_t> verify_sum_ids_dev_;   // [8, 64]
+  core::DeviceBuffer<float> verify_sum_vals_dev_;    // [8, 64]
+  core::DeviceBuffer<float> verify_sum_lse_dev_;     // [8]
+  core::DeviceBuffer<int32_t> verify_seqused_dev_;   // [8] == pos + t + 1 (per-row verify attention)
+  const int32_t* verify_rows_seqused_ = nullptr;     // set for the duration of a verify RunChunk (R4DX_LLAMA_VERIFY_ATTN=rows)
+                                                     // (the default fused verify leaves it null)
+  std::vector<kernels::RowSummary> round_summaries_;
 };
 
 }  // namespace r4dx::model

@@ -49,12 +49,14 @@ std::vector<int32_t> LlamaLocalTextModel::DecodeStepMtpSampled(int32_t, int64_t,
                                                               std::mt19937_64&) {
   throw std::runtime_error("LlamaLocalTextModel: MTP is not available for Llama (the checkpoint has no MTP head)");
 }
-std::vector<int32_t> LlamaLocalTextModel::DecodeStepDflashGreedy(int32_t, int64_t, float, int64_t, int64_t*) {
-  throw std::runtime_error("LlamaLocalTextModel: DFlash is not available for Llama (no drafter, docs/nanbeige-plan.md 1)");
+std::vector<int32_t> LlamaLocalTextModel::DecodeStepDflashGreedy(int32_t token_id, int64_t k, float p_min, int64_t n_min,
+                                                                int64_t* walk_len_out) {
+  return m_.DecodeStepDflashGreedy(token_id, k, p_min, n_min, walk_len_out);
 }
-std::vector<int32_t> LlamaLocalTextModel::DecodeStepDflashSampled(int32_t, int64_t, float, int64_t,
-                                                                 const kernels::SampleParams&, std::mt19937_64&, int64_t*) {
-  throw std::runtime_error("LlamaLocalTextModel: DFlash is not available for Llama (no drafter, docs/nanbeige-plan.md 1)");
+std::vector<int32_t> LlamaLocalTextModel::DecodeStepDflashSampled(int32_t token_id, int64_t k, float p_min, int64_t n_min,
+                                                                 const kernels::SampleParams& params, std::mt19937_64& rng,
+                                                                 int64_t* walk_len_out) {
+  return m_.DecodeStepDflashSampled(token_id, k, p_min, n_min, params, rng, walk_len_out);
 }
 
 LlamaModelOptions MakeLlamaModelOptions(const ModelOptions& opts) {
@@ -69,9 +71,11 @@ LlamaModelOptions MakeLlamaModelOptions(const ModelOptions& opts) {
   if (opts.mtp_draft_k > 0) {
     throw std::invalid_argument("LoadTextModel: MTP is not available for Llama (the checkpoint has no MTP head)");
   }
-  if (!opts.dflash_container.empty() || opts.dflash_draft_k > 0) {
-    throw std::invalid_argument("LoadTextModel: DFlash is not available for Llama (no drafter)");
+  if (!opts.dflash_container.empty() && opts.dflash_draft_k <= 0) {
+    throw std::invalid_argument("LoadTextModel: dflash_container is set but dflash_draft_k <= 0");
   }
+  o.dflash_container = opts.dflash_container;
+  o.dflash_draft_k = opts.dflash_container.empty() ? 0 : opts.dflash_draft_k;
   if (opts.vision == ModelOptions::VisionMode::kOn) {
     throw std::invalid_argument("LoadTextModel: --vision on, but a Llama container is text only");
   }

@@ -86,9 +86,14 @@ class LlamaAttnLayer {
   // positions: device int32 [T] -- the absolute positions, which are also the KV write slots (contiguous cache).
   // seqused_k: device int32 [1] == start_pos + T (the libr4d attention reads the context length on device).
   // start_pos: tokens already cached before this call (ctx = start_pos + T).
+  // seqused_rows (a DFlash verify window, T <= 9): device int32 [T] == start_pos + t + 1. Non-null: the h128 decode kernel
+  // runs once PER ROW at that row's own context length, which is exactly what plain decode computed for that position
+  // (the decode split law is a function of max_ctx, so one q_len = T launch partitions the keys differently and the
+  // rows drift by rounding; docs/nanbeige-dflash.md). Costs T reads of the KV instead of one.
   void Forward(core::Arena& arena, const uint16_t* x_normed, uint16_t* o_out, const LlamaAttnLayerWeights& w,
                GemmaKvCache& kv, int T, int start_pos, const int32_t* positions, const int32_t* seqused_k,
-               hipStream_t stream, SpanAccumulator* prof = nullptr, core::TpComm* comm = nullptr) const {
+               hipStream_t stream, SpanAccumulator* prof = nullptr, core::TpComm* comm = nullptr,
+               const int32_t* seqused_rows = nullptr) const {
     const int H = cfg_.heads, Hk = cfg_.kv_heads, D = cfg_.head_dim;
     if (T < 1) throw std::invalid_argument("LlamaAttnLayer::Forward: T must be >= 1");
     const bool fp8 = kv.Dtype() == GemmaKvDtype::kFp8;
@@ -146,7 +151,21 @@ class LlamaAttnLayer {
       a.scale = cfg_.Scale();
       a.splits = 0;
       a.max_ctx = ctx;
-      if (T <= kLlamaDecodeMaxRows) {
+      if (seqused_rows != nullptr && T > 1 && T <= kLlamaDecodeMaxRows) {
+        R4DArgs r = a;
+        r.q_len = 1;
+        r.max_ctx = start_pos + T;  // the largest row's: sizes the scratch for every row
+        r.scratch = arena.Alloc<uint8_t>(static_cast<size_t>(core::r4d::AttnDecodeH128ScratchBytes(r)), 16);
+        ProfiledCall(prof, stream, "attn.core_decode", [&] {
+          for (int t = 0; t < T; ++t) {
+            r.q = q + static_cast<size_t>(t) * H * D;
+            r.out = attn_out + static_cast<size_t>(t) * H * D;
+            r.seqused_k = seqused_rows + t;
+            r.max_ctx = start_pos + t + 1;
+            fp8 ? core::r4d::AttnDecodeH128Fp8Kv(r, stream) : core::r4d::AttnDecodeH128Bf16Kv(r, stream);
+          }
+        });
+      } else if (T <= kLlamaDecodeMaxRows) {
         a.scratch = arena.Alloc<uint8_t>(static_cast<size_t>(core::r4d::AttnDecodeH128ScratchBytes(a)), 16);
         ProfiledCall(prof, stream, "attn.core_decode", [&] {
           fp8 ? core::r4d::AttnDecodeH128Fp8Kv(a, stream) : core::r4d::AttnDecodeH128Bf16Kv(a, stream);

@@ -22,13 +22,18 @@
 
 .EXAMPLE
   .\tools\nanbeige\smoke_server.ps1
+.EXAMPLE
+  .\tools\nanbeige\smoke_server.ps1 -Dflash E:\models\r4dx\nanbeige\nanbeige43-dflash2-w4a16.r4dx
 #>
 [CmdletBinding()]
 param(
     [string]$Model = "",
     [string]$Preset = "win-hip",
     [int]$Port = 8093,
-    [int]$MaxCtx = 8192
+    [int]$MaxCtx = 8192,
+    # A DFlash2 drafter container (docs/nanbeige-dflash.md): every check then runs through DFlash rounds.
+    [string]$Dflash = "",
+    [int]$DflashK = 7
 )
 
 $ErrorActionPreference = "Stop"
@@ -106,7 +111,8 @@ try {
     Remove-Item env:HIP_VISIBLE_DEVICES -ErrorAction SilentlyContinue
     $args = @("--model", $Model, "--layout", "w8a16", "--tp", "2", "--tp-mode", "real", "--host", "127.0.0.1",
               "--port", "$Port", "--max-ctx", "$MaxCtx", "--dialect", "nanbeige")
-    Write-Output "[smoke] starting r4dx-server: $Model --tp 2 --layout w8a16 --max-ctx $MaxCtx port $Port"
+    if ($Dflash) { $args += @("--dflash", $Dflash, "--dflash-k", "$DflashK") }
+    Write-Output "[smoke] starting r4dx-server: $Model --tp 2 --layout w8a16 --max-ctx $MaxCtx port $Port$(if ($Dflash) { " --dflash $Dflash --dflash-k $DflashK" })"
     $proc = Start-Process -FilePath $ServerExe -ArgumentList $args -PassThru -RedirectStandardError $ErrLog -RedirectStandardOutput $OutLog
     $ready = $false
     for ($i = 0; $i -lt 300; $i++) {

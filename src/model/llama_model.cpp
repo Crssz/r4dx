@@ -13,6 +13,7 @@
 #include <stdexcept>
 #include <type_traits>
 
+#include "dflash_draft_weights.h"
 #include "kernels/model_kernels.h"
 #include "linear.h"
 #include "profile_span.h"
@@ -54,6 +55,20 @@ bool LlamaKvFp8Requested() {
     if (e == nullptr || *e == '\0' || std::strcmp(e, "bf16") == 0) return false;
     if (std::strcmp(e, "fp8") == 0) return true;
     throw std::invalid_argument(std::string("R4DX_LLAMA_KV='") + e + "' (want fp8|bf16)");
+  }();
+  return v;
+}
+
+// R4DX_LLAMA_VERIFY_ATTN (DFlash verify windows): fused (default) runs one q_len = k+1 decode launch (one KV read; a row
+// may differ from plain decode by rounding, so greedy output can flip at a near-tie); rows runs the decode attention once
+// per row at that row's own context length, so every verify row equals plain decode bit for bit (greedy DFlash output ==
+// plain greedy) at k+1 KV reads per layer -- slower than plain decode by 32k of context (docs/nanbeige-dflash.md). Read once.
+bool LlamaVerifyAttnPerRow() {
+  static const bool v = [] {
+    const char* e = std::getenv("R4DX_LLAMA_VERIFY_ATTN");
+    if (e == nullptr || *e == '\0' || std::strcmp(e, "fused") == 0) return false;
+    if (std::strcmp(e, "rows") == 0) return true;
+    throw std::invalid_argument(std::string("R4DX_LLAMA_VERIFY_ATTN='") + e + "' (want rows|fused)");
   }();
   return v;
 }
@@ -158,6 +173,72 @@ LlamaModel LlamaModel::Load(const LlamaModelOptions& opts) {
     ac.rope_theta = static_cast<float>(cfg.rope_theta);
     m.attn_.emplace_back(ac);
   }
+  // ---- DFlash2 drafter (docs/nanbeige-dflash.md): its own weights + ring, fed by the feature capture ----------------
+  if (opts.dflash_draft_k < 0) throw std::invalid_argument("LlamaModel::Load: dflash_draft_k must be >= 0");
+  if (!opts.dflash_container.empty()) {
+    if (opts.dflash_draft_k <= 0) throw std::invalid_argument("LlamaModel::Load: dflash_container is set but dflash_draft_k <= 0");
+    if (m.max_chunk_ < 8) throw std::invalid_argument("LlamaModel::Load: DFlash needs prefill_chunk >= 8 (the verify window)");
+    const DflashDraftWeights peek = DflashDraftWeights::Open(opts.dflash_container);  // CPU: metadata + directory only
+    const Dflash2Config& dc = peek.Config();
+    if (dc.layout.empty()) throw std::runtime_error("LlamaModel::Load: dflash container has no layout in its __metadata__.dflash2 block");
+    if (dc.hidden_size != hidden) {
+      throw std::runtime_error("LlamaModel::Load: dflash container hidden_size " + std::to_string(dc.hidden_size) +
+                               " != the target's " + std::to_string(hidden));
+    }
+    if (dc.vocab_size != cfg.vocab_size) {
+      throw std::runtime_error("LlamaModel::Load: dflash container vocab_size " + std::to_string(dc.vocab_size) +
+                               " != the target's " + std::to_string(cfg.vocab_size) + " (it shares the target embedding)");
+    }
+    // The verify window is k + 1 <= 8 rows: the h128_gqa7 decode kernel (kLlamaDecodeMaxRows) and the TP unsplit limit.
+    if (opts.dflash_draft_k > 7 || opts.dflash_draft_k > dc.block_size - 1) {
+      throw std::invalid_argument("LlamaModel::Load: dflash_draft_k " + std::to_string(opts.dflash_draft_k) +
+                                  " must be <= min(7, block_size - 1 = " + std::to_string(dc.block_size - 1) + ")");
+    }
+    // target_layers are layer-INPUT indices (the converter stores HF hidden_states[id + 1] as id + 1): the residual
+    // ENTERING layer L, i.e. layer L-1's output; L == layers is the last layer's output (before the final norm).
+    for (size_t i = 0; i < dc.target_layers.size(); ++i) {
+      const int64_t l = dc.target_layers[i];
+      if (l < 0 || l > layers || (i > 0 && l <= dc.target_layers[i - 1])) {
+        throw std::runtime_error("LlamaModel::Load: dflash target layers must be ascending in [0, " + std::to_string(layers) +
+                                 "], got " + std::to_string(l));
+      }
+    }
+    DflashDraftOptions d;
+    d.container_path = opts.dflash_container;
+    d.layout = LayoutFromName(dc.layout);
+    d.max_inject_rows = 64;
+    // The TARGET lm_head's rows: the whole vocabulary at TP=1, this rank's slice under TP (the drafter merges its per-rank
+    // top-k with the peer's, docs/tp.md 8.2).
+    d.lm_head_vocab = m.vocab_local_;
+    if (is_tp) {
+      d.vocab_offset = m.vocab_offset_;
+      d.global_vocab = cfg.vocab_size;
+      d.comm = m.comm_;
+      d.shared_codebooks = opts.dflash_codebooks;
+    }
+    m.dflash_ = DflashDraft::Load(d);
+    m.dflash_draft_k_ = opts.dflash_draft_k;
+    m.dflash_embed_scale_ = static_cast<float>(dc.embed_scale);
+    m.feature_layers_ = dc.target_layers;
+    m.features_dev_ = core::DeviceBuffer<uint16_t>(static_cast<size_t>(rows) * m.feature_layers_.size() *
+                                                   static_cast<size_t>(hidden));
+    constexpr int64_t kW = 8;
+    m.verify_logits_dev_ = core::DeviceBuffer<float>(static_cast<size_t>(kW * m.vocab_local_));
+    m.verify_argmax_dev_ = core::DeviceBuffer<int32_t>(kW);
+    m.verify_pair_dev_ = core::DeviceBuffer<int32_t>(2 * kW);
+    m.verify_sum_ids_dev_ = core::DeviceBuffer<int32_t>(kW * R4DX_TOPK_LSE_K);
+    m.verify_sum_vals_dev_ = core::DeviceBuffer<float>(kW * R4DX_TOPK_LSE_K);
+    m.verify_sum_lse_dev_ = core::DeviceBuffer<float>(kW);
+    m.verify_seqused_dev_ = core::DeviceBuffer<int32_t>(kW);
+    if (m.topk_lse_ws_.size() == 0) {
+      m.topk_lse_ws_ = core::DeviceBuffer<uint8_t>(static_cast<size_t>(r4dx_topk_lse_workspace_bytes()));
+    }
+    std::cerr << "[r4dx::model::LlamaModel] DFlash drafter loaded: " << opts.dflash_container << " (layout " << dc.layout
+              << ", " << dc.block_count << " layers, block " << dc.block_size << ", k " << opts.dflash_draft_k
+              << ", selector top-" << dc.selector_top_k << ", target layers [";
+    for (size_t i = 0; i < dc.target_layers.size(); ++i) std::cerr << (i ? "," : "") << dc.target_layers[i];
+    std::cerr << "], attention window " << dc.attention.sliding_window << ")\n";
+  }
   m.stream_.Synchronize();
   std::cerr << "[r4dx::model::LlamaModel] " << layers << " layers, max_ctx " << m.max_ctx_
             << ", KV " << (kv_fp8 ? "fp8" : "bf16") << " = "
@@ -182,6 +263,8 @@ void LlamaModel::Reset() {
   arena_.Reset();
   ckpt_pos_ = -1;
   submit_.Reset();
+  feature_rows_ = 0;
+  if (dflash_.has_value()) dflash_->Reset();
 }
 
 void LlamaModel::SaveCheckpoint() {
@@ -197,6 +280,9 @@ void LlamaModel::RestoreCheckpoint() {
   pos_ = ckpt_pos_;
   started_ = true;
   arena_.Reset();
+  feature_rows_ = 0;
+  // The drafter's ring is positional too: rewinding its frontier is the restore (rows past it are overwritten later).
+  if (dflash_.has_value() && dflash_->InjectedCount() > pos_) dflash_->Rewind(pos_);
 }
 
 void LlamaModel::UploadPositions(int64_t start_pos, int64_t T) {
@@ -252,7 +338,7 @@ void LlamaModel::RunLayer(int64_t i, uint16_t* h, int64_t T, int64_t start_pos, 
   aw.v_descale = lw.v_descale.data();
   attn_[static_cast<size_t>(i)].Forward(arena_, x, sub, aw, kv_[static_cast<size_t>(i)], static_cast<int>(T),
                                         static_cast<int>(start_pos), positions_dev_.data(), seqused_dev_.data(), s_raw,
-                                        prof, comm_);
+                                        prof, comm_, verify_rows_seqused_);
   take(dbg ? &dbg->attn_out : nullptr, sub);
   if (dbg == nullptr) {
     ProfiledCall(prof, s_raw, "layer.post_attn_norm", [&] {
@@ -301,8 +387,12 @@ std::vector<uint16_t> LlamaModel::DebugLayerForward(int64_t layer, const std::ve
 // ---- one chunk ------------------------------------------------------------------------------------------------------
 
 std::vector<float> LlamaModel::RunChunk(const std::vector<int32_t>& token_ids, bool want_logits, int32_t* greedy_out,
-                                        const SummaryRequest* summary_out, SpanAccumulator* prof, bool is_prefill) {
+                                        const SummaryRequest* summary_out, SpanAccumulator* prof, bool is_prefill,
+                                        const VerifyRequest* verify) {
   const int64_t T = static_cast<int64_t>(token_ids.size());
+  if (verify != nullptr && (T > 8 || prof != nullptr || want_logits || greedy_out != nullptr || summary_out != nullptr)) {
+    throw std::logic_error("LlamaModel::RunChunk: a verify window is 1..8 rows, unprofiled, with no other logits request");
+  }
   if (T < 1 || T > max_chunk_) {
     throw std::runtime_error("LlamaModel::RunChunk: token_ids.size() must be in [1, " + std::to_string(max_chunk_) + "]");
   }
@@ -332,15 +422,95 @@ std::vector<float> LlamaModel::RunChunk(const std::vector<int32_t>& token_ids, b
                                cfg.vocab_size, s);
   });
   UploadPositions(pos_, T);
+  verify_rows_seqused_ = nullptr;
+  if (verify != nullptr && T > 1 && LlamaVerifyAttnPerRow()) {
+    int32_t rows_used[8];
+    for (int64_t t = 0; t < T; ++t) rows_used[t] = static_cast<int32_t>(pos_ + t + 1);
+    verify_seqused_dev_.CopyFromHost(rows_used, static_cast<size_t>(T));
+    verify_rows_seqused_ = verify_seqused_dev_.data();
+  }
 
   // Bounded prefill submission under TP (tp/tp_submit.h), cut the same way on both ranks.
   const bool bounded = comm_ != nullptr && is_prefill && submit_.Active();
   int64_t unit_layers = bounded ? tp::UnitLayersForContext(submit_layers_, pos_ + T) : 0;
   if (bounded && T > 64) unit_layers = std::max<int64_t>(1, unit_layers * 64 / T);
   if (bounded) submit_.Reset();
+  // DFlash feature capture: the residual ENTERING each listed layer, packed [T, n_layers * hidden] (the drafter's fc input).
+  const bool capture = !feature_layers_.empty() && prof == nullptr;
+  const int64_t n_feat = static_cast<int64_t>(feature_layers_.size());
+  const auto capture_layer_input = [&](int64_t layer) {
+    if (!capture) return;
+    const auto it = std::find(feature_layers_.begin(), feature_layers_.end(), layer);
+    if (it == feature_layers_.end()) return;
+    const int64_t col = std::distance(feature_layers_.begin(), it);
+    R4DX_HIP_CHECK(hipMemcpy2DAsync(features_dev_.data() + col * hidden, static_cast<size_t>(n_feat * hidden) * sizeof(uint16_t),
+                                    h, static_cast<size_t>(hidden) * sizeof(uint16_t),
+                                    static_cast<size_t>(hidden) * sizeof(uint16_t), static_cast<size_t>(T),
+                                    hipMemcpyDeviceToDevice, s_raw));
+  };
   for (int64_t i = 0; i < num_layers; ++i) {
     if (bounded && i > 0 && i % unit_layers == 0) submit_.EndUnit(s_raw);
+    capture_layer_input(i);
     RunLayer(i, h, T, pos_, prof);
+  }
+  capture_layer_input(num_layers);
+  verify_rows_seqused_ = nullptr;
+
+  // ---- verify window: final norm + lm_head on EVERY row, then per-row argmax or row summaries ----
+  if (verify != nullptr) {
+    const int64_t vocab = vocab_local_;
+    uint16_t* xn = arena_.Alloc<uint16_t>(static_cast<size_t>(T * hidden), 16);
+    uint16_t* logits_bf16 = arena_.Alloc<uint16_t>(static_cast<size_t>(T * vocab), 16);
+    r4dx_rmsnorm_plain_bf16(P(h), P(container_.FinalNorm().data()), P(xn), T, hidden, eps, 0, s);
+    ApplyLinear(stream_, arena_, container_.LmHead(), xn, logits_bf16, T);
+    r4dx_model_widen_bf16_to_f32(P(logits_bf16), P(verify_logits_dev_.data()), T * vocab, s);
+    MaskPaddingLogits(verify_logits_dev_.data(), T, vocab);
+    if (verify->inv_temperature > 0.0f) {
+      r4dx_topk_lse_f32_ws(P(verify_logits_dev_.data()), P(verify_sum_ids_dev_.data()), P(verify_sum_vals_dev_.data()),
+                           P(verify_sum_lse_dev_.data()), static_cast<int>(T), vocab, verify->inv_temperature, s,
+                           P(topk_lse_ws_.data()));
+    } else {
+      for (int64_t t = 0; t < T; ++t) {
+        if (comm_ != nullptr) {
+          r4dx_argmax_val_f32(P(verify_logits_dev_.data() + t * vocab), P(verify_pair_dev_.data() + 2 * t),
+                              P(verify_pair_dev_.data() + 2 * t + 1), vocab, s);
+        } else {
+          r4dx_argmax_f32(P(verify_logits_dev_.data() + t * vocab), P(verify_argmax_dev_.data() + t), vocab, s);
+        }
+      }
+    }
+    arena_.Reset();
+    stream_.Synchronize();
+    if (verify->inv_temperature > 0.0f) {
+      std::vector<int32_t> ids(static_cast<size_t>(T * R4DX_TOPK_LSE_K));
+      std::vector<float> vals(static_cast<size_t>(T * R4DX_TOPK_LSE_K)), lse(static_cast<size_t>(T));
+      verify_sum_ids_dev_.CopyToHost(ids.data(), ids.size());
+      verify_sum_vals_dev_.CopyToHost(vals.data(), vals.size());
+      verify_sum_lse_dev_.CopyToHost(lse.data(), lse.size());
+      verify->summaries->resize(static_cast<size_t>(T));
+      for (int64_t t = 0; t < T; ++t) {
+        kernels::RowSummary& r = (*verify->summaries)[static_cast<size_t>(t)];
+        r.k = R4DX_TOPK_LSE_K;
+        r.vocab = vocab;
+        r.inv_temperature = verify->inv_temperature;
+        r.lse = lse[static_cast<size_t>(t)];
+        for (int j = 0; j < R4DX_TOPK_LSE_K; ++j) {
+          r.ids[j] = ids[static_cast<size_t>(t * R4DX_TOPK_LSE_K + j)];
+          r.vals[j] = vals[static_cast<size_t>(t * R4DX_TOPK_LSE_K + j)];
+        }
+        if (comm_ != nullptr) MergeSummary(&r);  // collective, once per row, the same T on every rank
+      }
+    } else {
+      verify->argmax->resize(static_cast<size_t>(T));
+      if (comm_ != nullptr) {
+        MergeVerifyPairs(T, verify->argmax);  // collective
+      } else {
+        verify_argmax_dev_.CopyToHost(verify->argmax->data(), static_cast<size_t>(T));
+      }
+    }
+    feature_rows_ = capture ? T : 0;
+    started_ = true;
+    return {};  // pos_ stays put until the round commits
   }
 
   // ---- final norm + lm_head on the LAST row ----
@@ -389,6 +559,9 @@ std::vector<float> LlamaModel::RunChunk(const std::vector<int32_t>& token_ids, b
       logits_dev_.CopyToHost(logits.data(), logits.size());
     }
   }
+  if (capture) feature_rows_ = T;
+  // Feed the drafter every committed row (a prefill chunk, a plain decode step); not while injection is off.
+  if (capture && dflash_.has_value() && dflash_injection_enabled_) InjectDflashRows(T, pos_);
   pos_ += T;
   started_ = true;
   return logits;
@@ -496,8 +669,148 @@ void LlamaModel::GatherVocabRow(std::vector<float>* full) {
 }
 
 int64_t LlamaModel::WarmupPositions(const LlamaModelOptions& o) {
-  // TpWarmup: one full chunk, then (after a Reset) a 64-row chunk and three decode steps.
-  return std::max<int64_t>(o.prefill_chunk, 64 + 3);
+  // TpWarmup: one full chunk, then (after a Reset) a 64-row chunk and three decode steps; with a drafter one greedy and one
+  // sampled DFlash round (8-row verify windows each) after them.
+  return std::max<int64_t>(o.prefill_chunk, 64 + 3 + (o.dflash_container.empty() ? 0 : 16));
+}
+
+// ---- DFlash2 (docs/nanbeige-dflash.md) ------------------------------------------------------------------------------
+
+void LlamaModel::InjectDflashRows(int64_t rows, int64_t start_pos) {
+  const int64_t cols = static_cast<int64_t>(feature_layers_.size()) * container_.Config().hidden_size;
+  for (int64_t row0 = 0; row0 < rows; row0 += 64) {
+    const int64_t n = std::min<int64_t>(64, rows - row0);
+    dflash_->InjectFeatures(stream_, arena_, features_dev_.data() + row0 * cols, n, start_pos + row0);
+    // InjectFeatures stages the slice's rope positions in one pinned host array, uploaded asynchronously: the next slice
+    // must not overwrite it first. Also keeps RunChunk's "device idle on return".
+    stream_.Synchronize();
+  }
+  arena_.Reset();
+}
+
+void LlamaModel::MergeVerifyPairs(int64_t rows, std::vector<int32_t>* out) {
+  static_assert(sizeof(tp::ArgmaxPair) == 8, "8 B per greedy row (docs/tp.md 7.3)");
+  constexpr int64_t kW = 8;
+  if (rows < 1 || rows > kW) throw std::logic_error("LlamaModel::MergeVerifyPairs: 1..8 rows");
+  std::array<tp::ArgmaxPair, kW> mine{};
+  R4DX_HIP_CHECK(hipMemcpy(mine.data(), verify_pair_dev_.data(), static_cast<size_t>(rows) * sizeof(tp::ArgmaxPair),
+                           hipMemcpyDeviceToHost));
+  for (int64_t t = 0; t < rows; ++t) mine[static_cast<size_t>(t)].idx += static_cast<int32_t>(vocab_offset_);
+  const int world = comm_->World();
+  std::array<tp::ArgmaxPair, 2 * kW> all{};  // [world <= 2][8]: every rank contributes a fixed 8-pair block
+  comm_->HostAllGather(mine.data(), mine.size() * sizeof(tp::ArgmaxPair), all.data());
+  std::array<tp::ArgmaxPair, 2 * kW> packed{};
+  for (int r = 0; r < world; ++r) {
+    for (int64_t t = 0; t < rows; ++t) packed[static_cast<size_t>(r * rows + t)] = all[static_cast<size_t>(r * kW + t)];
+  }
+  out->resize(static_cast<size_t>(rows));
+  tp::MergeArgmaxRows(packed.data(), world, static_cast<int>(rows), out->data());
+}
+
+void LlamaModel::ReadVerifyLogitsRow(int64_t row, std::vector<float>* full) {
+  const float* src = verify_logits_dev_.data() + row * vocab_local_;
+  if (comm_ == nullptr) {
+    full->resize(static_cast<size_t>(vocab_local_));
+    R4DX_HIP_CHECK(hipMemcpy(full->data(), src, static_cast<size_t>(vocab_local_) * sizeof(float), hipMemcpyDeviceToHost));
+    return;
+  }
+  gather_shard_host_.resize(static_cast<size_t>(vocab_local_));
+  R4DX_HIP_CHECK(hipMemcpy(gather_shard_host_.data(), src, static_cast<size_t>(vocab_local_) * sizeof(float),
+                           hipMemcpyDeviceToHost));
+  full->resize(static_cast<size_t>(container_.Config().vocab_size));
+  comm_->HostAllGather(gather_shard_host_.data(), static_cast<size_t>(vocab_local_) * sizeof(float), full->data());
+}
+
+std::vector<int32_t> LlamaModel::DecodeStepDflashGreedy(int32_t token_id, int64_t k, float p_min, int64_t n_min,
+                                                        int64_t* walk_len_out) {
+  return DecodeStepDflashImpl(token_id, k, p_min, n_min, nullptr, nullptr, walk_len_out);
+}
+
+std::vector<int32_t> LlamaModel::DecodeStepDflashSampled(int32_t token_id, int64_t k, float p_min, int64_t n_min,
+                                                         const kernels::SampleParams& params, std::mt19937_64& rng,
+                                                         int64_t* walk_len_out) {
+  // A greedy request keeps the greedy path exactly, consuming no draw.
+  const bool greedy = params.temperature <= 0.0f;
+  return DecodeStepDflashImpl(token_id, k, p_min, n_min, greedy ? nullptr : &params, greedy ? nullptr : &rng, walk_len_out);
+}
+
+std::vector<int32_t> LlamaModel::DecodeStepDflashImpl(int32_t token_id, int64_t k, float p_min, int64_t n_min,
+                                                      const kernels::SampleParams* params, std::mt19937_64* rng,
+                                                      int64_t* walk_len_out) {
+  if (!dflash_.has_value()) throw std::runtime_error("LlamaModel::DecodeStepDflash: no drafter (LlamaModelOptions::dflash_container)");
+  if (k < 0 || k > dflash_draft_k_) {
+    throw std::runtime_error("LlamaModel::DecodeStepDflash: k must be in [0, " + std::to_string(dflash_draft_k_) + "]");
+  }
+  if (!dflash_injection_enabled_) {
+    throw std::runtime_error("LlamaModel::DecodeStepDflash: drafter injection is disabled (SetDflashInjectionEnabled(false))");
+  }
+  if (dflash_->InjectedCount() != pos_) {
+    throw std::runtime_error("LlamaModel::DecodeStepDflash: drafter frontier (" + std::to_string(dflash_->InjectedCount()) +
+                             ") != PositionCount() (" + std::to_string(pos_) + ")");
+  }
+  if (pos_ + 1 > max_ctx_) {
+    throw std::runtime_error("LlamaModel::DecodeStepDflash: position " + std::to_string(pos_ + 1) + " exceeds max_ctx " +
+                             std::to_string(max_ctx_));
+  }
+  k = std::min<int64_t>(k, max_ctx_ - pos_ - 1);  // near the end of the context draft fewer (k = 0 verifies the anchor)
+  const LlamaConfig& cfg = container_.Config();
+  const DflashEmbeddingProvider embed = MakeEmbeddingProviderFromTable(container_.EmbedTokensDevice().data(), cfg.hidden_size,
+                                                                       cfg.vocab_size, dflash_embed_scale_);
+  const DflashLmHeadProvider lm_head = MakeLmHeadProviderFromLinear(&container_.LmHead());
+  const DflashDraftResult draft = dflash_->DraftRound(stream_, arena_, token_id, k, p_min, n_min, embed, lm_head);
+  arena_.Reset();
+  if (walk_len_out != nullptr) *walk_len_out = draft.walk_len;
+
+  std::vector<int32_t> cands;
+  cands.reserve(draft.tokens.size() + 1);
+  cands.push_back(token_id);
+  cands.insert(cands.end(), draft.tokens.begin(), draft.tokens.end());
+
+  // Sampled: the row summaries at the request's temperature; a temperature with no usable reciprocal takes the full rows
+  // (SampleCanonical), as DecodeStepSampled does. Greedy: per-row argmax.
+  const float inv_t = params != nullptr ? SummaryInvTemperature(*params) : 0.0f;
+  std::vector<int32_t> argmax;
+  VerifyRequest vr;
+  vr.inv_temperature = inv_t;
+  vr.argmax = &argmax;
+  vr.summaries = &round_summaries_;
+  RunChunk(cands, /*want_logits=*/false, nullptr, nullptr, nullptr, /*is_prefill=*/false, &vr);
+
+  const int64_t vocab = cfg.vocab_size;
+  const int64_t m = static_cast<int64_t>(draft.tokens.size());
+  std::vector<int32_t> result;
+  result.reserve(static_cast<size_t>(m + 1));
+  int64_t i = 0;
+  for (;; ++i) {
+    int32_t tok;
+    if (params == nullptr) {
+      tok = argmax[static_cast<size_t>(i)];
+    } else {
+      // ONE draw per emitted token, taken before either branch (docs/sampling.md section 2), so the round emits the same
+      // tokens plain sampled decode would for the same rng stream.
+      const double u = kernels::DrawUniform01(*rng);
+      kernels::SummarySampleResult r{};
+      if (inv_t > 0.0f) r = kernels::SampleFromSummary(round_summaries_[static_cast<size_t>(i)], *params, u);
+      if (inv_t > 0.0f && r.resolved) {
+        tok = r.token;
+      } else {
+        if (inv_t > 0.0f) ++sampled_fallback_rows_;
+        ReadVerifyLogitsRow(i, &sampled_row_scratch_);  // collective under TP: every rank takes the same branch
+        tok = kernels::SampleCanonical(sampled_row_scratch_.data(), vocab, *params, u);
+      }
+    }
+    result.push_back(tok);
+    if (i < m && tok == draft.tokens[static_cast<size_t>(i)]) continue;  // draft i confirmed
+    break;
+  }
+  const int64_t committed = i + 1;  // the anchor + the accepted drafts
+
+  // Inject the committed rows' features (rows 0..committed-1 of the window just captured) at the drafter's frontier, then
+  // commit. Rejected rows are never injected; their KV rows are overwritten by the next feed.
+  if (feature_rows_ < committed) throw std::runtime_error("LlamaModel::DecodeStepDflash: internal error, capture short");
+  InjectDflashRows(committed, dflash_->InjectedCount());
+  pos_ += committed;
+  return result;
 }
 
 void LlamaModel::TpWarmup() {
@@ -521,6 +834,12 @@ void LlamaModel::TpWarmup() {
   std::mt19937_64 rng(0x7e57);
   (void)DecodeStepSampled(1, sp, rng);
   (void)DecodeStep(2);  // the full-row gather
+  if (dflash_.has_value()) {
+    // The drafter's first-use kernels, the per-round top-k host merge and both verify merges; n_min 0 so the walk always
+    // drafts dflash_draft_k_ tokens.
+    (void)DecodeStepDflashGreedy(3, dflash_draft_k_, /*p_min=*/0.0f, /*n_min=*/0);
+    (void)DecodeStepDflashSampled(4, dflash_draft_k_, 0.0f, 0, sp, rng);
+  }
   Reset();
 }
 

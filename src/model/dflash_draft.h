@@ -418,13 +418,19 @@ class DflashDraft {
   core::DeviceBuffer<uint8_t> sel_stage_dev_;
   core::PinnedBuffer<uint8_t> sel_stage_host_;
   int64_t sel_off_unary_ = 0, sel_off_cand_ = 0, sel_off_gate_ = 0, sel_stage_bytes_ = 0;
+  // selector_top_k == 32 (Nanbeige4.3 DFlash2): r4dx_topk_lse_f32_ws's exact sorted top-64 lands here and its first 32
+  // columns are copied into the staging blob (the top-32 under the same total order). Empty for top-16.
+  core::DeviceBuffer<int32_t> top64_ids_dev_;  // [B, 64]
+  core::DeviceBuffer<float> top64_vals_dev_;   // [B, 64]
+  core::DeviceBuffer<float> top64_lse_dev_;    // [B] (unused)
+  core::DeviceBuffer<uint8_t> top64_ws_dev_;   // r4dx_topk_lse_workspace_bytes(): one per drafter, so TP ranks never share
 
   // ---- tensor parallel H7 host scratch (docs/tp.md 8.2); empty at TP=1 ---------------------------
   std::vector<uint8_t> top16_gather_;       // [world][unary | cand] staging bytes, rank order
-  std::vector<int32_t> top16_ids_all_;      // [world][block_size][16], ids global
-  std::vector<float> top16_vals_all_;       // [world][block_size][16]
-  std::vector<int32_t> merged_cand_;        // [block_size][16] -- the walk's input under TP
-  std::vector<float> merged_unary_;         // [block_size][16]
+  std::vector<int32_t> top16_ids_all_;      // [world][block_size][top_k], ids global
+  std::vector<float> top16_vals_all_;       // [world][block_size][top_k]
+  std::vector<int32_t> merged_cand_;        // [block_size][top_k] -- the walk's input under TP
+  std::vector<float> merged_unary_;         // [block_size][top_k]
 };
 
 }  // namespace r4dx::model

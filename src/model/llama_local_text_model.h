@@ -1,7 +1,7 @@
 // r4dx::model::LlamaLocalTextModel -- the TP=1 TextModel of a llama container (docs/nanbeige-plan.md 3.1, task N1-8): one
 // LlamaModel on the calling thread's current HIP device, every method a forward to the LlamaModel method of the same name.
-// No vision, audio, MTP or DFlash: HasVision() / MtpEnabled() / DflashEnabled() are false, an image span or an MTP / DFlash
-// decode throws naming the feature. LoadLlamaTextModel (llama_local_text_model.cpp) is the Llama branch of LoadTextModel.
+// No vision, audio or MTP: HasVision() / MtpEnabled() are false, an image span or an MTP decode throws naming the
+// feature. DFlash2 (docs/nanbeige-dflash.md) forwards to LlamaModel. LoadLlamaTextModel (llama_local_text_model.cpp) is the Llama branch of LoadTextModel.
 #pragma once
 
 #include <cstdint>
@@ -30,7 +30,7 @@ class LlamaLocalTextModel final : public TextModel {
   bool HasVision() const override { return false; }
   bool MtpEnabled() const override { return false; }
   bool MtpUsingReducedVocabDraft() const override { return false; }
-  bool DflashEnabled() const override { return false; }
+  bool DflashEnabled() const override { return m_.DflashEnabled(); }
   int64_t SampledFallbackRows() const override { return m_.SampledFallbackRows(); }
   int64_t PositionCount() const override { return m_.PositionCount(); }
   int64_t NumLoadedLayers() const override { return m_.GetContainer().NumLoadedLayers(); }
@@ -38,7 +38,7 @@ class LlamaLocalTextModel final : public TextModel {
   std::vector<VramReport> Vram() const override;
 
   void Reset() override { m_.Reset(); }
-  void SetDflashInjectionEnabled(bool) override {}  // no drafter: nothing to inject
+  void SetDflashInjectionEnabled(bool enabled) override { m_.SetDflashInjectionEnabled(enabled); }
   void SaveCheckpoint() override { m_.SaveCheckpoint(); }
   void RestoreCheckpoint() override { m_.RestoreCheckpoint(); }
 
@@ -67,7 +67,7 @@ class LlamaLocalTextModel final : public TextModel {
 };
 
 // ModelOptions -> the engine's options (shared by the TP=1 wrapper and LlamaTpModel, which then fills the per-rank tp_*
-// fields). Refuses what Llama does not have: MTP, DFlash, --vision on. Context: ModelOptions::max_ctx is honoured when it
+// fields). Refuses what Llama does not have: MTP, --vision on. Context: ModelOptions::max_ctx is honoured when it
 // differs from its Qwen default (262144); the default itself means LlamaConfig's default (min(32768,
 // max_position_embeddings)). The prefill chunk: ModelOptions::prefill_chunk when in [1, 256], else 256.
 LlamaModelOptions MakeLlamaModelOptions(const ModelOptions& opts);

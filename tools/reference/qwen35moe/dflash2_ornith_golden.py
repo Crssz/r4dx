@@ -7,6 +7,8 @@ path (`propose`, temperature 0).
 Writes <out>/ : manifest.json, features.bin (bf16 [n_ctx, 8 * 3072]), embed.bin (bf16 [V, 3072], also the lm_head),
 x_final_normed.bin (f32 [15, 3072]: block positions 1..15), cand.bin (i32 [15, 16]), unary.bin (f32 [15, 16]), path.bin (i32 [15]).
 
+Also used for ProCreations/Nanbeige4.3-33B-DFlash2 (block 8, selector top-32): the top-k width comes from the config and is recorded in the manifest.
+
 Run (system Python 3.12 with torch + transformers 5.x; CPU only):
   python tools/reference/qwen35moe/dflash2_ornith_golden.py --drafter E:/models/r4dx/Ornith-1.5-122B-DFlash2 --out E:/models/r4dx/q35moe-dflash2-golden
 Checked by tests/model/qwen35moe/test_q35moe_dflash2_golden.cpp.
@@ -63,6 +65,7 @@ def main() -> None:
     H = qc.hidden_size
     B = int(cfg_json["dflash_config"]["block_size"])
     n_taps = len(cfg_json["dflash_config"]["target_layer_ids"])
+    top_k = int(cfg_json["dflash_config"].get("selector_top_k", 16))  # 16 (Ornith) or 32 (Nanbeige4.3)
     mask_id = a.vocab - 1
     embed = bf16_round((rng.randn(a.vocab, H) * 0.5).astype(np.float32))
     feats = bf16_round(rng.randn(a.n_ctx, n_taps * H).astype(np.float32))
@@ -75,7 +78,7 @@ def main() -> None:
         head = lambda x: x @ torch.from_numpy(embed).T  # noqa: E731
         path, candidates, _ = model.propose(h, torch.tensor([a.anchor]), head, 0.0)
         logits = model.compute_logits(h, head)
-        unary, cand = torch.topk(logits, 16, dim=-1, sorted=True)
+        unary, cand = torch.topk(logits, top_k, dim=-1, sorted=True)
     # HF's own bf16-vs-fp32 noise on the same inputs: the floor any bf16 implementation (r4dx's) is judged against
     model_bf = zl.DFlash2DraftModel(qc).eval()
     model_bf.load_state_dict({k: v.to(torch.bfloat16) for k, v in sd.items()}, strict=False)
@@ -96,7 +99,7 @@ def main() -> None:
     path[0].numpy().astype(np.int32).tofile(out / "path.bin")
     (out / "manifest.json").write_text(json.dumps({
         "schema": "q35moe_dflash2_golden_v1", "vocab": a.vocab, "mask_id": mask_id, "n_ctx": a.n_ctx, "anchor": a.anchor,
-        "block": B, "hidden": H, "taps": n_taps, "seed": a.seed, "path": path[0].tolist()}, indent=2))
+        "block": B, "hidden": H, "taps": n_taps, "top_k": top_k, "seed": a.seed, "path": path[0].tolist()}, indent=2))
     print("path:", path[0].tolist())
     print("wrote", out)
 

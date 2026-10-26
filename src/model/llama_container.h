@@ -9,7 +9,8 @@
 //   text.final_norm          bf16 [hidden] (plain weight)
 //   lm_head                  QuantLinear [vocab, hidden] (untied; the rank's vocab slice under TP)
 //   per layer: input_norm / post_attn_norm (bf16 [hidden], replicated), attn.{q,k,v} (column-parallel by head),
-//              attn.o (row-parallel), mlp.gate_up (two-segment column split), mlp.down (row-parallel)
+//              attn.o (row-parallel), mlp.gate_up (two-segment column split), mlp.down (row-parallel),
+//              attn.{k,v}_descale (fp32 [kv_heads], split by kv head) when the container has them (--kv-calib, N5-2)
 //
 // Layouts: bf16, w4a16, w8a16 (TP=1 and TP=2: the w8a16 shard rule slices whole row tiles / K groups) and trellis
 // (TP=1 only, RefuseLlamaTrellisTp: the trellis TP=2 shard rules are not built for this arch, docs/nanbeige-plan.md
@@ -41,6 +42,7 @@ struct LlamaAttnWeights {
 struct LlamaLayerWeights {
   core::DeviceBuffer<uint16_t> input_norm, post_attn_norm;  // bf16 [hidden]
   LlamaAttnWeights attn;
+  core::DeviceBuffer<float> k_descale, v_descale;  // fp32 [kv_heads] (the rank's), only when the container has them
   MlpWeights mlp;  // gate_up [2 * intermediate, hidden] (gate rows first), down [hidden, intermediate]
 };
 

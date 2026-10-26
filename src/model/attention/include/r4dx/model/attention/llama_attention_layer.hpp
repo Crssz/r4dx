@@ -11,9 +11,10 @@
 //   o_out = o_proj(o)                          [TP: row-parallel, all-reduced here]
 // The residual add is the CALLER's.
 //
-// KV: bf16 (docs/nanbeige-plan.md 3.3; fp8 is N5-2), GemmaKvCache::Contiguous(kv_heads, head_dim, max_ctx).
-// Attention backend (N5-1): libr4d's h128_gqa7 bf16-KV kernels when head_dim == 128 and GQA == 7 (Nanbeige, at TP=1
-// and TP=2): split-KV decode for T <= 9 (its q_len x gqa <= 64 rows), prefill otherwise, split-KV prefill from
+// KV: GemmaKvCache::Contiguous(kv_heads, head_dim, max_ctx), bf16 (docs/nanbeige-plan.md 3.3) or fp8 e4m3 with the
+// container's static per-kv-head descales (N5-2: stored = fp8(x / descale), K post-rope, V raw).
+// Attention backend (N5-1): libr4d's h128_gqa7 kernels (the cache's dtype) when head_dim == 128 and GQA == 7 (Nanbeige,
+// at TP=1 and TP=2): split-KV decode for T <= 9 (its q_len x gqa <= 64 rows), prefill otherwise, split-KV prefill from
 // kSplitKvMinCtx tokens of context (Lfm2PrefillSplits' law). R4DX_LLAMA_ATTN=ref, or any other geometry, runs the
 // stage-0 reference kernel (exact, slow; the oracle of tests/kernels/test_attn_h128_gqa7.cpp).
 #pragma once
@@ -68,6 +69,8 @@ struct LlamaAttnLayerWeights {
   const QuantLinear* k = nullptr;
   const QuantLinear* v = nullptr;
   const QuantLinear* o = nullptr;
+  const float* k_descale = nullptr;  // fp32 [kv_heads] (fp8 KV only)
+  const float* v_descale = nullptr;
 };
 
 class LlamaAttnLayer {
@@ -88,11 +91,15 @@ class LlamaAttnLayer {
                hipStream_t stream, SpanAccumulator* prof = nullptr, core::TpComm* comm = nullptr) const {
     const int H = cfg_.heads, Hk = cfg_.kv_heads, D = cfg_.head_dim;
     if (T < 1) throw std::invalid_argument("LlamaAttnLayer::Forward: T must be >= 1");
-    if (kv.KvHeads() != Hk || kv.HeadDim() != D || kv.Dtype() != GemmaKvDtype::kBf16 || kv.IsRing()) {
-      throw std::invalid_argument("LlamaAttnLayer::Forward: the cache must be a contiguous bf16 cache of this geometry");
+    const bool fp8 = kv.Dtype() == GemmaKvDtype::kFp8;
+    if (kv.KvHeads() != Hk || kv.HeadDim() != D || kv.IsRing()) {
+      throw std::invalid_argument("LlamaAttnLayer::Forward: the cache must be a contiguous cache of this geometry");
     }
     if (w.q == nullptr || w.k == nullptr || w.v == nullptr || w.o == nullptr) {
       throw std::invalid_argument("LlamaAttnLayer::Forward: missing weights");
+    }
+    if (fp8 && (w.k_descale == nullptr || w.v_descale == nullptr)) {
+      throw std::invalid_argument("LlamaAttnLayer::Forward: an fp8 cache needs the layer's k / v descales");
     }
     const int64_t s = reinterpret_cast<int64_t>(stream);
     const auto P = [](const void* p) { return reinterpret_cast<int64_t>(p); };
@@ -105,8 +112,13 @@ class LlamaAttnLayer {
     ProfiledCall(prof, stream, "gemm:attn.v_proj", [&] { ApplyLinear(stream, arena, *w.v, x_normed, v, T); });
     ProfiledCall(prof, stream, "attn.rope", [&] { r4dx_rope_neox_bf16(P(q), P(k), P(positions), T, H, Hk, D, cfg_.rope_theta, s); });
     ProfiledCall(prof, stream, "attn.kv_write", [&] {
-      r4dx_model_kv_write_paged_bf16_hnd(P(k), P(v), P(positions), P(kv.Data()), T, Hk, D, GemmaKvCache::kBlockSize,
-                                         kv.KvBlockStride(), kv.KvHeadStride(), s);
+      if (fp8) {
+        r4dx_kv_write_paged_fp8_hnd(P(k), P(v), P(positions), P(w.k_descale), P(w.v_descale), P(kv.Data()), T, Hk, D,
+                                    GemmaKvCache::kBlockSize, kv.KvBlockStride(), kv.KvHeadStride(), s);
+      } else {
+        r4dx_model_kv_write_paged_bf16_hnd(P(k), P(v), P(positions), P(kv.Data()), T, Hk, D, GemmaKvCache::kBlockSize,
+                                           kv.KvBlockStride(), kv.KvHeadStride(), s);
+      }
     });
 
     uint16_t* attn_out = arena.Alloc<uint16_t>(static_cast<size_t>(T) * H * D, 16);
@@ -118,8 +130,8 @@ class LlamaAttnLayer {
       a.block_table = kv.BlockTable();
       a.seqused_k = seqused_k;
       a.out = attn_out;
-      a.k_descale = nullptr;
-      a.v_descale = nullptr;
+      a.k_descale = fp8 ? w.k_descale : nullptr;
+      a.v_descale = fp8 ? w.v_descale : nullptr;
       a.q_descale = nullptr;
       a.scratch = nullptr;
       a.num_seqs = 1;
@@ -136,15 +148,21 @@ class LlamaAttnLayer {
       a.max_ctx = ctx;
       if (T <= kLlamaDecodeMaxRows) {
         a.scratch = arena.Alloc<uint8_t>(static_cast<size_t>(core::r4d::AttnDecodeH128ScratchBytes(a)), 16);
-        ProfiledCall(prof, stream, "attn.core_decode", [&] { core::r4d::AttnDecodeH128Bf16Kv(a, stream); });
+        ProfiledCall(prof, stream, "attn.core_decode", [&] {
+          fp8 ? core::r4d::AttnDecodeH128Fp8Kv(a, stream) : core::r4d::AttnDecodeH128Bf16Kv(a, stream);
+        });
       } else {
         const int splits = Lfm2PrefillSplits(ctx, T, Hk);
         if (splits > 1) {
           a.splits = splits;
           a.scratch = arena.Alloc<uint8_t>(static_cast<size_t>(core::r4d::AttnPrefillSplitKvH128ScratchBytes(a)), 256);
-          ProfiledCall(prof, stream, "attn.core_prefill", [&] { core::r4d::AttnPrefillSplitKvH128Bf16Kv(a, stream); });
+          ProfiledCall(prof, stream, "attn.core_prefill", [&] {
+            fp8 ? core::r4d::AttnPrefillSplitKvH128Fp8Kv(a, stream) : core::r4d::AttnPrefillSplitKvH128Bf16Kv(a, stream);
+          });
         } else {
-          ProfiledCall(prof, stream, "attn.core_prefill", [&] { core::r4d::AttnPrefillH128Bf16Kv(a, stream); });
+          ProfiledCall(prof, stream, "attn.core_prefill", [&] {
+            fp8 ? core::r4d::AttnPrefillH128Fp8Kv(a, stream) : core::r4d::AttnPrefillH128Bf16Kv(a, stream);
+          });
         }
       }
     } else {
@@ -153,8 +171,8 @@ class LlamaAttnLayer {
       a.kv = P(kv.Data());
       a.block_table = P(kv.BlockTable());
       a.out = P(attn_out);
-      a.k_descale = 0;
-      a.v_descale = 0;
+      a.k_descale = fp8 ? P(w.k_descale) : 0;
+      a.v_descale = fp8 ? P(w.v_descale) : 0;
       a.klimit_ext = 0;
       a.q_len = T;
       a.q_heads = H;
@@ -167,8 +185,8 @@ class LlamaAttnLayer {
       a.kv_block_stride = kv.KvBlockStride();
       a.kv_head_stride = kv.KvHeadStride();
       ProfiledCall(prof, stream, "attn.core_ref", [&] {
-        const int rc = r4dx_gemma_attn_ref_bf16kv(&a, s);
-        if (rc != 0) throw std::runtime_error("LlamaAttnLayer: r4dx_gemma_attn_ref_bf16kv returned " + std::to_string(rc));
+        const int rc = fp8 ? r4dx_gemma_attn_ref_fp8kv(&a, s) : r4dx_gemma_attn_ref_bf16kv(&a, s);
+        if (rc != 0) throw std::runtime_error("LlamaAttnLayer: the reference attention kernel returned " + std::to_string(rc));
       });
     }
     ProfiledCall(prof, stream, "gemm:attn.o_proj", [&] { ApplyLinear(stream, arena, *w.o, attn_out, o_out, T); });

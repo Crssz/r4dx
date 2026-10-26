@@ -161,6 +161,16 @@ inline void AttnDecodeH128Bf16Kv(const Args& a, hipStream_t stream) {
   R4DX_R4D_CHECK("attn_decode_h128_gqa7_bf16kv", r4d_attn_decode_h128_gqa7_bf16kv(&a, stream));
 }
 inline int64_t AttnDecodeH128ScratchBytes(const Args& a) { return r4d_attn_decode_h128_gqa7_scratch_bytes(&a); }
+// The fp8-e4m3 KV instantiation (k_descale / v_descale required; the scratch queries above serve it too).
+inline void AttnPrefillH128Fp8Kv(const Args& a, hipStream_t stream) {
+  R4DX_R4D_CHECK("attn_prefill_h128_gqa7_fp8kv", r4d_attn_prefill_h128_gqa7_fp8kv(&a, stream));
+}
+inline void AttnPrefillSplitKvH128Fp8Kv(const Args& a, hipStream_t stream) {
+  R4DX_R4D_CHECK("attn_prefill_splitkv_h128_gqa7_fp8kv", r4d_attn_prefill_splitkv_h128_gqa7_fp8kv(&a, stream));
+}
+inline void AttnDecodeH128Fp8Kv(const Args& a, hipStream_t stream) {
+  R4DX_R4D_CHECK("attn_decode_h128_gqa7_fp8kv", r4d_attn_decode_h128_gqa7_fp8kv(&a, stream));
+}
 
 // Every attention geometry the build serves (r4d_attn_dims reports the gqa6 one only), for validating
 // a model's layer types against all of them at load.

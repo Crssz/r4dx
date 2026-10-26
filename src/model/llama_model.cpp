@@ -46,6 +46,18 @@ int64_t ResolveRealVocab(const LlamaModelOptions& o, int64_t vocab) {
 
 constexpr uint32_t kNegInfBits = 0xFF800000u;
 
+// R4DX_LLAMA_KV=fp8 (N5-2): the fp8 e4m3 cache with the container's descales (half the bytes); bf16 (the default)
+// otherwise. Read once.
+bool LlamaKvFp8Requested() {
+  static const bool v = [] {
+    const char* e = std::getenv("R4DX_LLAMA_KV");
+    if (e == nullptr || *e == '\0' || std::strcmp(e, "bf16") == 0) return false;
+    if (std::strcmp(e, "fp8") == 0) return true;
+    throw std::invalid_argument(std::string("R4DX_LLAMA_KV='") + e + "' (want fp8|bf16)");
+  }();
+  return v;
+}
+
 }  // namespace
 
 // ---- load -----------------------------------------------------------------------------------------------------------
@@ -129,8 +141,14 @@ LlamaModel LlamaModel::Load(const LlamaModelOptions& opts) {
   m.attn_.reserve(static_cast<size_t>(layers));
   m.kv_.reserve(static_cast<size_t>(layers));
   const int kvh = static_cast<int>(cfg.num_key_value_heads), hd = static_cast<int>(cfg.head_dim);
+  const bool kv_fp8 = LlamaKvFp8Requested();
+  if (kv_fp8 && !m.container_.Info().has_kv_descale) {
+    throw std::invalid_argument("LlamaModel::Load: R4DX_LLAMA_KV=fp8 needs a container converted with --kv-calib (" +
+                                opts.container_path + " has no attn.k_descale / v_descale tensors)");
+  }
+  const auto kv_dtype = kv_fp8 ? attention::GemmaKvDtype::kFp8 : attention::GemmaKvDtype::kBf16;
   for (int64_t i = 0; i < layers; ++i) {
-    m.kv_.push_back(attention::GemmaKvCache::Contiguous(kvh, hd, m.max_ctx_, attention::GemmaKvDtype::kBf16));
+    m.kv_.push_back(attention::GemmaKvCache::Contiguous(kvh, hd, m.max_ctx_, kv_dtype));
     m.kv_bytes_ += static_cast<int64_t>(m.kv_.back().Bytes());
     attention::LlamaAttnConfig ac;
     ac.hidden = static_cast<int>(hidden);
@@ -142,7 +160,8 @@ LlamaModel LlamaModel::Load(const LlamaModelOptions& opts) {
   }
   m.stream_.Synchronize();
   std::cerr << "[r4dx::model::LlamaModel] " << layers << " layers, max_ctx " << m.max_ctx_
-            << ", KV bf16 = " << (static_cast<double>(m.kv_bytes_) / (1024.0 * 1024.0 * 1024.0)) << " GiB, attention "
+            << ", KV " << (kv_fp8 ? "fp8" : "bf16") << " = "
+            << (static_cast<double>(m.kv_bytes_) / (1024.0 * 1024.0 * 1024.0)) << " GiB, attention "
             << ((hd == 128 && cfg.Gqa() == 7 && !attention::LlamaAttnForceRef()) ? "r4d h128_gqa7" : "reference kernel")
             << " (head_dim " << hd << ", GQA " << cfg.Gqa() << "), residual bf16"
             << (m.container_.HasTrellis() ? ", trellis body" : "") << ", logit mask "
@@ -229,6 +248,8 @@ void LlamaModel::RunLayer(int64_t i, uint16_t* h, int64_t T, int64_t start_pos, 
   aw.k = &lw.attn.k;
   aw.v = &lw.attn.v;
   aw.o = &lw.attn.o;
+  aw.k_descale = lw.k_descale.data();  // null for a container without them (bf16 KV only)
+  aw.v_descale = lw.v_descale.data();
   attn_[static_cast<size_t>(i)].Forward(arena_, x, sub, aw, kv_[static_cast<size_t>(i)], static_cast<int>(T),
                                         static_cast<int>(start_pos), positions_dev_.data(), seqused_dev_.data(), s_raw,
                                         prof, comm_);

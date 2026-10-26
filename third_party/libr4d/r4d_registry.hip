@@ -65,6 +65,15 @@ static const R4DConstraint cAttnDecodeH128Bf16[] = {
     C_EQ("head_dim", 128), C_EQ("gqa", 7), C_EQ("block_size", 16), C_EQ("causal", 1),
     C_LE("q_len", 9), C_IN("q_dtype", "bf16"), C_IN("kv_dtype", "bf16"),
 };
+// The same unit's fp8-e4m3 KV instantiation (N5-2).
+static const R4DConstraint cAttnPrefillH128Fp8[] = {
+    C_EQ("head_dim", 128), C_EQ("gqa", 7), C_EQ("block_size", 16), C_EQ("causal", 1),
+    C_IN("q_dtype", "bf16"), C_IN("kv_dtype", "fp8_e4m3"),
+};
+static const R4DConstraint cAttnDecodeH128Fp8[] = {
+    C_EQ("head_dim", 128), C_EQ("gqa", 7), C_EQ("block_size", 16), C_EQ("causal", 1),
+    C_LE("q_len", 9), C_IN("q_dtype", "bf16"), C_IN("kv_dtype", "fp8_e4m3"),
+};
 // head_dim 256 / gqa 16 / fp8 KV (r4d_attn_paged_h256_gqa16.hip, the Qwen3.5 MoE family); q_len <= 4 is the decode's
 // q_len*gqa <= 64.
 static const R4DConstraint cAttnPrefillG16Fp8[] = {
@@ -218,6 +227,21 @@ static const R4DKernelInfo kKernels[] = {
      "head_dim 128, 7 queries per kv head, paged block 16, q_len*gqa <= 64, scratch required",
      "bf16 query, bf16 kv cache (descales optional), bf16 out, f16 partials",
      ROW(cAttnDecodeH128Bf16)},
+    {"attn_prefill_h128_gqa7_fp8kv", "attn", "attn_prefill_paged",
+     "paged causal attention, query-tiled (prefill / chunked prefill)",
+     "head_dim 128, 7 queries per kv head, paged block 16, varlen",
+     "bf16 query, fp8-e4m3 kv cache with per-(seq,head) descales, bf16 out",
+     ROW(cAttnPrefillH128Fp8)},
+    {"attn_prefill_splitkv_h128_gqa7_fp8kv", "attn", "attn_prefill_paged_splitkv",
+     "paged causal attention, query-tiled and split-KV (long-context prefill), fixed-order merge",
+     "head_dim 128, 7 queries per kv head, paged block 16, varlen, caller's split count <= 64",
+     "bf16 query, fp8-e4m3 kv cache with per-(seq,head) descales, bf16 out, fp32 partials",
+     ROW(cAttnPrefillH128Fp8)},
+    {"attn_decode_h128_gqa7_fp8kv", "attn", "attn_decode_paged",
+     "paged causal attention, split-KV (decode / speculative verify)",
+     "head_dim 128, 7 queries per kv head, paged block 16, q_len*gqa <= 64, scratch required",
+     "bf16 query, fp8-e4m3 kv cache with per-(seq,head) descales, bf16 out, f16 partials",
+     ROW(cAttnDecodeH128Fp8)},
     {"attn_prefill_h256_gqa16_fp8kv", "attn", "attn_prefill_paged",
      "paged causal attention, query-tiled (prefill / chunked prefill)",
      "head_dim 256, 16 queries per kv head, paged block 16, varlen",

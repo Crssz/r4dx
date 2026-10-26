@@ -10,8 +10,8 @@
 //     3 layers, hidden 512, 28 q / 4 kv heads of 128, FFN 512, vocab 512, untied head, flat config with no
 //     layer_types), single-file AND sharded: the exact container tensor set, shapes, bf16 byte identity (embed, head,
 //     gate|up fusion, o_proj, norms), the w8a16 bytes against the quantizer, the w4a16 set, --layers, the header
-//     metadata, and every refusal (--vision / --mtp / --rotate / --kv-calib, a missing tensor, an unconsumed tensor, a
-//     wrong shape, a tied config, biases, rope scaling).
+//     metadata, --kv-calib's descales (N5-2), and every refusal (--vision / --mtp / --rotate, a missing tensor, an
+//     unconsumed tensor, a wrong shape, a tied config, biases, rope scaling).
 // The other families' byte-identity guards are their own convert_* tests; this file never runs their conversions.
 #include <algorithm>
 #include <cstdint>
@@ -27,6 +27,7 @@
 #include <set>
 #include <stdexcept>
 #include <string>
+#include <tuple>
 #include <vector>
 
 #include "llama_layout.hpp"
@@ -227,6 +228,26 @@ void TestRealGeometry() {
               !r2.Find("text.layers.8.attn.q") && r2.Find("lm_head"),
           "--layers 8 (the nanbeige-l8 test container): layers 0-7 + embed / norm / head, the rest allow-listed");
     Check(ll::UnconsumedTensors(all, c2, 52).size() == 44 * 9, "audit with all layers expected but 8 converted names the other 396");
+  }
+  // --kv-calib (N5-2): with add_descale set, every layer registers k then v descales of kv_heads entries, and nothing
+  // else changes; without it (above) none are registered.
+  {
+    Recorder r5;
+    r5.shapes = rec.shapes;
+    ll::Kit k5 = r5.MakeKit();
+    std::vector<std::tuple<std::string, int, int, std::string>> d;
+    k5.add_descale = [&d](const std::string& name, int n_kv, int layer, const char* kind) {
+      d.emplace_back(name, n_kv, layer, kind);
+    };
+    const std::set<std::string> c5 = ll::AddTextStack(k5, shape, 52);
+    bool ok = d.size() == 52 * 2 && c5.size() == 471 && r5.linear.size() == rec.linear.size();
+    for (size_t i = 0; ok && i < d.size(); ++i) {
+      const int layer = static_cast<int>(i / 2);
+      const char* kind = i % 2 ? "v" : "k";
+      ok = std::get<0>(d[i]) == "text.layers." + std::to_string(layer) + ".attn." + kind + "_descale" &&
+           std::get<1>(d[i]) == 8 && std::get<2>(d[i]) == layer && std::get<3>(d[i]) == kind;
+    }
+    Check(ok, "--kv-calib: 104 descales (k, v per layer, 8 kv heads each), the tensor set otherwise unchanged");
   }
   // The audit.
   {
@@ -666,7 +687,46 @@ void TestExe() {
     Check(run(ckpt, bf16_args + " --vision on") != 0 && log_has("--vision on"), "--vision on is refused");
     Check(run(ckpt, bf16_args + " --mtp on") != 0 && log_has("--mtp on"), "--mtp on is refused");
     Check(run(ckpt, bf16_args + " --rotate q2a") != 0 && log_has("--rotate"), "--rotate q2a is refused");
-    Check(run(ckpt, bf16_args + " --kv-calib nowhere.json") != 0 && log_has("--kv-calib"), "--kv-calib is refused");
+  }
+  // ---- --kv-calib (N5-2): fp32 [kv_heads] descales = amax / 448 per layer; without it there are none ----
+  {
+    const fs::path calib = root / "kvcalib.json";
+    json j;
+    for (int l = 0; l < 3; ++l) {
+      std::vector<float> k(4), v(4);
+      for (int h = 0; h < 4; ++h) {
+        k[h] = 10.0f * (l + 1) + h;
+        v[h] = 0.5f * (l + 1) + 0.25f * h;
+      }
+      j[std::to_string(l)] = {{"k_amax", k}, {"v_amax", v}};
+    }
+    std::ofstream(calib) << j.dump();
+    const int rc = run(ckpt, bf16_args + " --kv-calib \"" + calib.string() + "\"");
+    const Container c = ReadContainer(out);
+    Check(rc == 0 && c.ok, "--kv-calib: converts");
+    if (c.ok) {
+      bool ok = true;
+      for (int l = 0; l < 3 && ok; ++l) {
+        for (const char* kind : {"k", "v"}) {
+          const std::string n = "text.layers." + std::to_string(l) + ".attn." + kind + "_descale";
+          ok = ok && c.tensors.count(n) == 1 && c.tensors.at(n).size() == 16;
+          if (!ok) break;
+          const std::vector<float> want = j[std::to_string(l)][std::string(kind) + "_amax"].get<std::vector<float>>();
+          for (int h = 0; h < 4 && ok; ++h) {
+            float got;
+            std::memcpy(&got, c.tensors.at(n).data() + 4 * h, 4);
+            ok = got == want[h] / 448.0f;
+          }
+        }
+      }
+      Check(ok, "--kv-calib: every layer carries attn.k_descale / v_descale = amax / 448, fp32 [4]");
+    }
+    const int rc2 = run(ckpt, bf16_args);
+    const Container c2 = ReadContainer(out);
+    Check(rc2 == 0 && c2.ok && c2.tensors.count("text.layers.0.attn.k_descale") == 0,
+          "without --kv-calib: no descale tensors (the container is unchanged)");
+  }
+  {
 
     const fs::path bad = root / "ckpt-bad";
     auto refuses = [&](const Ckpt& c, const std::string& needle, const std::string& what) {

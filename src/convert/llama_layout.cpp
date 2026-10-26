@@ -119,6 +119,10 @@ std::set<std::string> AddTextStack(Kit& kit, const TextShape& s, int64_t layers)
     linear({hf + "self_attn.k_proj.weight"}, base + "attn.k", {kv_rows, H});
     linear({hf + "self_attn.v_proj.weight"}, base + "attn.v", {kv_rows, H});
     linear({hf + "self_attn.o_proj.weight"}, base + "attn.o", {H, q_rows});
+    if (kit.add_descale) {
+      kit.add_descale(base + "attn.k_descale", static_cast<int>(s.kv_heads), static_cast<int>(i), "k");
+      kit.add_descale(base + "attn.v_descale", static_cast<int>(s.kv_heads), static_cast<int>(i), "v");
+    }
     linear({hf + "mlp.gate_proj.weight", hf + "mlp.up_proj.weight"}, base + "mlp.gate_up", {I, H});
     linear({hf + "mlp.down_proj.weight"}, base + "mlp.down", {H, I});
   }

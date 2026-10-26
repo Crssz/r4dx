@@ -75,6 +75,10 @@ LlamaContainer LlamaContainer::Load(const std::string& path, const LlamaLoadOpti
     lw.attn.k = linear(b + "attn.k", o.layout, cfg.KvDim(), hidden);
     lw.attn.v = linear(b + "attn.v", o.layout, cfg.KvDim(), hidden);
     lw.attn.o = linear(b + "attn.o", o.layout, hidden, cfg.QDim());
+    if (c.info_.has_kv_descale) {  // fp8 KV dequant scales, the rank's kv heads under TP (tp::RuleFor's Llama table)
+      lw.k_descale = shard ? shard->Raw<float>(b + "attn.k_descale") : UploadRawF32(reader, b + "attn.k_descale");
+      lw.v_descale = shard ? shard->Raw<float>(b + "attn.v_descale") : UploadRawF32(reader, b + "attn.v_descale");
+    }
     lw.mlp.gate_up = linear(b + "mlp.gate_up", o.layout, cfg.GateUpRows(), hidden);
     lw.mlp.down = linear(b + "mlp.down", o.layout, hidden, cfg.intermediate_size);
     c.layers_.push_back(std::move(lw));

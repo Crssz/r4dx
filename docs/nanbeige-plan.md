@@ -16,8 +16,9 @@ before the code that depends on it is written. Section 11 lists every UNVERIFIED
 > N2-4 greedy smoke PASS (495 / 505 top-1, 10 near-ties < 0.25), N2-5 speed recorded (decode 31.2 / 30.0 / 26.2 tok/s and
 > prefill 624 / 616 / 581 tok/s at 2k / 8k / 32k), N0-5 survey (norm weights <= 5.25; residual max |h| about 32k, bf16 is
 > enough). N5-1's attention half shipped early: the libr4d `h128_gqa7` kernels. Measured numbers and commands:
-> [nanbeige.md](nanbeige.md). Left: N5-2 (fp8 KV) and the optional N5-3 / N5-4 / N5-6; prefill would need a large-M w8a16
-> GEMM (not in the N5 list).
+> [nanbeige.md](nanbeige.md). N5-2 fp8 KV built (kernels, `--kv-calib`, loader, `R4DX_LLAMA_KV=fp8`) and **fails the
+> gate** (ALL KL 0.0050, thai 0.0087 vs limit 0.0061, top-1 97.67 vs 97.71; headroom does not help), so bf16 KV stays the
+> default. Left: the optional N5-3 / N5-4 / N5-6; prefill would need a large-M w8a16 GEMM (not in the N5 list).
 
 ## Summary
 

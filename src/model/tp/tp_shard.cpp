@@ -234,6 +234,8 @@ bool LookupLlamaLayerRule(const std::string& s, const ModelConfig& g, ShardRule*
     *rule = Rows({g.num_attention_heads * g.head_dim});
   } else if (s == "attn.k" || s == "attn.v") {
     *rule = Rows({g.num_key_value_heads * g.head_dim});
+  } else if (s == "attn.k_descale" || s == "attn.v_descale") {
+    *rule = Rows({g.num_key_value_heads});  // fp8 KV (N5-2): each rank keeps its own kv heads' scales
   } else if (s == "attn.o") {
     *rule = Cols(g.num_attention_heads * g.head_dim);
   } else if (s == "mlp.gate_up") {

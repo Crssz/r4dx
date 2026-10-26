@@ -108,6 +108,7 @@ class LlamaStream:
         theta = float(c["rope_parameters"]["rope_theta"] if "rope_parameters" in c else c["rope_theta"])
         self.inv_freq = 1.0 / (theta ** (torch.arange(0, self.hd, 2, dtype=torch.int64).float() / self.hd))
         self.vocab = c["vocab_size"]
+        self.kv_amax = None  # --kv-calib-out: {"k": fp32 [nkv], "v": fp32 [nkv]} of the layer being run
 
     def rms(self, x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
         in_dtype = x.dtype
@@ -162,6 +163,9 @@ class LlamaStream:
         v = F.linear(x, L["v"]).view(T, self.nkv, self.hd).transpose(0, 1)
         q = q * cos + self.rotate_half(q) * sin
         k = k * cos + self.rotate_half(k) * sin
+        if self.kv_amax is not None:  # exactly what the fp8 cache stores: K post-rope, V raw (kv_calib.hpp)
+            for nm, t in (("k", k), ("v", v)):
+                self.kv_amax[nm] = torch.maximum(self.kv_amax[nm], t.float().abs().amax(dim=(1, 2)))
         h = h + F.linear(self.attention(q, k, v), L["o"])
         x = self.rms(h, L["post"])
         return h + F.linear(F.silu(F.linear(x, L["g"])) * F.linear(x, L["u"]), L["d"])
@@ -231,6 +235,13 @@ def main(argv=None) -> int:
     ap.add_argument("--debug-max-layers", type=int, default=None, help="NOT a valid reference (timing probes)")
     ap.add_argument("--no-resume", action="store_true")
     ap.add_argument("--tiny-ids", default=None, help="tests: comma list of ids, one segment named 'tiny' (no tokens file)")
+    ap.add_argument("--kv-calib-out", type=Path, default=None,
+                    help="fp8 KV calibration (N5-2): write r4dx-convert --kv-calib's JSON (per-layer, per-kv-head amax of "
+                         "K post-rope and V) over the --tokens segments instead of logprobs")
+    ap.add_argument("--kv-calib-margin", type=float, default=4.0,
+                    help="k_amax / v_amax written = measured x this. e4m3 is a float format, so headroom only raises the "
+                         "subnormal floor; without it unseen text clips (Nanbeige: the gate corpus exceeds an 18k-token "
+                         "calibration's amax by up to 1.8x in 194 of 416 V heads, and fails the gate)")
     args = ap.parse_args(argv)
     torch.set_num_threads(args.threads)
 
@@ -255,7 +266,9 @@ def main(argv=None) -> int:
     names = [s["name"] for s in segs]
     ckpt = out_dir / "_ckpt" / "state.pt"
     start_layer, states = 0, {}
-    if ckpt.exists() and not args.no_resume and not args.tiny_ids:
+    calib = args.kv_calib_out is not None
+    calib_out: dict = {}
+    if ckpt.exists() and not args.no_resume and not args.tiny_ids and not calib:
         c = torch.load(ckpt, weights_only=True)
         if c["names"] == names and c["variant"] == args.variant and c.get("debug") == args.debug_max_layers:
             start_layer, states = c["next_layer"], c["states"]
@@ -270,17 +283,39 @@ def main(argv=None) -> int:
             t0 = time.perf_counter()
             L = st.load_layer(i)
             t_load = time.perf_counter() - t0
+            if calib:
+                st.kv_amax = {"k": torch.zeros(st.nkv), "v": torch.zeros(st.nkv)}
             for n in names:
                 states[n] = st.layer(L, states[n], *ropes[n])
             del L
+            if calib:
+                km, vm = st.kv_amax["k"].tolist(), st.kv_amax["v"].tolist()
+                ka, va = [a * args.kv_calib_margin for a in km], [a * args.kv_calib_margin for a in vm]
+                calib_out[str(i)] = {"layer_idx": i, "kv_heads": st.nkv, "head_dim": st.hd,
+                                     "num_calibration_tokens": sum(len(s["token_ids"]) for s in segs),
+                                     "margin": args.kv_calib_margin, "k_amax_measured": km, "v_amax_measured": vm,
+                                     "k_amax": ka, "v_amax": va, "k_descale": [a / 448.0 for a in ka],
+                                     "v_descale": [a / 448.0 for a in va], "k_tap": "post rope", "v_tap": "v_proj output",
+                                     "stack": str(dtype)}
             hmax = max(float(states[n].abs().max()) for n in names)
-            print(f"[cpu-ref] L{i:02d} load {t_load:.1f}s total {time.perf_counter() - t0:.1f}s max|h|={hmax:.1f} "
+            extra = (f" k_amax max {max(calib_out[str(i)]['k_amax_measured']):.2f} "
+                     f"v_amax max {max(calib_out[str(i)]['v_amax_measured']):.2f}"
+                     if calib else "")
+            print(f"[cpu-ref] L{i:02d} load {t_load:.1f}s total {time.perf_counter() - t0:.1f}s max|h|={hmax:.1f}{extra} "
                   f"elapsed={(time.perf_counter() - t_start) / 60:.1f}min", flush=True)
-            if not args.tiny_ids:
+            if not args.tiny_ids and not calib:
                 ckpt.parent.mkdir(parents=True, exist_ok=True)
                 torch.save({"names": names, "variant": args.variant, "debug": args.debug_max_layers, "next_layer": i + 1,
                             "states": states}, str(ckpt) + ".tmp")
                 os.replace(str(ckpt) + ".tmp", ckpt)
+        if calib:
+            if n_layers != st.n_layers:
+                raise SystemExit("--kv-calib-out with --debug-max-layers would leave layers at descale 1.0")
+            args.kv_calib_out.parent.mkdir(parents=True, exist_ok=True)
+            args.kv_calib_out.write_text(json.dumps(calib_out, indent=1), encoding="utf-8")
+            print(f"[cpu-ref] wrote {args.kv_calib_out} ({len(calib_out)} layers) in "
+                  f"{(time.perf_counter() - t_start) / 60:.1f} min", flush=True)
+            return 0
         norm = st.ck.get("model.norm.weight").to(dtype)
         hid = {n: st.rms(states[n], norm) for n in names}
         meta_common = {"source": "reference-fp32-truth" if truth else "hf-bf16-sdpa", "variant": args.variant,

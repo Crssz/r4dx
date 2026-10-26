@@ -23,6 +23,7 @@
 //   text.layers.{i}.attn.{q,k,v,o}.{L}      self_attn.{q,k,v,o}_proj
 //   text.layers.{i}.mlp.gate_up.{L}         gate_proj rows then up_proj rows (N = 2I)
 //   text.layers.{i}.mlp.down.{L}            down_proj
+//   text.layers.{i}.attn.{k,v}_descale      fp32 [kv_heads], --kv-calib only (amax / 448; K post-rope, V raw)
 // Norms are stored raw: the runtime uses a plain RMSNorm (x * w, not 1 + w).
 #pragma once
 
@@ -63,6 +64,9 @@ struct Kit {
   // A quantizable linear; several hf names are fused on the output axis in order. `head`: lm_head (the --lm-head
   // layout set applies instead of --layouts).
   std::function<void(const std::vector<std::string>& hf, const std::string& base, bool head)> add_linear;
+  // fp8 KV dequant scales (N5-2): set by RunConvert only under --kv-calib, so a container converted without it has no
+  // descale tensors and is byte-identical to one from before. Empty = not called.
+  std::function<void(const std::string& name, int n_kv, int layer_idx, const char* kind)> add_descale;
 };
 
 // Registers every tensor of the first `layers` layers, then the embedding table, the final norm and lm_head. Throws

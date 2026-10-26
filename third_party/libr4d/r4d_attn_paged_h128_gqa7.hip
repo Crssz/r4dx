@@ -1,10 +1,10 @@
-// R4D attention dispatch: head_dim 128, 7 queries per KV head, paged block 16, bf16 KV, bf16 query --
+// R4D attention dispatch: head_dim 128, 7 queries per KV head, paged block 16, bf16 or fp8-e4m3 KV, bf16 query --
 // the attention layers of the dense Llama family (Nanbeige4.3-33B: 56 q heads / 8 KV heads, 28 / 4 per
 // rank at --tp 2; docs/nanbeige-plan.md 3.3, task N5-1).
 //
 // This is the gqa6 family's own kernel code (r4d_attn_prefill_h256_gqa6.hip and
 // r4d_attn_decode_h256_gqa6.hip, included below) instantiated at another geometry: HEAD_DIM, GQA and
-// the KV dtype (KVP = 1, bf16) are template arguments of those kernels, so nothing in them changes and
+// the KV dtype (KVP = 1 bf16, KVP = 0 fp8 with per-(seq, head) descales, task N5-2) are template arguments of those kernels, so nothing in them changes and
 // the Qwen / Gemma / LFM2 instantiations compile to the same code (third_party/check_qwen_attn_isa.cmake).
 //
 // GQA 7 and the prefill row map: a prefill workgroup holds NWARPS x 16 query-head rows, row r serving
@@ -15,8 +15,9 @@
 // q_len x GQA rows onto 16-row bands and leaves the rows past q_len x GQA dead, so it needs nothing.
 //
 // Option sets: the gqa6 ones (r4d_attn_paged_h256_gqa6.hip's header lists every bit) minus O_KWIDE for
-// the prefill, as h64_gqa4. Entry points (r4d.h): r4d_attn_{prefill,prefill_splitkv,decode}_h128_gqa7_bf16kv
-// and the two scratch_bytes queries. k_descale / v_descale may be null (a bf16 cache needs none: 1.0).
+// the prefill, as h64_gqa4. Entry points (r4d.h): r4d_attn_{prefill,prefill_splitkv,decode}_h128_gqa7_{bf16kv,fp8kv}
+// and the two scratch_bytes queries (one geometry, so shared). bf16: k_descale / v_descale may be null (1.0); fp8: they
+// are the cache's per-(seq, kv head) dequant scales.
 #include "r4d.h"
 #include "r4d_common.h"
 #include <cmath>
@@ -30,7 +31,6 @@ using std::max;
 #define H_HEAD_DIM  128
 #define H_GQA         7
 #define H_BLOCK_SIZE 16
-#define H_KVP         1             // bf16 cache
 #define H_MAX_DECODE_ROWS 64        // q_len * gqa a single decode workgroup can hold -> q_len <= 9
 
 static int h128_check(const R4DArgs* a) {
@@ -53,21 +53,26 @@ static int h128_check(const R4DArgs* a) {
 #endif
 static_assert((H_P_NWARPS * 16) % H_GQA == 0, "a prefill workgroup must hold whole queries (rows = NWARPS*16)");
 
-template <int SPLIT>
+template <int KVP, int SPLIT>
 static void prefill_launch_h128(const R4DArgs* a, int splits, hipStream_t s) {
     constexpr int BQ = (H_P_NWARPS * 16) / H_GQA;
     dim3 grid(((a->q_len + BQ - 1) / BQ) * splits, a->kv_heads, a->num_seqs);
     hipLaunchKernelGGL((r4d_attn_prefill_kernel<H_P_NWARPS, H_P_TILE, H_HEAD_DIM, H_GQA, H_BLOCK_SIZE,
-                                                H_KVP, H_P_OPT, SPLIT>),
+                                                KVP, H_P_OPT, SPLIT>),
                        grid, dim3(H_P_NWARPS * 32), 0, s, *a, splits);
 }
 
-extern "C" int r4d_attn_prefill_h128_gqa7_bf16kv(const R4DArgs* a, hipStream_t s) {
+
+template <int KVP>
+static int prefill_h128(const R4DArgs* a, hipStream_t s) {
     if (const int rc = h128_check(a)) return rc;
-    prefill_launch_h128<0>(a, 1, s);
+    prefill_launch_h128<KVP, 0>(a, 1, s);
     CHK();
     return 0;
 }
+
+extern "C" int r4d_attn_prefill_h128_gqa7_bf16kv(const R4DArgs* a, hipStream_t s) { return prefill_h128<1>(a, s); }
+extern "C" int r4d_attn_prefill_h128_gqa7_fp8kv(const R4DArgs* a, hipStream_t s) { return prefill_h128<0>(a, s); }
 
 // Split-KV prefill: the gqa6 contract (caller's segment count, clamped to 64; <= 1 IS the plain launch,
 // same bits, no scratch; fp32 partials, fixed-order merge).
@@ -83,12 +88,13 @@ extern "C" int64_t r4d_attn_prefill_splitkv_h128_gqa7_scratch_bytes(const R4DArg
     return rows * splits * (int64_t)(a->head_dim + 2) * 4;    // f32 O partials + m + l
 }
 
-extern "C" int r4d_attn_prefill_splitkv_h128_gqa7_bf16kv(const R4DArgs* a, hipStream_t s) {
+template <int KVP>
+static int prefill_splitkv_h128(const R4DArgs* a, hipStream_t s) {
     if (const int rc = h128_check(a)) return rc;
     const int splits = prefill_splits_h128(a);
-    if (splits <= 1) return r4d_attn_prefill_h128_gqa7_bf16kv(a, s);
+    if (splits <= 1) return prefill_h128<KVP>(a, s);
     if (a->scratch == nullptr) return -5;
-    prefill_launch_h128<1>(a, splits, s);
+    prefill_launch_h128<KVP, 1>(a, splits, s);
     CHK();
     const int jobs = a->num_seqs * a->q_len * a->q_heads;
     // The merge runs one thread per output column: HEAD_DIM threads (its reduction buffer is red[HEAD_DIM]).
@@ -96,6 +102,13 @@ extern "C" int r4d_attn_prefill_splitkv_h128_gqa7_bf16kv(const R4DArgs* a, hipSt
                        splits * sizeof(float), s, *a, splits, H_P_TILE);
     CHK();
     return 0;
+}
+
+extern "C" int r4d_attn_prefill_splitkv_h128_gqa7_bf16kv(const R4DArgs* a, hipStream_t s) {
+    return prefill_splitkv_h128<1>(a, s);
+}
+extern "C" int r4d_attn_prefill_splitkv_h128_gqa7_fp8kv(const R4DArgs* a, hipStream_t s) {
+    return prefill_splitkv_h128<0>(a, s);
 }
 
 // ---- decode ----------------------------------------------------------------------------------
@@ -134,7 +147,8 @@ extern "C" int64_t r4d_attn_decode_h128_gqa7_scratch_bytes(const R4DArgs* a) {
                           : rows * splits * (int64_t)(a->head_dim + 2) * 4L;     // f32 O partials + m + l
 }
 
-extern "C" int r4d_attn_decode_h128_gqa7_bf16kv(const R4DArgs* a, hipStream_t s) {
+template <int KVP>
+static int decode_h128(const R4DArgs* a, hipStream_t s) {
     if (const int rc = h128_check(a)) return rc;
     const int rows = a->q_len * H_GQA;
     if (a->q_len < 1 || rows > H_MAX_DECODE_ROWS) return -4;
@@ -144,7 +158,7 @@ extern "C" int r4d_attn_decode_h128_gqa7_bf16kv(const R4DArgs* a, hipStream_t s)
 
 #define D_LAUNCH(NW)                                                                          \
     hipLaunchKernelGGL((r4d_attn_decode_kernel<NW, H_D_TILE, H_HEAD_DIM, H_GQA, H_BLOCK_SIZE,  \
-                                               H_KVP, H_D_OPT>),                              \
+                                               KVP, H_D_OPT>),                                \
                        dim3(splits, a->kv_heads, a->num_seqs), dim3(NW * 32), 0, s, *a, splits)
     if      (nw == 1) D_LAUNCH(1);
     else if (nw == 2) D_LAUNCH(2);
@@ -163,3 +177,6 @@ extern "C" int r4d_attn_decode_h128_gqa7_bf16kv(const R4DArgs* a, hipStream_t s)
     CHK();
     return 0;
 }
+
+extern "C" int r4d_attn_decode_h128_gqa7_bf16kv(const R4DArgs* a, hipStream_t s) { return decode_h128<1>(a, s); }
+extern "C" int r4d_attn_decode_h128_gqa7_fp8kv(const R4DArgs* a, hipStream_t s) { return decode_h128<0>(a, s); }

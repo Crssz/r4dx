@@ -1939,11 +1939,10 @@ int RunConvert(const AppArgs& args) {
   }
   r4dx_convert::llama::TextShape llshape;
   if (is_llama) {
-    // The Llama layout is the plain bf16 / w4a16 / w8a16 body plus --trellis-from (docs/nanbeige-plan.md 4); fp8 KV
-    // calibration is N5-2, everything else belongs to another family. Refused rather than half-applied.
+    // The Llama layout is the plain bf16 / w4a16 / w8a16 body plus --trellis-from (docs/nanbeige-plan.md 4) and
+    // --kv-calib's descales (N5-2); everything else belongs to another family. Refused rather than half-applied.
     const char* refused = args.vision == 1       ? "--vision on (a llama checkpoint has no vision tower)"
                           : args.mtp == 1        ? "--mtp on (a llama checkpoint has no MTP head)"
-                          : !args.kv_calib.empty() ? "--kv-calib (the Llama KV cache is bf16 until N5-2: no descale tensors)"
                           : r4dx_convert::ParseRotationKind(args.rotate) != r4dx_convert::RotationKind::kNone
                               ? "--rotate (the Llama trellis is unrotated)"
                           : (args.record_reuse_guard || !args.reuse_from.empty())
@@ -2544,6 +2543,11 @@ int RunConvert(const AppArgs& args) {
     kit.add_linear = [&](const std::vector<std::string>& hf_names, const std::string& base, bool head) {
       add_linear(hf_names, base, head ? lm_head_layouts : layouts);
     };
+    if (have_kv_calib) {
+      kit.add_descale = [&](const std::string& container_name, int n_kv, int layer_idx, const char* kind) {
+        add_descale(container_name, n_kv, layer_idx, kind, /*calib_applicable=*/true);
+      };
+    }
     const std::set<std::string> consumed = ll::AddTextStack(kit, llshape, layers);
     // The coverage audit: nothing in the checkpoint may be silently left out of the container.
     const std::vector<std::string> unconsumed = ll::UnconsumedTensors(model.AllNames(), consumed, layers);
@@ -3006,6 +3010,8 @@ int RunConvert(const AppArgs& args) {
         {"text.embed_tokens", "bf16 [vocab, hidden], no scale"},
         {"lm_head", "w8a16|w4a16|bf16 (as requested by --lm-head), untied"},
     };
+    if (have_kv_calib)
+      metadata["quant_summary"]["text.layers.*.attn.k_descale|v_descale"] = "fp32 [kv_heads] (--kv-calib: fp8 KV)";
   }
   // --trellis-from: the body's summary lines say what the body now is (the four entries above
   // describe the multi-layout body, which a trellis container does not have), and

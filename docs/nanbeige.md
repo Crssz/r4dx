@@ -117,6 +117,28 @@ the final norm; `tools/reference/llama/survey_small_tensors.py`).
 `tools/reference/llama/greedy_check_llama.py` checks each generated token: 495 of 505 are the truth's top-1, the other 10 are
 near-ties (truth top-1 minus the chosen token's log-prob 0.014-0.243, limit 0.5), no misses.
 
+### fp8 KV (N5-2): built, fails the gate, opt-in
+
+`R4DX_LLAMA_KV=fp8` with a container converted with `--kv-calib` stores K (post-rope) and V as e4m3 with static per-kv-head
+descales (`h128_gqa7` fp8 kernels; half the KV bytes, so twice the context). Calibration:
+`full_logits_llama_cpu.py --variant bf16sdpa --kv-calib-out` over 18.4k tokens of the model's own generations (8 domains)
+plus 8k tokens of repo docs, none of them the KL corpus (28 min CPU). Gate against the same truth:
+
+| | ALL KL (limit 0.00615) | ALL top-1 (floor 97.71) | thai KL (limit 0.00606) | raw mixed_long KL |
+|---|--:|--:|--:|--:|
+| bf16 KV | 0.00118 | 98.45 | 0.00125 | 0.0200 |
+| fp8 KV, measured amax | 0.00509 | 97.57 | 0.00921 | 0.0771 |
+| fp8 KV, amax x 4 | 0.00496 | 97.67 | 0.00872 | 0.0837 |
+
+The gate text exceeds the calibration amax in many heads (up to 1.8x), but four times the headroom changes almost nothing,
+so clipping is not the cost: e4m3's 3-bit mantissa over 52 full-attention layers is (Qwen has 16). Ways that might pass,
+not built: K bf16 + V fp8, or per-token dynamic scales.
+
+```powershell
+r4dx-convert ... --kv-calib kvcalib.json          # adds text.layers.*.attn.{k,v}_descale; nothing else changes
+$env:R4DX_LLAMA_KV = 'fp8'; r4dx-server --model <kv8 container> ...
+```
+
 ## Tests
 
 | test | what |
@@ -125,12 +147,13 @@ near-ties (truth top-1 minus the chosen token's log-prob 0.014-0.243, limit 0.5)
 | `tokenizer_golden_nanbeige` | CPU: tokenizer + template vs HF |
 | `test_dialect` | CPU: the nanbeige dialect |
 | `llama_tiny_e2e` | GPU: the stack on a tiny checkpoint vs HF, bf16 / w8a16, TP=1 / TP=2 |
-| `test_attn_h128_gqa7` | GPU: the head_dim 128 / GQA 7 attention kernels vs the reference kernel |
+| `test_attn_h128_gqa7` | GPU: the head_dim 128 / GQA 7 attention kernels (bf16 and fp8 KV) vs the reference kernel |
 | `tools\nanbeige\smoke_server.ps1` | both GPUs: the server end to end |
 
 ## Known limits
 
-- bf16 KV only (fp8 KV is plan task N5-2), so long contexts cost 208 KiB per token.
+- KV is bf16 by default (208 KiB per token, 104 KiB per card). fp8 KV exists but **fails the KL gate** and is opt-in
+  only (N5-2, below).
 - No speculative decoding (no drafter), no batched decode, no `--pp 2`.
 - A DirectStorage load crashed once (an access violation inside `dstoragecore.dll`) while a long CPU job was reading the same
   drive; `R4DX_DIRECT_STORAGE=0` loads through the memory mapping instead.

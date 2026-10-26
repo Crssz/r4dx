@@ -27,6 +27,7 @@ struct LlamaContainerInfo {
   ModelConfig model_config;  // config.ToModelConfig(): what tp::RuleFor and TextModel::Config() read
   bool has_trellis = false;
   bool has_w8a16 = false;  // __metadata__.quant.w8a16 present (parsed strictly at Load)
+  bool has_kv_descale = false;  // every layer carries attn.{k,v}_descale (--kv-calib: fp8 KV can run, N5-2)
 };
 
 // Container tensor base names (the converter's llama_layout.hpp is the contract).
@@ -92,6 +93,8 @@ inline std::vector<std::string> LlamaTensorTableProblems(const r4dx_convert::Saf
   };
   const int64_t H = c.hidden_size;
   if (layers < 0 || layers > c.num_hidden_layers) bad.push_back("layer count out of range");
+  // fp8 KV descales (--kv-calib): all layers or none, decided by layer 0.
+  const bool descales = r.Has(LlamaLayerBase(0) + "attn.k_descale");
   need("text.embed_tokens", {c.vocab_size, H, 2});
   need("text.final_norm", {H, 2});
   if (!(r.Has("lm_head.bf16.w") || r.Has("lm_head.w4a16.wq") || r.Has("lm_head.w8a16.wq")))
@@ -107,6 +110,12 @@ inline std::vector<std::string> LlamaTensorTableProblems(const r4dx_convert::Saf
     linear(b + "attn.o", H, c.QDim());
     linear(b + "mlp.gate_up", c.GateUpRows(), H);
     linear(b + "mlp.down", H, c.intermediate_size);
+    if (descales) {
+      need(b + "attn.k_descale", {c.num_key_value_heads, 4});
+      need(b + "attn.v_descale", {c.num_key_value_heads, 4});
+    } else if (r.Has(b + "attn.k_descale") || r.Has(b + "attn.v_descale")) {
+      bad.push_back("layer " + std::to_string(i) + " has a kv descale but layer 0 has none (all layers or none)");
+    }
   }
   return bad;
 }
@@ -128,6 +137,7 @@ inline LlamaContainerInfo InspectLlamaContainer(const std::string& path, int64_t
     for (size_t i = 0; i < bad.size() && i < 8; ++i) msg += "\n  " + bad[i];
     throw std::runtime_error(msg);
   }
+  info.has_kv_descale = reader.Has(LlamaLayerBase(0) + "attn.k_descale");
   return info;
 }
 

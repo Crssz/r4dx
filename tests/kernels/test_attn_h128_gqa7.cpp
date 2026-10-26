@@ -1,5 +1,6 @@
-// tests/kernels/test_attn_h128_gqa7.cpp -- libr4d's h128_gqa7 bf16-KV attention (docs/nanbeige-plan.md 3.3, task N5-1)
-// against the stage-0 reference kernel r4dx_gemma_attn_ref_bf16kv on the SAME bf16 cache: Nanbeige's geometry, head_dim 128,
+// tests/kernels/test_attn_h128_gqa7.cpp -- libr4d's h128_gqa7 attention (docs/nanbeige-plan.md 3.3, tasks N5-1 / N5-2)
+// against the stage-0 reference kernel on the SAME cache, bf16 KV (r4dx_gemma_attn_ref_bf16kv) and fp8-e4m3 KV with random
+// per-head descales (r4dx_gemma_attn_ref_fp8kv; the suite runs once per dtype): Nanbeige's geometry, head_dim 128,
 // scale 128^-0.5, contiguous table, at TP=1 (56 q / 8 kv heads) and at a TP=2 rank's shapes (28 q / 4 kv heads).
 //   * decode / verify: q_len 1, 2, 7, 9 at contexts 1..4097 and the split law's own count plus explicit counts 1 and 16;
 //   * prefill (plain): q_len 1..256 as a chunk tail at several contexts (a partial 32-query workgroup, a partial tile;
@@ -24,6 +25,7 @@ using namespace r4dx::core;
 
 namespace {
 int kQH = 56, kKVH = 8;  // the geometry under test (TP=1 first, then a TP=2 rank)
+bool g_fp8 = false;      // the KV dtype under test
 constexpr int kD = 128, kBs = 16;
 const float kScale = 1.0f / std::sqrt(128.0f);
 
@@ -36,8 +38,11 @@ int64_t P(const void* p) { return reinterpret_cast<int64_t>(p); }
 
 struct Cache {
   int ctx;
-  DeviceBuffer<uint16_t> kv;
+  DeviceBuffer<uint16_t> kv;   // bf16 cache
+  DeviceBuffer<uint8_t> kv8;   // fp8 cache (g_fp8)
+  DeviceBuffer<float> k_descale, v_descale;  // fp32 [kv_heads] (fp8 only)
   DeviceBuffer<int32_t> table;
+  const void* Data() const { return g_fp8 ? static_cast<const void*>(kv8.data()) : static_cast<const void*>(kv.data()); }
   int64_t head_stride, block_stride;
   int blocks;
 };
@@ -49,10 +54,26 @@ Cache MakeCache(int ctx, std::mt19937& rng) {
   c.head_stride = static_cast<int64_t>(kBs) * 2 * kD;
   c.block_stride = kKVH * c.head_stride;
   std::normal_distribution<float> nd(0.0f, 1.0f);
-  std::vector<uint16_t> h(static_cast<size_t>(c.blocks) * c.block_stride, 0);
-  for (auto& v : h) v = FloatToBf16(nd(rng));  // finite everywhere, incl. the unused tail of the last block
-  c.kv.Resize(h.size());
-  c.kv.CopyFromHost(h);
+  if (g_fp8) {
+    // Stored values use e4m3's range (|x| up to about 400 of 448); the descales (0.002..0.02) put the real K / V near
+    // the bf16 case's scale, different per head so a head mix-up shows.
+    std::vector<uint8_t> h(static_cast<size_t>(c.blocks) * c.block_stride, 0);
+    for (auto& v : h) v = FloatToFp8E4M3(std::clamp(100.0f * nd(rng), -440.0f, 440.0f));
+    c.kv8.Resize(h.size());
+    c.kv8.CopyFromHost(h);
+    std::uniform_real_distribution<float> ud(0.002f, 0.02f);
+    std::vector<float> kd(kKVH), vd(kKVH);
+    for (int i = 0; i < kKVH; ++i) { kd[i] = ud(rng); vd[i] = ud(rng); }
+    c.k_descale.Resize(kd.size());
+    c.k_descale.CopyFromHost(kd);
+    c.v_descale.Resize(vd.size());
+    c.v_descale.CopyFromHost(vd);
+  } else {
+    std::vector<uint16_t> h(static_cast<size_t>(c.blocks) * c.block_stride, 0);
+    for (auto& v : h) v = FloatToBf16(nd(rng));  // finite everywhere, incl. the unused tail of the last block
+    c.kv.Resize(h.size());
+    c.kv.CopyFromHost(h);
+  }
   const int entries = c.blocks + 4;  // the layers' table has 4 slack entries, clamped to the last block
   std::vector<int32_t> t(entries);
   for (int i = 0; i < entries; ++i) t[i] = std::min(i, c.blocks - 1);
@@ -73,13 +94,17 @@ std::vector<uint16_t> Reference(const Cache& c, const DeviceBuffer<uint16_t>& q,
   out.Zero();
   R4dxGemmaAttnRefArgs a{};
   a.q = P(q.data());
-  a.kv = P(c.kv.data());
+  a.kv = P(c.Data());
   a.block_table = P(c.table.data());
   a.out = P(out.data());
+  if (g_fp8) {
+    a.k_descale = P(c.k_descale.data());
+    a.v_descale = P(c.v_descale.data());
+  }
   a.q_len = q_len; a.q_heads = kQH; a.kv_heads = kKVH; a.head_dim = kD; a.block_size = kBs;
   a.ctx = c.ctx; a.window = 0; a.scale = kScale;
   a.kv_block_stride = c.block_stride; a.kv_head_stride = c.head_stride;
-  Check(r4dx_gemma_attn_ref_bf16kv(&a, 0) == 0, "reference launch returns 0");
+  Check((g_fp8 ? r4dx_gemma_attn_ref_fp8kv(&a, 0) : r4dx_gemma_attn_ref_bf16kv(&a, 0)) == 0, "reference launch returns 0");
   R4DX_HIP_CHECK(hipDeviceSynchronize());
   return out.CopyToHost();
 }
@@ -88,9 +113,13 @@ R4DArgs Args(const Cache& c, const DeviceBuffer<uint16_t>& q, DeviceBuffer<uint1
              int q_len, int splits) {
   R4DArgs a{};
   a.q = q.data();
-  a.kv = c.kv.data();
+  a.kv = c.Data();
   a.block_table = c.table.data();
   a.seqused_k = used.data();
+  if (g_fp8) {
+    a.k_descale = c.k_descale.data();
+    a.v_descale = c.v_descale.data();
+  }
   a.out = out.data();
   a.num_seqs = 1; a.q_len = q_len; a.q_heads = kQH; a.kv_heads = kKVH; a.head_dim = kD; a.block_size = kBs;
   a.max_blocks = c.blocks + 4;
@@ -134,21 +163,23 @@ void Run(Mode m, int ctx, int q_len, int splits, std::mt19937& rng) {
       const int64_t sb = r4d_attn_decode_h128_gqa7_scratch_bytes(args);
       if (static_cast<int64_t>(scratch.size()) < sb) scratch.Resize(static_cast<size_t>(sb));
       args->scratch = scratch.data();
-      return r4d_attn_decode_h128_gqa7_bf16kv(args, nullptr);
+      return g_fp8 ? r4d_attn_decode_h128_gqa7_fp8kv(args, nullptr) : r4d_attn_decode_h128_gqa7_bf16kv(args, nullptr);
     }
     if (m == Mode::kSplit) {
       const int64_t sb = r4d_attn_prefill_splitkv_h128_gqa7_scratch_bytes(args);
       if (static_cast<int64_t>(scratch.size()) < sb) scratch.Resize(static_cast<size_t>(std::max<int64_t>(sb, 1)));
       args->scratch = scratch.data();
-      return r4d_attn_prefill_splitkv_h128_gqa7_bf16kv(args, nullptr);
+      return g_fp8 ? r4d_attn_prefill_splitkv_h128_gqa7_fp8kv(args, nullptr)
+                   : r4d_attn_prefill_splitkv_h128_gqa7_bf16kv(args, nullptr);
     }
-    return r4d_attn_prefill_h128_gqa7_bf16kv(args, nullptr);
+    return g_fp8 ? r4d_attn_prefill_h128_gqa7_fp8kv(args, nullptr) : r4d_attn_prefill_h128_gqa7_bf16kv(args, nullptr);
   };
   const char* kind = m == Mode::kDecode ? "decode" : (m == Mode::kSplit ? "prefill split-KV" : "prefill");
   int rc = launch(&a);
   R4DX_HIP_CHECK(hipDeviceSynchronize());
   char name[160];
-  std::snprintf(name, sizeof name, "[%d/%d heads] %s ctx %d q_len %d splits %d", kQH, kKVH, kind, ctx, q_len, splits);
+  std::snprintf(name, sizeof name, "[%s %d/%d heads] %s ctx %d q_len %d splits %d", g_fp8 ? "fp8" : "bf16", kQH, kKVH,
+                kind, ctx, q_len, splits);
   if (rc != 0) {
     Check(false, std::string(name) + ": returned " + std::to_string(rc));
     return;
@@ -194,12 +225,36 @@ int main() {
   R4DX_HIP_CHECK(hipSetDevice(0));
   std::mt19937 rng(128);
 
-  Suite(rng);          // TP=1: 56 q / 8 kv heads
-  kQH = 28;
-  kKVH = 4;
-  Suite(rng);          // a TP=2 rank: 28 q / 4 kv heads
+  for (bool fp8 : {false, true}) {
+    g_fp8 = fp8;
+    kQH = 56;
+    kKVH = 8;
+    Suite(rng);        // TP=1: 56 q / 8 kv heads
+    kQH = 28;
+    kKVH = 4;
+    Suite(rng);        // a TP=2 rank: 28 q / 4 kv heads
+  }
+  g_fp8 = false;
   kQH = 56;
   kKVH = 8;
+
+  // fp8: splits 1 is the plain launch bit for bit, as for bf16 below.
+  {
+    g_fp8 = true;
+    Cache c = MakeCache(1500, rng);
+    const std::vector<uint16_t> qh = RandomQ(64, rng);
+    DeviceBuffer<uint16_t> q(qh.size()), o1(qh.size()), o2(qh.size());
+    q.CopyFromHost(qh);
+    DeviceBuffer<int32_t> used(1);
+    used.CopyFromHost(std::vector<int32_t>{1500});
+    R4DArgs a = Args(c, q, o1, used, 64, 0), b = Args(c, q, o2, used, 64, 1);
+    const int r1 = r4d_attn_prefill_h128_gqa7_fp8kv(&a, nullptr);
+    const int r2 = r4d_attn_prefill_splitkv_h128_gqa7_fp8kv(&b, nullptr);
+    R4DX_HIP_CHECK(hipDeviceSynchronize());
+    Check(r1 == 0 && r2 == 0 && o1.CopyToHost() == o2.CopyToHost(),
+          "fp8: split-KV prefill with splits 1 == the plain launch");
+    g_fp8 = false;
+  }
 
   // splits 1 is the plain launch bit for bit (same instantiation).
   {

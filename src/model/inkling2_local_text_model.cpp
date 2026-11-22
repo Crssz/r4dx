@@ -53,13 +53,14 @@ std::vector<int32_t> Inkling2LocalTextModel::DecodeStepMtpSampled(int32_t, int64
                                                                   std::mt19937_64&) {
   throw std::runtime_error(std::string("Inkling2LocalTextModel: ") + kNoMtp);
 }
-std::vector<int32_t> Inkling2LocalTextModel::DecodeStepDflashGreedy(int32_t, int64_t, float, int64_t, int64_t*) {
-  throw std::runtime_error(std::string("Inkling2LocalTextModel: ") + kNoDflash);
+std::vector<int32_t> Inkling2LocalTextModel::DecodeStepDflashGreedy(int32_t token_id, int64_t k, float, int64_t,
+                                                                    int64_t* walk_len_out) {
+  return m_.DecodeStepDflashGreedy(token_id, k, walk_len_out);
 }
-std::vector<int32_t> Inkling2LocalTextModel::DecodeStepDflashSampled(int32_t, int64_t, float, int64_t,
-                                                                     const kernels::SampleParams&, std::mt19937_64&,
-                                                                     int64_t*) {
-  throw std::runtime_error(std::string("Inkling2LocalTextModel: ") + kNoDflash);
+std::vector<int32_t> Inkling2LocalTextModel::DecodeStepDflashSampled(int32_t token_id, int64_t k, float, int64_t,
+                                                                     const kernels::SampleParams& params,
+                                                                     std::mt19937_64& rng, int64_t* walk_len_out) {
+  return m_.DecodeStepDflashSampled(token_id, k, params, rng, walk_len_out);
 }
 
 Inkling2ModelOptions MakeInkling2ModelOptions(const ModelOptions& opts) {
@@ -75,8 +76,7 @@ Inkling2ModelOptions MakeInkling2ModelOptions(const ModelOptions& opts) {
   if (opts.layer_limit >= 0)
     throw std::invalid_argument("LoadTextModel: --layers is not supported for inkling2_loop (the looped stack runs whole)");
   if (opts.mtp_draft_k > 0) throw std::invalid_argument(std::string("LoadTextModel: ") + kNoMtp);
-  if (!opts.dflash_container.empty() || opts.dflash_draft_k > 0)
-    throw std::invalid_argument(std::string("LoadTextModel: ") + kNoDflash);
+  if (!opts.dflash_container.empty()) o.dspark_path = opts.dflash_container;
   if (opts.vision == ModelOptions::VisionMode::kOn)
     throw std::invalid_argument(std::string("LoadTextModel: --vision on, but ") + kTextOnly);
   if (opts.batch_slots > 0)

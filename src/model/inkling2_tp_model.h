@@ -66,7 +66,7 @@ class Inkling2TpModel final : public TextModel, public TpDiagnostics {
   bool HasVision() const override { return false; }
   bool MtpEnabled() const override { return false; }
   bool MtpUsingReducedVocabDraft() const override { return false; }
-  bool DflashEnabled() const override { return false; }
+  bool DflashEnabled() const override { return !lopts_.dspark_path.empty(); }
   int64_t SampledFallbackRows() const override { return cached_fallback_rows_; }
   int64_t PositionCount() const override { return cached_position_; }
   int64_t NumLoadedLayers() const override { return num_loaded_layers_; }

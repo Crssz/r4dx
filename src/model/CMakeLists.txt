@@ -141,6 +141,7 @@ set(R4DX_MODEL_SOURCES
   # inkling2_loop (docs/inkling2-plan.md 5): the container loader (TP=1 and the rank shard), the engine (48-visit table),
   # the TP=1 TextModel + the LoadInkling2TextModel dispatch, and the TP=2 facade.
   inkling2_container.cpp
+  inkling2_dspark.cpp
   inkling2_model.cpp
   inkling2_local_text_model.cpp
   inkling2_tp_model.cpp

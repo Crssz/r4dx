@@ -176,7 +176,11 @@ Inkling2Model Inkling2Model::Load(const Inkling2ModelOptions& opts) {
   m.kv_.resize(static_cast<size_t>(slots));
   m.kv_ckpt_.resize(static_cast<size_t>(slots));
   int64_t conv_total = 0;
+  int64_t conv_hist_total = 0;
+  constexpr int64_t kVerifyMaxT = 8;
   m.conv_off_.assign(static_cast<size_t>(slots * 4), 0);
+  m.conv_hist_off_.assign(static_cast<size_t>(slots * 4), 0);
+  m.conv_ch_.assign(static_cast<size_t>(slots * 4), 0);
   for (int64_t s = 0; s < slots; ++s) {
     const int layer = slot_layer[static_cast<size_t>(s)];
     if (layer < 0) throw std::logic_error("Inkling2Model::Load: cache slot without a visit");
@@ -188,8 +192,12 @@ Inkling2Model Inkling2Model::Load(const Inkling2ModelOptions& opts) {
       m.kv_ckpt_[static_cast<size_t>(s)] = core::DeviceBuffer<uint16_t>(static_cast<size_t>(nblk * block_elems));
     const int64_t C[4] = {kvl * hd, kvl * hd, H, H};
     for (int w = 0; w < 4; ++w) {
-      m.conv_off_[static_cast<size_t>(s * 4 + w)] = conv_total;
+      const size_t idx = static_cast<size_t>(s * 4 + w);
+      m.conv_off_[idx] = conv_total;
+      m.conv_hist_off_[idx] = conv_hist_total;
+      m.conv_ch_[idx] = C[w];
       conv_total += 3 * C[w];
+      conv_hist_total += kVerifyMaxT * C[w];
     }
   }
   m.conv_ = core::DeviceBuffer<float>(static_cast<size_t>(conv_total));
@@ -197,6 +205,15 @@ Inkling2Model Inkling2Model::Load(const Inkling2ModelOptions& opts) {
   if (opts.prompt_checkpoint) {
     m.conv_ckpt_ = core::DeviceBuffer<float>(static_cast<size_t>(conv_total));
     m.conv_ckpt_.Zero();
+  }
+  if (!opts.dspark_path.empty()) {
+    m.dspark_ = std::make_unique<Inkling2DsparkDraft>(Inkling2DsparkDraft::Load(opts.dspark_path, m.max_ctx_));
+    for (int j = 0; j < 4; ++j) m.dspark_taps_[static_cast<size_t>(j)] = core::DeviceBuffer<uint16_t>(static_cast<size_t>(rows * H));
+    m.conv_verify_bak_ = core::DeviceBuffer<float>(static_cast<size_t>(conv_total));
+    m.conv_verify_hist_ = core::DeviceBuffer<float>(static_cast<size_t>(conv_hist_total));
+    m.verify_logits_dev_ = core::DeviceBuffer<float>(static_cast<size_t>(kVerifyMaxT * cfg.HeadRowsLocal()));
+    m.verify_argmax_dev_ = core::DeviceBuffer<int32_t>(static_cast<size_t>(kVerifyMaxT));
+    m.verify_argmax_pair_dev_ = core::DeviceBuffer<int32_t>(static_cast<size_t>(kVerifyMaxT * 2));
   }
 
   m.moe_ids_host_ = core::PinnedBuffer<int32_t>(static_cast<size_t>(rows * cfg.num_experts_per_tok));
@@ -233,6 +250,11 @@ Inkling2Model Inkling2Model::Load(const Inkling2ModelOptions& opts) {
   // The widest visit: the relative bias [T, heads, extent] fp32 (25 MiB at T 256), the MoE gather / slot rows
   // (2 x T * top_k * H bf16 = 19 MiB), the attention inputs and temporaries -- well inside 256 MiB.
   m.arena_.Reserve(256ull * 1024 * 1024);
+  if (m.dspark_) {
+    m.dspark_->InitFoldedLmHead(
+        vl, m.stream_, m.arena_,
+        [&](const uint16_t* h_bf16, int64_t M, uint16_t* out_bf16) { m.Lin(m.container_.LmHead(), h_bf16, out_bf16, M); });
+  }
   m.stream_.Synchronize();
 
   const double gib = 1024.0 * 1024.0 * 1024.0;
@@ -258,6 +280,7 @@ void Inkling2Model::Reset() {
   started_ = false;
   arena_.Reset();
   ckpt_pos_ = -1;
+  if (dspark_) dspark_->Reset();
 }
 
 void Inkling2Model::SaveCheckpoint() {
@@ -269,6 +292,7 @@ void Inkling2Model::SaveCheckpoint() {
     if (kv_ckpt_[s].empty()) continue;
     R4DX_HIP_CHECK(hipMemcpyAsync(kv_ckpt_[s].data(), kv_[s].data(), kv_[s].bytes(), hipMemcpyDeviceToDevice, stream_.get()));
   }
+  if (dspark_) dspark_->SaveCheckpoint(stream_);
   stream_.Synchronize();
   ckpt_pos_ = pos_;
 }
@@ -282,6 +306,7 @@ void Inkling2Model::RestoreCheckpoint() {
     if (kv_ckpt_[s].empty()) continue;
     R4DX_HIP_CHECK(hipMemcpyAsync(kv_[s].data(), kv_ckpt_[s].data(), kv_[s].bytes(), hipMemcpyDeviceToDevice, stream_.get()));
   }
+  if (dspark_) dspark_->RestoreCheckpoint(stream_);
   stream_.Synchronize();
   pos_ = ckpt_pos_;
   started_ = true;
@@ -290,6 +315,10 @@ void Inkling2Model::RestoreCheckpoint() {
 
 float* Inkling2Model::ConvState(int slot, int which) {
   return conv_.data() + conv_off_.at(static_cast<size_t>(slot) * 4 + static_cast<size_t>(which));
+}
+
+float* Inkling2Model::ConvHist(int slot, int which) {
+  return conv_verify_hist_.data() + conv_hist_off_.at(static_cast<size_t>(slot) * 4 + static_cast<size_t>(which));
 }
 
 void Inkling2Model::SetRouterTrace(bool on) {
@@ -326,7 +355,8 @@ void Inkling2Model::MsgGate(const Inkling2MsgGateWeights& g, const float* x, con
 }
 
 void Inkling2Model::Attention(const Inkling2Visit& v, const uint16_t* xq, const uint16_t* xk, const uint16_t* xv,
-                              uint16_t* out, int64_t T, SpanAccumulator* prof, bool use_pos_dev, bool graph_long_ctx) {
+                              uint16_t* out, int64_t T, SpanAccumulator* prof, bool use_pos_dev, bool graph_long_ctx,
+                              bool capture_conv_hist) {
   const Inkling2Config& cfg = container_.Config();
   const Inkling2Config& g = container_.GlobalConfig();
   const Inkling2LayerWeights& w = container_.Layer(v.layer);
@@ -357,8 +387,8 @@ void Inkling2Model::Attention(const Inkling2Visit& v, const uint16_t* xq, const 
     }
   };
   const bool has_concat = !a.qgrkv_wq.empty();
-  const bool concat_all5 = has_concat && T == 1 && xk == xq && xv == xq;
-  const bool concat_qgr = has_concat && T == 1 && !concat_all5;
+  const bool concat_all5 = has_concat && T <= 16 && xk == xq && xv == xq;
+  const bool concat_qgr = has_concat && T <= 16 && !concat_all5;
 
   const int64_t rel_all = g.num_attention_heads * drel;
   uint16_t* qlin = nullptr;
@@ -367,19 +397,38 @@ void Inkling2Model::Attention(const Inkling2Visit& v, const uint16_t* xq, const 
   uint16_t* rlin = nullptr;
   uint16_t* gt = nullptr;
   if (concat_all5) {
-    uint16_t* all = arena_.Alloc<uint16_t>(static_cast<size_t>(a.qgrkv_n), 16);
+    uint16_t* all = arena_.Alloc<uint16_t>(static_cast<size_t>(T * a.qgrkv_n), 16);
     ProfiledCall(prof, sr, "gemm:attn.q", [&] { lin_slice(0, a.qgrkv_n, xq, all); });
-    qlin = all + a.q_row0;
-    gt = all + a.gate_row0;
-    rlin = all + a.rel_row0;
-    klin = all + a.k_row0;
-    vlin = all + a.v_row0;
+    if (T == 1) {
+      qlin = all + a.q_row0;
+      gt = all + a.gate_row0;
+      rlin = all + a.rel_row0;
+      klin = all + a.k_row0;
+      vlin = all + a.v_row0;
+    } else {
+      qlin = arena_.Alloc<uint16_t>(static_cast<size_t>(T * hl * hd), 16);
+      gt = arena_.Alloc<uint16_t>(static_cast<size_t>(T * hl * hd), 16);
+      rlin = arena_.Alloc<uint16_t>(static_cast<size_t>(T * rel_all), 16);
+      klin = arena_.Alloc<uint16_t>(static_cast<size_t>(T * C), 16);
+      vlin = arena_.Alloc<uint16_t>(static_cast<size_t>(T * C), 16);
+      r4dx_inkling2_qgrkv_split_bf16(P(all), a.qgrkv_n, P(qlin), a.q_row0, hl * hd, P(gt), a.gate_row0, hl * hd,
+                                     P(rlin), a.rel_row0, rel_all, P(klin), a.k_row0, C, P(vlin), a.v_row0, C,
+                                     static_cast<int>(T), s);
+    }
   } else if (concat_qgr) {
-    uint16_t* qgr = arena_.Alloc<uint16_t>(static_cast<size_t>(a.qgr_n), 16);
+    uint16_t* qgr = arena_.Alloc<uint16_t>(static_cast<size_t>(T * a.qgr_n), 16);
     ProfiledCall(prof, sr, "gemm:attn.q", [&] { lin_slice(0, a.qgr_n, xq, qgr); });
-    qlin = qgr + a.q_row0;
-    gt = qgr + a.gate_row0;
-    rlin = qgr + a.rel_row0;
+    if (T == 1) {
+      qlin = qgr + a.q_row0;
+      gt = qgr + a.gate_row0;
+      rlin = qgr + a.rel_row0;
+    } else {
+      qlin = arena_.Alloc<uint16_t>(static_cast<size_t>(T * hl * hd), 16);
+      gt = arena_.Alloc<uint16_t>(static_cast<size_t>(T * hl * hd), 16);
+      rlin = arena_.Alloc<uint16_t>(static_cast<size_t>(T * rel_all), 16);
+      r4dx_inkling2_qgrkv_split_bf16(P(qgr), a.qgr_n, P(qlin), a.q_row0, hl * hd, P(gt), a.gate_row0, hl * hd, P(rlin),
+                                     a.rel_row0, rel_all, 0, 0, 0, 0, 0, 0, static_cast<int>(T), s);
+    }
     klin = arena_.Alloc<uint16_t>(static_cast<size_t>(T * C), 16);
     vlin = arena_.Alloc<uint16_t>(static_cast<size_t>(T * C), 16);
     ProfiledCall(prof, sr, "gemm:attn.kv", [&] {
@@ -422,6 +471,8 @@ void Inkling2Model::Attention(const Inkling2Visit& v, const uint16_t* xq, const 
   float* kc = arena_.Alloc<float>(static_cast<size_t>(T * C), 16);
   float* vc = arena_.Alloc<float>(static_cast<size_t>(T * C), 16);
   ProfiledCall(prof, sr, "attn.kv_conv", [&] {
+    const int64_t khist = capture_conv_hist ? P(ConvHist(slot, 0)) : 0;
+    const int64_t vhist = capture_conv_hist ? P(ConvHist(slot, 1)) : 0;
     if (full) {
       float* dk = arena_.Alloc<float>(static_cast<size_t>(T * kvl * 4), 16);
       float* dv = arena_.Alloc<float>(static_cast<size_t>(T * kvl * 4), 16);
@@ -429,15 +480,17 @@ void Inkling2Model::Attention(const Inkling2Visit& v, const uint16_t* xq, const 
                                static_cast<int>(kvl * 4), static_cast<int>(H), s);
       r4dx_inkling2_dense_bf16(P(xv), H, P(a.v_conv_proj.data()), P(dv), 0, kvl * 4, static_cast<int>(T),
                                static_cast<int>(kvl * 4), static_cast<int>(H), s);
-      r4dx_inkling2_sconv_dynamic_f32(P(klin), 1, P(dk), 0, P(a.k_conv_static.data()), P(ConvState(slot, 0)), P(kc),
-                                      static_cast<int>(T), static_cast<int>(C), static_cast<int>(kvl), s);
-      r4dx_inkling2_sconv_dynamic_f32(P(vlin), 1, P(dv), 0, P(a.v_conv_static.data()), P(ConvState(slot, 1)), P(vc),
-                                      static_cast<int>(T), static_cast<int>(C), static_cast<int>(kvl), s);
+      r4dx_inkling2_sconv_dynamic_hist_f32(P(klin), 1, P(dk), 0, P(a.k_conv_static.data()), P(ConvState(slot, 0)),
+                                           P(kc), khist, static_cast<int>(T), static_cast<int>(C),
+                                           static_cast<int>(kvl), s);
+      r4dx_inkling2_sconv_dynamic_hist_f32(P(vlin), 1, P(dv), 0, P(a.v_conv_static.data()), P(ConvState(slot, 1)),
+                                           P(vc), vhist, static_cast<int>(T), static_cast<int>(C),
+                                           static_cast<int>(kvl), s);
     } else {
-      r4dx_inkling2_sconv_static_f32(P(klin), 1, P(a.k_conv.data()), P(ConvState(slot, 0)), 0, P(kc), static_cast<int>(T),
-                                     static_cast<int>(C), s);
-      r4dx_inkling2_sconv_static_f32(P(vlin), 1, P(a.v_conv.data()), P(ConvState(slot, 1)), 0, P(vc), static_cast<int>(T),
-                                     static_cast<int>(C), s);
+      r4dx_inkling2_sconv_static_hist_f32(P(klin), 1, P(a.k_conv.data()), P(ConvState(slot, 0)), 0, P(kc), khist,
+                                          static_cast<int>(T), static_cast<int>(C), s);
+      r4dx_inkling2_sconv_static_hist_f32(P(vlin), 1, P(a.v_conv.data()), P(ConvState(slot, 1)), 0, P(vc), vhist,
+                                          static_cast<int>(T), static_cast<int>(C), s);
     }
     R4dxInkling2HeadOut paged{};
     paged.kind = 1;
@@ -487,7 +540,8 @@ void Inkling2Model::Attention(const Inkling2Visit& v, const uint16_t* xq, const 
   ProfiledCall(prof, sr, "attn.core", [&] {
     if (use_fused_attn) {
       constexpr int kMaxSplits = 32;
-      float* attn_ws = (T == 1) ? arena_.Alloc<float>(static_cast<size_t>(hl * kMaxSplits * (hd + 2)), 16) : nullptr;
+      float* attn_ws =
+          (T <= 16) ? arena_.Alloc<float>(static_cast<size_t>(T * hl * kMaxSplits * (hd + 2)), 16) : nullptr;
       R4dxInkling2AttnFusedArgs af{};
       af.q = P(q);
       af.kv = P(kv);
@@ -693,7 +747,7 @@ void Inkling2Model::Moe(int64_t layer, const uint16_t* x, uint16_t* out, int64_t
 // ---- one visit ------------------------------------------------------------------------------------------------------
 
 void Inkling2Model::RunVisit(const Inkling2Visit& v, Chunk& c, int64_t T, SpanAccumulator* prof, bool use_pos_dev,
-                             bool graph_long_ctx) {
+                             bool graph_long_ctx, bool capture_conv_hist) {
   const Inkling2Config& cfg = container_.Config();
   const Inkling2LayerWeights& w = container_.Layer(v.layer);
   const hipStream_t sr = stream_.get();
@@ -760,19 +814,21 @@ void Inkling2Model::RunVisit(const Inkling2Visit& v, Chunk& c, int64_t T, SpanAc
   });
 
   uint16_t* o = arena_.Alloc<uint16_t>(n, 16);
-  Attention(v, xq, xk, xv, o, T, prof, use_pos_dev, graph_long_ctx);
+  Attention(v, xq, xk, xv, o, T, prof, use_pos_dev, graph_long_ctx, capture_conv_hist);
 
   // post-attention convolution; a block boundary keeps the incoming partial as a block
   ProfiledCall(prof, sr, "conv.post_attn", [&] {
+    const int64_t hist2 = capture_conv_hist ? P(ConvHist(v.cache_slot, 2)) : 0;
     if (cfg.IsBoundary(v.layer)) {
       c.B.push_back(c.h);
       const int hn = c.Acquire();
-      r4dx_inkling2_sconv_static_f32(P(o), 1, P(w.attn_conv.data()), P(ConvState(v.cache_slot, 2)), 0,
-                                     P(pool_[static_cast<size_t>(hn)].data()), static_cast<int>(T), static_cast<int>(H), s);
+      r4dx_inkling2_sconv_static_hist_f32(P(o), 1, P(w.attn_conv.data()), P(ConvState(v.cache_slot, 2)), 0,
+                                          P(pool_[static_cast<size_t>(hn)].data()), hist2, static_cast<int>(T),
+                                          static_cast<int>(H), s);
       c.h = hn;
     } else {
-      r4dx_inkling2_sconv_static_f32(P(o), 1, P(w.attn_conv.data()), P(ConvState(v.cache_slot, 2)), P(h), P(h),
-                                     static_cast<int>(T), static_cast<int>(H), s);
+      r4dx_inkling2_sconv_static_hist_f32(P(o), 1, P(w.attn_conv.data()), P(ConvState(v.cache_slot, 2)), P(h), P(h),
+                                          hist2, static_cast<int>(T), static_cast<int>(H), s);
     }
   });
   h = pool_[static_cast<size_t>(c.h)].data();
@@ -794,8 +850,9 @@ void Inkling2Model::RunVisit(const Inkling2Visit& v, Chunk& c, int64_t T, SpanAc
   uint16_t* f = arena_.Alloc<uint16_t>(n, 16);
   Moe(v.layer, xm, f, T, v.index, prof);
   ProfiledCall(prof, sr, "conv.post_mlp", [&] {
-    r4dx_inkling2_sconv_static_f32(P(f), 1, P(w.mlp_conv.data()), P(ConvState(v.cache_slot, 3)), P(h), P(h),
-                                   static_cast<int>(T), static_cast<int>(H), s);
+    const int64_t hist3 = capture_conv_hist ? P(ConvHist(v.cache_slot, 3)) : 0;
+    r4dx_inkling2_sconv_static_hist_f32(P(f), 1, P(w.mlp_conv.data()), P(ConvState(v.cache_slot, 3)), P(h), P(h),
+                                        hist3, static_cast<int>(T), static_cast<int>(H), s);
   });
   arena_.Rewind(mark);
 }
@@ -831,7 +888,8 @@ void Inkling2Model::Head(const float* h_row, const std::vector<const float*>& bl
 }
 
 std::vector<float> Inkling2Model::RunChunk(const std::vector<int32_t>& token_ids, bool want_logits, int32_t* greedy_out,
-                                           const SummaryRequest* summary, SpanAccumulator* prof) {
+                                           const SummaryRequest* summary, SpanAccumulator* prof,
+                                           bool verify_conv_hist, std::vector<int32_t>* verify_greedy_out) {
   const int64_t T = static_cast<int64_t>(token_ids.size());
   if (T < 1 || T > max_chunk_)
     throw std::runtime_error("Inkling2Model::RunChunk: token_ids.size() must be in [1, " + std::to_string(max_chunk_) + "]");
@@ -849,6 +907,8 @@ std::vector<float> Inkling2Model::RunChunk(const std::vector<int32_t>& token_ids
   }
   std::copy(token_ids.begin(), token_ids.end(), ids_host_.data());
   ids_dev_.CopyFromHostAsync(ids_host_.data(), static_cast<size_t>(T), stream_);
+
+  const bool capture_taps = (dspark_ != nullptr);
 
   auto run_body = [&](bool use_pos_dev, bool graph_long_ctx) {
     arena_.Reset();
@@ -880,7 +940,17 @@ std::vector<float> Inkling2Model::RunChunk(const std::vector<int32_t>& token_ids
         c.prev_h = -1;
         c.prev_B.clear();
       }
-      RunVisit(v, c, T, prof, use_pos_dev, graph_long_ctx);
+      if (capture_taps) {
+        int tap_idx = -1;
+        if (v.index == 5) tap_idx = 0;
+        else if (v.index == 23) tap_idx = 1;
+        else if (v.index == 41) tap_idx = 2;
+        if (tap_idx >= 0) {
+          r4dx_f32_to_bf16(P(pool_[static_cast<size_t>(c.h)].data()),
+                           P(dspark_taps_[static_cast<size_t>(tap_idx)].data()), T * H, s);
+        }
+      }
+      RunVisit(v, c, T, prof, use_pos_dev, graph_long_ctx, verify_conv_hist);
       if (v.phase == Inkling2Visit::Phase::kPre && v.layer == cfg.loop_start - 1) {
         c.h_pre = c.h;
         c.B_pre = c.B;
@@ -889,7 +959,31 @@ std::vector<float> Inkling2Model::RunChunk(const std::vector<int32_t>& token_ids
     }
     arena_.Rewind(base_mark);
 
-    if (want_logits) {
+    if (capture_taps) {
+      float* fr_all = arena_.Alloc<float>(static_cast<size_t>(T * H), 16);
+      std::vector<int64_t> st;
+      for (int b : c.B) st.push_back(P(pool_[static_cast<size_t>(b)].data()));
+      st.push_back(P(pool_[static_cast<size_t>(c.h)].data()));
+      r4dx_inkling2_attnres_f32(st.data(), static_cast<int>(st.size()), P(container_.FinalQuery().data()), 1, P(fr_all),
+                                static_cast<int>(T), static_cast<int>(H), static_cast<float>(cfg.rms_norm_eps), s);
+      r4dx_rmsnorm_plain_f32in_bf16(P(fr_all), P(container_.FinalNorm().data()), P(dspark_taps_[3].data()), T, H,
+                                    static_cast<float>(cfg.rms_norm_eps), s);
+    }
+
+    if (verify_greedy_out != nullptr) {
+      const int64_t vl = cfg.HeadRowsLocal();
+      uint16_t* lg = arena_.Alloc<uint16_t>(static_cast<size_t>(T * vl), 16);
+      Lin(container_.LmHead(), dspark_taps_[3].data(), lg, T);
+      r4dx_inkling2_logit_softcap_f32(P(lg), 1, vl, P(verify_logits_dev_.data()), vl, static_cast<int>(T),
+                                      static_cast<int>(vl), static_cast<float>(cfg.final_logit_softcap), s);
+      if (vocab_local_valid_ < vl) {
+        for (int64_t r = 0; r < T; ++r) {
+          R4DX_HIP_CHECK(hipMemsetD32Async(
+              reinterpret_cast<hipDeviceptr_t>(verify_logits_dev_.data() + r * vl + vocab_local_valid_),
+              static_cast<int>(kNegInfBits), static_cast<size_t>(vl - vocab_local_valid_), sr));
+        }
+      }
+    } else if (want_logits) {
       std::vector<const float*> blocks;
       for (int b : c.B) blocks.push_back(pool_[static_cast<size_t>(b)].data() + (T - 1) * H);
       Head(pool_[static_cast<size_t>(c.h)].data() + (T - 1) * H, blocks, prof);
@@ -898,7 +992,10 @@ std::vector<float> Inkling2Model::RunChunk(const std::vector<int32_t>& token_ids
   };
 
   const bool try_graph = T == 1 && want_logits && prof == nullptr && !trace_.enabled && decode_graph_eligible_ &&
-                         !decode_graph_disabled_;
+                         !decode_graph_disabled_ && verify_greedy_out == nullptr && !dspark_;
+  const bool try_verify_graph = T > 1 && T <= 8 && verify_greedy_out != nullptr && prof == nullptr && !trace_.enabled &&
+                                decode_graph_eligible_ && !decode_graph_disabled_ && MoeGroupedPrefillEnabled() &&
+                                !MoeCheckOffsetsEnabled();
   bool launched_graph = false;
   if (try_graph) {
     if (decode_steps_seen_ >= 1) {
@@ -923,11 +1020,41 @@ std::vector<float> Inkling2Model::RunChunk(const std::vector<int32_t>& token_ids
       }
     }
     ++decode_steps_seen_;
+  } else if (try_verify_graph) {
+    pos_host_.data()[0] = static_cast<int32_t>(pos_);
+    pos_dev_.CopyFromHostAsync(pos_host_.data(), 1, stream_);
+    if (!verify_graph_ || verify_graph_T_ != T) {
+      verify_graph_.reset();
+      hipGraphExec_t exec = nullptr;
+      if (CaptureDecodeGraph(sr, &exec, [&] {
+            run_body(/*use_pos_dev=*/true, /*graph_long_ctx=*/true);
+          })) {
+        verify_graph_.reset(exec);
+        verify_graph_T_ = T;
+      } else {
+        decode_graph_disabled_ = true;
+        std::cerr << "[r4dx::model::Inkling2Model] HIP verify graph capture failed; falling back to eager verify\n";
+      }
+    }
+    if (verify_graph_) {
+      R4DX_HIP_CHECK(hipGraphLaunch(static_cast<hipGraphExec_t>(verify_graph_.get()), sr));
+      launched_graph = true;
+    }
   }
   if (!launched_graph) {
     run_body(/*use_pos_dev=*/false, /*graph_long_ctx=*/true);
   }
-  if (want_logits) {
+  if (verify_greedy_out != nullptr) {
+    const int64_t vl = cfg.HeadRowsLocal();
+    if (comm_ != nullptr) {
+      r4dx_argmax_rows_f32(P(verify_logits_dev_.data()), vl, P(verify_argmax_pair_dev_.data()),
+                           P(verify_argmax_pair_dev_.data() + 1), 2, T, vl, s);
+    } else {
+      r4dx_argmax_rows_f32(P(verify_logits_dev_.data()), vl, P(verify_argmax_dev_.data()), 0, 1, T,
+                           vocab_local_valid_, s);
+    }
+  }
+  if (want_logits && verify_greedy_out == nullptr) {
     const int64_t vl = cfg.HeadRowsLocal();
     if (greedy_out != nullptr && comm_ != nullptr) {
       r4dx_argmax_val_f32(P(logits_dev_.data()), P(argmax_pair_dev_.data()), P(argmax_pair_dev_.data() + 1), vl, s);
@@ -939,7 +1066,22 @@ std::vector<float> Inkling2Model::RunChunk(const std::vector<int32_t>& token_ids
                            summary->inv_temperature, s, comm_ != nullptr ? P(topk_lse_ws_.data()) : 0);
     }
   }
+  if (capture_taps && verify_greedy_out == nullptr) {
+    dspark_->InjectTaps(dspark_taps_[0].data(), dspark_taps_[1].data(), dspark_taps_[2].data(), dspark_taps_[3].data(),
+                        T, pos_, stream_, arena_);
+  }
   if (prof == nullptr) stream_.Synchronize();
+
+  if (verify_greedy_out != nullptr) {
+    verify_greedy_out->resize(static_cast<size_t>(T));
+    if (comm_ != nullptr) {
+      for (int64_t r = 0; r < T; ++r) {
+        (*verify_greedy_out)[static_cast<size_t>(r)] = MergeGreedyPairAt(verify_argmax_pair_dev_.data() + r * 2);
+      }
+    } else {
+      verify_argmax_dev_.CopyToHost(verify_greedy_out->data(), static_cast<size_t>(T));
+    }
+  }
 
   std::vector<float> logits;
   if (want_logits && prof == nullptr) {
@@ -1038,14 +1180,155 @@ void Inkling2Model::RequireNotTp(const char* what) const {
   if (comm_ != nullptr) throw core::TpUnsupportedError(std::string("Inkling2Model::") + what + ": not supported under TP");
 }
 
-int32_t Inkling2Model::MergeGreedyPair() {
+int32_t Inkling2Model::MergeGreedyPairAt(const int32_t* dev_pair) {
   tp::ArgmaxPair mine{};
   static_assert(sizeof(tp::ArgmaxPair) == 2 * sizeof(int32_t), "{idx, value} pair is two 32-bit words");
-  R4DX_HIP_CHECK(hipMemcpy(&mine, argmax_pair_dev_.data(), sizeof(mine), hipMemcpyDeviceToHost));
+  R4DX_HIP_CHECK(hipMemcpy(&mine, dev_pair, sizeof(mine), hipMemcpyDeviceToHost));
   mine.idx += static_cast<int32_t>(container_.Config().HeadRowBegin());
   std::array<tp::ArgmaxPair, 2> all{};
   comm_->HostAllGather(&mine, sizeof(mine), all.data());
   return tp::MergeArgmax(all.data(), comm_->World());
+}
+
+int32_t Inkling2Model::MergeGreedyPair() { return MergeGreedyPairAt(argmax_pair_dev_.data()); }
+
+int32_t Inkling2Model::LmHeadArgmaxFromBf16(const uint16_t* h_bf16) {
+  const Inkling2Config& cfg = container_.Config();
+  const hipStream_t sr = stream_.get();
+  const int64_t s = P(sr);
+  const int64_t vl = cfg.HeadRowsLocal();
+  const size_t mark = arena_.Mark();
+  uint16_t* lg = arena_.Alloc<uint16_t>(static_cast<size_t>(vl), 16);
+  Lin(container_.LmHead(), h_bf16, lg, 1);
+  r4dx_inkling2_logit_softcap_f32(P(lg), 1, vl, P(logits_dev_.data()), vl, 1, static_cast<int>(vl),
+                                  static_cast<float>(cfg.final_logit_softcap), s);
+  if (vocab_local_valid_ < vl) {
+    R4DX_HIP_CHECK(hipMemsetD32Async(reinterpret_cast<hipDeviceptr_t>(logits_dev_.data() + vocab_local_valid_),
+                                     static_cast<int>(kNegInfBits), static_cast<size_t>(vl - vocab_local_valid_), sr));
+  }
+  if (comm_ != nullptr) {
+    r4dx_argmax_val_f32(P(logits_dev_.data()), P(argmax_pair_dev_.data()), P(argmax_pair_dev_.data() + 1), vl, s);
+  } else {
+    r4dx_argmax_f32(P(logits_dev_.data()), P(argmax_dev_.data()), vocab_local_valid_, s);
+  }
+  arena_.Rewind(mark);
+  stream_.Synchronize();
+  if (comm_ != nullptr) return MergeGreedyPair();
+  int32_t tok = -1;
+  argmax_dev_.CopyToHost(&tok, 1);
+  return tok;
+}
+
+int32_t Inkling2Model::DsparkLogitsArgmax(const uint16_t* base_bf16, const uint16_t* delta_bf16,
+                                          const uint16_t* bias_bf16) {
+  const Inkling2Config& cfg = container_.Config();
+  const hipStream_t sr = stream_.get();
+  const int64_t s = P(sr);
+  const int64_t vl = cfg.HeadRowsLocal();
+  r4dx_inkling2_dspark_add_softcap_f32(P(base_bf16), P(delta_bf16), P(bias_bf16), P(logits_dev_.data()), vl,
+                                       static_cast<float>(cfg.final_logit_softcap), s);
+  if (vocab_local_valid_ < vl) {
+    R4DX_HIP_CHECK(hipMemsetD32Async(reinterpret_cast<hipDeviceptr_t>(logits_dev_.data() + vocab_local_valid_),
+                                     static_cast<int>(kNegInfBits), static_cast<size_t>(vl - vocab_local_valid_), sr));
+  }
+  if (comm_ != nullptr) {
+    r4dx_argmax_val_f32(P(logits_dev_.data()), P(argmax_pair_dev_.data()), P(argmax_pair_dev_.data() + 1), vl, s);
+  } else {
+    r4dx_argmax_f32(P(logits_dev_.data()), P(argmax_dev_.data()), vocab_local_valid_, s);
+  }
+  stream_.Synchronize();
+  if (comm_ != nullptr) return MergeGreedyPair();
+  int32_t tok = -1;
+  argmax_dev_.CopyToHost(&tok, 1);
+  return tok;
+}
+
+std::vector<int32_t> Inkling2Model::DecodeStepDflashGreedy(int32_t token_id, int64_t draft_k, int64_t* walk_len_out) {
+  if (!dspark_) throw std::runtime_error("Inkling2Model::DecodeStepDflashGreedy: no DSpark drafter loaded");
+  const Inkling2Config& cfg = container_.Config();
+  const hipStream_t sr = stream_.get();
+  const int64_t s = P(sr);
+  const int64_t H = cfg.hidden_size;
+  int64_t k = (draft_k > 0) ? std::min<int64_t>(draft_k, dspark_->NumSpecTokens()) : dspark_->NumSpecTokens();
+  k = std::min<int64_t>(k, max_ctx_ - pos_ - 1);
+  if (k <= 0) {
+    if (walk_len_out != nullptr) *walk_len_out = 0;
+    return {DecodeStepGreedy(token_id)};
+  }
+
+  // 1. Draft k speculative tokens using DSpark.
+  const auto embed_anchor = [&](int32_t id, uint16_t* out_bf16) {
+    ids_host_.data()[0] = id;
+    ids_dev_.CopyFromHostAsync(ids_host_.data(), 1, stream_);
+    const size_t emark = arena_.Mark();
+    uint16_t* e = arena_.Alloc<uint16_t>(static_cast<size_t>(H), 16);
+    r4dx_embedding_gather_bf16(P(container_.EmbedTokens().data()), P(ids_dev_.data()), P(e), 1, H, cfg.vocab_size, s);
+    r4dx_rmsnorm_plain_bf16(P(e), P(container_.EmbedNorm().data()), P(out_bf16), 1, H,
+                            static_cast<float>(cfg.rms_norm_eps), /*out_fp32=*/0, s);
+    arena_.Rewind(emark);
+  };
+  const auto lm_argmax = [&](const uint16_t* h_bf16) { return LmHeadArgmaxFromBf16(h_bf16); };
+  const auto lm_batch = [&](const uint16_t* h_bf16, int64_t M, uint16_t* out_bf16) {
+    Lin(container_.LmHead(), h_bf16, out_bf16, M);
+  };
+  const auto lg_argmax = [&](const uint16_t* base_bf16, const uint16_t* delta_bf16, const uint16_t* bias_bf16) {
+    return DsparkLogitsArgmax(base_bf16, delta_bf16, bias_bf16);
+  };
+  std::vector<int32_t> drafted =
+      dspark_->DraftGreedy(token_id, pos_, k, stream_, arena_, embed_anchor, lm_argmax, lm_batch, lg_argmax);
+
+  // 2. Snapshot short-conv states before running the [token_id, d_0..d_{k-1}] verify window.
+  R4DX_HIP_CHECK(hipMemcpyAsync(conv_verify_bak_.data(), conv_.data(), conv_.bytes(), hipMemcpyDeviceToDevice, sr));
+  std::vector<int32_t> window;
+  window.reserve(static_cast<size_t>(1 + k));
+  window.push_back(token_id);
+  window.insert(window.end(), drafted.begin(), drafted.end());
+
+  const int64_t pos_before = pos_;
+  std::vector<int32_t> tgt;
+  (void)RunChunk(window, /*want_logits=*/false, nullptr, nullptr, nullptr, /*verify_conv_hist=*/true, &tgt);
+
+  // 3. Accept prefix + bonus token.
+  std::vector<int32_t> out;
+  out.reserve(static_cast<size_t>(1 + k));
+  out.push_back(tgt[0]);
+  int64_t n_keep = 1;
+  for (int64_t i = 0; i < k; ++i) {
+    if (tgt[static_cast<size_t>(i)] == drafted[static_cast<size_t>(i)]) {
+      out.push_back(tgt[static_cast<size_t>(i + 1)]);
+      ++n_keep;
+    } else {
+      break;
+    }
+  }
+
+  // 4. Exact short-conv rollback if fewer than all 1 + k tokens were kept.
+  if (n_keep < 1 + k) {
+    const int64_t n_convs = static_cast<int64_t>(conv_off_.size());
+    for (int64_t ci = 0; ci < n_convs; ++ci) {
+      const int64_t off = conv_off_[static_cast<size_t>(ci)];
+      const int64_t hoff = conv_hist_off_[static_cast<size_t>(ci)];
+      const int64_t C = conv_ch_[static_cast<size_t>(ci)];
+      r4dx_inkling2_sconv_rollback_f32(P(conv_verify_bak_.data() + off), P(conv_verify_hist_.data() + hoff),
+                                       P(conv_.data() + off), static_cast<int>(n_keep), static_cast<int>(C), s);
+    }
+    pos_ = pos_before + n_keep;
+  }
+
+  // 5. Inject the n_keep committed taps into the DSpark context KV cache.
+  dspark_->InjectTaps(dspark_taps_[0].data(), dspark_taps_[1].data(), dspark_taps_[2].data(), dspark_taps_[3].data(),
+                      n_keep, pos_before, stream_, arena_);
+  stream_.Synchronize();
+  if (walk_len_out != nullptr) *walk_len_out = k;
+  return out;
+}
+
+std::vector<int32_t> Inkling2Model::DecodeStepDflashSampled(int32_t token_id, int64_t draft_k,
+                                                            const kernels::SampleParams& params, std::mt19937_64& rng,
+                                                            int64_t* walk_len_out) {
+  if (params.temperature <= 0.0f) return DecodeStepDflashGreedy(token_id, draft_k, walk_len_out);
+  if (walk_len_out != nullptr) *walk_len_out = 0;
+  return {DecodeStepSampled(token_id, params, rng)};
 }
 
 void Inkling2Model::MergeSummary(kernels::RowSummary* out) {

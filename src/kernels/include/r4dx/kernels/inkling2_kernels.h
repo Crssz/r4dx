@@ -170,8 +170,65 @@ struct R4dxInkling2AttnFusedArgs {
   float scale;          // head_dim^-0.5
   int64_t kv_block_stride;
   int64_t kv_head_stride;
-  int64_t pos_dev;      // optional device int32* holding qpos (q_len == 1 only; 0 = use host ctx - 1)
+  int64_t pos_dev;      // optional device int32* holding pos0 (0 = use host ctx - q_len)
 };
 int r4dx_inkling2_attn_fused_bf16kv(const R4dxInkling2AttnFusedArgs* a, int64_t stream);
+
+// ---- Inkling2 DSpark / MTP drafter kernels (mtp.safetensors) -------------------------------------------------------
+// Mix 4 target tap buffers (each [T, H] bf16 contiguous) with softmax weights (a0..a3) and apply plain RMSNorm with weight [H] bf16.
+void r4dx_inkling2_dspark_mix_rmsnorm_bf16(int64_t tap0, int64_t tap1, int64_t tap2, int64_t tap3,
+                                           float a0, float a1, float a2, float a3, int64_t weight,
+                                           int64_t out, int T, int H, float eps, int64_t stream);
+
+// In-place per-head optional plain RMSNorm (weight != 0, rounded to bf16) + Neox RoPE (theta, positions pos0..pos0+T-1)
+// on x [T, heads, head_dim] bf16 with row stride x_row_stride.
+void r4dx_inkling2_dspark_head_norm_rope_bf16(int64_t x, int64_t x_row_stride, int64_t weight, int T, int heads,
+                                              int head_dim, int64_t pos0, float rope_theta, float eps, int64_t stream);
+
+// Recurrent Markov gate (rank R <= 512): raw [3 * R] bf16 + optional bias [3 * R] bf16 -> state_out [R] bf16, latent_out [R] bf16.
+void r4dx_inkling2_dspark_markov_gate_bf16(int64_t raw, int64_t bias, int64_t state_in, int64_t state_out,
+                                           int64_t latent_out, int R, int64_t stream);
+
+// out[i] = softcap * tanh((base[i] + delta[i] + bias[i]) / softcap) -> fp32 [N] (base, delta, bias bf16; delta/bias may be 0).
+void r4dx_inkling2_dspark_add_softcap_f32(int64_t base, int64_t delta, int64_t bias, int64_t out, int64_t n,
+                                          float softcap, int64_t stream);
+
+// Transpose [rows, cols] bf16 -> [cols, rows] bf16.
+void r4dx_inkling2_dspark_transpose_bf16(int64_t in, int64_t out, int64_t rows, int64_t cols, int64_t stream);
+
+// Bidirectional block attention for DSpark draft (head_dim == 128, 1 <= T <= 16, GQA <= 8):
+// Context KV store is [slots, kv_heads, 128] bf16 (indexed at p % slots for p in [k_begin .. n_injected - 1],
+// where k_begin = window > 0 ? max(0, n_injected - window) : 0), plus all T block keys/values [T, kv_heads, 128] bf16.
+void r4dx_inkling2_dspark_attn_bf16(int64_t q, int64_t k_block, int64_t v_block, int64_t k_store, int64_t v_store,
+                                    int64_t out, int T, int q_heads, int kv_heads, int head_dim, int n_injected,
+                                    int window, int slots, float scale, int64_t stream);
+
+// Write n rows of [n, kv_heads, head_dim] bf16 K/V into ring store [slots, kv_heads, head_dim] at positions pos0..pos0+n-1.
+void r4dx_inkling2_dspark_kv_write_bf16(int64_t k_in, int64_t v_in, int64_t k_store, int64_t v_store, int n,
+                                        int kv_heads, int head_dim, int64_t pos0, int slots, int64_t stream);
+
+// Exact short-conv rollback helpers for speculative verification (VerifyWindow):
+// sconv_*_hist_f32 fuses capturing x [T, C] into hist [T, C] fp32 inside the short-conv kernel (hist == 0 disables).
+// capture_x copies x [T, C] (bf16 or fp32) into hist [T, C] fp32; rollback sets state_out [3, C] to the last 3 rows
+// of [state_bak[0..2], hist[0..n_keep-1]] for 0 <= n_keep <= T.
+void r4dx_inkling2_sconv_static_hist_f32(int64_t x, int x_bf16, int64_t weight, int64_t state, int64_t residual,
+                                         int64_t out, int64_t hist, int T, int C, int64_t stream);
+void r4dx_inkling2_sconv_dynamic_hist_f32(int64_t x, int x_bf16, int64_t dyn, int dyn_bf16, int64_t static_w,
+                                          int64_t state, int64_t out, int64_t hist, int T, int C, int heads,
+                                          int64_t stream);
+void r4dx_inkling2_sconv_capture_x_f32(int64_t x, int x_bf16, int64_t hist, int T, int C, int64_t stream);
+void r4dx_inkling2_sconv_rollback_f32(int64_t state_bak, int64_t hist, int64_t state_out, int n_keep, int C,
+                                      int64_t stream);
+
+// Split concatenated [T, total_n] bf16 Q/gate/rel/(optional K/V) rows into contiguous [T, slice_n] outputs.
+void r4dx_inkling2_qgrkv_split_bf16(int64_t src, int64_t total_n, int64_t q_out, int64_t q_off, int64_t q_n,
+                                    int64_t g_out, int64_t g_off, int64_t g_n, int64_t r_out, int64_t r_off,
+                                    int64_t r_n, int64_t k_out, int64_t k_off, int64_t k_n, int64_t v_out,
+                                    int64_t v_off, int64_t v_n, int T, int64_t stream);
+
+// Add bias [N] bf16 to x [N] bf16 -> out [N] bf16 (or fp32->bf16): out[i] = bf16(f32(x[i]) + f32(b[i])).
+void r4dx_inkling2_add_bf16(int64_t a, int64_t b, int64_t out, int64_t n, int64_t stream);
+// out[i] = a[i] + f32(b[i]) (a fp32, b bf16, out fp32), n elements.
+void r4dx_inkling2_add_f32_bf16(int64_t a, int64_t b, int64_t out, int64_t n, int64_t stream);
 
 }  // extern "C"

@@ -537,21 +537,164 @@ void TestFusedAttention() {
     const std::vector<float> fus_host = HostBf16(o_fus, static_cast<size_t>(c.q_len * qh * d));
     Check(rc == 0 && Bf16Close(fus_host, HostBf16(o_ref, static_cast<size_t>(c.q_len * qh * d)), 2),
           tag + ": matches ref kernel within 2 bf16 ULP");
-    if (c.q_len == 1) {
-      DeviceBuffer<int32_t> pos_d = Dev(std::vector<int32_t>{c.ctx - 1});
-      DeviceBuffer<uint16_t> o_pd(static_cast<size_t>(qh * d));
+    if (c.q_len == 1 || c.q_len <= 8) {
+      DeviceBuffer<int32_t> pos_d = Dev(std::vector<int32_t>{c.ctx - c.q_len});
+      DeviceBuffer<uint16_t> o_pd(static_cast<size_t>(c.q_len * qh * d));
+      DeviceBuffer<float> ws_q(static_cast<size_t>(c.q_len * qh * 32 * (d + 2)));
       R4dxInkling2AttnFusedArgs ap = af;
       ap.out = P(o_pd.data());
+      ap.workspace = P(ws_q.data());
       ap.ctx = 0;
       ap.pos_dev = P(pos_d.data());
       const int rcp = r4dx_inkling2_attn_fused_bf16kv(&ap, 0);
-      Check(rcp == 0 && HostBf16(o_pd, static_cast<size_t>(qh * d)) == fus_host,
+      Check(rcp == 0 && HostBf16(o_pd, static_cast<size_t>(c.q_len * qh * d)) == fus_host,
             tag + ": pos_dev mode is bit-identical to host ctx");
     }
   }
   R4dxInkling2AttnFusedArgs bad{};
   Check(r4dx_inkling2_attn_fused_bf16kv(nullptr, 0) < 0, "fused_attn: null args refused");
   Check(r4dx_inkling2_attn_fused_bf16kv(&bad, 0) < 0, "fused_attn: zero shapes refused");
+}
+
+// ---- DSpark / MTP drafter kernels + short-conv rollback + qgrkv_split ----------------------------------------------
+void TestDsparkKernels() {
+  const float eps = 1e-6f;
+  // 1. mix_rmsnorm_bf16
+  {
+    const int T = 4, H = 512;
+    const std::vector<float> t0 = RoundBf16(Rand(T * H)), t1 = RoundBf16(Rand(T * H)), t2 = RoundBf16(Rand(T * H)),
+                             t3 = RoundBf16(Rand(T * H)), w = RoundBf16(Rand(H, 1.0f));
+    const float a0 = 0.1f, a1 = 0.2f, a2 = 0.3f, a3 = 0.4f;
+    std::vector<float> want(T * H);
+    for (int t = 0; t < T; ++t) {
+      double ss = 0.0;
+      std::vector<float> m(H);
+      for (int h = 0; h < H; ++h) {
+        const size_t i = static_cast<size_t>(t * H + h);
+        m[h] = a0 * t0[i] + a1 * t1[i] + a2 * t2[i] + a3 * t3[i];
+        ss += static_cast<double>(m[h]) * m[h];
+      }
+      const float inv = 1.0f / std::sqrt(static_cast<float>(ss / H) + eps);
+      for (int h = 0; h < H; ++h) want[static_cast<size_t>(t * H + h)] = m[h] * inv * w[h];
+    }
+    DeviceBuffer<uint16_t> d0 = Dev(ToBf16(t0)), d1 = Dev(ToBf16(t1)), d2 = Dev(ToBf16(t2)), d3 = Dev(ToBf16(t3)),
+                           dw = Dev(ToBf16(w)), dout(T * H);
+    r4dx_inkling2_dspark_mix_rmsnorm_bf16(P(d0.data()), P(d1.data()), P(d2.data()), P(d3.data()), a0, a1, a2, a3,
+                                          P(dw.data()), P(dout.data()), T, H, eps, 0);
+    Check(Bf16Close(HostBf16(dout, T * H), want, 2), "dspark_mix_rmsnorm_bf16");
+  }
+
+  // 2. head_norm_rope_bf16
+  {
+    const int T = 4, heads = 6, hd = 128;
+    const int64_t pos0 = 37;
+    const float theta = 1000000.0f;
+    const std::vector<float> x = RoundBf16(Rand(T * heads * hd)), w = RoundBf16(Rand(hd, 1.0f));
+    std::vector<float> want(T * heads * hd);
+    for (int t = 0; t < T; ++t) {
+      for (int h = 0; h < heads; ++h) {
+        double ss = 0.0;
+        const size_t base = static_cast<size_t>((t * heads + h) * hd);
+        for (int i = 0; i < hd; ++i) ss += static_cast<double>(x[base + i]) * x[base + i];
+        const float inv = 1.0f / std::sqrt(static_cast<float>(ss / hd) + eps);
+        const int half = hd / 2;
+        for (int i = 0; i < half; ++i) {
+          const float x1 = Bf16ToFloat(FloatToBf16(x[base + i] * inv * w[i]));
+          const float x2 = Bf16ToFloat(FloatToBf16(x[base + half + i] * inv * w[half + i]));
+          const float angle = static_cast<float>(pos0 + t) * std::pow(theta, -2.0f * i / hd);
+          const float c = std::cos(angle), s = std::sin(angle);
+          want[base + i] = x1 * c - x2 * s;
+          want[base + half + i] = x2 * c + x1 * s;
+        }
+      }
+    }
+    DeviceBuffer<uint16_t> dx = Dev(ToBf16(x)), dw = Dev(ToBf16(w));
+    r4dx_inkling2_dspark_head_norm_rope_bf16(P(dx.data()), heads * hd, P(dw.data()), T, heads, hd, pos0, theta, eps, 0);
+    Check(Bf16Close(HostBf16(dx, want.size()), want, 2), "dspark_head_norm_rope_bf16");
+  }
+
+  // 3. markov_gate_bf16 + add_softcap_f32 + transpose_bf16
+  {
+    const int R = 256;
+    const std::vector<float> raw = RoundBf16(Rand(3 * R)), bias = RoundBf16(Rand(3 * R)), st = RoundBf16(Rand(R));
+    std::vector<float> want_st(R), want_lat(R);
+    auto rbf = [](float v) { return Bf16ToFloat(FloatToBf16(v)); };
+    for (int c = 0; c < R; ++c) {
+      const float g_in = rbf(raw[c] + bias[c]);
+      const float cand_in = rbf(raw[R + c] + bias[R + c]);
+      const float out_in = rbf(raw[2 * R + c] + bias[2 * R + c]);
+      const float gate = rbf(1.0f / (1.0f + std::exp(-g_in)));
+      const float cand = rbf(std::tanh(cand_in));
+      want_st[c] = rbf(rbf(gate * st[c]) + rbf(rbf(1.0f - gate) * cand));
+      want_lat[c] = rbf(std::tanh(out_in));
+    }
+    DeviceBuffer<uint16_t> dr = Dev(ToBf16(raw)), db = Dev(ToBf16(bias)), ds = Dev(ToBf16(st)), dso(R), dlat(R);
+    r4dx_inkling2_dspark_markov_gate_bf16(P(dr.data()), P(db.data()), P(ds.data()), P(dso.data()), P(dlat.data()), R, 0);
+    Check(Bf16Close(HostBf16(dso, R), want_st, 1), "dspark_markov_gate_bf16 state");
+    Check(Bf16Close(HostBf16(dlat, R), want_lat, 1), "dspark_markov_gate_bf16 latent");
+
+    const std::vector<float> a = RoundBf16(Rand(R)), b = RoundBf16(Rand(R)), c = RoundBf16(Rand(R));
+    std::vector<float> want_sc(R);
+    for (int i = 0; i < R; ++i) want_sc[i] = 30.0f * std::tanh((a[i] + b[i] + c[i]) / 30.0f);
+    DeviceBuffer<uint16_t> da = Dev(ToBf16(a)), dbb = Dev(ToBf16(b)), dc = Dev(ToBf16(c));
+    DeviceBuffer<float> dsc(R);
+    r4dx_inkling2_dspark_add_softcap_f32(P(da.data()), P(dbb.data()), P(dc.data()), P(dsc.data()), R, 30.0f, 0);
+    Check(RelErr(Host(dsc, R), want_sc) < 1e-4, "dspark_add_softcap_f32");
+
+    const int rows = 16, cols = 48;
+    const std::vector<uint16_t> m_in = ToBf16(Rand(rows * cols));
+    DeviceBuffer<uint16_t> dm_in = Dev(m_in), dm_out(rows * cols);
+    r4dx_inkling2_dspark_transpose_bf16(P(dm_in.data()), P(dm_out.data()), rows, cols, 0);
+    std::vector<uint16_t> m_got(rows * cols);
+    dm_out.CopyToHost(m_got.data(), m_got.size());
+    bool tr_ok = true;
+    for (int r = 0; r < rows; ++r)
+      for (int cl = 0; cl < cols; ++cl)
+        if (m_got[static_cast<size_t>(cl * rows + r)] != m_in[static_cast<size_t>(r * cols + cl)]) tr_ok = false;
+    Check(tr_ok, "dspark_transpose_bf16");
+  }
+
+  // 4. sconv_static_hist + sconv_rollback exactness across n_keep = 0..T
+  {
+    const int T = 6, C = 512;
+    const std::vector<float> x = RoundBf16(Rand(T * C)), w = Rand(C * 4, 0.5f), init = Rand(3 * C, 0.5f);
+    DeviceBuffer<uint16_t> dx = Dev(ToBf16(x));
+    DeviceBuffer<float> dw = Dev(w), dbak = Dev(init), dhist(T * C), dout(T * C), dst_full = Dev(init);
+    r4dx_inkling2_sconv_static_hist_f32(P(dx.data()), 1, P(dw.data()), P(dst_full.data()), 0, P(dout.data()),
+                                        P(dhist.data()), T, C, 0);
+    for (int n_keep = 0; n_keep <= T; ++n_keep) {
+      DeviceBuffer<float> dst_rb(3 * C);
+      r4dx_inkling2_sconv_rollback_f32(P(dbak.data()), P(dhist.data()), P(dst_rb.data()), n_keep, C, 0);
+      DeviceBuffer<float> dst_ref = Dev(init), dout_ref(std::max(1, n_keep) * C);
+      if (n_keep > 0) {
+        r4dx_inkling2_sconv_static_f32(P(dx.data()), 1, P(dw.data()), P(dst_ref.data()), 0, P(dout_ref.data()),
+                                       n_keep, C, 0);
+      }
+      Check(Host(dst_rb, 3 * C) == Host(dst_ref, 3 * C),
+            "sconv_rollback bit-exact n_keep=" + std::to_string(n_keep));
+    }
+  }
+
+  // 5. qgrkv_split_bf16
+  {
+    const int T = 4, qn = 64, gn = 64, rn = 32, kn = 32, vn = 32, total = qn + gn + rn + kn + vn;
+    const std::vector<uint16_t> src = ToBf16(Rand(T * total));
+    DeviceBuffer<uint16_t> ds = Dev(src), dq(T * qn), dg(T * gn), dr(T * rn), dk(T * kn), dv(T * vn);
+    r4dx_inkling2_qgrkv_split_bf16(P(ds.data()), total, P(dq.data()), 0, qn, P(dg.data()), qn, gn, P(dr.data()),
+                                   qn + gn, rn, P(dk.data()), qn + gn + rn, kn, P(dv.data()), qn + gn + rn + kn, vn, T,
+                                   0);
+    std::vector<uint16_t> hq(T * qn), hv(T * vn);
+    dq.CopyToHost(hq.data(), hq.size());
+    dv.CopyToHost(hv.data(), hv.size());
+    bool sp_ok = true;
+    for (int t = 0; t < T; ++t) {
+      for (int c = 0; c < qn; ++c)
+        if (hq[t * qn + c] != src[t * total + c]) sp_ok = false;
+      for (int c = 0; c < vn; ++c)
+        if (hv[t * vn + c] != src[t * total + qn + gn + rn + kn + c]) sp_ok = false;
+    }
+    Check(sp_ok, "qgrkv_split_bf16");
+  }
 }
 
 }  // namespace
@@ -570,6 +713,7 @@ int main() {
   TestRouterSwigluSoftcapDense();
   TestAttention();
   TestFusedAttention();
+  TestDsparkKernels();
   if (g_fail != 0) {
     std::printf("%d check(s) FAILED\n", g_fail);
     return 1;

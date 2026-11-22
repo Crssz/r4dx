@@ -746,12 +746,30 @@ std::vector<int32_t> Inkling2TpModel::DecodeStepMtpGreedy(int32_t, int64_t) {
 std::vector<int32_t> Inkling2TpModel::DecodeStepMtpSampled(int32_t, int64_t, const kernels::SampleParams&, std::mt19937_64&) {
   throw std::runtime_error("Inkling2TpModel: MTP / the DSpark drafter is not available for inkling2_loop (milestone 1)");
 }
-std::vector<int32_t> Inkling2TpModel::DecodeStepDflashGreedy(int32_t, int64_t, float, int64_t, int64_t*) {
-  throw std::runtime_error("Inkling2TpModel: DFlash is not available for inkling2_loop (no drafter)");
+std::vector<int32_t> Inkling2TpModel::DecodeStepDflashGreedy(int32_t token_id, int64_t k, float, int64_t,
+                                                             int64_t* walk_len_out) {
+  auto walks = std::make_shared<std::vector<int64_t>>(ranks_.size(), 0);
+  const std::vector<std::vector<int32_t>> r = RunCollective([token_id, k, walks](Inkling2Model& m, int slot) {
+    return m.DecodeStepDflashGreedy(token_id, k, &(*walks)[static_cast<size_t>(slot)]);
+  });
+  RequireAllEqual(r, "DecodeStepDflashGreedy tokens");
+  if (walk_len_out != nullptr) *walk_len_out = (*walks)[0];
+  return r[0];
 }
-std::vector<int32_t> Inkling2TpModel::DecodeStepDflashSampled(int32_t, int64_t, float, int64_t, const kernels::SampleParams&,
-                                                          std::mt19937_64&, int64_t*) {
-  throw std::runtime_error("Inkling2TpModel: DFlash is not available for inkling2_loop (no drafter)");
+std::vector<int32_t> Inkling2TpModel::DecodeStepDflashSampled(int32_t token_id, int64_t k, float, int64_t,
+                                                              const kernels::SampleParams& params, std::mt19937_64& rng,
+                                                              int64_t* walk_len_out) {
+  auto rngs = std::make_shared<std::vector<std::mt19937_64>>(ranks_.size(), rng);
+  auto walks = std::make_shared<std::vector<int64_t>>(ranks_.size(), 0);
+  const std::vector<std::vector<int32_t>> r =
+      RunCollective([token_id, k, params, rngs, walks](Inkling2Model& m, int slot) {
+        return m.DecodeStepDflashSampled(token_id, k, params, (*rngs)[static_cast<size_t>(slot)],
+                                         &(*walks)[static_cast<size_t>(slot)]);
+      });
+  RequireAllEqual(r, "DecodeStepDflashSampled tokens");
+  rng = (*rngs)[0];
+  if (walk_len_out != nullptr) *walk_len_out = (*walks)[0];
+  return r[0];
 }
 
 StepProfile Inkling2TpModel::DecodeStepProfiled(int32_t) {

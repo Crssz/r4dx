@@ -33,6 +33,7 @@
 #include <vector>
 
 #include "inkling2_container.h"
+#include "inkling2_dspark.h"
 #include "model_types.h"
 #include "r4dx/core/arena.hpp"
 #include "r4dx/core/device_buffer.hpp"
@@ -52,6 +53,7 @@ struct Inkling2ModelOptions {
   int64_t max_ctx = 0;        // <= 0: Inkling2Config::ResolveMaxCtx default (131072)
   int prefill_chunk = 256;    // [1, 256]
   bool prompt_checkpoint = false;
+  std::string dspark_path;    // optional path to mtp.safetensors (Inkling2 DSpark drafter)
   // Tensor parallel (Inkling2TpModel fills these per rank).
   int tp_world = 1;
   int tp_rank = 0;
@@ -79,6 +81,7 @@ class Inkling2Model {
   int64_t KvBytes() const { return kv_bytes_; }
   int64_t Vocab() const { return container_.GlobalConfig().unpadded_vocab_size; }  // the logits width
   int TpWorld() const { return opts_.tp_world; }
+  bool DsparkEnabled() const { return dspark_ != nullptr; }
 
   void Reset();
   void SaveCheckpoint();
@@ -88,6 +91,9 @@ class Inkling2Model {
   std::vector<float> DecodeStep(int32_t token_id);
   int32_t DecodeStepGreedy(int32_t token_id);
   int32_t DecodeStepSampled(int32_t token_id, const kernels::SampleParams& params, std::mt19937_64& rng);
+  std::vector<int32_t> DecodeStepDflashGreedy(int32_t token_id, int64_t draft_k, int64_t* walk_len_out = nullptr);
+  std::vector<int32_t> DecodeStepDflashSampled(int32_t token_id, int64_t draft_k, const kernels::SampleParams& params,
+                                               std::mt19937_64& rng, int64_t* walk_len_out = nullptr);
   StepProfile DecodeStepProfiled(int32_t token_id);
   StepProfile PrefillProfiled(const std::vector<int32_t>& token_ids);
 
@@ -107,17 +113,23 @@ class Inkling2Model {
   struct Chunk;  // the per-chunk fp32 state (inkling2_model.cpp)
 
   std::vector<float> RunChunk(const std::vector<int32_t>& ids, bool want_logits, int32_t* greedy_out,
-                              const SummaryRequest* summary, SpanAccumulator* prof);
+                              const SummaryRequest* summary, SpanAccumulator* prof,
+                              bool verify_conv_hist = false, std::vector<int32_t>* verify_greedy_out = nullptr);
   void RunVisit(const Inkling2Visit& v, Chunk& c, int64_t T, SpanAccumulator* prof, bool use_pos_dev = false,
-                bool graph_long_ctx = true);
+                bool graph_long_ctx = true, bool capture_conv_hist = false);
   void Attention(const Inkling2Visit& v, const uint16_t* xq, const uint16_t* xk, const uint16_t* xv, uint16_t* out,
-                 int64_t T, SpanAccumulator* prof, bool use_pos_dev = false, bool graph_long_ctx = true);
+                 int64_t T, SpanAccumulator* prof, bool use_pos_dev = false, bool graph_long_ctx = true,
+                 bool capture_conv_hist = false);
   void Moe(int64_t layer, const uint16_t* x, uint16_t* out, int64_t T, int visit, SpanAccumulator* prof);
   void MsgGate(const Inkling2MsgGateWeights& g, const float* x, const float* m, float* out, int64_t T);
   void Lin(const QuantLinear& w, const uint16_t* x, uint16_t* y, int64_t M);
   float* ConvState(int slot, int which);  // which: 0 k, 1 v, 2 post-attention, 3 post-MLP
+  float* ConvHist(int slot, int which);
+  int32_t LmHeadArgmaxFromBf16(const uint16_t* h_bf16);
+  int32_t DsparkLogitsArgmax(const uint16_t* base_bf16, const uint16_t* delta_bf16, const uint16_t* bias_bf16);
   void Head(const float* h_row, const std::vector<const float*>& blocks, SpanAccumulator* prof);
   int32_t MergeGreedyPair();
+  int32_t MergeGreedyPairAt(const int32_t* dev_pair);
   void MergeSummary(kernels::RowSummary* out);
   void GatherVocabRow(std::vector<float>* full);
   void FetchRowSummary(float inv_temperature, kernels::RowSummary* out);
@@ -145,7 +157,15 @@ class Inkling2Model {
   core::DeviceBuffer<int32_t> table_full_, table_ring_;
   // Conv states: [slot][4][3, C] fp32 in one buffer.
   std::vector<int64_t> conv_off_;  // [slot * 4 + which]
-  core::DeviceBuffer<float> conv_, conv_ckpt_;
+  std::vector<int64_t> conv_hist_off_;
+  std::vector<int64_t> conv_ch_;
+  core::DeviceBuffer<float> conv_, conv_ckpt_, conv_verify_bak_, conv_verify_hist_;
+
+  // Optional Inkling2 DSpark / MTP drafter (mtp.safetensors).
+  std::unique_ptr<Inkling2DsparkDraft> dspark_;
+  std::array<core::DeviceBuffer<uint16_t>, 4> dspark_taps_;  // [4][max_chunk, H] bf16
+  core::DeviceBuffer<float> verify_logits_dev_;              // [8, HeadRowsLocal]
+  core::DeviceBuffer<int32_t> verify_argmax_dev_, verify_argmax_pair_dev_;
 
   // The fp32 state pool (h, blocks, h_pre, the previous pass's states) and the message buffer.
   std::vector<core::DeviceBuffer<float>> pool_;
@@ -162,7 +182,8 @@ class Inkling2Model {
 
   core::PinnedBuffer<int32_t> ids_host_, pos_host_;
   core::DeviceBuffer<int32_t> ids_dev_, pos_dev_;
-  GraphExecPtr decode_graph_short_, decode_graph_long_;
+  GraphExecPtr decode_graph_short_, decode_graph_long_, verify_graph_;
+  int64_t verify_graph_T_ = 0;
   bool decode_graph_eligible_ = false;
   bool decode_graph_disabled_ = false;
   int64_t decode_steps_seen_ = 0;

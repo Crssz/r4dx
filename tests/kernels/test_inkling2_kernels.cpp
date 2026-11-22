@@ -534,9 +534,20 @@ void TestFusedAttention() {
     const std::string tag = "fused_attn ctx " + std::to_string(c.ctx) + " q_len " + std::to_string(c.q_len) +
                             " win " + std::to_string(c.window) + (c.bias ? " +bias" : "") + (c.sink ? " +sink" : "");
     Check(rc == 0, tag + ": launch accepted");
-    Check(rc == 0 && Bf16Close(HostBf16(o_fus, static_cast<size_t>(c.q_len * qh * d)),
-                               HostBf16(o_ref, static_cast<size_t>(c.q_len * qh * d)), 2),
+    const std::vector<float> fus_host = HostBf16(o_fus, static_cast<size_t>(c.q_len * qh * d));
+    Check(rc == 0 && Bf16Close(fus_host, HostBf16(o_ref, static_cast<size_t>(c.q_len * qh * d)), 2),
           tag + ": matches ref kernel within 2 bf16 ULP");
+    if (c.q_len == 1) {
+      DeviceBuffer<int32_t> pos_d = Dev(std::vector<int32_t>{c.ctx - 1});
+      DeviceBuffer<uint16_t> o_pd(static_cast<size_t>(qh * d));
+      R4dxInkling2AttnFusedArgs ap = af;
+      ap.out = P(o_pd.data());
+      ap.ctx = 0;
+      ap.pos_dev = P(pos_d.data());
+      const int rcp = r4dx_inkling2_attn_fused_bf16kv(&ap, 0);
+      Check(rcp == 0 && HostBf16(o_pd, static_cast<size_t>(qh * d)) == fus_host,
+            tag + ": pos_dev mode is bit-identical to host ctx");
+    }
   }
   R4dxInkling2AttnFusedArgs bad{};
   Check(r4dx_inkling2_attn_fused_bf16kv(nullptr, 0) < 0, "fused_attn: null args refused");

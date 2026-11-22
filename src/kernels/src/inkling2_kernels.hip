@@ -243,13 +243,14 @@ __global__ __launch_bounds__(kThreads) void HeadKernel(HeadArgs a) {
       ss += xv * xv;
     }
   }
+  const int64_t pos0 = (a.o.pos_dev != 0) ? static_cast<int64_t>(*reinterpret_cast<const int32_t*>(a.o.pos_dev)) : a.pos0;
   ss = WaveSum(ss);
   float f;
   float tau = 1.0f;
   if (a.mode == 0) {
     f = fminf(1.0f, a.threshold / (sqrtf(ss) + 1e-6f));
     if (a.log_alpha != 0.0f) {
-      const float r = static_cast<float>(a.pos0 + t + 1) / a.log_floor;
+      const float r = static_cast<float>(pos0 + t + 1) / a.log_floor;
       tau = 1.0f + a.log_alpha * logf(fmaxf(r, 1.0f));
     }
   } else {
@@ -268,7 +269,7 @@ __global__ __launch_bounds__(kThreads) void HeadKernel(HeadArgs a) {
       else
         reinterpret_cast<float*>(a.o.out)[idx] = y;
     } else {
-      const int64_t p = a.pos0 + t;
+      const int64_t p = pos0 + t;
       const int* bt = reinterpret_cast<const int*>(a.o.block_table);
       const int64_t idx = static_cast<int64_t>(bt[p / a.o.block_size]) * a.o.kv_block_stride +
                           static_cast<int64_t>(h) * a.o.kv_head_stride + (p % a.o.block_size) * 2 * a.d +
@@ -325,23 +326,52 @@ __global__ __launch_bounds__(kThreads) void MsgPrepKernel(const float* __restric
 }
 
 constexpr int kMaxRank = 256;
-__global__ __launch_bounds__(kThreads) void MsgApplyKernel(const float* x, const float* m, const void* __restrict__ g,
-                                                           int g_bf16, const float* __restrict__ forget,
-                                                           const float* __restrict__ gain, float* out, int H, int R) {
+// Coalesced, bit-exact MsgApply: each block handles 32 output channels h0..h0+31 across 4 waves (128 threads),
+// loading [32][32] tiles of forget/gain coalesced along R into LDS and summing r = 0..R-1 in exact order.
+constexpr int kMsgTile = 32;
+constexpr int kMsgWaves = 4;
+__global__ __launch_bounds__(kMsgWaves * 32) void MsgApplyKernel(
+    const float* x, const float* m, const void* __restrict__ g, int g_bf16,
+    const float* __restrict__ forget, const float* __restrict__ gain, float* out, int H, int R) {
   __shared__ float gs[kMaxRank];
+  __shared__ float sf[kMsgTile][kMsgTile + 1];
+  __shared__ float sg[kMsgTile][kMsgTile + 1];
   const int64_t t = blockIdx.y;
-  for (int r = threadIdx.x; r < R; r += kThreads) gs[r] = LoadF(g, t * R + r, g_bf16);
+  const int tid = threadIdx.x;
+  const int wave = tid >> 5;
+  const int lane = tid & 31;
+  for (int r = tid; r < R; r += kMsgWaves * 32) gs[r] = LoadF(g, t * R + r, g_bf16);
   __syncthreads();
-  const int h = blockIdx.x * kThreads + threadIdx.x;
-  if (h >= H) return;
+  const int h0 = static_cast<int>(blockIdx.x) * kMsgTile;
   float f = 0.0f, a = 0.0f;
-  for (int r = 0; r < R; ++r) f += gs[r] * forget[static_cast<int64_t>(h) * R + r];
-  for (int r = 0; r < R; ++r) a += gs[r] * gain[static_cast<int64_t>(h) * R + r];
-  f = tanhf(f);
-  a = tanhf(a);
-  const int64_t i = t * H + h;
-  const float xv = x[i], mv = m[i];
-  out[i] = (1.0f - f) * xv + a * mv;
+  for (int r0 = 0; r0 < R; r0 += kMsgTile) {
+    const int rlen = (R - r0 < kMsgTile) ? (R - r0) : kMsgTile;
+    for (int lh = wave; lh < kMsgTile; lh += kMsgWaves) {
+      const int h = h0 + lh;
+      if (h < H && lane < rlen) {
+        const int64_t off = static_cast<int64_t>(h) * R + (r0 + lane);
+        sf[lh][lane] = forget[off];
+        sg[lh][lane] = gain[off];
+      }
+    }
+    __syncthreads();
+    if (wave == 0 && h0 + lane < H) {
+      for (int j = 0; j < rlen; ++j) {
+        const float gj = gs[r0 + j];
+        f += gj * sf[lane][j];
+        a += gj * sg[lane][j];
+      }
+    }
+    __syncthreads();
+  }
+  if (wave == 0 && h0 + lane < H) {
+    const int h = h0 + lane;
+    f = tanhf(f);
+    a = tanhf(a);
+    const int64_t i = t * H + h;
+    const float xv = x[i], mv = m[i];
+    out[i] = (1.0f - f) * xv + a * mv;
+  }
 }
 
 // ---- router: one block per token; wave w computes experts w, w + 8, ...; thread 0 selects ---------------------------
@@ -619,10 +649,24 @@ __global__ __launch_bounds__(kFusedWaves * 32) void Inkling2AttnDecodeSplitKerne
   const int wave = threadIdx.x >> 5;
   const int lane = threadIdx.x & 31;
   const int qh0 = kvh * GQA;
-  const int qpos = a.ctx - 1;
+  const int qpos = (a.pos_dev != 0) ? (*reinterpret_cast<const int32_t*>(a.pos_dev)) : (a.ctx - 1);
   const int klow = r4d_win_klow(qpos, a.window);
   const int klen = qpos - klow + 1;
-  const int per_split = (klen + n_splits - 1) / n_splits;
+  int active_splits = (klen > kDecTile && n_splits > 1) ? ((klen + kDecTile - 1) / kDecTile) : 1;
+  if (active_splits > n_splits) active_splits = n_splits;
+  if (split >= active_splits) {
+    if (n_splits > 1 && wave == 0 && lane == 0) {
+      float* ws_ptr = reinterpret_cast<float*>(a.workspace);
+#pragma unroll
+      for (int g = 0; g < GQA; ++g) {
+        float* dst = ws_ptr + (static_cast<int64_t>(qh0 + g) * n_splits + split) * (kFusedHd + 2);
+        dst[0] = -INFINITY;
+        dst[1] = 0.0f;
+      }
+    }
+    return;
+  }
+  const int per_split = (klen + active_splits - 1) / active_splits;
   const int s_begin = klow + split * per_split;
   const int s_end = (s_begin + per_split < qpos + 1) ? (s_begin + per_split) : (qpos + 1);
 
@@ -1011,7 +1055,8 @@ void RunHead(const char* fn, HeadArgs a, int64_t stream) {
   if (a.o.kind == 0) {
     if (a.o.out_row_stride < static_cast<int64_t>(a.heads) * a.d) Fail(fn, "out_row_stride < heads * d");
   } else if (a.o.kind == 1) {
-    if (a.o.block_table == 0 || a.o.block_size <= 0 || a.pos0 < 0) Fail(fn, "paged output needs a block table, block_size > 0, pos0 >= 0");
+    if (a.o.block_table == 0 || a.o.block_size <= 0 || (a.o.pos_dev == 0 && a.pos0 < 0))
+      Fail(fn, "paged output needs a block table, block_size > 0, pos0 >= 0");
     if (a.o.col_offset != 0 && a.o.col_offset != a.d) Fail(fn, "col_offset must be 0 (K) or d (V)");
   } else {
     Fail(fn, "out kind must be 0 (dense) or 1 (paged KV)");
@@ -1151,8 +1196,8 @@ void r4dx_inkling2_msg_gate_apply_f32(int64_t x, int64_t m, int64_t g, int g_bf1
   if (T <= 0) return;
   if (x == 0 || m == 0 || g == 0 || forget == 0 || gain == 0 || out == 0) Fail(fn, "null pointer");
   if (H < 1 || R < 1 || R > kMaxRank) Fail(fn, "H >= 1 and R in 1..256");
-  hipLaunchKernelGGL(MsgApplyKernel, dim3(static_cast<unsigned>((H + kThreads - 1) / kThreads), static_cast<unsigned>(T)),
-                     dim3(kThreads), 0, reinterpret_cast<hipStream_t>(stream), reinterpret_cast<const float*>(x),
+  hipLaunchKernelGGL(MsgApplyKernel, dim3(static_cast<unsigned>((H + kMsgTile - 1) / kMsgTile), static_cast<unsigned>(T)),
+                     dim3(kMsgWaves * 32), 0, reinterpret_cast<hipStream_t>(stream), reinterpret_cast<const float*>(x),
                      reinterpret_cast<const float*>(m), reinterpret_cast<const void*>(g), g_bf16,
                      reinterpret_cast<const float*>(forget), reinterpret_cast<const float*>(gain),
                      reinterpret_cast<float*>(out), H, R);
@@ -1262,17 +1307,33 @@ int r4dx_inkling2_attn_fused_bf16kv(const R4dxInkling2AttnFusedArgs* a, int64_t 
   if (a->q_heads % a->kv_heads != 0) return -4;
   const int gqa = a->q_heads / a->kv_heads;
   if (gqa < 1 || gqa > kFusedMaxGqa) return -4;
-  if (a->ctx < a->q_len || a->window < 0) return -5;
+  if (a->pos_dev != 0) {
+    if (a->q_len != 1 || a->max_splits < 1 || (a->max_splits > 1 && a->workspace == 0)) return -7;
+  } else {
+    if (a->ctx < a->q_len) return -5;
+  }
+  if (a->window < 0) return -5;
   if (a->r != 0 && (a->rel_proj == 0 || a->d_rel <= 0 || a->d_rel > kFusedMaxDrel || a->rel_extent <= 0)) return -6;
   hipStream_t st = reinterpret_cast<hipStream_t>(stream);
   if (a->q_len == 1) {
-    const int qpos = a->ctx - 1;
-    const int klow = r4d_win_klow(qpos, a->window);
-    const int klen = qpos - klow + 1;
     int n_splits = 1;
-    if (klen > 128 && a->workspace != 0 && a->max_splits > 1) {
-      n_splits = (klen + 127) / 128;
-      if (n_splits > a->max_splits) n_splits = a->max_splits;
+    if (a->pos_dev != 0) {
+      if (a->max_splits > 1) {
+        n_splits = a->max_splits;
+        if (a->window > 0) {
+          const int win_splits = (a->window + kDecTile - 1) / kDecTile;
+          if (win_splits < n_splits) n_splits = win_splits;
+        }
+        if (n_splits < 2) n_splits = 2;
+      }
+    } else {
+      const int qpos = a->ctx - 1;
+      const int klow = r4d_win_klow(qpos, a->window);
+      const int klen = qpos - klow + 1;
+      if (klen > kDecTile && a->workspace != 0 && a->max_splits > 1) {
+        n_splits = (klen + kDecTile - 1) / kDecTile;
+        if (n_splits > a->max_splits) n_splits = a->max_splits;
+      }
     }
     const dim3 grid(static_cast<unsigned>(a->kv_heads), static_cast<unsigned>(n_splits));
     const dim3 block(kFusedWaves * 32);

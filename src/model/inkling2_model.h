@@ -27,6 +27,7 @@
 #pragma once
 
 #include <cstdint>
+#include <memory>
 #include <random>
 #include <string>
 #include <vector>
@@ -107,9 +108,10 @@ class Inkling2Model {
 
   std::vector<float> RunChunk(const std::vector<int32_t>& ids, bool want_logits, int32_t* greedy_out,
                               const SummaryRequest* summary, SpanAccumulator* prof);
-  void RunVisit(const Inkling2Visit& v, Chunk& c, int64_t T, SpanAccumulator* prof);
+  void RunVisit(const Inkling2Visit& v, Chunk& c, int64_t T, SpanAccumulator* prof, bool use_pos_dev = false,
+                bool graph_long_ctx = true);
   void Attention(const Inkling2Visit& v, const uint16_t* xq, const uint16_t* xk, const uint16_t* xv, uint16_t* out,
-                 int64_t T, SpanAccumulator* prof);
+                 int64_t T, SpanAccumulator* prof, bool use_pos_dev = false, bool graph_long_ctx = true);
   void Moe(int64_t layer, const uint16_t* x, uint16_t* out, int64_t T, int visit, SpanAccumulator* prof);
   void MsgGate(const Inkling2MsgGateWeights& g, const float* x, const float* m, float* out, int64_t T);
   void Lin(const QuantLinear& w, const uint16_t* x, uint16_t* y, int64_t M);
@@ -153,8 +155,17 @@ class Inkling2Model {
   core::PinnedBuffer<int32_t> moe_ids_host_, moe_off_host_;
   Inkling2RouterTrace trace_;
 
-  core::PinnedBuffer<int32_t> ids_host_;
-  core::DeviceBuffer<int32_t> ids_dev_;
+  struct GraphExecDeleter {
+    void operator()(void* p) const noexcept;
+  };
+  using GraphExecPtr = std::unique_ptr<void, GraphExecDeleter>;
+
+  core::PinnedBuffer<int32_t> ids_host_, pos_host_;
+  core::DeviceBuffer<int32_t> ids_dev_, pos_dev_;
+  GraphExecPtr decode_graph_short_, decode_graph_long_;
+  bool decode_graph_eligible_ = false;
+  bool decode_graph_disabled_ = false;
+  int64_t decode_steps_seen_ = 0;
   core::DeviceBuffer<float> logits_dev_;  // [HeadRowsLocal]
   core::DeviceBuffer<int32_t> argmax_dev_, argmax_pair_dev_, summary_ids_dev_;
   core::DeviceBuffer<float> summary_vals_dev_, summary_lse_dev_;

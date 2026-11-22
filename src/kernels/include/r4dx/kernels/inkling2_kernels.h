@@ -61,6 +61,7 @@ struct R4dxInkling2HeadOut {
   int block_size;         // paged
   int col_offset;         // paged: 0 (K) or d (V)
   int64_t kv_block_stride, kv_head_stride;  // paged, elements
+  int64_t pos_dev;        // optional device int32* holding pos0 (0 = use host pos0); for HIP graph capture
 };
 // v = x * scale[h] (scale fp32 [heads, d] or 0 = none); out = v * min(1, threshold / (||v|| + 1e-6)), times
 // 1 + log_alpha * ln(max((pos0 + t + 1) / log_floor, 1)) when log_alpha != 0. x: [T, heads * d] bf16 or fp32 with row
@@ -169,6 +170,7 @@ struct R4dxInkling2AttnFusedArgs {
   float scale;          // head_dim^-0.5
   int64_t kv_block_stride;
   int64_t kv_head_stride;
+  int64_t pos_dev;      // optional device int32* holding qpos (q_len == 1 only; 0 = use host ctx - 1)
 };
 int r4dx_inkling2_attn_fused_bf16kv(const R4dxInkling2AttnFusedArgs* a, int64_t stream);
 

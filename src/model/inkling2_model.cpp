@@ -59,6 +59,29 @@ bool AttnFusedEnabled() {
   return kEnabled;
 }
 
+bool DecodeGraphEnabled() {
+  static const bool kEnabled = InkEnvFlag("R4DX_INK_DECODE_GRAPH", true);
+  return kEnabled;
+}
+
+template <class Record>
+bool CaptureDecodeGraph(hipStream_t s, hipGraphExec_t* exec, Record&& record) {
+  if (hipStreamBeginCapture(s, hipStreamCaptureModeThreadLocal) != hipSuccess) return false;
+  struct Guard {
+    hipStream_t stream;
+    bool capturing = true;
+    hipGraph_t graph = nullptr;
+    ~Guard() {
+      if (capturing) static_cast<void>(hipStreamEndCapture(stream, &graph));
+      if (graph != nullptr) static_cast<void>(hipGraphDestroy(graph));
+    }
+  } guard{s};
+  record();
+  guard.capturing = false;
+  if (hipStreamEndCapture(s, &guard.graph) != hipSuccess) return false;
+  return hipGraphInstantiate(exec, guard.graph, nullptr, nullptr, 0) == hipSuccess;
+}
+
 float SummaryInvTemperature(const kernels::SampleParams& params) {
   if (!(params.temperature > 0.0f) || params.temperature < kMinSummaryTemperature) return 0.0f;
   const float inv = 1.0f / params.temperature;
@@ -67,6 +90,10 @@ float SummaryInvTemperature(const kernels::SampleParams& params) {
 }
 
 }  // namespace
+
+void Inkling2Model::GraphExecDeleter::operator()(void* p) const noexcept {
+  if (p != nullptr) static_cast<void>(hipGraphExecDestroy(static_cast<hipGraphExec_t>(p)));
+}
 
 // The per-chunk fp32 state: indices into pool_ (see the header comment).
 struct Inkling2Model::Chunk {
@@ -176,6 +203,24 @@ Inkling2Model Inkling2Model::Load(const Inkling2ModelOptions& opts) {
   m.moe_off_host_ = core::PinnedBuffer<int32_t>(static_cast<size_t>(cfg.num_experts + 1));
   m.ids_host_ = core::PinnedBuffer<int32_t>(static_cast<size_t>(rows));
   m.ids_dev_ = core::DeviceBuffer<int32_t>(static_cast<size_t>(rows));
+  m.pos_host_ = core::PinnedBuffer<int32_t>(1);
+  m.pos_dev_ = core::DeviceBuffer<int32_t>(1);
+  {
+    const int64_t hl = cfg.num_attention_heads;
+    const int64_t gqa = (kvl > 0) ? (hl / kvl) : 0;
+    bool all_grouped_mx = !is_tp && DecodeGraphEnabled() && MoeGroupedDecodeEnabled() && AttnFusedEnabled() &&
+                          hd == 128 && cfg.d_rel <= 32 && kvl > 0 && hl % kvl == 0 &&
+                          (gqa == 1 || gqa == 2 || gqa == 3 || gqa == 4 || gqa == 6 || gqa == 8);
+    for (int64_t l = 0; all_grouped_mx && l < cfg.num_hidden_layers; ++l) {
+      const Inkling2LayerWeights& lw = m.container_.Layer(l);
+      if (lw.gate_up_ptrs0.empty() || lw.gate_up_ptrs1.empty() || lw.down_ptrs0.empty() || lw.down_ptrs1.empty() ||
+          lw.gate_up.empty() || lw.down.empty() || lw.gate_up[0].layout != Layout::kMxfp8 ||
+          lw.down[0].layout != Layout::kMxfp8) {
+        all_grouped_mx = false;
+      }
+    }
+    m.decode_graph_eligible_ = all_grouped_mx;
+  }
   const int64_t vl = cfg.HeadRowsLocal();
   m.logits_dev_ = core::DeviceBuffer<float>(static_cast<size_t>(vl));
   m.vocab_local_valid_ = std::max<int64_t>(0, std::min<int64_t>(vl, cfg.unpadded_vocab_size - cfg.HeadRowBegin()));
@@ -197,7 +242,8 @@ Inkling2Model Inkling2Model::Load(const Inkling2ModelOptions& opts) {
             << static_cast<double>(m.conv_.bytes()) / (1024.0 * 1024.0) << " MiB, layout " << LayoutName(opts.layout)
             << ", residual fp32, attention "
             << (AttnFusedEnabled() ? "fused h128 (on-the-fly bias + sink)" : "reference (bias + sink)") << ", MoE "
-            << (MoeGroupedDecodeEnabled() ? "grouped decode (mxfp8)" : "staged (host sync per visit)");
+            << (MoeGroupedDecodeEnabled() ? "grouped decode (mxfp8)" : "staged (host sync per visit)")
+            << (m.decode_graph_eligible_ ? ", decode graph on" : "");
   if (is_tp) std::cerr << ", TP rank " << opts.tp_rank << "/" << opts.tp_world << " (head rows " << vl << ")";
   std::cerr << "\n";
   return m;
@@ -280,7 +326,7 @@ void Inkling2Model::MsgGate(const Inkling2MsgGateWeights& g, const float* x, con
 }
 
 void Inkling2Model::Attention(const Inkling2Visit& v, const uint16_t* xq, const uint16_t* xk, const uint16_t* xv,
-                              uint16_t* out, int64_t T, SpanAccumulator* prof) {
+                              uint16_t* out, int64_t T, SpanAccumulator* prof, bool use_pos_dev, bool graph_long_ctx) {
   const Inkling2Config& cfg = container_.Config();
   const Inkling2Config& g = container_.GlobalConfig();
   const Inkling2LayerWeights& w = container_.Layer(v.layer);
@@ -361,6 +407,7 @@ void Inkling2Model::Attention(const Inkling2Visit& v, const uint16_t* xq, const 
     });
   }
 
+  const int64_t pos_dev_ptr = use_pos_dev ? P(pos_dev_.data()) : 0;
   // q clip
   uint16_t* q = arena_.Alloc<uint16_t>(static_cast<size_t>(T * hl * hd), 16);
   R4dxInkling2HeadOut dense_q{};
@@ -368,6 +415,7 @@ void Inkling2Model::Attention(const Inkling2Visit& v, const uint16_t* xq, const 
   dense_q.out_bf16 = 1;
   dense_q.out = P(q);
   dense_q.out_row_stride = hl * hd;
+  dense_q.pos_dev = pos_dev_ptr;
   r4dx_inkling2_head_clip(P(qlin), 1, hl * hd, P(a.q_scale.data()), static_cast<float>(cfg.qk_clip), pos0, log_alpha,
                           log_floor, &dense_q, static_cast<int>(T), static_cast<int>(hl), static_cast<int>(hd), s);
   // k, v: short conv -> clip / rms -> the paged cache
@@ -398,6 +446,7 @@ void Inkling2Model::Attention(const Inkling2Visit& v, const uint16_t* xq, const 
     paged.block_size = bs;
     paged.kv_block_stride = kvl * bs * 2 * hd;
     paged.kv_head_stride = static_cast<int64_t>(bs) * 2 * hd;
+    paged.pos_dev = pos_dev_ptr;
     paged.col_offset = 0;
     r4dx_inkling2_head_clip(P(kc), 0, C, 0, static_cast<float>(cfg.qk_clip), pos0, 0.0f, 1.0f, &paged, static_cast<int>(T),
                             static_cast<int>(kvl), static_cast<int>(hd), s);
@@ -422,6 +471,7 @@ void Inkling2Model::Attention(const Inkling2Visit& v, const uint16_t* xq, const 
     dense_r.out_bf16 = 0;
     dense_r.out = P(r);
     dense_r.out_row_stride = hl * drel;
+    dense_r.pos_dev = pos_dev_ptr;
     r4dx_inkling2_head_clip(P(rlin + cfg.tp_rank * hl * drel), 1, rel_all, P(a.rel_scale.data()),
                             static_cast<float>(cfg.rel_clip), pos0, log_alpha, log_floor, &dense_r, static_cast<int>(T),
                             static_cast<int>(hl), static_cast<int>(drel), s);
@@ -456,10 +506,11 @@ void Inkling2Model::Attention(const Inkling2Visit& v, const uint16_t* xq, const 
       af.window = static_cast<int>(cfg.Window(v.layer));
       af.d_rel = static_cast<int>(drel);
       af.rel_extent = static_cast<int>(ext);
-      af.max_splits = kMaxSplits;
+      af.max_splits = (use_pos_dev && !graph_long_ctx) ? 1 : kMaxSplits;
       af.scale = 1.0f / std::sqrt(static_cast<float>(hd));
       af.kv_block_stride = kvl * bs * 2 * hd;
       af.kv_head_stride = static_cast<int64_t>(bs) * 2 * hd;
+      af.pos_dev = pos_dev_ptr;
       const int rc = r4dx_inkling2_attn_fused_bf16kv(&af, s);
       if (rc != 0) throw std::runtime_error("Inkling2Model: r4dx_inkling2_attn_fused_bf16kv refused the launch (" + std::to_string(rc) + ")");
     } else {
@@ -641,7 +692,8 @@ void Inkling2Model::Moe(int64_t layer, const uint16_t* x, uint16_t* out, int64_t
 
 // ---- one visit ------------------------------------------------------------------------------------------------------
 
-void Inkling2Model::RunVisit(const Inkling2Visit& v, Chunk& c, int64_t T, SpanAccumulator* prof) {
+void Inkling2Model::RunVisit(const Inkling2Visit& v, Chunk& c, int64_t T, SpanAccumulator* prof, bool use_pos_dev,
+                             bool graph_long_ctx) {
   const Inkling2Config& cfg = container_.Config();
   const Inkling2LayerWeights& w = container_.Layer(v.layer);
   const hipStream_t sr = stream_.get();
@@ -708,7 +760,7 @@ void Inkling2Model::RunVisit(const Inkling2Visit& v, Chunk& c, int64_t T, SpanAc
   });
 
   uint16_t* o = arena_.Alloc<uint16_t>(n, 16);
-  Attention(v, xq, xk, xv, o, T, prof);
+  Attention(v, xq, xk, xv, o, T, prof, use_pos_dev, graph_long_ctx);
 
   // post-attention convolution; a block boundary keeps the incoming partial as a block
   ProfiledCall(prof, sr, "conv.post_attn", [&] {
@@ -795,49 +847,87 @@ std::vector<float> Inkling2Model::RunChunk(const std::vector<int32_t>& token_ids
       throw std::invalid_argument("Inkling2Model::RunChunk: token id " + std::to_string(id) + " outside [0, " +
                                   std::to_string(cfg.vocab_size) + ")");
   }
-  Chunk c;
-  c.used.assign(pool_.size(), false);
-  c.h = c.Acquire();
   std::copy(token_ids.begin(), token_ids.end(), ids_host_.data());
   ids_dev_.CopyFromHostAsync(ids_host_.data(), static_cast<size_t>(T), stream_);
-  ProfiledCall(prof, sr, "embed", [&] {
-    uint16_t* e = arena_.Alloc<uint16_t>(static_cast<size_t>(T * H), 16);
-    r4dx_embedding_gather_bf16(P(container_.EmbedTokens().data()), P(ids_dev_.data()), P(e), T, H, cfg.vocab_size, s);
-    r4dx_rmsnorm_plain_bf16(P(e), P(container_.EmbedNorm().data()), P(pool_[static_cast<size_t>(c.h)].data()), T, H,
-                            static_cast<float>(cfg.rms_norm_eps), /*out_fp32=*/1, s);
-  });
-  const size_t base_mark = arena_.Mark();
 
-  for (const Inkling2Visit& v : visits_) {
-    if (v.phase == Inkling2Visit::Phase::kLoop && v.pass >= 1 && v.loop_j == 0) {
-      // A pass restarts from the pre-loop state and receives the previous pass's last block(s) and output.
-      c.Release(c.prev_h);
-      for (int b : c.prev_B) c.Release(b);
-      c.prev_B.assign(c.B.begin() + static_cast<std::ptrdiff_t>(c.n_pre + 1), c.B.end());
-      // B[n_pre] is h_pre (appended at the first loop layer): it stays alive as h_pre.
-      c.prev_h = c.h;
-      c.B = c.B_pre;
-      c.h = c.h_pre;
+  auto run_body = [&](bool use_pos_dev, bool graph_long_ctx) {
+    arena_.Reset();
+    Chunk c;
+    c.used.assign(pool_.size(), false);
+    c.h = c.Acquire();
+    ProfiledCall(prof, sr, "embed", [&] {
+      uint16_t* e = arena_.Alloc<uint16_t>(static_cast<size_t>(T * H), 16);
+      r4dx_embedding_gather_bf16(P(container_.EmbedTokens().data()), P(ids_dev_.data()), P(e), T, H, cfg.vocab_size, s);
+      r4dx_rmsnorm_plain_bf16(P(e), P(container_.EmbedNorm().data()), P(pool_[static_cast<size_t>(c.h)].data()), T, H,
+                              static_cast<float>(cfg.rms_norm_eps), /*out_fp32=*/1, s);
+    });
+    const size_t base_mark = arena_.Mark();
+
+    for (const Inkling2Visit& v : visits_) {
+      if (v.phase == Inkling2Visit::Phase::kLoop && v.pass >= 1 && v.loop_j == 0) {
+        // A pass restarts from the pre-loop state and receives the previous pass's last block(s) and output.
+        c.Release(c.prev_h);
+        for (int b : c.prev_B) c.Release(b);
+        c.prev_B.assign(c.B.begin() + static_cast<std::ptrdiff_t>(c.n_pre + 1), c.B.end());
+        // B[n_pre] is h_pre (appended at the first loop layer): it stays alive as h_pre.
+        c.prev_h = c.h;
+        c.B = c.B_pre;
+        c.h = c.h_pre;
+      }
+      if (v.phase == Inkling2Visit::Phase::kPost && v.layer == cfg.loop_end) {
+        c.Release(c.prev_h);
+        for (int b : c.prev_B) c.Release(b);
+        c.prev_h = -1;
+        c.prev_B.clear();
+      }
+      RunVisit(v, c, T, prof, use_pos_dev, graph_long_ctx);
+      if (v.phase == Inkling2Visit::Phase::kPre && v.layer == cfg.loop_start - 1) {
+        c.h_pre = c.h;
+        c.B_pre = c.B;
+        c.n_pre = c.B.size();
+      }
     }
-    if (v.phase == Inkling2Visit::Phase::kPost && v.layer == cfg.loop_end) {
-      c.Release(c.prev_h);
-      for (int b : c.prev_B) c.Release(b);
-      c.prev_h = -1;
-      c.prev_B.clear();
+    arena_.Rewind(base_mark);
+
+    if (want_logits) {
+      std::vector<const float*> blocks;
+      for (int b : c.B) blocks.push_back(pool_[static_cast<size_t>(b)].data() + (T - 1) * H);
+      Head(pool_[static_cast<size_t>(c.h)].data() + (T - 1) * H, blocks, prof);
     }
-    RunVisit(v, c, T, prof);
-    if (v.phase == Inkling2Visit::Phase::kPre && v.layer == cfg.loop_start - 1) {
-      c.h_pre = c.h;
-      c.B_pre = c.B;
-      c.n_pre = c.B.size();
+    arena_.Reset();
+  };
+
+  const bool try_graph = T == 1 && want_logits && prof == nullptr && !trace_.enabled && decode_graph_eligible_ &&
+                         !decode_graph_disabled_;
+  bool launched_graph = false;
+  if (try_graph) {
+    if (decode_steps_seen_ >= 1) {
+      pos_host_.data()[0] = static_cast<int32_t>(pos_);
+      pos_dev_.CopyFromHostAsync(pos_host_.data(), 1, stream_);
+      const bool long_ctx = (pos_ >= 128);
+      GraphExecPtr& slot = long_ctx ? decode_graph_long_ : decode_graph_short_;
+      if (!slot) {
+        hipGraphExec_t exec = nullptr;
+        if (CaptureDecodeGraph(sr, &exec, [&] {
+              run_body(/*use_pos_dev=*/true, /*graph_long_ctx=*/long_ctx);
+            })) {
+          slot.reset(exec);
+        } else {
+          decode_graph_disabled_ = true;
+          std::cerr << "[r4dx::model::Inkling2Model] HIP graph capture failed; falling back to eager decode\n";
+        }
+      }
+      if (slot) {
+        R4DX_HIP_CHECK(hipGraphLaunch(static_cast<hipGraphExec_t>(slot.get()), sr));
+        launched_graph = true;
+      }
     }
+    ++decode_steps_seen_;
   }
-  arena_.Rewind(base_mark);
-
+  if (!launched_graph) {
+    run_body(/*use_pos_dev=*/false, /*graph_long_ctx=*/true);
+  }
   if (want_logits) {
-    std::vector<const float*> blocks;
-    for (int b : c.B) blocks.push_back(pool_[static_cast<size_t>(b)].data() + (T - 1) * H);
-    Head(pool_[static_cast<size_t>(c.h)].data() + (T - 1) * H, blocks, prof);
     const int64_t vl = cfg.HeadRowsLocal();
     if (greedy_out != nullptr && comm_ != nullptr) {
       r4dx_argmax_val_f32(P(logits_dev_.data()), P(argmax_pair_dev_.data()), P(argmax_pair_dev_.data() + 1), vl, s);
@@ -849,7 +939,6 @@ std::vector<float> Inkling2Model::RunChunk(const std::vector<int32_t>& token_ids
                            summary->inv_temperature, s, comm_ != nullptr ? P(topk_lse_ws_.data()) : 0);
     }
   }
-  arena_.Reset();
   if (prof == nullptr) stream_.Synchronize();
 
   std::vector<float> logits;

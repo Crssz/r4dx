@@ -433,6 +433,10 @@ void LoadExpertClass(const SafetensorsReader& r, const LinearLoadMeta& meta, Lay
     case Layout::kW8a16:
       throw std::runtime_error(kWho + "layer " + std::to_string(layer) + " class " + cls +
                                ": --layout w8a16 is not supported for qwen3_5_moe experts (use w4a16, bf16 or trellis)");
+    case Layout::kMxfp8:
+      // MXFP8 (docs/inkling2-plan.md 4.1) is wired for inkling2_loop only.
+      throw std::runtime_error(kWho + "layer " + std::to_string(layer) + " class " + cls +
+                               ": --layout mxfp8 is not supported for qwen3_5_moe experts (use w4a16, bf16 or trellis)");
     case Layout::kTrellis: {
       const TrellisLinearSpec& ts0 = TrellisFor(meta, base_of(0));
       const size_t parts = static_cast<size_t>(ts0.Parts());

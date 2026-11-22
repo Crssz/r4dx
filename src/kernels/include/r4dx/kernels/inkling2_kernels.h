@@ -110,6 +110,14 @@ void r4dx_inkling2_swiglu_softcap_bf16(int64_t gate_up, int64_t out, int64_t row
 void r4dx_inkling2_logit_softcap_f32(int64_t x, int x_bf16, int64_t x_row_stride, int64_t out, int64_t out_row_stride,
                                      int rows, int n, float cap, int64_t stream);
 
+// ---- small dense GEMM (no tiling: one wave per output element) ------------------------------------------------------
+// out[m][n] = sum_k x[m][k] * w[n][k] (fp32, k in lane-strided order then a wave reduction), x bf16 [M, K] (row stride
+// x_row_stride), w bf16 [N, K] contiguous, out fp32 (out_bf16 == 0) or bf16 (RNE) with row stride out_row_stride. Any
+// N, K >= 1 (the shapes the tiled GEMMs do not take: the sink [heads, H], the dynamic-conv weight_proj [kv*4, H], the
+// message-gate down [rank, 2H], and tiny-fixture linears with K % 64 != 0). M <= 65535.
+void r4dx_inkling2_dense_bf16(int64_t x, int64_t x_row_stride, int64_t w, int64_t out, int out_bf16,
+                              int64_t out_row_stride, int M, int N, int K, int64_t stream);
+
 // ---- reference attention with relative bias and sinks (inkling2_ref::Attention) -----------------------------------
 // The stage-0 oracle, derived from r4dx_gemma_attn_ref_bf16kv (attn_ref.h; that entry point is unchanged): one
 // workgroup per (query row, q head), fp32 two-pass softmax, bf16 paged KV in attn_ref.h's layout (num_blocks,

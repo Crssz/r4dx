@@ -205,6 +205,8 @@ void LoadExpertClassSharded(const SafetensorsReader& r, const LinearLoadMeta& me
     }
     case Layout::kW8a16:
       throw std::runtime_error(kWho + "layer " + std::to_string(layer) + " class " + cls + ": w8a16 is not supported for qwen3_5_moe experts");
+    case Layout::kMxfp8:
+      throw std::runtime_error(kWho + "layer " + std::to_string(layer) + " class " + cls + ": mxfp8 is not supported for qwen3_5_moe experts");
     case Layout::kTrellis: {
       const TrellisLinearSpec& ts0 = TrellisFor(meta, base0);
       const int bits = ts0.bits;

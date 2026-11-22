@@ -459,3 +459,28 @@ add_executable(tool_w8a16_gemm_bench tool_w8a16_gemm_bench.cpp)
 target_link_libraries(tool_w8a16_gemm_bench PRIVATE r4dx_core r4dx_kernels r4d_core)
 # /EHc-: the sweep skips illegal geometries by catching the launchers' throws.
 set_source_files_properties(tool_w8a16_gemm_bench.cpp PROPERTIES COMPILE_OPTIONS "/EHc-")
+
+# ---- Inkling2 (docs/inkling2-plan.md 4.1, 5) ------------------------------------------------------------------------
+# test_mxfp8_ref_cpu: pure CPU, tests/kernels/mxfp8_ref.hpp (the kernel-exact reference of r4dx_gemm_mxfp8_nt) against the
+# fixed on-disk codec r4dx_convert/mxfp8_format.hpp. test_inkling2_ref_cpu: pure CPU, r4dx/kernels/inkling2_ref.hpp against
+# the HF-module goldens (tests/kernels/fixtures/inkling2/inkling2_ref_golden.bin, 77 when absent). Both always run.
+add_executable(test_mxfp8_ref_cpu test_mxfp8_ref_cpu.cpp)
+target_include_directories(test_mxfp8_ref_cpu PRIVATE "${CMAKE_SOURCE_DIR}/src/convert/include")
+add_test(NAME test_mxfp8_ref_cpu COMMAND test_mxfp8_ref_cpu)
+add_executable(test_inkling2_ref_cpu test_inkling2_ref_cpu.cpp)
+target_include_directories(test_inkling2_ref_cpu PRIVATE "${CMAKE_SOURCE_DIR}/src/kernels/include")
+add_test(NAME test_inkling2_ref_cpu COMMAND test_inkling2_ref_cpu)
+set_tests_properties(test_inkling2_ref_cpu PROPERTIES SKIP_RETURN_CODE 77)
+# GPU (WRITTEN, NOT YET RUN by their authors): test_mxfp8_gemm (r4dx_gemm_mxfp8_nt vs mxfp8_ref.hpp) and
+# test_inkling2_kernels (every inkling2_kernels.h entry point vs inkling2_ref.hpp, chunk boundaries T = 1..600, the
+# bias + sink + window attention). HIP_VISIBLE_DEVICES=1 like every kernel test (device 0 is never used); label
+# inkling2_gpu so `ctest -L inkling2_gpu` selects exactly these, `-LE inkling2_gpu` skips them:
+#   $env:HIP_VISIBLE_DEVICES='1'; ctest --test-dir build\win-hip -L inkling2_gpu --output-on-failure
+foreach(t test_mxfp8_gemm test_inkling2_kernels)
+  add_executable(${t} ${t}.cpp)
+  target_link_libraries(${t} PRIVATE r4dx_core r4dx_kernels r4d_core)
+  target_include_directories(${t} PRIVATE "${CMAKE_SOURCE_DIR}/src/convert/include")
+  set_source_files_properties(${t}.cpp PROPERTIES COMPILE_OPTIONS "/EHc-")
+  add_test(NAME ${t} COMMAND ${t})
+  set_tests_properties(${t} PROPERTIES ENVIRONMENT "HIP_VISIBLE_DEVICES=1" LABELS inkling2_gpu)
+endforeach()

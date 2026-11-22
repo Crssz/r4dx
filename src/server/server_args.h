@@ -208,7 +208,7 @@ struct ServerUsageError : std::runtime_error {
 
 inline std::string ServerUsageText(const char* argv0) {
   return std::string("usage: ") + argv0 +
-         " --model <container.r4dx> --layout {w4a16|bf16|trellis|w8a16} "
+         " --model <container.r4dx> --layout {w4a16|bf16|trellis|w8a16|mxfp8} "
          "[--tokenizer-dir <dir>] [--dialect {auto|qwen35|gemma4|lfm2|qwen4_exp|nanbeige|inkling2}] [--host <addr>] [--port N] "
          "[--max-ctx N] [--extended-ctx] "
          "[--max-tokens-default N] [--max-queue N] [--think {on|off}] [--layers N] "
@@ -400,6 +400,11 @@ inline ServerArgs ParseServerArgs(int argc, char** argv) {
   if (a.dialect != "auto" && a.dialect != "qwen35" && a.dialect != "gemma4" && a.dialect != "lfm2" &&
       a.dialect != "qwen4_exp" && a.dialect != "nanbeige" && a.dialect != "inkling2") {
     throw ServerUsageError("--dialect must be 'auto', 'qwen35', 'gemma4', 'lfm2', 'qwen4_exp', 'nanbeige' or 'inkling2'");
+  }
+  // --layout: the five current layouts; the retired mxfp4 / w4a8 names reach LayoutFromName for its own message.
+  if (a.layout != "bf16" && a.layout != "w4a16" && a.layout != "trellis" && a.layout != "w8a16" && a.layout != "mxfp8" &&
+      a.layout != "mxfp4" && a.layout != "w4a8") {
+    throw ServerUsageError("--layout must be 'w4a16', 'bf16', 'trellis', 'w8a16' or 'mxfp8' (mxfp8: inkling2_loop only)");
   }
   if (a.request_log_tokens && a.request_log.empty()) {
     throw ServerUsageError("--request-log-tokens needs --request-log <path> (it adds fields to that file)");

@@ -483,6 +483,27 @@ __global__ __launch_bounds__(kThreads) void Inkling2AttnRefKernel(const R4dxInkl
   if (threadIdx.x + kThreads < hd) orow[threadIdx.x + kThreads] = r4dx::core::FloatToBf16(acc1 * inv);
 }
 
+// ---- small dense GEMM: one wave per output element ----------------------------------------------------------------
+__global__ __launch_bounds__(kThreads) void DenseBf16Kernel(const uint16_t* __restrict__ x, int64_t xs,
+                                                            const uint16_t* __restrict__ w, void* __restrict__ out,
+                                                            int out_bf16, int64_t os, int N, int K) {
+  const int64_t m = blockIdx.y;
+  const int n = blockIdx.x * kWaves + (threadIdx.x >> 5);
+  const int lane = threadIdx.x & 31;
+  if (n >= N) return;
+  const uint16_t* xr = x + m * xs;
+  const uint16_t* wr = w + static_cast<int64_t>(n) * K;
+  float a = 0.0f;
+  for (int k = lane; k < K; k += 32) a += r4dx::core::Bf16ToFloat(xr[k]) * r4dx::core::Bf16ToFloat(wr[k]);
+  a = WaveSum(a);
+  if (lane != 0) return;
+  if (out_bf16) {
+    static_cast<uint16_t*>(out)[m * os + n] = r4dx::core::FloatToBf16(a);
+  } else {
+    static_cast<float*>(out)[m * os + n] = a;
+  }
+}
+
 void RunHead(const char* fn, HeadArgs a, int64_t stream) {
   if (a.T <= 0 || a.heads <= 0) return;
   if (a.x == nullptr) Fail(fn, "null x");
@@ -680,6 +701,20 @@ void r4dx_inkling2_logit_softcap_f32(int64_t x, int x_bf16, int64_t x_row_stride
   hipLaunchKernelGGL(LogitSoftcapKernel, dim3(static_cast<unsigned>((n + kThreads - 1) / kThreads), static_cast<unsigned>(rows)),
                      dim3(kThreads), 0, reinterpret_cast<hipStream_t>(stream), reinterpret_cast<const void*>(x), x_bf16,
                      x_row_stride, reinterpret_cast<float*>(out), out_row_stride, n, cap);
+  CheckLaunch(fn);
+}
+
+void r4dx_inkling2_dense_bf16(int64_t x, int64_t x_row_stride, int64_t w, int64_t out, int out_bf16,
+                              int64_t out_row_stride, int M, int N, int K, int64_t stream) {
+  const char* fn = "r4dx_inkling2_dense_bf16";
+  if (M <= 0 || N <= 0) return;
+  if (x == 0 || w == 0 || out == 0) Fail(fn, "null pointer");
+  if (K < 1 || x_row_stride < K || out_row_stride < N) Fail(fn, "K >= 1, x_row_stride >= K, out_row_stride >= N");
+  if (M > 65535) Fail(fn, "M > 65535");
+  hipLaunchKernelGGL(DenseBf16Kernel, dim3(static_cast<unsigned>((N + kWaves - 1) / kWaves), static_cast<unsigned>(M)),
+                     dim3(kThreads), 0, reinterpret_cast<hipStream_t>(stream), reinterpret_cast<const uint16_t*>(x),
+                     x_row_stride, reinterpret_cast<const uint16_t*>(w), reinterpret_cast<void*>(out), out_bf16,
+                     out_row_stride, N, K);
   CheckLaunch(fn);
 }
 

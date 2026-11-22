@@ -181,6 +181,10 @@ QuantLinear LoadQuantLinear(const DflashDraftWeights& w, const std::string& base
       throw std::runtime_error("r4dx::model::DflashDraft: '" + base +
                                "' requested as w8a16 -- a DFlash2 draft container has no w8a16 "
                                "layout (w4a16 or bf16)");
+    case Layout::kMxfp8:
+      throw std::runtime_error("r4dx::model::DflashDraft: '" + base +
+                               "' requested as mxfp8 -- a DFlash2 draft container has no mxfp8 "
+                               "layout (w4a16 or bf16)");
   }
   return q;
 }

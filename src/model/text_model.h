@@ -266,4 +266,8 @@ std::unique_ptr<TextModel> LoadQwen4ExpTextModel(const ModelOptions& opts, const
 // R4DX_Q35_SPLIT choose them). TextModel::Config().arch is Arch::kQwen35Moe for what it returns.
 std::unique_ptr<TextModel> LoadQwen35MoeTextModel(const ModelOptions& opts, const TpOptions& tp);
 
+// The inkling2_loop branch of LoadTextModel (arch.h: DetectArch == kInkling2Loop). Defined in inkling2_local_text_model.cpp
+// (docs/inkling2-plan.md 5): tp.world == 1 -> Inkling2LocalTextModel, tp.world == 2 -> Inkling2TpModel.
+std::unique_ptr<TextModel> LoadInkling2TextModel(const ModelOptions& opts, const TpOptions& tp);
+
 }  // namespace r4dx::model

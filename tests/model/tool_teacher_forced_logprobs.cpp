@@ -20,7 +20,7 @@
 //   --model <path>        r4dx container (required; must match this build's w4a16 group, 64 -- the
 //                         production trellis container and every g64 container; a container packed
 //                         at another group is refused at load when --layout w4a16 reads it)
-//   --layout <name>       body layout: bf16 | w4a16 | trellis   (default w4a16;
+//   --layout <name>       body layout: bf16 | w4a16 | trellis | w8a16 | mxfp8 (inkling2_loop)   (default w4a16;
 //                         trellis for a trellis container -- the production container -- whose
 //                         heads then load w4a16 or bf16)
 //   --tokens <path>       tokens.json in the shared format (required):
@@ -337,6 +337,12 @@ int main(int argc, char** argv) {
       // the arch is reported; add `split=.. devices=..` here when the model grows a diagnostics interface.
       std::printf("[qwen4exp] arch=%s (text only; split/devices not exposed by TextModel)\n",
                   r4dx::model::ArchName(model.Config().arch));
+    }
+    if (model.Config().arch == r4dx::model::Arch::kInkling2Loop) {
+      // LoadTextModel's inkling2_loop branch (Inkling2LocalTextModel / Inkling2TpModel): rows are the first
+      // unpadded_vocab_size logits (vocab above), softcapped at 30 -- the width kl_report.py pairs with the reference dumps.
+      std::printf("[inkling2] arch=%s logits width %lld (unpadded vocab), softcap 30\n",
+                  r4dx::model::ArchName(model.Config().arch), static_cast<long long>(vocab));
     }
     if (tp == 1) {
       std::printf("[vram]  %.2f GiB after load (delta %.2f GiB)\n", vram_after_load,

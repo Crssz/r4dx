@@ -728,7 +728,7 @@ int RunMain(int argc, char** argv) {
       // Reset() drops the per-sequence state (conv state, positions) and keeps the weights.
       if (args.tp == 1 && dynamic_cast<r4dx::model::PpModel*>(model.get()) == nullptr && !container_is_lfm2 &&
           container_arch != r4dx::model::Arch::kQwen4Exp && container_arch != r4dx::model::Arch::kQwen35Moe &&
-          container_arch != r4dx::model::Arch::kLlama) {
+          container_arch != r4dx::model::Arch::kLlama && container_arch != r4dx::model::Arch::kInkling2Loop) {
         model = r4dx::model::LoadTextModel(opts, tpo, ppo);
       } else {
         // docs/tp.md 2.8: a second full TP load would need twice the VRAM; Reset() drops the same

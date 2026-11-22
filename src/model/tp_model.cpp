@@ -1279,6 +1279,16 @@ std::unique_ptr<TextModel> LoadTextModel(const ModelOptions& opts, const TpOptio
   // kQwen35 for every container without a `model_arch` / Gemma, LFM2 or qwen4_exp model_config --
   // including a file it cannot read -- so the Qwen branches below see exactly what they saw before.
   const Arch arch = DetectArch(opts.container_path);
+  // MXFP8 (docs/inkling2-plan.md 4.1) is wired for inkling2_loop only: every other loader would silently take the bf16
+  // fallback for each linear, so the layout is refused here, before any load.
+  if (opts.layout == Layout::kMxfp8 && arch != Arch::kInkling2Loop) {
+    throw std::invalid_argument(std::string("LoadTextModel: --layout mxfp8 is supported for inkling2_loop containers only (") +
+                                opts.container_path + " is " + ArchName(arch) + ")");
+  }
+  if (arch == Arch::kInkling2Loop) {
+    if (pp_on) throw std::invalid_argument("LoadTextModel: --pp 2 does not support inkling2_loop (it has its own RunChunk)");
+    return LoadInkling2TextModel(opts, tp);
+  }
   if (arch == Arch::kQwen4Exp) {
     if (pp_on) {
       throw std::invalid_argument("LoadTextModel: --pp 2 does not support qwen4_exp (it splits its layers over the two "

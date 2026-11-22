@@ -790,3 +790,37 @@ endif()
 # tests/model/qwen4exp/: glob-registered tests of the qwen4_exp arch (docs/qwen4exp-plan.md).
 add_subdirectory(qwen4exp)
 add_subdirectory(qwen35moe)
+
+# ---- inkling2_loop (docs/inkling2-plan.md 5) ------------------------------------------------------------------------
+#   test_inkling2_config   CPU: Inkling2Config on the real and tiny config.json, the 48-visit table and its cache slots,
+#                          Shard(2, r), ResolveMaxCtx / ResolveContainerMaxCtx, DetectArch for inkling2_loop. Always runs.
+#   test_inkling2_mxfp8    CPU: mxfp8_meta.h's refusals, Layout::kMxfp8, the TP=2 byte plans of mxfp8 linears (gathered
+#                          == the converter's packers on the slice) for inkling2's shard rules. Always runs.
+#   inkling2_tiny_e2e      GPU (WRITTEN, NOT YET RUN): the tiny checkpoint converted bf16 + mxfp8 (by this build's
+#                          r4dx-convert, at test time) vs HF fp32 logits, TP=1 and TP=2 emulate; device 1, label
+#                          inkling2_gpu, SKIP 77 without the fixture's inputs.
+#   inkling2_tiny_e2e_tp2  the same binary with --tp2-real: TP=2 over both GPUs (tp2gpu: tests\run_tests.ps1 -TwoGpu).
+add_executable(test_inkling2_config test_inkling2_config.cpp)
+target_link_libraries(test_inkling2_config PRIVATE r4dx_model_arch)
+add_test(NAME test_inkling2_config COMMAND test_inkling2_config)
+add_executable(test_inkling2_mxfp8 test_inkling2_mxfp8.cpp)
+target_link_libraries(test_inkling2_mxfp8 PRIVATE r4dx_model_linear r4dx_tp_shard r4dx_convert r4dx_core)
+add_test(NAME test_inkling2_mxfp8 COMMAND test_inkling2_mxfp8)
+add_executable(test_inkling2_tiny_e2e test_inkling2_tiny_e2e.cpp)
+target_link_libraries(test_inkling2_tiny_e2e PRIVATE r4dx_model r4dx_convert r4dx_core r4d_core)
+if(TARGET r4dx-convert)
+  target_compile_definitions(test_inkling2_tiny_e2e PRIVATE R4DX_CONVERT_EXE="$<TARGET_FILE:r4dx-convert>")
+  add_dependencies(test_inkling2_tiny_e2e r4dx-convert)
+endif()
+add_test(NAME inkling2_tiny_e2e COMMAND test_inkling2_tiny_e2e)
+set_tests_properties(inkling2_tiny_e2e PROPERTIES ENVIRONMENT "HIP_VISIBLE_DEVICES=1" SKIP_RETURN_CODE 77 LABELS inkling2_gpu)
+add_test(NAME inkling2_tiny_e2e_tp2 COMMAND test_inkling2_tiny_e2e --tp2-real)
+set_tests_properties(inkling2_tiny_e2e_tp2 PROPERTIES SKIP_RETURN_CODE 77 LABELS tp2gpu)
+#   test_inkling2_cpu_graph  CPU: the Inkling2Model graph (visit table, block-state pool, pass restarts, messages, conv / KV
+#                          per slot, chunked prefill) on the CPU with inkling2_ref.hpp, on the tiny bf16 container
+#                          (%TEMP%\r4dx_inkling2_tiny_e2e, R4DX_INKLING2_TINY_DIR) vs HF fp32 logits. SKIP 77 without it.
+add_executable(test_inkling2_cpu_graph test_inkling2_cpu_graph.cpp)
+target_link_libraries(test_inkling2_cpu_graph PRIVATE r4dx_model_arch r4dx_convert)
+target_include_directories(test_inkling2_cpu_graph PRIVATE "${CMAKE_SOURCE_DIR}/src/kernels/include")
+add_test(NAME test_inkling2_cpu_graph COMMAND test_inkling2_cpu_graph)
+set_tests_properties(test_inkling2_cpu_graph PROPERTIES SKIP_RETURN_CODE 77)

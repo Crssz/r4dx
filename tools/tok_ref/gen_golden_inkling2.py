@@ -72,6 +72,8 @@ def main():
         ],
         "code": [
             "def bpe_merge(word: str) -> list[int]:\n    return [ord(c) for c in word]\n",
+            # llama.cpp #32798: " kwargs" is one vocab entry that no merge sequence builds (ignore_merges); HF gives 10 ids
+            "def f(*args, **kwargs):",
             "function add(a, b) {\n  return a + b;\n}\n", "#include <vector>\nstd::vector<int> v = {1, 2, 3};\n",
             "for (int i = 0; i < 10; ++i) { total += i * i; }", "if x is None:\n\tpass\nelse:\n\treturn x + 1",
             "SELECT * FROM tokens WHERE id > 124892 ORDER BY id;", "let x: Option<u32> = None;\nmatch x { Some(v) => v, None => 0 }",

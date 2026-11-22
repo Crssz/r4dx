@@ -800,6 +800,25 @@
   {
    "kind": "encode",
    "name": "code_1",
+   "text": "def f(*args, **kwargs):",
+   "parse_special": false,
+   "ids": [
+    1719,
+    149983,
+    7,
+    9,
+    70747,
+    11,
+    197033,
+    87550,
+    8,
+    25
+   ],
+   "decoded": "def f(*args, **kwargs):"
+  },
+  {
+   "kind": "encode",
+   "name": "code_2",
    "text": "function add(a, b) {\n  return a + b;\n}\n",
    "parse_special": false,
    "ids": [
@@ -826,7 +845,7 @@
   },
   {
    "kind": "encode",
-   "name": "code_2",
+   "name": "code_3",
    "text": "#include <vector>\nstd::vector<int> v = {1, 2, 3};\n",
    "parse_special": false,
    "ids": [
@@ -860,7 +879,7 @@
   },
   {
    "kind": "encode",
-   "name": "code_3",
+   "name": "code_4",
    "text": "for (int i = 0; i < 10; ++i) { total += i * i; }",
    "parse_special": false,
    "ids": [
@@ -893,7 +912,7 @@
   },
   {
    "kind": "encode",
-   "name": "code_4",
+   "name": "code_5",
    "text": "if x is None:\n\tpass\nelse:\n\treturn x + 1",
    "parse_special": false,
    "ids": [
@@ -920,7 +939,7 @@
   },
   {
    "kind": "encode",
-   "name": "code_5",
+   "name": "code_6",
    "text": "SELECT * FROM tokens WHERE id > 124892 ORDER BY id;",
    "parse_special": false,
    "ids": [
@@ -943,7 +962,7 @@
   },
   {
    "kind": "encode",
-   "name": "code_6",
+   "name": "code_7",
    "text": "let x: Option<u32> = None;\nmatch x { Some(v) => v, None => 0 }",
    "parse_special": false,
    "ids": [
@@ -979,7 +998,7 @@
   },
   {
    "kind": "encode",
-   "name": "code_7",
+   "name": "code_8",
    "text": "printf(\"%d + %d = %d\\n\", a, b, a + b);",
    "parse_special": false,
    "ids": [
@@ -1012,7 +1031,7 @@
   },
   {
    "kind": "encode",
-   "name": "code_8",
+   "name": "code_9",
    "text": "git commit -m \"fix: empty merges\" --no-verify",
    "parse_special": false,
    "ids": [
@@ -1036,7 +1055,7 @@
   },
   {
    "kind": "encode",
-   "name": "code_9",
+   "name": "code_10",
    "text": "// comment with /slashes/ and /* blocks */ and ///doc\nint x = a / b;",
    "parse_special": false,
    "ids": [
@@ -1066,7 +1085,7 @@
   },
   {
    "kind": "encode",
-   "name": "code_10",
+   "name": "code_11",
    "text": "#!/usr/bin/env python\n# -*- coding: utf-8 -*-\nimport os, sys",
    "parse_special": false,
    "ids": [
@@ -1102,7 +1121,7 @@
   },
   {
    "kind": "encode",
-   "name": "code_11",
+   "name": "code_12",
    "text": "<div class=\"a\">&nbsp;</div>\n<!-- c -->",
    "parse_special": false,
    "ids": [
@@ -1133,7 +1152,7 @@
   },
   {
    "kind": "encode",
-   "name": "code_12",
+   "name": "code_13",
    "text": "a->b.c::d[e](f){g}<h>~i!j@k#l$m%n^o&p*q",
    "parse_special": false,
    "ids": [
@@ -1179,7 +1198,7 @@
   },
   {
    "kind": "encode",
-   "name": "code_13",
+   "name": "code_14",
    "text": "http://a.b/c//d///e/\n/\n//",
    "parse_special": false,
    "ids": [
@@ -1205,7 +1224,7 @@
   },
   {
    "kind": "encode",
-   "name": "code_14",
+   "name": "code_15",
    "text": "x = '''doc''' + \"\"\"d\"\"\"",
    "parse_special": false,
    "ids": [

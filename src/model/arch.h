@@ -25,6 +25,7 @@ enum class Arch {
   kQwen4Exp,  // qwen4_exp (Qwen3.8-Flash-Next): GDN + QSA, 512-expert MoE, hyper-connections, PLE
   kQwen35Moe, // qwen3_5_moe (Ornith-1.5-122B): the Qwen3.5 GDN + full-attention hybrid with a 256-expert top-8 MoE FFN
   kLlama,     // llama (Nanbeige4.3-33B): dense, every layer full GQA attention + SwiGLU MLP, untied head
+  kInkling2Loop,  // inkling2_loop (Inkling-2-Mini): 24 stored layers, 6-17 looped 3x (48 visits), no RoPE, AttnRes, 128-expert MoE
 };
 
 // Stable on-disk / log spelling: `__metadata__.model_arch` for Gemma, LFM2 and qwen4_exp, "qwen3_5"
@@ -44,6 +45,8 @@ inline const char* ArchName(Arch a) {
       return "qwen3_5_moe";
     case Arch::kLlama:
       return "llama";
+    case Arch::kInkling2Loop:
+      return "inkling2_loop";
   }
   return "qwen3_5";  // unreachable: every enumerator is handled above
 }
@@ -85,6 +88,8 @@ bool Qwen4ExpDefaultsToTrellis(const std::string& container_path);
 //   * kLfm2Moe: Lfm2Config::ResolveMaxCtx on the container's (flat) model_config: the default is the config's
 //     max_position_embeddings (131072), an explicit larger value throws std::invalid_argument (no rope
 //     scaling exists beyond it, so there is no extended-context opt-in; `extended_ctx` does not change that);
+//   * kInkling2Loop: Inkling2Config::ResolveMaxCtx (docs/inkling2-plan.md 0.4): the default is 131072 (the KV budget,
+//     not the checkpoint's 1048576 model_max_length), an explicit value up to 1048576 is allowed, above it throws;
 //   * kGemma4: GemmaConfig::ResolveMaxCtx on the container's text_config. `requested_given` false means
 //     the user passed no --max-ctx: the default is the checkpoint's max_position_embeddings (131072
 //     for Huihui), or kExtendedMaxCtx (262144) when `extended_ctx` (the opt-in flag) is set. An explicit

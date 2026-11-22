@@ -312,7 +312,10 @@ void TestEveryCode() {
       const uint16_t wb = FloatToBf16Rne(want);
       // -0 * 1 summed from +0: the kernel's split sum starts at 0.0f, so -0 comes out +0 (as the reference)
       const uint16_t wref = (wb == 0x8000) ? 0 : wb;
-      if (c[n] != wref) {
+      // A value below the bf16 range (e.g. -2^-136 at scale byte 0) may come out as either signed zero (the f32
+      // product is flushed with its sign kept); the bitwise check against mxfp8_ref::Gemm below pins the exact bits.
+      const bool both_zero = (wref & 0x7FFF) == 0 && (c[n] & 0x7FFF) == 0;
+      if (c[n] != wref && !both_zero) {
         ok = false;
         if (first < 0) first = n;
       }

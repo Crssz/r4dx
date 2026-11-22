@@ -120,8 +120,10 @@ void TestAttnRes() {
       r4dx_inkling2_attnres_f32(ptrs.data(), n_states, P(qd.data()), nq, P(od.data()), T, H, 1e-6f, 0);
       std::vector<float> want(static_cast<size_t>(nq * T * H));
       ref::AttnRes(hp.data(), n_states, q.data(), nq, T, H, want.data());
-      const double e = RelErr(Host(od, want.size()), want, 1e-2);
-      Check(e < 1e-4, "attnres n_states " + std::to_string(n_states) + " nq " + std::to_string(nq) + " (rel " + std::to_string(e) + ")");
+      // The outputs mix RMS-normalized states (scale ~1), so the error is measured in absolute terms (floor 1):
+      // fp32 rounding over the 2304-wide dots and norms lands around 1e-6.
+      const double e = RelErr(Host(od, want.size()), want, 1.0);
+      Check(e < 1e-5, "attnres n_states " + std::to_string(n_states) + " nq " + std::to_string(nq) + " (rel " + std::to_string(e) + ")");
     }
   }
 }

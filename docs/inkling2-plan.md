@@ -1,6 +1,6 @@
 # Inkling-2-Mini (inkling2_loop) support for r4dx: design and task plan
 
-Branch `inkling2` (from `main` at `42e8a54`), worktree `C:\Users\pay20\dev\r4dx-inkling2`. Written 2026-11-22.
+Branch `inkling2` (from `main` at `42e8a54`), worktree `r4dx-inkling2` next to the main checkout. Written 2026-11-22.
 **Status 2026-11-22: implemented** (converter, kernels, model TP=1 and TP=2, CLI, server); the KL gate PASSES at TP=1 and
 misses two groups narrowly at TP=2. Results and the corrections found while building are in section 11; user doc
 [inkling2.md](inkling2.md). The design sections below are kept as written, so where section 11 corrects them, section 11 wins. Structure follows

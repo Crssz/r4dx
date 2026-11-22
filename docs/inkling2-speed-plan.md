@@ -1,7 +1,7 @@
 # Inkling-2-Mini decode and prefill speed-up plan
 
 Status: plan only, nothing implemented (written 2026-11-22). Base: branch `inkling2` at `f3e58ef` (worktree
-`C:\Users\pay20\dev\r4dx-inkling2`). Model semantics and the KL gate are in [inkling2-plan.md](inkling2-plan.md) and
+`r4dx-inkling2` next to the main checkout). Model semantics and the KL gate are in [inkling2-plan.md](inkling2-plan.md) and
 [inkling2.md](inkling2.md); read those first.
 
 ## 0. Rules for whoever runs this

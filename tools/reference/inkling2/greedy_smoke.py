@@ -223,7 +223,11 @@ def greedy(model, ids: list[int], max_new: int, eos_ids: tuple, pad_id: int):
         v, ix = torch.topk(row, 2)
         steps.append({"i": i, "id": int(ix[0]), "logit": float(v[0]), "id2": int(ix[1]), "logit2": float(v[1]),
                       "gap": float(v[0] - v[1]), "prob": float(torch.softmax(row, -1)[ix[0]])})
-        assert steps[-1]["id"] == gen[i], "greedy token != argmax of the recorded logits"
+        # An exact tie (common after the bf16 logit softcap) lets topk and generate's argmax pick different ids of
+        # the same value; record the generated id and flag the tie instead of failing.
+        assert float(row[gen[i]]) == float(v[0]), "greedy token is not a maximum of the recorded logits"
+        if steps[-1]["id"] != gen[i]:
+            steps[-1].update({"id2": steps[-1]["id"], "logit2": float(v[0]), "id": gen[i], "gap": 0.0, "tie": True})
     return gen, steps
 
 

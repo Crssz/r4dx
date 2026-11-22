@@ -379,12 +379,18 @@ ReasoningSplitter::StartState ModelDialect::ReasoningStart(bool enable_thinking,
 // <|end_message|> and the model's reply (its own <|message_model|> ... parts, then <|content_model_end_sampling|>) starts
 // strictly AFTER it. A later turn replays the conversation with that reply appended (reasoning dropped or kept, tool-call
 // JSON re-sorted by the template), so every difference sits after the previous prompt's last token: the previous prompt is
-// always a token prefix of the next one, and a checkpoint at the prompt end is always reusable (ckpt_back 0). Qwen and LFM2
-// differ because their prompts END inside the assistant turn ("<think>\n" / "<think>"), which a replay rewrites. The
-// "Thinking effort level" system message sits before the FIRST non-system message (not at the tail), so it only breaks the
-// prefix when the effort itself changes between turns.
+// always a token prefix of the next one. The checkpoint still holds back that final <|end_message|> (ckpt_back 1): a
+// request whose prompt EQUALS the previous one (a regenerate, a repeated turn) must restore the checkpoint and feed at least
+// one token to get logits, and a checkpoint at the very end leaves none, so it would reset and re-prefill everything (the
+// smoke's "repeating turn 2 hits the cache" check, 2026-11-22). The held-back token is the same in every later turn, so
+// the checkpoint stays a prefix. Qwen and LFM2 hold back for a different reason: their prompts END inside the assistant
+// turn ("<think>\n" / "<think>"), which a replay rewrites. The "Thinking effort level" system message sits before the FIRST
+// non-system message (not at the tail), so it only breaks the prefix when the effort itself changes between turns.
 std::string ModelDialect::CheckpointSuffix(bool /*enable_thinking*/, std::string_view rendered_prompt) const {
-  if (kind == DialectKind::kInkling2) return "";
+  if (kind == DialectKind::kInkling2) {
+    static constexpr std::string_view kEndMessage = "<|end_message|>";
+    return EndsWith(rendered_prompt, kEndMessage) ? std::string(kEndMessage) : std::string();
+  }
   if (kind == DialectKind::kGemma4) {
     // Thinking on ends "<|turn>model\n" (no reasoning suffix) or, after a tool response,
     // "<|channel>thought\n" (replays identically, so no holdback either): 0 tokens.

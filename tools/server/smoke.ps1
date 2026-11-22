@@ -2595,8 +2595,9 @@ try {
                      max_tokens = 1536; temperature = 0; stream = $false } }
     $pcT2 = Invoke-InkChat (& $pcT2Body)
     Check ($pcT2.Status -eq 200 -and [bool]$pcT2.Content) "prefix cache: turn 2 (replayed without reasoning) returns 200 with an answer ('$($pcT2.Content)')"
-    # CheckpointSuffix is empty for this dialect (ckpt_back 0): at least the whole of turn 1's prompt is reused.
-    $pcWant = $pcT2.Chat.usage.prompt_tokens - $pcT1.Chat.usage.prompt_tokens
+    # CheckpointSuffix holds back turn 1's final <|end_message|> (ckpt_back 1): all of turn 1's prompt but that one token
+    # is reused, so turn 2 prefills at most its new tokens plus 1.
+    $pcWant = $pcT2.Chat.usage.prompt_tokens - $pcT1.Chat.usage.prompt_tokens + 1
     Check ($pcT2.Chat.timings.prompt_n -le $pcWant) `
         ("prefix cache: turn 2 prefilled at most the $pcWant token(s) after turn 1's prompt (timings.prompt_n $($pcT2.Chat.timings.prompt_n) of usage.prompt_tokens $($pcT2.Chat.usage.prompt_tokens))")
     Write-Output "  [info] $(Get-RequestLogLine $pcT2.Chat.id)"

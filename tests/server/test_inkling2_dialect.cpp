@@ -181,7 +181,8 @@ void TestPromptState() {
   const std::string prompt = "<|message_system|><|content_text|>Thinking effort level: 0.9<|end_message|>"
                              "<|message_user|><|content_text|>hi<|end_message|>";
   for (const bool thinking : {true, false}) {
-    CHECK(d.CheckpointSuffix(thinking, prompt).empty());  // no generation prompt: nothing to hold back, ckpt_back 0
+    // The final <|end_message|> is held back (ckpt_back 1) so an identical repeated prompt can restore and feed one token.
+    CHECK(d.CheckpointSuffix(thinking, prompt) == "<|end_message|>");
     CHECK(!d.ReasoningOpenInPrompt(thinking, prompt));
   }
   CHECK(d.CheckpointSuffix(true, "").empty());

@@ -1,9 +1,9 @@
 # Inkling-2-Mini (inkling2_loop) support for r4dx: design and task plan
 
 Branch `inkling2` (from `main` at `42e8a54`), worktree `C:\Users\pay20\dev\r4dx-inkling2`. Written 2026-11-22.
-**Design only so far**: no source file was edited, no GPU workload was run, and no weights were downloaded. Only the
-small metadata files (config, tokenizer_config, chat template, index, hf_quant_config) and the two safetensors
-*headers* (an HTTP range request for the first 148 KB, no tensor bytes) were read. Structure follows
+**Status 2026-11-22: implemented** (converter, kernels, model TP=1 and TP=2, CLI, server); the KL gate PASSES at TP=1 and
+misses two groups narrowly at TP=2. Results and the corrections found while building are in section 11; user doc
+[inkling2.md](inkling2.md). The design sections below are kept as written, so where section 11 corrects them, section 11 wins. Structure follows
 `docs/lfm2-plan.md` and `docs/nanbeige-plan.md`. Section 9 lists the decisions the user still has to make.
 
 Target: `OpenUncensored/Inkling-2-Mini-Uncensored` (Apache-2.0). It is `thinkingmachines/Inkling-2-Mini` with
@@ -378,3 +378,50 @@ at 131072, 32 GiB at 1M). Sliding: 40 visits x 1024 x 4 KiB = 160 MiB. Conv stat
 3. minja support for every construct in the template (I3-2).
 4. Whether `embed` rows 200058..201023 are ever indexed (pad/unused ids); they are kept.
 5. The conv state for padding tokens (`apply_mask_to_padding_states`): irrelevant for single-sequence r4dx.
+
+## 11. Results and corrections (2026-11-22)
+
+### 11.1 KL gate (recorded)
+
+fp32 CPU truth (11.8 min) and HF-bf16 noise (7.9 min) from `tools/reference/inkling2/ref.py`; r4dx dumps from
+`tool_teacher_forced_logprobs --layout mxfp8 --max-ctx 8192`; `kl_report.py --gate inkling2-fp32` (epsilon 0.005).
+
+| group | noise KL | limit | TP=1 KL | TP=1 top-1 (min) | TP=2 KL | TP=2 top-1 |
+|---|---|---|---|---|---|---|
+| code | 0.00205 | 0.00807 | 0.00392 | 98.10 % (98.02) | 0.00412 | 98.24 % |
+| english | 0.00291 | 0.00937 | 0.00633 | 97.07 % (96.35) | 0.00720 | 96.93 % |
+| thai | 0.00283 | 0.00924 | 0.00634 | 97.42 % (97.35) | 0.00621 | **96.77 % FAIL** |
+| tool | 0.00213 | 0.00820 | 0.00740 | 98.22 % (98.21) | **0.00834 FAIL** | 98.22 % |
+| chat-ALL | 0.00255 | 0.00882 | **0.00573** | **97.60 % (97.34)** | 0.00611 | 97.41 % |
+
+**Gate: PASS at TP=1** (every group). TP=2: chat-ALL, code and english pass; thai top-1 and tool KL miss by 0.58 pt and
+0.00014. The TP all-reduce is bf16 only, so each rank's partial is rounded before the sum; an fp32 all-reduce is the
+follow-up. Raw / long sets are reported in [inkling2.md](inkling2.md) (not gated). The router keeps the same 8 experts as the
+truth under HF bf16 for 97 % of tokens at visit 0 but about 60 % at visits 30-39: routing is fragile in the late loop passes,
+which is why the router runs in fp32.
+
+Smoke: `smoke.ps1 -Dialect inkling2 -Tp 2` 65 PASS / 0 FAIL, after one fix: the prompt checkpoint now holds back the
+prompt's final `<|end_message|>` (`ckpt_back` 1, not 0 as section 6 said), because an identical repeated prompt otherwise
+has no token left to feed and the engine re-prefilled the whole prompt.
+
+### 11.2 Corrections to the design above
+
+1. **Block states** (3.3): before the loop, `B` holds ONE block (the embedding); layers 6 and 12 append in each pass; the
+   pass-2/3 messages attend over [the block appended at layer 12 of the previous pass, the previous pass's final `h`].
+2. **w13 rows** (3.2, 10.1): even checkpoint rows are gate, odd rows are up (`Interleave(dim=1)`); resolved and tested.
+3. **Tensor names** carry `.weight` (`attn.wq_du.weight`, ...); `loop_config.core_end` 18 is exclusive.
+4. **lm_head** is stored with 200064 rows (200058 used + 6 zero rows: the mxfp8 fragment needs whole 16-row tiles); the
+   model uses 200058 logits; TP=2 splits 100032 / 100032 and masks the 6 pad columns.
+5. **TP=2 split** (5): `attn.rel` (wr) is replicated, not split per head; Save/RestoreCheckpoint also copy the 40 sliding
+   rings (about 240 MiB) because a ring is only 1536 positions.
+6. **Pre-tokenizer**: the regex is o200k with `[\r\n/]*` in the symbol branch (not stock); a hand-written splitter implements it.
+7. **HF bf16 noise** casts amax / outer_scale_denominator to bf16 before dequantizing; the truth and r4dx use the exact f32.
+8. **Memory** (0): TP=1 measured 31.45 GiB at `--max-ctx 8192`, so the 131072 default only fits at `--tp 2`.
+9. **Build**: r4dx_model sees ROCm's nlohmann 3.12 while r4dx_model_arch uses third_party's 3.11; passing a json across
+   that boundary fails to link (the container calls `DetectArch(path)` instead).
+
+### 11.3 Left
+
+Vision, the DSpark drafter, fp32 TP all-reduce, grouped MoE decode and a fused bias+sink attention kernel (speed), fp8 KV,
+and the HF-vs-r4dx greedy token comparison (the CPU reference crashed the machine once when overlapped with a GPU model load
+and is rerun on its own).

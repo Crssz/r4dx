@@ -1,0 +1,704 @@
+// inkling2_kernels.hip -- implements include/r4dx/kernels/inkling2_kernels.h (docs/inkling2-plan.md 3.3, 5). The spec
+// of each entry point is include/r4dx/kernels/inkling2_ref.hpp; the expressions below are the same, term for term,
+// with sums over long axes done by block reductions (different association, so the GPU tests use a tolerance).
+// Built with r4dx_kernels.hip's flags (-ffp-contract=off: every a * b + c is two roundings, as in the reference).
+#include <hip/hip_runtime.h>
+#include <hip/hip_bf16.h>
+
+#include <cmath>
+#include <cstdint>
+#include <stdexcept>
+#include <string>
+
+#include "r4d_attn_window.h"
+#include "r4dx/core/dtype.hpp"
+#include "r4dx/kernels/inkling2_kernels.h"
+#include "r4dx/kernels/kernels.h"  // r4dx_kernel_launch_counter_add
+
+namespace {
+
+constexpr int kThreads = 256;
+constexpr int kWaves = kThreads / 32;
+
+[[noreturn]] void Fail(const char* fn, const std::string& what) { throw std::runtime_error(std::string(fn) + ": " + what); }
+
+void CheckLaunch(const char* fn) {
+  const hipError_t e = hipGetLastError();
+  if (e != hipSuccess) Fail(fn, std::string("launch failed: ") + hipGetErrorString(e));
+  r4dx_kernel_launch_counter_add(1);
+}
+
+__device__ __forceinline__ float LoadF(const void* p, int64_t i, int bf16) {
+  return bf16 ? r4dx::core::Bf16ToFloat(static_cast<const uint16_t*>(p)[i]) : static_cast<const float*>(p)[i];
+}
+
+__device__ __forceinline__ float WaveSum(float v) {
+  for (int o = 16; o; o >>= 1) v += __shfl_xor(v, o, 32);
+  return v;
+}
+
+// Sum over the 256-thread block; `red` holds kWaves floats. Every thread gets the total.
+__device__ __forceinline__ float BlockSum(float v, float* red) {
+  v = WaveSum(v);
+  if ((threadIdx.x & 31) == 0) red[threadIdx.x >> 5] = v;
+  __syncthreads();
+  float out = red[0];
+  for (int i = 1; i < kWaves; ++i) out += red[i];
+  __syncthreads();
+  return out;
+}
+
+__device__ __forceinline__ float SigmoidF(float x) { return 1.0f / (1.0f + expf(-x)); }
+
+// ---- attnres ---------------------------------------------------------------------------------------------------
+constexpr int kMaxStates = 6;
+constexpr int kMaxQueries = 4;
+struct AttnResPtrs {
+  const float* s[kMaxStates];
+};
+
+__global__ __launch_bounds__(kThreads) void AttnResKernel(AttnResPtrs st, int n_states, const float* __restrict__ q,
+                                                          int nq, float* __restrict__ out, int T, int H, float eps) {
+  __shared__ float red[kWaves * (kMaxStates + kMaxStates * kMaxQueries)];
+  __shared__ float inv[kMaxStates];
+  __shared__ float p[kMaxQueries][kMaxStates];
+  const int t = blockIdx.x;
+  // 1. per state: the sum of squares -> inv
+  float ss[kMaxStates];
+#pragma unroll
+  for (int i = 0; i < kMaxStates; ++i) ss[i] = 0.0f;
+  for (int h = threadIdx.x; h < H; h += kThreads) {
+#pragma unroll
+    for (int i = 0; i < kMaxStates; ++i) {
+      if (i < n_states) {
+        const float x = st.s[i][static_cast<int64_t>(t) * H + h];
+        ss[i] += x * x;
+      }
+    }
+  }
+#pragma unroll
+  for (int i = 0; i < kMaxStates; ++i) {
+    const float v = WaveSum(ss[i]);
+    if ((threadIdx.x & 31) == 0) red[i * kWaves + (threadIdx.x >> 5)] = v;
+  }
+  __syncthreads();
+  if (threadIdx.x < n_states) {
+    float a = 0.0f;
+    for (int w = 0; w < kWaves; ++w) a += red[threadIdx.x * kWaves + w];
+    inv[threadIdx.x] = 1.0f / sqrtf(a / static_cast<float>(H) + eps);
+  }
+  __syncthreads();
+  // 2. per (query, state): q . rms(S_i)
+  float d[kMaxQueries][kMaxStates];
+#pragma unroll
+  for (int qi = 0; qi < kMaxQueries; ++qi)
+#pragma unroll
+    for (int i = 0; i < kMaxStates; ++i) d[qi][i] = 0.0f;
+  for (int h = threadIdx.x; h < H; h += kThreads) {
+#pragma unroll
+    for (int i = 0; i < kMaxStates; ++i) {
+      if (i >= n_states) continue;
+      const float r = st.s[i][static_cast<int64_t>(t) * H + h] * inv[i];
+#pragma unroll
+      for (int qi = 0; qi < kMaxQueries; ++qi) {
+        if (qi < nq) d[qi][i] += q[static_cast<int64_t>(qi) * H + h] * r;
+      }
+    }
+  }
+  float* red2 = red + kWaves * kMaxStates;
+#pragma unroll
+  for (int qi = 0; qi < kMaxQueries; ++qi)
+#pragma unroll
+    for (int i = 0; i < kMaxStates; ++i) {
+      const float v = WaveSum(d[qi][i]);
+      if ((threadIdx.x & 31) == 0) red2[(qi * kMaxStates + i) * kWaves + (threadIdx.x >> 5)] = v;
+    }
+  __syncthreads();
+  if (threadIdx.x < nq) {
+    const int qi = threadIdx.x;
+    const float scale = 1.0f / sqrtf(static_cast<float>(H));
+    float lg[kMaxStates];
+    float m = -INFINITY;
+    for (int i = 0; i < n_states; ++i) {
+      float a = 0.0f;
+      for (int w = 0; w < kWaves; ++w) a += red2[(qi * kMaxStates + i) * kWaves + w];
+      lg[i] = a * scale;
+      m = fmaxf(m, lg[i]);
+    }
+    float l = 0.0f;
+    for (int i = 0; i < n_states; ++i) {
+      lg[i] = expf(lg[i] - m);
+      l += lg[i];
+    }
+    for (int i = 0; i < n_states; ++i) p[qi][i] = lg[i] / l;
+  }
+  __syncthreads();
+  // 3. the mix of the normalized states
+  for (int h = threadIdx.x; h < H; h += kThreads) {
+    float r[kMaxStates];
+#pragma unroll
+    for (int i = 0; i < kMaxStates; ++i) r[i] = i < n_states ? st.s[i][static_cast<int64_t>(t) * H + h] * inv[i] : 0.0f;
+    for (int qi = 0; qi < nq; ++qi) {
+      float a = 0.0f;
+      for (int i = 0; i < n_states; ++i) a += p[qi][i] * r[i];
+      out[(static_cast<int64_t>(qi) * T + t) * H + h] = a;
+    }
+  }
+}
+
+// ---- short convolutions -----------------------------------------------------------------------------------------
+__global__ __launch_bounds__(kThreads) void SconvStaticKernel(const void* __restrict__ x, int x_bf16,
+                                                              const float* __restrict__ w, float* __restrict__ state,
+                                                              const float* residual, float* out, int T, int C) {
+  const int c = blockIdx.x * kThreads + threadIdx.x;
+  if (c >= C) return;
+  const float inv = sqrtf(5.0f);
+  float h0 = state[c], h1 = state[C + c], h2 = state[2 * C + c];
+  const float w0 = w[c * 4 + 0], w1 = w[c * 4 + 1], w2 = w[c * 4 + 2], w3 = w[c * 4 + 3];
+  for (int t = 0; t < T; ++t) {
+    const int64_t i = static_cast<int64_t>(t) * C + c;
+    const float xt = LoadF(x, i, x_bf16);
+    const float conv = w0 * h0 + w1 * h1 + w2 * h2 + w3 * xt;
+    float y = (conv + xt) / inv;
+    if (residual != nullptr) y = residual[i] + y;
+    out[i] = y;
+    h0 = h1;
+    h1 = h2;
+    h2 = xt;
+  }
+  state[c] = h0;
+  state[C + c] = h1;
+  state[2 * C + c] = h2;
+}
+
+__global__ __launch_bounds__(kThreads) void SconvDynamicKernel(const void* __restrict__ x, int x_bf16,
+                                                               const void* __restrict__ dyn, int dyn_bf16,
+                                                               const float* __restrict__ sw, float* __restrict__ state,
+                                                               float* __restrict__ out, int T, int C, int heads) {
+  const int c = blockIdx.x * kThreads + threadIdx.x;
+  if (c >= C) return;
+  const int hd = c / (C / heads);
+  float h0 = state[c], h1 = state[C + c], h2 = state[2 * C + c];
+  const float s0 = sw[c], s1 = sw[C + c], s2 = sw[2 * C + c], s3 = sw[3 * C + c];
+  for (int t = 0; t < T; ++t) {
+    const int64_t di = static_cast<int64_t>(t) * heads * 4 + hd * 4;
+    const float t0 = s0 + LoadF(dyn, di + 0, dyn_bf16), t1 = s1 + LoadF(dyn, di + 1, dyn_bf16);
+    const float t2 = s2 + LoadF(dyn, di + 2, dyn_bf16), t3 = s3 + LoadF(dyn, di + 3, dyn_bf16);
+    const int64_t i = static_cast<int64_t>(t) * C + c;
+    const float xt = LoadF(x, i, x_bf16);
+    const float sum = xt * t0 + h2 * t1 + h1 * t2 + h0 * t3;
+    out[i] = (sum + xt) / 3.0f;
+    h0 = h1;
+    h1 = h2;
+    h2 = xt;
+  }
+  state[c] = h0;
+  state[C + c] = h1;
+  state[2 * C + c] = h2;
+}
+
+// ---- per-head ops: one wave per (t, head), d / 32 elements per lane (d <= 512) ------------------------------------
+constexpr int kMaxHeadDim = 512;
+struct HeadArgs {
+  const void* x;
+  int x_bf16;
+  int64_t x_row_stride;
+  const float* scale;
+  float threshold, log_alpha, log_floor, eps;
+  int64_t pos0;
+  int mode;  // 0 clip, 1 rms
+  R4dxInkling2HeadOut o;
+  int T, heads, d;
+};
+
+__global__ __launch_bounds__(kThreads) void HeadKernel(HeadArgs a) {
+  const int wave = (blockIdx.x * kThreads + threadIdx.x) >> 5, lane = threadIdx.x & 31;
+  if (wave >= a.T * a.heads) return;
+  const int t = wave / a.heads, h = wave % a.heads;
+  constexpr int kPer = kMaxHeadDim / 32;
+  float v[kPer];
+  float ss = 0.0f;
+#pragma unroll
+  for (int j = 0; j < kPer; ++j) {
+    const int i = lane + 32 * j;
+    v[j] = 0.0f;
+    if (i < a.d) {
+      float xv = LoadF(a.x, static_cast<int64_t>(t) * a.x_row_stride + static_cast<int64_t>(h) * a.d + i, a.x_bf16);
+      if (a.mode == 0 && a.scale != nullptr) xv = xv * a.scale[static_cast<int64_t>(h) * a.d + i];
+      v[j] = xv;
+      ss += xv * xv;
+    }
+  }
+  ss = WaveSum(ss);
+  float f;
+  float tau = 1.0f;
+  if (a.mode == 0) {
+    f = fminf(1.0f, a.threshold / (sqrtf(ss) + 1e-6f));
+    if (a.log_alpha != 0.0f) {
+      const float r = static_cast<float>(a.pos0 + t + 1) / a.log_floor;
+      tau = 1.0f + a.log_alpha * logf(fmaxf(r, 1.0f));
+    }
+  } else {
+    f = 1.0f / sqrtf(ss / static_cast<float>(a.d) + a.eps);
+  }
+#pragma unroll
+  for (int j = 0; j < kPer; ++j) {
+    const int i = lane + 32 * j;
+    if (i >= a.d) continue;
+    float y = v[j] * f;
+    if (a.mode == 0 && a.log_alpha != 0.0f) y = y * tau;
+    if (a.o.kind == 0) {
+      const int64_t idx = static_cast<int64_t>(t) * a.o.out_row_stride + static_cast<int64_t>(h) * a.d + i;
+      if (a.o.out_bf16)
+        reinterpret_cast<uint16_t*>(a.o.out)[idx] = r4dx::core::FloatToBf16(y);
+      else
+        reinterpret_cast<float*>(a.o.out)[idx] = y;
+    } else {
+      const int64_t p = a.pos0 + t;
+      const int* bt = reinterpret_cast<const int*>(a.o.block_table);
+      const int64_t idx = static_cast<int64_t>(bt[p / a.o.block_size]) * a.o.kv_block_stride +
+                          static_cast<int64_t>(h) * a.o.kv_head_stride + (p % a.o.block_size) * 2 * a.d +
+                          a.o.col_offset + i;
+      reinterpret_cast<uint16_t*>(a.o.out)[idx] = r4dx::core::FloatToBf16(y);
+    }
+  }
+}
+
+// ---- rel logits: one block per row, threads over the extent --------------------------------------------------------
+__global__ __launch_bounds__(kThreads) void RelLogitsKernel(const float* __restrict__ r, const float* __restrict__ proj,
+                                                            float* __restrict__ rel, int d_rel, int extent) {
+  __shared__ float rs[64];
+  const int64_t row = blockIdx.x;
+  if (threadIdx.x < d_rel) rs[threadIdx.x] = r[row * d_rel + threadIdx.x];
+  __syncthreads();
+  for (int e = threadIdx.x; e < extent; e += kThreads) {
+    float a = 0.0f;
+    for (int j = 0; j < d_rel; ++j) a += rs[j] * proj[static_cast<int64_t>(j) * extent + e];
+    rel[row * extent + e] = a;
+  }
+}
+
+__global__ __launch_bounds__(kThreads) void SigmoidGateMulKernel(const uint16_t* o, const uint16_t* __restrict__ g,
+                                                                 uint16_t* out, int64_t n) {
+  const int64_t i = static_cast<int64_t>(blockIdx.x) * kThreads + threadIdx.x;
+  if (i >= n) return;
+  const float ov = r4dx::core::Bf16ToFloat(o[i]);
+  const float gv = r4dx::core::Bf16ToFloat(g[i]);
+  out[i] = r4dx::core::FloatToBf16(ov * SigmoidF(gv));
+}
+
+// ---- message gate --------------------------------------------------------------------------------------------------
+__global__ __launch_bounds__(kThreads) void MsgPrepKernel(const float* __restrict__ x, const float* __restrict__ m,
+                                                          uint16_t* __restrict__ out, int H, float eps) {
+  __shared__ float red[kWaves];
+  const int64_t t = blockIdx.x;
+  const float* xr = x + t * H;
+  const float* mr = m + t * H;
+  float sx = 0.0f, sm = 0.0f;
+  for (int h = threadIdx.x; h < H; h += kThreads) {
+    sx += xr[h] * xr[h];
+    sm += mr[h] * mr[h];
+  }
+  sx = BlockSum(sx, red);
+  sm = BlockSum(sm, red);
+  const float ix = 1.0f / sqrtf(sx / static_cast<float>(H) + eps);
+  const float im = 1.0f / sqrtf(sm / static_cast<float>(H) + eps);
+  uint16_t* o = out + t * 2 * H;
+  for (int h = threadIdx.x; h < H; h += kThreads) {
+    o[h] = r4dx::core::FloatToBf16(xr[h] * ix);
+    o[H + h] = r4dx::core::FloatToBf16(mr[h] * im);
+  }
+}
+
+constexpr int kMaxRank = 256;
+__global__ __launch_bounds__(kThreads) void MsgApplyKernel(const float* x, const float* m, const void* __restrict__ g,
+                                                           int g_bf16, const float* __restrict__ forget,
+                                                           const float* __restrict__ gain, float* out, int H, int R) {
+  __shared__ float gs[kMaxRank];
+  const int64_t t = blockIdx.y;
+  for (int r = threadIdx.x; r < R; r += kThreads) gs[r] = LoadF(g, t * R + r, g_bf16);
+  __syncthreads();
+  const int h = blockIdx.x * kThreads + threadIdx.x;
+  if (h >= H) return;
+  float f = 0.0f, a = 0.0f;
+  for (int r = 0; r < R; ++r) f += gs[r] * forget[static_cast<int64_t>(h) * R + r];
+  for (int r = 0; r < R; ++r) a += gs[r] * gain[static_cast<int64_t>(h) * R + r];
+  f = tanhf(f);
+  a = tanhf(a);
+  const int64_t i = t * H + h;
+  const float xv = x[i], mv = m[i];
+  out[i] = (1.0f - f) * xv + a * mv;
+}
+
+// ---- router: one block per token; wave w computes experts w, w + 8, ...; thread 0 selects ---------------------------
+constexpr int kMaxExperts = 256;
+constexpr int kMaxTopK = 16;
+__global__ __launch_bounds__(kThreads) void RouterKernel(const uint16_t* __restrict__ x, const uint16_t* __restrict__ gw,
+                                                         const float* __restrict__ bias, int32_t* __restrict__ ids,
+                                                         float* __restrict__ wout, int H, int E, int K, float scale,
+                                                         int64_t x_row_stride, float* __restrict__ logits_out) {
+  __shared__ float s[kMaxExperts], sc[kMaxExperts];
+  const int64_t t = blockIdx.x;
+  const int wave = threadIdx.x >> 5, lane = threadIdx.x & 31;
+  const uint16_t* xr = x + t * x_row_stride;
+  for (int e = wave; e < E; e += kWaves) {
+    const uint16_t* wr = gw + static_cast<int64_t>(e) * H;
+    float a = 0.0f;
+    for (int h = lane; h < H; h += 32) a += r4dx::core::Bf16ToFloat(xr[h]) * r4dx::core::Bf16ToFloat(wr[h]);
+    a = WaveSum(a);
+    if (lane == 0) {
+      if (logits_out != nullptr) logits_out[t * E + e] = a;
+      const float sv = SigmoidF(a);
+      s[e] = sv;
+      sc[e] = sv + (bias != nullptr ? bias[e] : 0.0f);
+    }
+  }
+  __syncthreads();
+  if (threadIdx.x != 0) return;
+  int sel[kMaxTopK];
+  float sum = 0.0f;
+  for (int j = 0; j < K; ++j) {
+    int best = -1;
+    for (int e = 0; e < E; ++e) {
+      bool taken = false;
+      for (int q = 0; q < j; ++q) taken = taken || sel[q] == e;
+      if (taken) continue;
+      if (best < 0 || sc[e] > sc[best]) best = e;  // strict >: ties keep the lower index
+    }
+    sel[j] = best;
+    sum += s[best];
+  }
+  for (int j = 0; j < K; ++j) {
+    ids[t * K + j] = sel[j];
+    wout[t * K + j] = s[sel[j]] / (sum + 1e-20f) * scale;
+  }
+}
+
+__global__ __launch_bounds__(kThreads) void SwigluSoftcapKernel(const uint16_t* __restrict__ gu, uint16_t* __restrict__ out,
+                                                                int64_t inter, int64_t in_row_stride) {
+  const int64_t r = blockIdx.y;
+  const int64_t i = static_cast<int64_t>(blockIdx.x) * kThreads + threadIdx.x;
+  if (i >= inter) return;
+  const float g = r4dx::core::Bf16ToFloat(gu[r * in_row_stride + i]);
+  const float u = r4dx::core::Bf16ToFloat(gu[r * in_row_stride + inter + i]);
+  const float y = tanhf(g / 4.0f) * 4.0f * SigmoidF(g) * (tanhf(u / 25.0f) * 25.0f);
+  out[r * inter + i] = r4dx::core::FloatToBf16(y);
+}
+
+__global__ __launch_bounds__(kThreads) void LogitSoftcapKernel(const void* x, int x_bf16, int64_t xs, float* out,
+                                                               int64_t os, int n, float cap) {
+  const int64_t r = blockIdx.y;
+  const int i = blockIdx.x * kThreads + threadIdx.x;
+  if (i >= n) return;
+  const float v = LoadF(x, r * xs + i, x_bf16);
+  out[r * os + i] = tanhf(v / cap) * cap;
+}
+
+// ---- reference attention with rel bias and sinks (r4dx_gemma_attn_ref_bf16kv + two terms) --------------------------
+constexpr int kAttnMaxHeadDim = 512;
+
+__device__ __forceinline__ float BlockReduce(float v, bool is_max, float* red) {
+  for (int o = 16; o; o >>= 1) {
+    const float w = __shfl_xor(v, o, 32);
+    v = is_max ? fmaxf(v, w) : v + w;
+  }
+  if ((threadIdx.x & 31) == 0) red[threadIdx.x >> 5] = v;
+  __syncthreads();
+  float out = red[0];
+  for (int i = 1; i < kWaves; ++i) out = is_max ? fmaxf(out, red[i]) : out + red[i];
+  __syncthreads();
+  return out;
+}
+
+__global__ __launch_bounds__(kThreads) void Inkling2AttnRefKernel(const R4dxInkling2AttnRefArgs a) {
+  __shared__ float sq[kAttnMaxHeadDim];
+  __shared__ float sp[kThreads];
+  __shared__ float red[kWaves];
+
+  const int h = blockIdx.x, t = blockIdx.y;
+  const int hd = a.head_dim, bs = a.block_size;
+  const int kvh = h / (a.q_heads / a.kv_heads);
+  const int qpos = a.ctx - a.q_len + t;
+  const int* bt = reinterpret_cast<const int*>(a.block_table);
+  const uint16_t* kv = reinterpret_cast<const uint16_t*>(a.kv);
+  const float* rel = a.rel ? reinterpret_cast<const float*>(a.rel) + (static_cast<int64_t>(t) * a.q_heads + h) * a.rel_extent
+                           : nullptr;
+  const bool has_sink = a.sink != 0;
+  const float sink = has_sink ? reinterpret_cast<const float*>(a.sink)[static_cast<int64_t>(t) * a.q_heads + h] : 0.0f;
+
+  const int klow = r4d_win_klow(qpos, a.window);
+  int khigh = qpos;
+  if (khigh > a.ctx - 1) khigh = a.ctx - 1;
+
+  const uint16_t* qrow = reinterpret_cast<const uint16_t*>(a.q) + (static_cast<int64_t>(t) * a.q_heads + h) * hd;
+  for (int d = threadIdx.x; d < hd; d += kThreads) sq[d] = r4dx::core::Bf16ToFloat(qrow[d]);
+  __syncthreads();
+
+  auto key_base = [&](int k) -> int64_t {
+    return static_cast<int64_t>(bt[k / bs]) * a.kv_block_stride + static_cast<int64_t>(kvh) * a.kv_head_stride +
+           static_cast<int64_t>(k % bs) * 2 * hd;
+  };
+  auto score = [&](int k) -> float {
+    const int64_t base = key_base(k);
+    float acc = 0.0f;
+    for (int d = 0; d < hd; ++d) acc += sq[d] * r4dx::core::Bf16ToFloat(kv[base + d]);
+    acc = acc * a.scale;
+    const int dist = qpos - k;
+    if (rel != nullptr && dist < a.rel_extent) acc = acc + rel[dist];
+    return acc;
+  };
+
+  float m = -INFINITY;
+  for (int k0 = klow; k0 <= khigh; k0 += kThreads) {
+    const int k = k0 + static_cast<int>(threadIdx.x);
+    if (k <= khigh) m = fmaxf(m, score(k));
+  }
+  m = BlockReduce(m, true, red);
+  if (has_sink) m = fmaxf(m, sink);
+
+  float l = 0.0f, acc0 = 0.0f, acc1 = 0.0f;
+  for (int k0 = klow; k0 <= khigh; k0 += kThreads) {
+    const int k = k0 + static_cast<int>(threadIdx.x);
+    float p = 0.0f;
+    if (k <= khigh) p = expf(score(k) - m);
+    sp[threadIdx.x] = p;
+    l += p;
+    __syncthreads();
+    const int n = (khigh - k0 + 1 < kThreads) ? (khigh - k0 + 1) : kThreads;
+    const int d0 = threadIdx.x, d1 = threadIdx.x + kThreads;
+    for (int j = 0; j < n; ++j) {
+      const int64_t vb = key_base(k0 + j) + hd;
+      const float pj = sp[j];
+      if (d0 < hd) acc0 += pj * r4dx::core::Bf16ToFloat(kv[vb + d0]);
+      if (d1 < hd) acc1 += pj * r4dx::core::Bf16ToFloat(kv[vb + d1]);
+    }
+    __syncthreads();
+  }
+  l = BlockReduce(l, false, red);
+  if (has_sink) l = l + expf(sink - m);
+
+  const float inv = (l > 0.0f) ? (1.0f / l) : 0.0f;
+  uint16_t* orow = reinterpret_cast<uint16_t*>(a.out) + (static_cast<int64_t>(t) * a.q_heads + h) * hd;
+  if (threadIdx.x < hd) orow[threadIdx.x] = r4dx::core::FloatToBf16(acc0 * inv);
+  if (threadIdx.x + kThreads < hd) orow[threadIdx.x + kThreads] = r4dx::core::FloatToBf16(acc1 * inv);
+}
+
+void RunHead(const char* fn, HeadArgs a, int64_t stream) {
+  if (a.T <= 0 || a.heads <= 0) return;
+  if (a.x == nullptr) Fail(fn, "null x");
+  if (a.d < 4 || a.d > kMaxHeadDim || a.d % 4 != 0) Fail(fn, "d must be a multiple of 4 in 4..512");
+  if (a.x_row_stride < static_cast<int64_t>(a.heads) * a.d) Fail(fn, "x_row_stride < heads * d");
+  if (a.o.out == 0) Fail(fn, "null output");
+  if (a.o.kind == 0) {
+    if (a.o.out_row_stride < static_cast<int64_t>(a.heads) * a.d) Fail(fn, "out_row_stride < heads * d");
+  } else if (a.o.kind == 1) {
+    if (a.o.block_table == 0 || a.o.block_size <= 0 || a.pos0 < 0) Fail(fn, "paged output needs a block table, block_size > 0, pos0 >= 0");
+    if (a.o.col_offset != 0 && a.o.col_offset != a.d) Fail(fn, "col_offset must be 0 (K) or d (V)");
+  } else {
+    Fail(fn, "out kind must be 0 (dense) or 1 (paged KV)");
+  }
+  const int64_t waves = static_cast<int64_t>(a.T) * a.heads;
+  const unsigned blocks = static_cast<unsigned>((waves + kWaves - 1) / kWaves);
+  hipLaunchKernelGGL(HeadKernel, dim3(blocks), dim3(kThreads), 0, reinterpret_cast<hipStream_t>(stream), a);
+  CheckLaunch(fn);
+}
+
+}  // namespace
+
+extern "C" {
+
+void r4dx_inkling2_attnres_f32(const int64_t* states, int n_states, int64_t queries, int nq, int64_t out, int T,
+                               int H, float eps, int64_t stream) {
+  const char* fn = "r4dx_inkling2_attnres_f32";
+  if (T <= 0) return;
+  if (states == nullptr || n_states < 1 || n_states > kMaxStates) Fail(fn, "n_states must be 1..6 with a pointer array");
+  if (nq < 1 || nq > kMaxQueries) Fail(fn, "nq must be 1..4");
+  if (H < 1 || H > 8192) Fail(fn, "H must be 1..8192");
+  if (queries == 0 || out == 0) Fail(fn, "null queries / out");
+  AttnResPtrs p{};
+  for (int i = 0; i < n_states; ++i) {
+    if (states[i] == 0) Fail(fn, "null state pointer");
+    p.s[i] = reinterpret_cast<const float*>(states[i]);
+  }
+  hipLaunchKernelGGL(AttnResKernel, dim3(static_cast<unsigned>(T)), dim3(kThreads), 0,
+                     reinterpret_cast<hipStream_t>(stream), p, n_states, reinterpret_cast<const float*>(queries), nq,
+                     reinterpret_cast<float*>(out), T, H, eps);
+  CheckLaunch(fn);
+}
+
+void r4dx_inkling2_sconv_static_f32(int64_t x, int x_bf16, int64_t weight, int64_t state, int64_t residual,
+                                    int64_t out, int T, int C, int64_t stream) {
+  const char* fn = "r4dx_inkling2_sconv_static_f32";
+  if (T <= 0 || C <= 0) return;
+  if (x == 0 || weight == 0 || state == 0 || out == 0) Fail(fn, "null pointer");
+  if (x == out) Fail(fn, "out must not alias x");
+  hipLaunchKernelGGL(SconvStaticKernel, dim3(static_cast<unsigned>((C + kThreads - 1) / kThreads)), dim3(kThreads), 0,
+                     reinterpret_cast<hipStream_t>(stream), reinterpret_cast<const void*>(x), x_bf16,
+                     reinterpret_cast<const float*>(weight), reinterpret_cast<float*>(state),
+                     reinterpret_cast<const float*>(residual), reinterpret_cast<float*>(out), T, C);
+  CheckLaunch(fn);
+}
+
+void r4dx_inkling2_sconv_dynamic_f32(int64_t x, int x_bf16, int64_t dyn, int dyn_bf16, int64_t static_w,
+                                     int64_t state, int64_t out, int T, int C, int heads, int64_t stream) {
+  const char* fn = "r4dx_inkling2_sconv_dynamic_f32";
+  if (T <= 0 || C <= 0) return;
+  if (x == 0 || dyn == 0 || static_w == 0 || state == 0 || out == 0) Fail(fn, "null pointer");
+  if (heads < 1 || C % heads != 0) Fail(fn, "C must be a multiple of heads");
+  if (x == out) Fail(fn, "out must not alias x");
+  hipLaunchKernelGGL(SconvDynamicKernel, dim3(static_cast<unsigned>((C + kThreads - 1) / kThreads)), dim3(kThreads), 0,
+                     reinterpret_cast<hipStream_t>(stream), reinterpret_cast<const void*>(x), x_bf16,
+                     reinterpret_cast<const void*>(dyn), dyn_bf16, reinterpret_cast<const float*>(static_w),
+                     reinterpret_cast<float*>(state), reinterpret_cast<float*>(out), T, C, heads);
+  CheckLaunch(fn);
+}
+
+void r4dx_inkling2_head_clip(int64_t x, int x_bf16, int64_t x_row_stride, int64_t scale, float threshold,
+                             int64_t pos0, float log_alpha, float log_floor, const R4dxInkling2HeadOut* out, int T,
+                             int heads, int d, int64_t stream) {
+  const char* fn = "r4dx_inkling2_head_clip";
+  if (out == nullptr) Fail(fn, "null output descriptor");
+  if (log_alpha != 0.0f && !(log_floor > 0.0f)) Fail(fn, "log_floor must be > 0");
+  HeadArgs a{};
+  a.x = reinterpret_cast<const void*>(x);
+  a.x_bf16 = x_bf16;
+  a.x_row_stride = x_row_stride;
+  a.scale = reinterpret_cast<const float*>(scale);
+  a.threshold = threshold;
+  a.log_alpha = log_alpha;
+  a.log_floor = log_floor;
+  a.pos0 = pos0;
+  a.mode = 0;
+  a.o = *out;
+  a.T = T;
+  a.heads = heads;
+  a.d = d;
+  RunHead(fn, a, stream);
+}
+
+void r4dx_inkling2_head_rms(int64_t x, int x_bf16, int64_t x_row_stride, float eps, int64_t pos0,
+                            const R4dxInkling2HeadOut* out, int T, int heads, int d, int64_t stream) {
+  const char* fn = "r4dx_inkling2_head_rms";
+  if (out == nullptr) Fail(fn, "null output descriptor");
+  HeadArgs a{};
+  a.x = reinterpret_cast<const void*>(x);
+  a.x_bf16 = x_bf16;
+  a.x_row_stride = x_row_stride;
+  a.eps = eps;
+  a.pos0 = pos0;
+  a.mode = 1;
+  a.o = *out;
+  a.T = T;
+  a.heads = heads;
+  a.d = d;
+  RunHead(fn, a, stream);
+}
+
+void r4dx_inkling2_rel_logits_f32(int64_t r, int64_t proj, int64_t rel, int rows, int d_rel, int extent,
+                                  int64_t stream) {
+  const char* fn = "r4dx_inkling2_rel_logits_f32";
+  if (rows <= 0) return;
+  if (r == 0 || proj == 0 || rel == 0) Fail(fn, "null pointer");
+  if (d_rel < 1 || d_rel > 64 || extent < 1) Fail(fn, "d_rel must be 1..64 and extent >= 1");
+  hipLaunchKernelGGL(RelLogitsKernel, dim3(static_cast<unsigned>(rows)), dim3(kThreads), 0,
+                     reinterpret_cast<hipStream_t>(stream), reinterpret_cast<const float*>(r),
+                     reinterpret_cast<const float*>(proj), reinterpret_cast<float*>(rel), d_rel, extent);
+  CheckLaunch(fn);
+}
+
+void r4dx_inkling2_sigmoid_gate_mul_bf16(int64_t o, int64_t g, int64_t out, int64_t n, int64_t stream) {
+  const char* fn = "r4dx_inkling2_sigmoid_gate_mul_bf16";
+  if (n <= 0) return;
+  if (o == 0 || g == 0 || out == 0) Fail(fn, "null pointer");
+  hipLaunchKernelGGL(SigmoidGateMulKernel, dim3(static_cast<unsigned>((n + kThreads - 1) / kThreads)), dim3(kThreads),
+                     0, reinterpret_cast<hipStream_t>(stream), reinterpret_cast<const uint16_t*>(o),
+                     reinterpret_cast<const uint16_t*>(g), reinterpret_cast<uint16_t*>(out), n);
+  CheckLaunch(fn);
+}
+
+void r4dx_inkling2_msg_gate_prep_bf16(int64_t x, int64_t m, int64_t out, int T, int H, float eps, int64_t stream) {
+  const char* fn = "r4dx_inkling2_msg_gate_prep_bf16";
+  if (T <= 0) return;
+  if (x == 0 || m == 0 || out == 0 || H < 1) Fail(fn, "null pointer or H < 1");
+  hipLaunchKernelGGL(MsgPrepKernel, dim3(static_cast<unsigned>(T)), dim3(kThreads), 0,
+                     reinterpret_cast<hipStream_t>(stream), reinterpret_cast<const float*>(x),
+                     reinterpret_cast<const float*>(m), reinterpret_cast<uint16_t*>(out), H, eps);
+  CheckLaunch(fn);
+}
+
+void r4dx_inkling2_msg_gate_apply_f32(int64_t x, int64_t m, int64_t g, int g_bf16, int64_t forget, int64_t gain,
+                                      int64_t out, int T, int H, int R, int64_t stream) {
+  const char* fn = "r4dx_inkling2_msg_gate_apply_f32";
+  if (T <= 0) return;
+  if (x == 0 || m == 0 || g == 0 || forget == 0 || gain == 0 || out == 0) Fail(fn, "null pointer");
+  if (H < 1 || R < 1 || R > kMaxRank) Fail(fn, "H >= 1 and R in 1..256");
+  hipLaunchKernelGGL(MsgApplyKernel, dim3(static_cast<unsigned>((H + kThreads - 1) / kThreads), static_cast<unsigned>(T)),
+                     dim3(kThreads), 0, reinterpret_cast<hipStream_t>(stream), reinterpret_cast<const float*>(x),
+                     reinterpret_cast<const float*>(m), reinterpret_cast<const void*>(g), g_bf16,
+                     reinterpret_cast<const float*>(forget), reinterpret_cast<const float*>(gain),
+                     reinterpret_cast<float*>(out), H, R);
+  CheckLaunch(fn);
+}
+
+void r4dx_inkling2_router_f32(int64_t x, int64_t gate_w, int64_t bias, int64_t ids, int64_t w, int T, int H, int E,
+                              int top_k, float route_scale, int64_t x_row_stride, int64_t logits_out, int64_t stream) {
+  const char* fn = "r4dx_inkling2_router_f32";
+  if (T <= 0) return;
+  if (x == 0 || gate_w == 0 || ids == 0 || w == 0) Fail(fn, "null pointer");
+  if (E < 1 || E > kMaxExperts) Fail(fn, "E must be 1..256");
+  if (top_k < 1 || top_k > kMaxTopK || top_k > E) Fail(fn, "top_k must be 1..min(16, E)");
+  if (H < 1 || H > 8192 || x_row_stride < H) Fail(fn, "H must be 1..8192 and x_row_stride >= H");
+  hipLaunchKernelGGL(RouterKernel, dim3(static_cast<unsigned>(T)), dim3(kThreads), 0,
+                     reinterpret_cast<hipStream_t>(stream), reinterpret_cast<const uint16_t*>(x),
+                     reinterpret_cast<const uint16_t*>(gate_w), reinterpret_cast<const float*>(bias),
+                     reinterpret_cast<int32_t*>(ids), reinterpret_cast<float*>(w), H, E, top_k, route_scale,
+                     x_row_stride, reinterpret_cast<float*>(logits_out));
+  CheckLaunch(fn);
+}
+
+void r4dx_inkling2_swiglu_softcap_bf16(int64_t gate_up, int64_t out, int64_t rows, int64_t intermediate,
+                                       int64_t in_row_stride, int64_t stream) {
+  const char* fn = "r4dx_inkling2_swiglu_softcap_bf16";
+  if (rows <= 0 || intermediate <= 0) return;
+  if (gate_up == 0 || out == 0) Fail(fn, "null pointer");
+  if (in_row_stride < 2 * intermediate) Fail(fn, "in_row_stride < 2 * intermediate");
+  if (rows > 65535) Fail(fn, "rows > 65535");
+  hipLaunchKernelGGL(SwigluSoftcapKernel,
+                     dim3(static_cast<unsigned>((intermediate + kThreads - 1) / kThreads), static_cast<unsigned>(rows)),
+                     dim3(kThreads), 0, reinterpret_cast<hipStream_t>(stream), reinterpret_cast<const uint16_t*>(gate_up),
+                     reinterpret_cast<uint16_t*>(out), intermediate, in_row_stride);
+  CheckLaunch(fn);
+}
+
+void r4dx_inkling2_logit_softcap_f32(int64_t x, int x_bf16, int64_t x_row_stride, int64_t out, int64_t out_row_stride,
+                                     int rows, int n, float cap, int64_t stream) {
+  const char* fn = "r4dx_inkling2_logit_softcap_f32";
+  if (rows <= 0 || n <= 0) return;
+  if (x == 0 || out == 0) Fail(fn, "null pointer");
+  if (x_row_stride < n || out_row_stride < n || !(cap > 0.0f)) Fail(fn, "row strides >= n and cap > 0");
+  if (rows > 65535) Fail(fn, "rows > 65535");
+  hipLaunchKernelGGL(LogitSoftcapKernel, dim3(static_cast<unsigned>((n + kThreads - 1) / kThreads), static_cast<unsigned>(rows)),
+                     dim3(kThreads), 0, reinterpret_cast<hipStream_t>(stream), reinterpret_cast<const void*>(x), x_bf16,
+                     x_row_stride, reinterpret_cast<float*>(out), out_row_stride, n, cap);
+  CheckLaunch(fn);
+}
+
+int r4dx_inkling2_attn_ref_bf16kv(const R4dxInkling2AttnRefArgs* a, int64_t stream) {
+  if (a == nullptr) return -1;
+  if (a->q_len <= 0 || a->q_heads <= 0 || a->kv_heads <= 0 || a->block_size <= 0 || a->ctx <= 0 ||
+      a->q_len > a->ctx || a->window < 0) {
+    return -1;
+  }
+  if (a->head_dim < 8 || a->head_dim > kAttnMaxHeadDim || (a->head_dim % 8) != 0) return -2;
+  if (a->q_heads % a->kv_heads != 0) return -3;
+  if (a->q == 0 || a->kv == 0 || a->block_table == 0 || a->out == 0) return -4;
+  if (a->rel != 0 && a->rel_extent <= 0) return -5;
+  hipLaunchKernelGGL(Inkling2AttnRefKernel, dim3(static_cast<unsigned>(a->q_heads), static_cast<unsigned>(a->q_len)),
+                     dim3(kThreads), 0, reinterpret_cast<hipStream_t>(stream), *a);
+  const hipError_t e = hipGetLastError();
+  if (e != hipSuccess) return -100 - static_cast<int>(e);
+  r4dx_kernel_launch_counter_add(1);
+  return 0;
+}
+
+}  // extern "C"

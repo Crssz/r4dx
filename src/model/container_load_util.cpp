@@ -84,6 +84,38 @@ bool TakeW8a16Bf16Head(const LinearLoadMeta& meta, const QuantLinear& head, int 
   return true;
 }
 
+std::optional<Mxfp8Spec> CheckMxfp8Choice(const nlohmann::json& metadata, const std::string& path, Layout layout,
+                                          Layout lm_head_layout, Layout mtp_head_layout) {
+  const bool requested = layout == Layout::kMxfp8 || lm_head_layout == Layout::kMxfp8 ||
+                         mtp_head_layout == Layout::kMxfp8;
+  if (!requested) return std::nullopt;
+  std::optional<Mxfp8Spec> spec = ParseMxfp8Metadata(metadata, path);
+  RefuseMxfp8Choice(spec, requested, path);
+  CheckMxfp8Meta(spec->group, path);
+  return spec;
+}
+
+void CheckMxfp8Shape(const SafetensorsReader& r, const std::string& base, int64_t N, int64_t K) {
+  const auto span = [&](const char* suffix) {
+    const auto& m = r.Meta(base + suffix);
+    return static_cast<uint64_t>(m.end - m.begin);
+  };
+  const std::string why = Mxfp8ShapeProblem(base, N, K, span(r4dx_convert::mxfp8::kWqSuffix),
+                                            span(r4dx_convert::mxfp8::kWsSuffix));
+  if (!why.empty()) throw Mxfp8FormatMismatch("r4dx::model::Container: " + why);
+}
+
+void LogMxfp8(const Mxfp8Spec& spec, const std::string& path) {
+  std::fprintf(stderr, "r4dx: %s is an mxfp8 container: e4m3fn weights, E8M0 scales per %d along K\n", path.c_str(),
+               spec.group);
+}
+
+bool TakeMxfp8Bf16Head(const LinearLoadMeta& meta, const QuantLinear& head, int fallbacks_before, int* fallbacks) {
+  if (!meta.mxfp8 || *fallbacks == fallbacks_before || head.layout != Layout::kBf16) return false;
+  --*fallbacks;
+  return true;
+}
+
 void LogW8a16Bf16Head(const std::string& path) {
   std::fprintf(stderr,
                "r4dx: %s stores lm_head as bf16 only (a w8a16 container converted with --lm-head bf16) -- loaded "
@@ -430,6 +462,18 @@ QuantLinear LoadQuantLinear(const SafetensorsReader& r, const LinearLoadMeta& me
       q.w8_ws = UploadRawU16(r, base + r4dx_convert::w8a16::kWsSuffix);
       break;
     }
+    case Layout::kMxfp8: {
+      // docs/inkling2-plan.md 4.1: codes and E8M0 bytes as stored (the kernel's fragment order), sized before a byte
+      // is uploaded.
+      if (!meta.mxfp8) {
+        throw std::logic_error("r4dx::model::Container: '" + base + "' read as mxfp8 without a checked "
+                               "__metadata__.quant.mxfp8 (CheckMxfp8Choice) for " + meta.path);
+      }
+      CheckMxfp8Shape(r, base, N, K);
+      q.mx_wq = UploadRawU8(r, base + r4dx_convert::mxfp8::kWqSuffix);
+      q.mx_ws = UploadRawU8(r, base + r4dx_convert::mxfp8::kWsSuffix);
+      break;
+    }
   }
   return q;
 }
@@ -450,6 +494,9 @@ bool HasLayout(const SafetensorsReader& r, const LinearLoadMeta& meta, const std
       // Both tensors (docs/w8a16.md 6.1); a base without them -- a `--keep-bf16` linear of a mixed
       // container -- takes the bf16 fallback like any other layout's.
       return r.Has(base + r4dx_convert::w8a16::kWqSuffix) && r.Has(base + r4dx_convert::w8a16::kWsSuffix);
+    case Layout::kMxfp8:
+      // Both tensors; a `--keep-bf16` linear of a mixed container has neither and takes the bf16 fallback.
+      return r.Has(base + r4dx_convert::mxfp8::kWqSuffix) && r.Has(base + r4dx_convert::mxfp8::kWsSuffix);
   }
   return false;
 }

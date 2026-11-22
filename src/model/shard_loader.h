@@ -37,6 +37,7 @@ inline uint64_t PartBytes(const tp::PartShape& s) {
     case tp::Part::kW4a16Wsz: return N * (K / static_cast<uint64_t>(s.group)) * 4;
     case tp::Part::kW8Wq: return N * K;
     case tp::Part::kW8a16Ws: return N * (K / static_cast<uint64_t>(s.group)) * 2;
+    case tp::Part::kMxfp8Ws: return N * (K / 32);
     case tp::Part::kElem: return N * static_cast<uint64_t>(s.row_bytes);
     case tp::Part::kTrellisW: return N * K * static_cast<uint64_t>(s.rate) / 8;
   }
@@ -192,6 +193,18 @@ class ShardLoader {
         q.w8_wq = Part<uint8_t>(base + r4dx_convert::w8a16::kWqSuffix, shape(tp::Part::kW8Wq, group), rule, rows, cols);
         q.w8_ws = Part<uint16_t>(base + r4dx_convert::w8a16::kWsSuffix, shape(tp::Part::kW8a16Ws, group), rule, rows,
                                  cols);
+        break;
+      }
+      case Layout::kMxfp8: {
+        // docs/inkling2-plan.md 4.1: wq slices as w8a16's (whole 16-row tiles / 32-K blocks), ws by whole tiles / 32-K
+        // groups (16 B per (tile, group)); PlanRows / PlanCols refuse a rank range that is not.
+        if (!meta_.mxfp8) {
+          throw std::logic_error("r4dx::model::Container: '" + base + "' read as mxfp8 without a checked "
+                                 "__metadata__.quant.mxfp8 (CheckMxfp8Choice)");
+        }
+        CheckMxfp8Shape(r_, base, N, K);
+        q.mx_wq = Part<uint8_t>(base + r4dx_convert::mxfp8::kWqSuffix, shape(tp::Part::kW8Wq, 32), rule, rows, cols);
+        q.mx_ws = Part<uint8_t>(base + r4dx_convert::mxfp8::kWsSuffix, shape(tp::Part::kMxfp8Ws, 32), rule, rows, cols);
         break;
       }
     }

@@ -1,0 +1,282 @@
+// mxfp8_gemm.hip -- r4dx_gemm_mxfp8_nt (docs/inkling2-plan.md 4.1; ABI and numerics in
+// include/r4dx/kernels/mxfp8_gemm.h). C[M,N] bf16 = A[M,K] bf16 @ dequant(W)[N,K]^T, M <= 256.
+//
+// A copy of w8a16_gemm.hip's w8a16_gemm_nt_m64_kernel (whose header and docs/w8a16.md 3-4 are the rationale for
+// every structural choice: f16 WMMA, per-group f32 epilogue, NPW, clamped row / column tiles, the fixed-order
+// in-block split-K) with these changes:
+//
+//  1. GROUP = ONE PACKED BLOCK. The E8M0 scale group is 32 K, exactly one 512-byte packed block (16 rows x 32 K, one
+//     global_load_b128 per lane, two k steps). The group loop runs two groups per iteration (both groups' weight
+//     and scale loads in flight before the first WMMA), plus a tail group when the split has an odd count.
+//  2. UNPACK. e4m3fn byte b = s eeee mmm. v_perm_b32 puts b into the HIGH byte of a 16-bit half (b << 8); then
+//     ((x >> 1) & 0x3F80) | (x & 0x8000) is the f16 with sign s, exponent field eeee and mantissa mmm0000000, i.e.
+//     exactly value(b) * 2^-8 (an f16 subnormal when e == 0, since an e4m3 subnormal m * 2^-9 becomes m * 2^-17);
+//     one v_pk_mul_f16 by 2^8 makes every value the exact normal f16 it is (|value| in [2^-9, 448]). 4 half pairs
+//     per fragment: per pair 1 perm + shift/and/or + 1 pk_mul. No table, no NaN handling (never written).
+//  3. SCALE. One byte per (row, group): float(2^(byte - 127)) built from its bits (byte 0 -> the f32 subnormal
+//     2^-127), applied as acc = fmaf(g_acc, sc, acc) at the group's end. There is no output unbias: the scale is the
+//     true power of two.
+//  4. M up to 256: the grid's y covers ceil(M/16) row tiles in groups of MB, as w8a16's does at M <= 64.
+#include <hip/hip_runtime.h>
+#include <hip/hip_bf16.h>
+#include <hip/hip_fp16.h>
+
+#include "r4dx/kernels/mxfp8_gemm.h"
+#include "r4dx/kernels/kernels.h"  // r4dx_kernel_launch_counter_add
+#include "r4d_gdn_wmma.h"          // rowGo, v8f
+
+#include <cstdint>
+#include <stdexcept>
+#include <string>
+
+namespace {
+
+constexpr int kMaxM = 256;
+constexpr int kGroup = 32;  // K per scale = K per packed block: 2 k steps, 16 bytes per lane
+constexpr int kWave = 32;
+
+typedef _Float16 v8h __attribute__((ext_vector_type(8)));
+typedef unsigned uint4v __attribute__((ext_vector_type(4)));
+
+typedef __attribute__((address_space(1))) const uint4v* gw4;
+typedef __attribute__((address_space(1))) const unsigned long long* gu2;
+typedef __attribute__((address_space(1))) const unsigned char* gub;
+
+// Two bf16 (low half = first element) -> two f16, RTZ (w8a16_gemm.hip's).
+__device__ __forceinline__ unsigned bf2_to_h2(unsigned d) {
+  const float lo = __uint_as_float(d << 16);
+  const float hi = __uint_as_float(d & 0xffff0000u);
+  union { decltype(__builtin_amdgcn_cvt_pkrtz(0.f, 0.f)) h; unsigned u; } x;
+  x.h = __builtin_amdgcn_cvt_pkrtz(lo, hi);
+  return x.u;
+}
+
+__device__ __forceinline__ v8h fragA_bf16(gu2 p, int u) {
+  const unsigned long long w0 = p[4 * u];
+  const unsigned long long w1 = p[4 * u + 2];
+  union { unsigned u[4]; v8h f; } x;
+  x.u[0] = bf2_to_h2((unsigned)w0);
+  x.u[1] = bf2_to_h2((unsigned)(w0 >> 32));
+  x.u[2] = bf2_to_h2((unsigned)w1);
+  x.u[3] = bf2_to_h2((unsigned)(w1 >> 32));
+  return x.f;
+}
+
+// Bytes (sel picks two of d's bytes into bits 8..15 and 24..31) -> two f16 of value * 2^-8, bit exact.
+__device__ __forceinline__ unsigned e4m3x2_scaled(unsigned d, unsigned sel) {
+  const unsigned x = __builtin_amdgcn_perm(0u, d, sel);
+  return ((x >> 1) & 0x3F803F80u) | (x & 0x80008000u);
+}
+
+// Two dwords of four e4m3 codes (elements e0..e3, e4..e7) -> one f16 B fragment of the exact values.
+__device__ __forceinline__ v8h dequant8(unsigned d0, unsigned d1) {
+  const __half2 k256 = __halves2half2(__ushort_as_half((unsigned short)0x5C00u),   // 2^8
+                                      __ushort_as_half((unsigned short)0x5C00u));
+  union { unsigned u[4]; __half2 h2[4]; v8h f; } x;
+  x.u[0] = e4m3x2_scaled(d0, 0x010C000Cu);  // bytes 0, 1 -> e0, e1
+  x.u[1] = e4m3x2_scaled(d0, 0x030C020Cu);  // bytes 2, 3 -> e2, e3
+  x.u[2] = e4m3x2_scaled(d1, 0x010C000Cu);  // e4, e5
+  x.u[3] = e4m3x2_scaled(d1, 0x030C020Cu);  // e6, e7
+#pragma unroll
+  for (int i = 0; i < 4; i++) x.h2[i] = __hmul2(x.h2[i], k256);
+  return x.f;
+}
+
+// E8M0 byte -> 2^(b - 127) as f32 (b == 0: the subnormal 2^-127 = 0x00400000).
+__device__ __forceinline__ float e8m0_value(unsigned b) {
+  return __uint_as_float(b != 0u ? (b << 23) : 0x00400000u);
+}
+
+__device__ __forceinline__ v8f mmah(v8h a, v8h b, v8f c) {
+  return __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(a, b, c);
+}
+
+// One 32-K group of NPW column tiles x MT row tiles: two WMMAs into g_acc (the first with a zero C), then the
+// scaled fold into acc. `wv` holds the group's packed block per column tile, `sc` its scales, `u0` the k step of
+// the group within the split (pa advances by 2 k steps per group).
+template <int MT, int NPW>
+__device__ __forceinline__ void group_step(v8f (&acc)[NPW][MT], const uint4v (&wv)[NPW], const float (&sc)[NPW],
+                                           const gu2 (&pa)[MT], int u0) {
+  v8f g_acc[NPW][MT];
+#pragma unroll
+  for (int s = 0; s < 2; s++) {
+    v8h afrag[MT];
+#pragma unroll
+    for (int i = 0; i < MT; i++) afrag[i] = fragA_bf16(pa[i], u0 + s);
+#pragma unroll
+    for (int j = 0; j < NPW; j++) {
+      const v8h bfrag = dequant8(wv[j][2 * s], wv[j][2 * s + 1]);
+#pragma unroll
+      for (int i = 0; i < MT; i++)
+        g_acc[j][i] = s == 0 ? mmah(afrag[i], bfrag, (v8f)(0.f)) : mmah(afrag[i], bfrag, g_acc[j][i]);
+    }
+  }
+#pragma unroll
+  for (int j = 0; j < NPW; j++)
+#pragma unroll
+    for (int i = 0; i < MT; i++)
+#pragma unroll
+      for (int e = 0; e < 8; e++) acc[j][i][e] = fmaf(g_acc[j][i][e], sc[j], acc[j][i][e]);
+}
+
+template <int MT, int NPW, bool NT>
+__global__ __launch_bounds__(1024) void mxfp8_gemm_nt_kernel(const unsigned short* __restrict__ A,
+                                                            const unsigned char* __restrict__ Wq,
+                                                            const unsigned char* __restrict__ Ws,
+                                                            __hip_bfloat16* __restrict__ C, int M, int K, int N,
+                                                            int WV, int SK) {
+  extern __shared__ float red[];  // WV*NPW*SK*256 floats
+  const int tid = threadIdx.x, wave = tid / kWave, lane = tid % kWave;
+  const int col_local = wave / SK, ksplit = wave % SK;
+  const int nt0 = (blockIdx.x * WV + col_local) * NPW;
+  const int n0 = nt0 * 16;
+  const int mt0 = blockIdx.y * MT;
+  const int Ks = K / SK;
+  const int groups = Ks / kGroup;
+  const int kbase = ksplit * Ks;
+
+  v8f acc[NPW][MT];
+#pragma unroll
+  for (int j = 0; j < NPW; j++)
+#pragma unroll
+    for (int i = 0; i < MT; i++) acc[j][i] = (v8f)(0.f);
+
+  if (n0 < N) {
+    gu2 pa[MT];
+#pragma unroll
+    for (int i = 0; i < MT; i++) {
+      const unsigned off = rowGo((unsigned)K, (mt0 + i) * 16, M - 1, lane) + (unsigned)kbase;
+      pa[i] = (gu2)(const unsigned long long*)(A + off);
+    }
+
+    const int kpb = K / kGroup;  // packed blocks (= scale groups) per row tile
+    gw4 pw[NPW];
+    gub ps[NPW];
+    const int ntlast = N / 16 - 1;
+#pragma unroll
+    for (int j = 0; j < NPW; j++) {
+      const int t = (nt0 + j) < ntlast ? (nt0 + j) : ntlast;  // clamped, never masked
+      pw[j] = (gw4)(const uint4v*)(Wq) + (size_t)(t * (size_t)kpb + kbase / kGroup) * kWave + lane;
+      ps[j] = (gub)(Ws) + (size_t)(t * (size_t)kpb + kbase / kGroup) * 16 + (lane & 15);
+    }
+
+    // Two groups per iteration only while both groups' operands fit the 192-VGPR cap of a 1024-thread block
+    // (hipcc -S: MT*NPW <= 8 is spill-free paired; at MT 3 / 4 with NPW 4 the pair spilled 2 / 123 VGPRs).
+    constexpr bool kPair = MT * NPW <= 8;
+    int g = 0;
+    for (; kPair && g + 1 < groups; g += 2) {
+      uint4v wv0[NPW], wv1[NPW];
+      float sc0[NPW], sc1[NPW];
+#pragma unroll
+      for (int j = 0; j < NPW; j++) {
+        const size_t o = (size_t)g * kWave;
+        wv0[j] = NT ? __builtin_nontemporal_load(&pw[j][o]) : pw[j][o];
+        wv1[j] = NT ? __builtin_nontemporal_load(&pw[j][o + kWave]) : pw[j][o + kWave];
+        sc0[j] = e8m0_value(ps[j][(size_t)g * 16]);
+        sc1[j] = e8m0_value(ps[j][(size_t)(g + 1) * 16]);
+      }
+      group_step<MT, NPW>(acc, wv0, sc0, pa, 2 * g);
+      group_step<MT, NPW>(acc, wv1, sc1, pa, 2 * g + 2);
+    }
+    // The odd tail group when paired (an `if`: the loop form spilled at MT 2 NPW 4), every group otherwise.
+    auto single = [&](int gg) {
+      uint4v wv0[NPW];
+      float sc0[NPW];
+#pragma unroll
+      for (int j = 0; j < NPW; j++) {
+        const size_t o = (size_t)gg * kWave;
+        wv0[j] = NT ? __builtin_nontemporal_load(&pw[j][o]) : pw[j][o];
+        sc0[j] = e8m0_value(ps[j][(size_t)gg * 16]);
+      }
+      group_step<MT, NPW>(acc, wv0, sc0, pa, 2 * gg);
+    };
+    if constexpr (kPair) {
+      if (g < groups) single(g);
+    } else {
+      for (; g < groups; ++g) single(g);
+    }
+  }
+
+  // Split-K reduction and store (w8a16's, without the unbias): one row tile at a time, fixed split order, so the
+  // result does not depend on wave scheduling.
+  const int ncols = WV * NPW;
+  const int nthreads = WV * SK * kWave;
+#pragma unroll
+  for (int i = 0; i < MT; i++) {
+    __syncthreads();
+#pragma unroll
+    for (int j = 0; j < NPW; j++) {
+      const int slot = ((col_local * NPW + j) * SK + ksplit) * 256;
+#pragma unroll
+      for (int e = 0; e < 8; e++) red[slot + e * kWave + lane] = acc[j][i][e];
+    }
+    __syncthreads();
+    for (int idx = tid; idx < ncols * 256; idx += nthreads) {
+      const int col = idx >> 8, off = idx & 255;
+      float v = 0.f;
+      for (int s = 0; s < SK; s++) v += red[(col * SK + s) * 256 + off];
+      const int l = off & 31;
+      const int n = (blockIdx.x * ncols + col) * 16 + (l & 15);
+      const int m = (mt0 + i) * 16 + 8 * (l >> 4) + (off >> 5);
+      if (n < N && m < M) C[(size_t)m * N + n] = __float2bfloat16(v);
+    }
+  }
+}
+
+[[noreturn]] void Fail(const std::string& what) { throw std::runtime_error("r4dx_gemm_mxfp8_nt: " + what); }
+
+void Launch(int64_t a, int64_t wq, int64_t ws, int64_t c, int M, int K, int N, int WV, int SK, int MB, int NPW,
+            int NT, int64_t stream) {
+  const int ntiles = N / 16, mtiles = (M + 15) / 16;
+  const int ncols = WV * NPW;
+  dim3 grid((ntiles + ncols - 1) / ncols, (mtiles + MB - 1) / MB), block(WV * SK * kWave);
+  const size_t smem = (size_t)ncols * SK * 256 * sizeof(float);
+  auto Ap = (const unsigned short*)a;
+  auto Wp = (const unsigned char*)wq;
+  auto Sp = (const unsigned char*)ws;
+  auto Cp = (__hip_bfloat16*)c;
+  hipStream_t st = (hipStream_t)stream;
+#define MX8_LAUNCH(MT, NP, TT) \
+  hipLaunchKernelGGL((mxfp8_gemm_nt_kernel<MT, NP, TT>), grid, block, smem, st, Ap, Wp, Sp, Cp, M, K, N, WV, SK)
+#define MX8_LAUNCH_MB(NP, TT)             \
+  switch (MB) {                           \
+    case 1: MX8_LAUNCH(1, NP, TT); break; \
+    case 2: MX8_LAUNCH(2, NP, TT); break; \
+    case 3: MX8_LAUNCH(3, NP, TT); break; \
+    default: MX8_LAUNCH(4, NP, TT); break; \
+  }
+  if (NPW == 1) {
+    if (NT) { MX8_LAUNCH_MB(1, true); } else { MX8_LAUNCH_MB(1, false); }
+  } else {
+    if (NT) { MX8_LAUNCH_MB(4, true); } else { MX8_LAUNCH_MB(4, false); }
+  }
+#undef MX8_LAUNCH_MB
+#undef MX8_LAUNCH
+  const hipError_t err = hipGetLastError();
+  if (err != hipSuccess) Fail(std::string("launch failed: ") + hipGetErrorString(err));
+}
+
+}  // namespace
+
+extern "C" {
+
+void r4dx_gemm_mxfp8_nt(int64_t a_bf16, int64_t wq, int64_t ws, int64_t c, int M, int K, int N, int WV, int SK,
+                        int MB, int NPW, int NT, int64_t stream) {
+  if (M < 1 || M > kMaxM) Fail("M must be 1..256 (got " + std::to_string(M) + ")");
+  if (N < 16 || N % 16) Fail("N must be a positive multiple of 16 (got " + std::to_string(N) + ")");
+  if (WV < 1 || SK < 1) Fail("WV and SK must be >= 1");
+  if (K < 1 || K % (SK * kGroup))
+    Fail("K must be a positive multiple of SK*32 (K " + std::to_string(K) + ", SK " + std::to_string(SK) + ")");
+  if (WV * SK * kWave > 1024) Fail("WV*SK*32 > 1024 threads per block");
+  if (MB < 1 || MB > 4) Fail("MB must be 1..4");
+  if (NPW != 1 && NPW != 4) Fail("NPW must be 1 or 4");
+  if ((size_t)WV * NPW * SK * 256 * sizeof(float) > 64 * 1024) Fail("LDS WV*NPW*SK KiB > 64");
+  if (!a_bf16 || !wq || !ws || !c) Fail("null pointer");
+  Launch(a_bf16, wq, ws, c, M, K, N, WV, SK, MB, NPW, NT, stream);
+  r4dx_kernel_launch_counter_add(1);
+}
+
+int r4dx_gemm_mxfp8_group(void) { return kGroup; }
+int r4dx_gemm_mxfp8_max_m(void) { return kMaxM; }
+
+}  // extern "C"

@@ -44,6 +44,16 @@ bool MoeGroupedDecodeEnabled() {
   return kEnabled;
 }
 
+bool MoeGroupedPrefillEnabled() {
+  static const bool kEnabled = InkEnvFlag("R4DX_INK_MOE_PREFILL", true);
+  return kEnabled;
+}
+
+bool MoeCheckOffsetsEnabled() {
+  static const bool kEnabled = InkEnvFlag("R4DX_INK_MOE_CHECK_OFFSETS", false);
+  return kEnabled;
+}
+
 float SummaryInvTemperature(const kernels::SampleParams& params) {
   if (!(params.temperature > 0.0f) || params.temperature < kMinSummaryTemperature) return 0.0f;
   const float inv = 1.0f / params.temperature;
@@ -463,32 +473,65 @@ void Inkling2Model::Moe(int64_t layer, const uint16_t* x, uint16_t* out, int64_t
     int32_t* sorted = arena_.Alloc<int32_t>(static_cast<size_t>(Pn), 16);
     int32_t* pos_of_pair = arena_.Alloc<int32_t>(static_cast<size_t>(Pn), 16);
     uint16_t* xs = arena_.Alloc<uint16_t>(static_cast<size_t>(Pn * H), 16);
-    uint16_t* gu = arena_.Alloc<uint16_t>(static_cast<size_t>(T * 2 * I), 16);
-    uint16_t* act = arena_.Alloc<uint16_t>(static_cast<size_t>(T * I), 16);
     ProfiledCall(prof, sr, "moe.sort", [&] {
       r4dx_lfm2_moe_sort(P(ids), static_cast<int>(T), static_cast<int>(K), static_cast<int>(E), P(counts), P(offsets),
                          P(sorted), P(pos_of_pair), s);
       r4dx_lfm2_moe_gather_bf16(P(x), P(sorted), P(xs), static_cast<int>(Pn), static_cast<int>(K), static_cast<int>(H), H,
                                 P(offsets + E), s);
     });
-    ProfiledCall(prof, sr, "moe.readback", [&] {
-      R4DX_HIP_CHECK(hipMemcpyAsync(moe_off_host_.data(), offsets, static_cast<size_t>(E + 1) * sizeof(int32_t),
-                                    hipMemcpyDeviceToHost, sr));
-      R4DX_HIP_CHECK(hipStreamSynchronize(sr));
-    });
-    const int32_t* off = moe_off_host_.data();
-    if (off[0] != 0 || off[E] != Pn)
-      throw std::runtime_error("Inkling2Model: the expert sort covers " + std::to_string(off[E]) + " of " +
-                               std::to_string(Pn) + " pairs");
-    const size_t mark = arena_.Mark();
-    for (int64_t e = 0; e < E; ++e) {
-      const int64_t r0 = off[e], c = off[e + 1] - off[e];
-      if (c == 0) continue;
-      if (c < 0 || c > T) throw std::runtime_error("Inkling2Model: bad expert row count " + std::to_string(c));
-      arena_.Rewind(mark);
-      ProfiledCall(prof, sr, "gemm:moe.gate_up", [&] { Lin(w.gate_up[static_cast<size_t>(e)], xs + r0 * H, gu, c); });
-      ProfiledCall(prof, sr, "moe.act", [&] { r4dx_inkling2_swiglu_softcap_bf16(P(gu), P(act), c, I, 2 * I, s); });
-      ProfiledCall(prof, sr, "gemm:moe.down", [&] { Lin(w.down[static_cast<size_t>(e)], act, ys + r0 * H, c); });
+    const bool grouped_mx_pf = MoeGroupedPrefillEnabled() && !w.gate_up_ptrs0.empty() && !w.gate_up_ptrs1.empty() &&
+                               !w.down_ptrs0.empty() && !w.down_ptrs1.empty() && !w.gate_up.empty() &&
+                               w.gate_up[0].layout == Layout::kMxfp8 && w.down[0].layout == Layout::kMxfp8;
+    if (grouped_mx_pf) {
+      if (MoeCheckOffsetsEnabled()) {
+        R4DX_HIP_CHECK(hipMemcpyAsync(moe_off_host_.data(), offsets, static_cast<size_t>(E + 1) * sizeof(int32_t),
+                                      hipMemcpyDeviceToHost, sr));
+        R4DX_HIP_CHECK(hipStreamSynchronize(sr));
+        const int32_t* off = moe_off_host_.data();
+        if (off[0] != 0 || off[E] != Pn)
+          throw std::runtime_error("Inkling2Model: the expert sort covers " + std::to_string(off[E]) + " of " +
+                                   std::to_string(Pn) + " pairs");
+      }
+      uint16_t* gu = arena_.Alloc<uint16_t>(static_cast<size_t>(Pn * 2 * I), 16);
+      uint16_t* act = arena_.Alloc<uint16_t>(static_cast<size_t>(Pn * I), 16);
+      const int64_t m_tune = std::min<int64_t>(T, 64);
+      const LinearTuning t_gu = PickTuning(Layout::kMxfp8, w.gate_up[0].N, w.gate_up[0].K, m_tune);
+      const LinearTuning t_dn = PickTuning(Layout::kMxfp8, w.down[0].N, w.down[0].K, m_tune);
+      ProfiledCall(prof, sr, "gemm:moe.gate_up", [&] {
+        r4dx_gemm_mxfp8_moe_prefill(P(xs), P(w.gate_up_ptrs0.data()), P(w.gate_up_ptrs1.data()), P(offsets), P(gu),
+                                    static_cast<int>(Pn), static_cast<int>(E), static_cast<int>(w.gate_up[0].K),
+                                    static_cast<int>(w.gate_up[0].N), t_gu.WV, t_gu.SK, t_gu.NPW, t_gu.NT, s);
+      });
+      ProfiledCall(prof, sr, "moe.act", [&] {
+        r4dx_inkling2_swiglu_softcap_bf16(P(gu), P(act), Pn, I, 2 * I, s);
+      });
+      ProfiledCall(prof, sr, "gemm:moe.down", [&] {
+        r4dx_gemm_mxfp8_moe_prefill(P(act), P(w.down_ptrs0.data()), P(w.down_ptrs1.data()), P(offsets), P(ys),
+                                    static_cast<int>(Pn), static_cast<int>(E), static_cast<int>(w.down[0].K),
+                                    static_cast<int>(w.down[0].N), t_dn.WV, t_dn.SK, t_dn.NPW, t_dn.NT, s);
+      });
+    } else {
+      uint16_t* gu = arena_.Alloc<uint16_t>(static_cast<size_t>(T * 2 * I), 16);
+      uint16_t* act = arena_.Alloc<uint16_t>(static_cast<size_t>(T * I), 16);
+      ProfiledCall(prof, sr, "moe.readback", [&] {
+        R4DX_HIP_CHECK(hipMemcpyAsync(moe_off_host_.data(), offsets, static_cast<size_t>(E + 1) * sizeof(int32_t),
+                                      hipMemcpyDeviceToHost, sr));
+        R4DX_HIP_CHECK(hipStreamSynchronize(sr));
+      });
+      const int32_t* off = moe_off_host_.data();
+      if (off[0] != 0 || off[E] != Pn)
+        throw std::runtime_error("Inkling2Model: the expert sort covers " + std::to_string(off[E]) + " of " +
+                                 std::to_string(Pn) + " pairs");
+      const size_t mark = arena_.Mark();
+      for (int64_t e = 0; e < E; ++e) {
+        const int64_t r0 = off[e], c = off[e + 1] - off[e];
+        if (c == 0) continue;
+        if (c < 0 || c > T) throw std::runtime_error("Inkling2Model: bad expert row count " + std::to_string(c));
+        arena_.Rewind(mark);
+        ProfiledCall(prof, sr, "gemm:moe.gate_up", [&] { Lin(w.gate_up[static_cast<size_t>(e)], xs + r0 * H, gu, c); });
+        ProfiledCall(prof, sr, "moe.act", [&] { r4dx_inkling2_swiglu_softcap_bf16(P(gu), P(act), c, I, 2 * I, s); });
+        ProfiledCall(prof, sr, "gemm:moe.down", [&] { Lin(w.down[static_cast<size_t>(e)], act, ys + r0 * H, c); });
+      }
     }
     ProfiledCall(prof, sr, "moe.combine", [&] {
       r4dx_lfm2_moe_combine_bf16(P(ys), P(pos_of_pair), P(wts), P(out), static_cast<int>(T), static_cast<int>(K),

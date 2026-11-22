@@ -59,4 +59,13 @@ void r4dx_gemm_mxfp8_moe_decode(int64_t a_bf16, int64_t wq_ptrs, int64_t ws_ptrs
                                 int n_pairs, int a_row_group, int n_experts, int K, int N, int WV, int SK,
                                 int NPW, int NT, int64_t stream);
 
+// Device-indexed grouped MoE prefill GEMM (docs/inkling2-speed-plan.md S2; copy-adapt of r4dx_gemm_w8a16_moe_prefill):
+// runs over the expert-sorted rows A[n_pairs, K] -> C[n_pairs, N], driven by device `expert_offsets[n_experts + 1]`
+// with zero host readback. Each 16-row tile of each non-empty expert e runs the exact MT = 1 WMMA + LDS split-K
+// reduction of r4dx_gemm_mxfp8_nt on wq_ptrs[e], ws_ptrs[e], producing output bytes identical to calling
+// r4dx_gemm_mxfp8_nt per non-empty expert at the same SK. Counts 1 launch in r4dx_kernel_launch_counter.
+void r4dx_gemm_mxfp8_moe_prefill(int64_t a_bf16, int64_t wq_ptrs, int64_t ws_ptrs, int64_t expert_offsets,
+                                 int64_t c, int n_pairs, int n_experts, int K, int N, int WV, int SK,
+                                 int NPW, int NT, int64_t stream);
+
 }  // extern "C"

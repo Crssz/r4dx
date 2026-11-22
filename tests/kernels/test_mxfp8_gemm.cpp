@@ -493,6 +493,83 @@ void TestMoeDecode(std::mt19937& rng, bool quick) {
   }
 }
 
+void TestMoePrefill(std::mt19937& rng, bool quick) {
+  struct PfShape {
+    const char* name;
+    int N, K;
+  };
+  const PfShape shapes[] = {
+      {"tiny.gate_up", 64, 64},
+      {"tiny.down", 64, 32},
+      {"inkling.gate_up", 2304, 2304},
+      {"inkling.down", 2304, 1152},
+      {"tp2.gate_up", 1152, 2304},
+      {"tp2.down", 2304, 576},
+  };
+  // Counts per expert covering 0, 1, 7, 16, 17, 35 rows (empty, partial tile, exact tile, multi-tile).
+  const std::vector<int> counts = {0, 1, 0, 7, 16, 0, 17, 35, 3, 0};
+  const int n_experts = static_cast<int>(counts.size());
+  std::vector<int32_t> off_h(static_cast<size_t>(n_experts + 1), 0);
+  for (int e = 0; e < n_experts; ++e) off_h[static_cast<size_t>(e + 1)] = off_h[static_cast<size_t>(e)] + counts[static_cast<size_t>(e)];
+  const int n_pairs = off_h[static_cast<size_t>(n_experts)];
+  DeviceBuffer<int32_t> off_d(off_h.size());
+  off_d.CopyFromHost(off_h);
+
+  for (const auto& s : shapes) {
+    if (quick && std::string(s.name).find("tp2") != std::string::npos) continue;
+    std::vector<Problem> experts(static_cast<size_t>(n_experts));
+    std::vector<uint64_t> wq_h(static_cast<size_t>(n_experts)), ws_h(static_cast<size_t>(n_experts));
+    for (int e = 0; e < n_experts; ++e) {
+      experts[static_cast<size_t>(e)].N = s.N;
+      experts[static_cast<size_t>(e)].K = s.K;
+      experts[static_cast<size_t>(e)].cols = {0};
+      MakeWeight(rng, experts[static_cast<size_t>(e)]);
+      wq_h[static_cast<size_t>(e)] = static_cast<uint64_t>(P(experts[static_cast<size_t>(e)].wq.data()));
+      ws_h[static_cast<size_t>(e)] = static_cast<uint64_t>(P(experts[static_cast<size_t>(e)].ws.data()));
+    }
+    DeviceBuffer<uint64_t> wq_ptrs(wq_h.size()), ws_ptrs(ws_h.size());
+    wq_ptrs.CopyFromHost(wq_h);
+    ws_ptrs.CopyFromHost(ws_h);
+
+    std::vector<uint16_t> a_h(static_cast<size_t>(n_pairs) * s.K);
+    std::normal_distribution<float> nd(0.0f, 1.0f);
+    for (auto& v : a_h) v = FloatToBf16Rne(std::clamp(nd(rng), -4.0f, 4.0f));
+    DeviceBuffer<uint16_t> a_d(a_h.size());
+    a_d.CopyFromHost(a_h);
+
+    DeviceBuffer<uint16_t> c_grp(static_cast<size_t>(n_pairs) * s.N), c_ref(static_cast<size_t>(n_pairs) * s.N);
+    const int fsk = FallbackSk(s.K, 64, s.N);
+    std::vector<Geo> geos = {Fallback(64, s.N, fsk)};
+    if (!quick) {
+      for (int sk : {1, 2, 4, 8}) {
+        for (int npw : {1, 4}) {
+          Geo g{1, sk, 1, npw, 0};
+          if (Legal(g, s.K)) geos.push_back(g);
+        }
+      }
+    }
+    for (const Geo& g : geos) {
+      R4DX_HIP_CHECK(hipMemset(c_grp.data(), 0x5A, c_grp.bytes()));
+      R4DX_HIP_CHECK(hipMemset(c_ref.data(), 0x5A, c_ref.bytes()));
+      r4dx_gemm_mxfp8_moe_prefill(P(a_d.data()), P(wq_ptrs.data()), P(ws_ptrs.data()), P(off_d.data()), P(c_grp.data()),
+                                  n_pairs, n_experts, s.K, s.N, g.WV, g.SK, g.NPW, g.NT, 0);
+      for (int e = 0; e < n_experts; ++e) {
+        const int r0 = off_h[static_cast<size_t>(e)], cnt = counts[static_cast<size_t>(e)];
+        if (cnt == 0) continue;
+        const int64_t ap = P(a_d.data() + static_cast<size_t>(r0) * s.K);
+        const int64_t cp = P(c_ref.data() + static_cast<size_t>(r0) * s.N);
+        r4dx_gemm_mxfp8_nt(ap, P(experts[static_cast<size_t>(e)].wq.data()), P(experts[static_cast<size_t>(e)].ws.data()),
+                           cp, cnt, s.K, s.N, g.WV, g.SK, std::min(4, (cnt + 15) / 16), g.NPW, g.NT, 0);
+      }
+      R4DX_HIP_CHECK(hipDeviceSynchronize());
+      const auto got = c_grp.CopyToHost();
+      const auto ref = c_ref.CopyToHost();
+      Check(got == ref, std::string("moe_prefill ") + s.name + " [" + std::to_string(s.N) + "x" + std::to_string(s.K) +
+                            "] pairs=" + std::to_string(n_pairs) + " " + GeoStr(g) + ": bit-identical to per-expert nt");
+    }
+  }
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -517,6 +594,7 @@ int main(int argc, char** argv) {
     for (const auto& s : shapes) TestProblem(rng, s.name, s.N, s.K, Ms, quick);
     if (!quick) TestProblem(rng, "lm_head (200058 rounded to 200064)", 200064, 2304, {1}, false);
     TestMoeDecode(rng, quick);
+    TestMoePrefill(rng, quick);
   } catch (const std::exception& e) {
     std::printf("EXCEPTION: %s\n", e.what());
     return 1;

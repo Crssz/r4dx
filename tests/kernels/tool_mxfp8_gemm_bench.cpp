@@ -45,6 +45,14 @@ std::vector<Shape> DefaultShapes() {
       {"attn.o", 2304, 3072},
       {"attn.rel", 384, 2304},
       {"lm_head", 200064, 2304},
+      {"tp2.expert.gate_up", 1152, 2304},
+      {"tp2.expert.down", 2304, 576},
+      {"tp2.attn.qgrkv", 4480, 2304},
+      {"tp2.attn.qgr", 3456, 2304},
+      {"tp2.attn.q_gate", 1536, 2304},
+      {"tp2.attn.kv", 512, 2304},
+      {"tp2.attn.o", 2304, 1536},
+      {"tp2.lm_head", 100032, 2304},
   };
 }
 
@@ -156,7 +164,7 @@ int main(int argc, char** argv) {
 
       const bool is_expert = s.name.find("expert.") != std::string::npos;
       const int k_top = 8;
-      const int input_div = (s.name == "expert.gate_up") ? k_top : 1;
+      const int input_div = (s.name.find("expert.gate_up") != std::string::npos) ? k_top : 1;
       const int n_moe_sets = static_cast<int>(std::max<size_t>(1, wq.bufs.size() / k_top));
       std::vector<DeviceBuffer<uint64_t>> wq_ptrs_sets, ws_ptrs_sets;
       DeviceBuffer<int32_t> moe_ids(k_top);
@@ -200,7 +208,7 @@ int main(int argc, char** argv) {
       }
 
       for (int M : Ms) {
-        if (s.name == "lm_head" && M > 1) continue;  // lm_head only runs at M = 1
+        if (s.name.find("lm_head") != std::string::npos && M > 1) continue;  // lm_head only runs at M = 1
         const int runM = (M == 64 && !is_expert) ? 256 : M;  // real prefill chunks are M = 256
         if (runM > maxM) {
           a = DeviceBuffer<uint16_t>(static_cast<size_t>(runM) * K);

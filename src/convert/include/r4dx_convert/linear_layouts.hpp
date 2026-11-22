@@ -16,8 +16,10 @@
 
 #include "r4dx_convert/container_writer.hpp"
 #include "r4dx_convert/quant_int4.hpp"
+#include "r4dx_convert/mxfp8_format.hpp"
 #include "r4dx_convert/quant_int8.hpp"
 #include "r4dx_convert/quant_ldlq.hpp"
+#include "r4dx_convert/quant_mxfp8.hpp"
 #include "r4dx_convert/quant_search.hpp"
 #include "r4dx_convert/tensor_codec.hpp"
 
@@ -38,6 +40,9 @@ struct LayoutSet {
   // `w8a16_group` is run-wide (--w8a16-group), 64 or 128; ignored when `w8a16` is false.
   bool w8a16 = false;
   int w8a16_group = kW8A16Group;
+  // The mxfp8 layout (docs/inkling2-plan.md 4.1, mxfp8_format.hpp): e4m3 codes + one E8M0 scale per 32 K,
+  // `<base>.mxfp8.wq` / `.ws`, RTN-free (the ceil rule never clips). Run-wide group is fixed at 32.
+  bool mxfp8 = false;
   // The trellis layout (docs/trellis-kernel.md 2; r4dx-convert --trellis-from, trellis_import.hpp):
   // `<base>.trellis.w` / `.suh` / `.svh`, IMPORTED from an oracle directory, never quantized here.
   // Exclusive -- a trellis linear has no other layout (3.4: no `.bf16.w` may defeat the old-binary
@@ -105,6 +110,10 @@ inline std::vector<std::string> LinearLayoutTensorNames(const std::string& base,
     n.push_back(base + w8a16::kWqSuffix);
     n.push_back(base + w8a16::kWsSuffix);
   }
+  if (layouts.mxfp8) {
+    n.push_back(base + mxfp8::kWqSuffix);
+    n.push_back(base + mxfp8::kWsSuffix);
+  }
   if (layouts.trellis) {
     n.push_back(base + ".trellis.w");
     n.push_back(base + ".trellis.suh");
@@ -126,6 +135,7 @@ inline std::string LayoutSetId(const LayoutSet& ls) {
   if (ls.bf16) add("bf16");
   if (ls.w4a16) add("w4a16.g" + std::to_string(ls.w4a16_group));
   if (ls.w8a16) add(w8a16::kLayoutIdPrefix + std::to_string(ls.w8a16_group));
+  if (ls.mxfp8) add(mxfp8::kLayoutId);
   if (ls.trellis) add("trellis.k" + std::to_string(ls.trellis_bits));
   return s.empty() ? std::string("none") : s;
 }
@@ -154,6 +164,8 @@ inline bool ParseLayoutSetId(const std::string& id, LayoutSet* out) {
         ls.w8a16 = true;
         ls.w8a16_group = std::stoi(t.substr(7));
         if (!IsW8A16GroupSupported(ls.w8a16_group)) return false;
+      } else if (t == mxfp8::kLayoutId) {
+        ls.mxfp8 = true;
       } else if (t == "trellis.k3" || t == "trellis.k4" || t == "trellis.k5") {
         ls.trellis = true;
         ls.trellis_bits = t.back() - '0';
@@ -167,7 +179,7 @@ inline bool ParseLayoutSetId(const std::string& id, LayoutSet* out) {
   // Canonical only: the fixed order, each layout once, no empty token, no leading zeros.
   if (LayoutSetId(ls) != id) return false;
   // Trellis is exclusive (TrellisLayoutSet): "bf16+trellis.k4" is not a set this converter writes.
-  if (ls.trellis && (ls.bf16 || ls.w4a16 || ls.w8a16)) return false;
+  if (ls.trellis && (ls.bf16 || ls.w4a16 || ls.w8a16 || ls.mxfp8)) return false;
   *out = ls;
   return true;
 }
@@ -183,6 +195,7 @@ inline uint64_t LinearLayoutBytes(int N, int K, const LayoutSet& layouts) {
   if (layouts.bf16) bytes += NK * 2;
   if (layouts.w4a16) bytes += NK / 2 + NK / layouts.w4a16_group * 4;
   if (layouts.w8a16) bytes += NK + NK / layouts.w8a16_group * 2;
+  if (layouts.mxfp8) bytes += NK + NK / mxfp8::kGroup;
   if (layouts.trellis) {
     bytes += NK * static_cast<uint64_t>(layouts.trellis_bits) / 8 +
              static_cast<uint64_t>(TrellisPartCount(layouts)) * static_cast<uint64_t>(K) * 2 +
@@ -222,7 +235,7 @@ inline void CheckTrellisLayout(const std::string& base, int64_t N, int64_t K, co
     throw std::runtime_error("r4dx_convert: trellis linear " + base + " [" + std::to_string(N) +
                              "," + std::to_string(K) + "]: " + why);
   };
-  if (ls.bf16 || ls.w4a16 || ls.w8a16)
+  if (ls.bf16 || ls.w4a16 || ls.w8a16 || ls.mxfp8)
     fail("a trellis linear is written in the trellis layout only (docs/trellis-kernel.md 3.4; "
          "no w8a16 next to trellis, docs/w8a16.md 5.2)");
   if (ls.trellis_bits != 3 && ls.trellis_bits != 4 && ls.trellis_bits != 5)
@@ -276,6 +289,11 @@ inline void PlanLinearLayouts(ContainerWriter& writer, const std::string& base, 
     RequireDivisible(K, layouts.w8a16_group, "K", base.c_str());
     RequireDivisible(K, w8a16::kKBlock, "K", base.c_str());
   }
+  if (layouts.mxfp8) {
+    // mxfp8_format.hpp: the fragment permutation of w8a16 (N % 16, K % 32) and one scale per 32 K.
+    RequireDivisible(N, w8a16::kTileRows, "N", base.c_str());
+    RequireDivisible(K, mxfp8::kGroup, "K", base.c_str());
+  }
   if (layouts.bf16)
     writer.Plan(base + ".bf16.w", {N, K, 2}, static_cast<uint64_t>(N) * K * 2);
   if (layouts.w4a16) {
@@ -290,6 +308,27 @@ inline void PlanLinearLayouts(ContainerWriter& writer, const std::string& base, 
     writer.Plan(base + w8a16::kWsSuffix, {NK / layouts.w8a16_group, 2},
                 static_cast<uint64_t>(NK / layouts.w8a16_group) * 2);
   }
+  if (layouts.mxfp8) {
+    const int64_t NK = static_cast<int64_t>(N) * K;
+    writer.Plan(base + mxfp8::kWqSuffix, {NK}, static_cast<uint64_t>(NK));
+    writer.Plan(base + mxfp8::kWsSuffix, {NK / mxfp8::kGroup}, static_cast<uint64_t>(NK / mxfp8::kGroup));
+  }
+}
+
+// Writes the mxfp8 tensors of one linear from ALREADY QUANTIZED `codes` [N*K] (logical row-major e4m3 codes) and
+// `scales` [N*K/32] ((row, group) E8M0 bytes): the permutation only, no re-encoding. This is how the checkpoint's own
+// MXFP8 experts (Inkling layers 20-23) are copied bit-exact. NaN codes / scale byte 255 are refused (never written).
+inline void EmitMxfp8Prequantized(ContainerWriter& writer, const std::string& base, const std::vector<uint8_t>& codes,
+                                  const std::vector<uint8_t>& scales, int N, int K, int nthreads) {
+  for (uint8_t c : codes)
+    if ((c & 0x7F) == 0x7F)
+      throw std::runtime_error("EmitMxfp8Prequantized: '" + base + "' holds an e4m3 NaN code");
+  for (uint8_t s : scales)
+    if (s == 255) throw std::runtime_error("EmitMxfp8Prequantized: '" + base + "' holds the E8M0 NaN scale byte");
+  const std::vector<uint8_t> wq = PackMxfp8Codes(codes, N, K, nthreads);
+  const std::vector<uint8_t> ws = PackMxfp8Scales(scales, N, K);
+  writer.WriteTensor(base + mxfp8::kWqSuffix, wq.data(), wq.size());
+  writer.WriteTensor(base + mxfp8::kWsSuffix, ws.data(), ws.size());
 }
 
 inline void EmitLinearLayouts(ContainerWriter& writer, const std::string& base,
@@ -344,6 +383,11 @@ inline void EmitLinearLayouts(ContainerWriter& writer, const std::string& base,
     auto ws = PackW8a16Scales(scale16, N, K, g8);
     writer.WriteTensor(base + w8a16::kWqSuffix, wq.data(), wq.size());
     writer.WriteTensor(base + w8a16::kWsSuffix, ws.data(), ws.size() * 2);
+  }
+  if (layouts.mxfp8) {
+    std::vector<uint8_t> codes, scales;
+    QuantizeMxfp8(w.data(), N, K, nthreads, codes, scales, base.c_str());
+    EmitMxfp8Prequantized(writer, base, codes, scales, N, K, nthreads);
   }
 }
 

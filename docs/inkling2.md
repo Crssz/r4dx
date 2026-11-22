@@ -95,4 +95,12 @@ follow-ups are a grouped device-indexed MoE decode (LFM2/Ornith style) and a fus
 
 - Vision (23-layer ViT) and the DSpark/MTP drafter (`mtp.safetensors`).
 - fp32 TP all-reduce (the TP=2 gate miss), performance work above, fp8 KV.
-- HF-vs-r4dx greedy token comparison (`tools/reference/inkling2/greedy_smoke.py --compare`): see the plan doc for its status.
+- HF-vs-r4dx greedy token comparison: the HF reference is recorded (`E:\models\r4dx\inkling2\greedy\hf_greedy.json`, 4
+  prompts x 64 tokens); the r4dx side and `greedy_smoke.py --compare` have not been run.
+- **Positions past 8192 on the real model are untested.** That is where the full-attention layers' log scaling
+  (`log_scaling_n_floor` 8192) starts. The code path is covered by the tiny end-to-end test against HF (floor 16 there), and
+  the 6144-token set covers the sliding-ring wrap, but no real-weight run went beyond 6144 tokens. A 16k-token TP=2 NLL dump
+  plus a 20k-token needle test was started on 2026-11-22 and stopped by the user before it finished (inputs were made by a
+  scratch script from the repo's docs text; rerun it before relying on long contexts).
+- Variable loop passes (`is_varloop`, the TML-d24-varloop-research checkpoint): skipped by decision; r4dx refuses such a
+  config.

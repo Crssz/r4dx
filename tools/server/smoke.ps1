@@ -174,6 +174,17 @@
   recovery steps as every other -Tp 2 run (80 all-reduces per forward on LFM2, so the default -TpFaultSpec fires about
   37 tokens into request A).
 
+  `inkling2` (Inkling-2-Mini, arch inkling2_loop, docs/inkling2-plan.md section 6) passes `--dialect inkling2`, defaults -Layout to
+  mxfp8 and -Layers to -1, requires -Model, and replaces the Qwen-specific checks by the Inkling suite: /v1/models with
+  reasoning.default_enabled true (thinking is the model's own default); the typed-part split non-streaming and streaming
+  (reasoning_content / content, live, never both keys in one delta, no `<|...|>` part marker in any delta, greedy stream ==
+  non-stream, usage.reasoning_tokens counted from the thinking part); reasoning_effort as a level name or a number in [0, 0.99]
+  (enable_thinking=false == effort none; out-of-range / unknown values 400); the prefix cache (the chat template has no
+  generation prompt, so turn 1's prompt is a token prefix of turn 2's); one-call, streamed and two-call tool round trips with a
+  role:"tool" turn; max_tokens truncation (finish_reason length); a Thai answer; the generation_config sampling default
+  (temperature 1). Not -Mtp/-Dflash/-Pp 2/-Vision/-ToolRoundTrip. The suite has NOT been run yet (written CPU-only).
+.EXAMPLE
+  .\tools\server\smoke.ps1 -Model E:\models\r4dx\inkling2\inkling2-mini-uncensored-mxfp8.r4dx -Tp 2 -Dialect inkling2 -Port 8091
 .EXAMPLE
   .\tools\server\smoke.ps1 -Model E:\models\r4dx\lfm2\lfm2-24b-a2b-bf16.r4dx -Tp 2 -Dialect lfm2 -Port 8091
 .EXAMPLE
@@ -218,7 +229,7 @@ param(
     [int]$PpSplit = 0,
     [int]$HybridFillerLines = 50,
     [switch]$VisionStraddle,
-    [ValidateSet("auto", "qwen35", "gemma4", "lfm2")][string]$Dialect = "auto"
+    [ValidateSet("auto", "qwen35", "gemma4", "lfm2", "inkling2")][string]$Dialect = "auto"
 )
 
 Add-Type -AssemblyName System.Drawing
@@ -303,7 +314,9 @@ if (-not (Test-Path $Model)) { throw "model container not found: $Model" }
 # -Dialect: auto resolves from the container's file name here (the server's own auto-detection reads the container
 # header; this script only needs to know which check suite to run). lfm2 has its own defaults and exclusions.
 if ($Dialect -eq "auto" -and (Split-Path $Model -Leaf) -match 'lfm2') { $Dialect = "lfm2" }
+if ($Dialect -eq "auto" -and (Split-Path $Model -Leaf) -match 'inkling') { $Dialect = "inkling2" }
 $IsLfm2 = ($Dialect -eq "lfm2")
+$IsInkling2 = ($Dialect -eq "inkling2")
 if ($IsLfm2) {
     if (-not $PSBoundParameters.ContainsKey("Layout")) { $Layout = "bf16" }
     if (-not $PSBoundParameters.ContainsKey("Layers")) { $Layers = -1 }
@@ -314,6 +327,17 @@ if ($IsLfm2) {
     if (-not $PSBoundParameters.ContainsKey("Model")) { throw "-Dialect lfm2 needs -Model <the lfm2 .r4dx container>" }
 }
 
+# -Dialect inkling2 (docs/inkling2-plan.md section 6): the real mxfp8 container only (default -Layout mxfp8, -Layers -1); no drafter,
+# no vision. NOT RUN in the lane that wrote it (CPU-only): run it with the GPUs free and the container converted.
+if ($IsInkling2) {
+    if (-not $PSBoundParameters.ContainsKey("Layout")) { $Layout = "mxfp8" }
+    if (-not $PSBoundParameters.ContainsKey("Layers")) { $Layers = -1 }
+    if ($Mtp -gt 0 -or $Dflash -ne "" -or $Pp -eq 2 -or $Vision -or $ToolRoundTrip) {
+        throw "-Dialect inkling2: -Mtp, -Dflash, -Pp 2, -Vision and -ToolRoundTrip do not apply (no drafter, no vision; the tool round trip is always on)"
+    }
+    if ($Layers -ge 0) { throw "-Dialect inkling2 needs the full container (-Layers -1): the checks read real answers" }
+    if (-not $PSBoundParameters.ContainsKey("Model")) { throw "-Dialect inkling2 needs -Model <the inkling2 .r4dx container, e.g. E:\models\r4dx\inkling2\inkling2-mini-uncensored-mxfp8.r4dx>" }
+}
 $BaseUrl = "http://127.0.0.1:$Port"
 $script:Failures = 0
 
@@ -651,7 +675,7 @@ try {
     $ckptVram = @(Select-String -Path $ServerErrLog -Pattern "prompt checkpoint VRAM:" -SimpleMatch -ErrorAction SilentlyContinue)
     # LFM2 keeps its conv state in the engine (a few hundred KB) and logs no checkpoint VRAM line; the restore/ckpt
     # request-log fields are checked in the LFM suite instead.
-    if (-not $IsLfm2) {
+    if (-not $IsLfm2 -and -not $IsInkling2) {
         Check ($ckptVram.Count -ge 1) "--prompt-checkpoint (default on): the load log reports the checkpoint's VRAM"
     }
     foreach ($l in $ckptVram) { Write-Output "  [info] $($l.Line)" }
@@ -743,7 +767,7 @@ try {
         Check ($faultBStatus -eq 200) "TpFault: request B (the standard smoke prompt, after the fault) returns 200 (got $faultBStatus)"
         $refText = [string]$faultRef.choices[0].message.content
         $bText = if ($null -ne $faultB) { [string]$faultB.choices[0].message.content } else { "" }
-        if ($IsLfm2) {
+        if ($IsLfm2 -or $IsInkling2) {
             # LFM2.5 always thinks: 8 tokens end inside the reasoning, so the visible text is reasoning_content.
             $refText = [string]$faultRef.choices[0].message.reasoning_content + "|" + $refText
             $bText = $(if ($null -ne $faultB) { [string]$faultB.choices[0].message.reasoning_content } else { "" }) + "|" + $bText
@@ -766,7 +790,7 @@ try {
 
     # Everything from here to the matching `} else {` just before the final `finally` is the Qwen-family suite
     # (its indentation is unchanged on purpose: no diff noise); -Dialect lfm2 runs the LFM2.5 suite in the else branch.
-    if (-not $IsLfm2) {
+    if (-not $IsLfm2 -and -not $IsInkling2) {
 
     # ---- GET /v1/models ------------------------------------------------------------------------
     $modelsResp =Invoke-WebRequest -Uri "$BaseUrl/v1/models" -UseBasicParsing
@@ -2420,6 +2444,251 @@ try {
                           "MTP head never accepts a draft at all, task's own container note)")
         }
     }
+
+    } elseif ($IsInkling2) {
+    # =====================================================================================================
+    # -Dialect inkling2: the Inkling-2-Mini suite (docs/inkling2-plan.md section 6; NOT RUN YET -- written with the engine
+    # wiring on CPU only). Real container, real answers. The generation is a stream of typed parts
+    # (<|message_model|> [name] <|content_thinking|> | <|content_text|> | <|content_invoke_tool_json|> ... <|end_message|>) that the
+    # server splits into reasoning_content / content / tool_calls (Inkling2StreamParser); the chat template has no generation
+    # prompt, so the previous turn's prompt is always a token prefix of the next one.
+    # =====================================================================================================
+    function Get-Prop { param($Obj, [string]$Name) if ($null -ne $Obj -and ($Obj.PSObject.Properties.Name -contains $Name)) { $Obj.$Name } else { $null } }
+
+    # One non-streaming chat request; body out as UTF-8 bytes, response decoded as UTF-8 from the raw stream.
+    function Invoke-InkChat {
+        param([hashtable]$Body, [int]$TimeoutSec = 900)
+        $bytes = [System.Text.Encoding]::UTF8.GetBytes(($Body | ConvertTo-Json -Depth 12))
+        $status = 0
+        $chat = $null
+        try {
+            $resp = Invoke-WebRequest -Uri "$BaseUrl/v1/chat/completions" -Method Post -ContentType "application/json; charset=utf-8" `
+                -Body $bytes -UseBasicParsing -TimeoutSec $TimeoutSec
+            $status = [int]$resp.StatusCode
+            $chat = [System.Text.Encoding]::UTF8.GetString($resp.RawContentStream.ToArray()) | ConvertFrom-Json
+        } catch {
+            if ($null -eq $_.Exception.Response) { throw }
+            $status = [int]$_.Exception.Response.StatusCode.value__
+        }
+        $msg = $null
+        if ($null -ne $chat -and $chat.choices.Count -gt 0) { $msg = $chat.choices[0].message }
+        [pscustomobject]@{
+            Status = $status; Chat = $chat; Msg = $msg
+            Content = [string](Get-Prop $msg "content"); Reasoning = [string](Get-Prop $msg "reasoning_content")
+            ToolCalls = @(Get-Prop $msg "tool_calls")
+            Finish = $(if ($null -ne $chat -and $chat.choices.Count -gt 0) { [string]$chat.choices[0].finish_reason } else { "" })
+        }
+    }
+
+    # One streaming chat request, parsed (reasoning / content text, every tool_calls delta entry, finish reason, structural violations).
+    function Get-InkStream {
+        param([hashtable]$Body)
+        $Body["stream"] = $true
+        $Body["stream_options"] = @{ include_usage = $true }
+        $sse = Invoke-SseStream -Uri "$BaseUrl/v1/chat/completions" -Body ($Body | ConvertTo-Json -Depth 12)
+        $r = @{ Reasoning = ""; Content = ""; ToolCalls = @(); Finish = ""; Both = $false; Interleaved = $false; Leak = $false
+                FirstReasoningMs = -1.0; FirstContentMs = -1.0; TotalMs = $sse.TotalMs; Done = $false; Usage = $null }
+        $rb = New-Object System.Text.StringBuilder
+        $cb = New-Object System.Text.StringBuilder
+        foreach ($ev in $sse.Events) {
+            if ($ev.Data -eq "[DONE]") { $r.Done = $true; continue }
+            $c = $ev.Data | ConvertFrom-Json
+            if ($null -ne (Get-Prop $c "usage")) { $r.Usage = $c.usage }
+            if ($c.choices.Count -eq 0) { continue }
+            if ($null -ne $c.choices[0].finish_reason) { $r.Finish = [string]$c.choices[0].finish_reason }
+            $d = $c.choices[0].delta
+            if ($null -eq $d) { continue }
+            $rs = Get-Prop $d "reasoning_content"
+            $ct = Get-Prop $d "content"
+            if ($null -ne $rs -and $rs -ne "") {
+                if ($r.FirstReasoningMs -lt 0) { $r.FirstReasoningMs = $ev.Ms }
+                [void]$rb.Append($rs)
+            }
+            if ($null -ne $ct -and $ct -ne "") {
+                if ($r.FirstContentMs -lt 0) { $r.FirstContentMs = $ev.Ms }
+                [void]$cb.Append($ct)
+            }
+            if ($null -ne $rs -and $null -ne $ct -and $rs -ne "" -and $ct -ne "") { $r.Both = $true }
+            if ($null -ne (Get-Prop $d "tool_calls")) { $r.ToolCalls += @($d.tool_calls) }
+        }
+        $r.Reasoning = $rb.ToString()
+        $r.Content = $cb.ToString()
+        # Any part marker in a delta is a leak (the parser must have consumed every one of them).
+        $all = $r.Reasoning + $r.Content
+        $r.Leak = $all.Contains("<|message_model|>") -or $all.Contains("<|content_") -or $all.Contains("<|end_message|>")
+        $r
+    }
+
+    $logCount = { param([string]$Pattern) @(Select-String -Path $ServerErrLog -Pattern $Pattern -SimpleMatch -ErrorAction SilentlyContinue).Count }
+
+    # ---- start-up facts and /v1/models ----------------------------------------------------------------
+    Check ((& $logCount "[r4dx-server] dialect: inkling2") -ge 1) "dialect: the server log says 'dialect: inkling2'"
+    $mResp = Invoke-WebRequest -Uri "$BaseUrl/v1/models" -UseBasicParsing
+    $mList = $mResp.Content | ConvertFrom-Json
+    $md = $mList.data[0]
+    Check ($mResp.StatusCode -eq 200 -and $mList.object -eq "list" -and $mList.data.Count -eq 1) "/v1/models: 200, a list with exactly one entry"
+    Check ($md.context_length -eq $MaxCtx -and $md.meta.n_ctx -eq $MaxCtx) "/v1/models: context_length / meta.n_ctx == --max-ctx ($MaxCtx)"
+    Check (($md.capabilities) -contains "reasoning") "/v1/models: capabilities contain reasoning"
+    Check ($md.reasoning.default_enabled -eq $true) "/v1/models: reasoning.default_enabled == true (thinking is the model's own default, effort 0.9)"
+
+    # ---- thinking + text, non-streaming and streaming ----------------------------------------------------
+    $q42 = "What is 12 plus 30? Answer with just the number."
+    $bodyThink = { @{ messages = @(@{ role = "user"; content = $q42 }); max_tokens = 1536; temperature = 0; stream = $false } }
+    $rThink = Invoke-InkChat (& $bodyThink)
+    Check ($rThink.Status -eq 200) "thinking + text: request returns 200"
+    Check ($rThink.Finish -eq "stop") "thinking + text: finish_reason == 'stop' (got '$($rThink.Finish)'; 'length' means the parts did not close in 1536 tokens)"
+    Check ([bool]$rThink.Content -and $rThink.Content -match '42') "thinking + text: message.content has the answer 42 (content='$($rThink.Content)')"
+    Check (-not ($rThink.Content.Contains("<|") -or $rThink.Reasoning.Contains("<|"))) "thinking + text: no part marker in content or reasoning_content"
+    Check ($rThink.Finish -ne "tool_calls" -and $null -eq $rThink.ToolCalls[0]) "thinking + text: no tool_calls"
+    $rtok = [int](Get-Prop (Get-Prop $rThink.Chat.usage "completion_tokens_details") "reasoning_tokens")
+    if ([bool]$rThink.Reasoning) {
+        Check ($rtok -gt 0 -and $rtok -lt $rThink.Chat.usage.completion_tokens) `
+            "thinking + text: usage.completion_tokens_details.reasoning_tokens ($rtok) is in (0, completion_tokens $($rThink.Chat.usage.completion_tokens))"
+    } else {
+        Write-Output "  [info] the model skipped its thinking part for this prompt (no reasoning_content, reasoning_tokens $rtok)"
+    }
+    $lineThink = Get-RequestLogLine $rThink.Chat.id
+    Check ($lineThink -match ' thinking=yes') "thinking + text: the request log line shows thinking=yes"
+    Check ($lineThink -match ' temperature=0 ') "thinking + text: temperature 0 in the request is honored (log line)"
+    Write-Output "  [info] $lineThink"
+
+    $sThink = Get-InkStream (& $bodyThink)
+    Check ($sThink.Done -and $sThink.Finish -eq "stop") "thinking + text (streaming): ends with finish_reason 'stop' and data: [DONE] (got '$($sThink.Finish)')"
+    Check (-not $sThink.Both) "thinking + text (streaming): no delta carries both reasoning_content and content"
+    Check (-not $sThink.Leak) "thinking + text (streaming): no part marker in any delta"
+    if ([bool]$sThink.Reasoning) {
+        Check ($sThink.FirstReasoningMs -ge 0 -and $sThink.FirstReasoningMs -lt ($sThink.TotalMs / 2)) `
+            "thinking + text (streaming): reasoning streams LIVE (first reasoning delta at $([int]$sThink.FirstReasoningMs) ms of $([int]$sThink.TotalMs) ms)"
+    }
+    # Same tokens: compare modulo the surrounding whitespace (the non-streaming reasoning is trimmed, the stream keeps it).
+    Check ($sThink.Reasoning.Trim() -ceq $rThink.Reasoning.Trim() -and $sThink.Content -ceq $rThink.Content) `
+        "thinking + text (streaming): the greedy streamed reasoning and content equal the non-streaming ones"
+    Check ($null -ne $sThink.Usage -and ($sThink.Usage.completion_tokens_details.reasoning_tokens -eq $rtok)) `
+        "thinking + text (streaming): the usage chunk's reasoning_tokens equals the non-streaming count ($rtok)"
+
+    # reasoning.exclude: the thought is withheld, the answer is unchanged.
+    $rExcl = Invoke-InkChat @{ messages = @(@{ role = "user"; content = $q42 }); max_tokens = 1536; temperature = 0; stream = $false; reasoning = @{ exclude = $true } }
+    Check ($rExcl.Status -eq 200 -and -not [bool]$rExcl.Reasoning -and $rExcl.Content -ceq $rThink.Content) "reasoning.exclude: 200, no reasoning_content, content unchanged"
+
+    # ---- reasoning_effort: level names and numbers in [0, 0.99]; enable_thinking=false is effort none -----------------
+    foreach ($eff in @("none", "minimal", "low", "medium", "high", "xhigh", "max", 0.5, 0)) {
+        $rEff = Invoke-InkChat @{ messages = @(@{ role = "user"; content = $q42 }); max_tokens = 1536; temperature = 0; stream = $false; reasoning_effort = $eff }
+        Check ($rEff.Status -eq 200 -and [bool]$rEff.Content) "reasoning_effort $eff is accepted: 200 with an answer (finish '$($rEff.Finish)')"
+    }
+    $rOff = Invoke-InkChat @{ messages = @(@{ role = "user"; content = $q42 }); max_tokens = 1536; temperature = 0; stream = $false; enable_thinking = $false }
+    $rNone = Invoke-InkChat @{ messages = @(@{ role = "user"; content = $q42 }); max_tokens = 1536; temperature = 0; stream = $false; reasoning_effort = "none" }
+    Check ($rOff.Status -eq 200 -and $rOff.Content -ceq $rNone.Content -and $rOff.Reasoning -ceq $rNone.Reasoning) `
+        "enable_thinking=false renders effort none: the greedy reply equals the reasoning_effort=none one"
+    Check ((Get-RequestLogLine $rOff.Chat.id) -match ' thinking=no') "enable_thinking=false: the request log line shows thinking=no"
+    foreach ($bad in @(@{ Label = "1.5"; Value = 1.5 }, @{ Label = "-0.1"; Value = -0.1 }, @{ Label = "'bogus'"; Value = "bogus" })) {
+        $rBad = Invoke-InkChat @{ messages = @(@{ role = "user"; content = $q42 }); max_tokens = 4; stream = $false; reasoning_effort = $bad.Value }
+        Check ($rBad.Status -eq 400) "reasoning_effort $($bad.Label) is rejected with 400 (got $($rBad.Status))"
+    }
+
+    # ---- prefix cache: the template has no generation prompt, so turn 1's prompt is a token prefix of turn 2's ---------
+    $nonce = [guid]::NewGuid().ToString("N").Substring(0, 8)
+    $pcQ1 = "[$nonce] What is the capital of Japan? Answer in one word."
+    $pcT1 = Invoke-InkChat @{ messages = @(@{ role = "user"; content = $pcQ1 }); max_tokens = 1536; temperature = 0; stream = $false }
+    Check ($pcT1.Status -eq 200 -and [bool]$pcT1.Content) "prefix cache: turn 1 returns 200 with an answer ('$($pcT1.Content)')"
+    Write-Output "  [info] $(Get-RequestLogLine $pcT1.Chat.id)"
+    $pcT2Body = { @{ messages = @(@{ role = "user"; content = $pcQ1 }, @{ role = "assistant"; content = $pcT1.Content }, @{ role = "user"; content = "And of France? One word." })
+                     max_tokens = 1536; temperature = 0; stream = $false } }
+    $pcT2 = Invoke-InkChat (& $pcT2Body)
+    Check ($pcT2.Status -eq 200 -and [bool]$pcT2.Content) "prefix cache: turn 2 (replayed without reasoning) returns 200 with an answer ('$($pcT2.Content)')"
+    # CheckpointSuffix is empty for this dialect (ckpt_back 0): at least the whole of turn 1's prompt is reused.
+    $pcWant = $pcT2.Chat.usage.prompt_tokens - $pcT1.Chat.usage.prompt_tokens
+    Check ($pcT2.Chat.timings.prompt_n -le $pcWant) `
+        ("prefix cache: turn 2 prefilled at most the $pcWant token(s) after turn 1's prompt (timings.prompt_n $($pcT2.Chat.timings.prompt_n) of usage.prompt_tokens $($pcT2.Chat.usage.prompt_tokens))")
+    Write-Output "  [info] $(Get-RequestLogLine $pcT2.Chat.id)"
+    $pcT3 = Invoke-InkChat (& $pcT2Body)
+    Check ($pcT3.Status -eq 200 -and $pcT3.Chat.timings.prompt_n -lt $pcT3.Chat.usage.prompt_tokens -and $pcT3.Content -ceq $pcT2.Content) `
+        "prefix cache: repeating turn 2 hits the cache (timings.prompt_n $($pcT3.Chat.timings.prompt_n) < usage.prompt_tokens $($pcT3.Chat.usage.prompt_tokens)) and gives the same greedy answer"
+
+    # ---- tool calls: a multi-turn round trip including a tool-result turn ------------------------------------------------
+    $weatherTool = @{
+        type     = "function"
+        function = @{
+            name        = "get_current_weather"
+            description = "Get the current weather for a location."
+            parameters  = @{
+                type       = "object"
+                properties = @{ location = @{ type = "string"; description = "City, e.g. Bangkok" }; unit = @{ type = "string"; enum = @("celsius", "fahrenheit") } }
+                required   = @("location")
+            }
+        }
+    }
+    $toolQ = "What is the weather in Bangkok right now? Use the get_current_weather tool."
+    $toolT1 = Invoke-InkChat @{ messages = @(@{ role = "user"; content = $toolQ }); tools = @($weatherTool); max_tokens = 1536; temperature = 0; stream = $false }
+    Check ($toolT1.Status -eq 200) "tool round trip: tool-offering request returns 200"
+    $gotCall = $toolT1.ToolCalls.Count -ge 1 -and $null -ne $toolT1.ToolCalls[0]
+    Check $gotCall "tool round trip: the model emitted a structured tool_calls entry (finish '$($toolT1.Finish)', content '$($toolT1.Content)')"
+    Check (-not ($toolT1.Content.Contains("<|") -or $toolT1.Reasoning.Contains("<|"))) "tool round trip: no part marker left in content or reasoning"
+    if ($gotCall) {
+        $call = $toolT1.ToolCalls[0]
+        Check ($call.type -eq "function" -and $call.function.name -eq "get_current_weather") "tool round trip: tool_calls[0] is a function call to get_current_weather"
+        Check ($call.function.arguments -is [string]) "tool round trip: function.arguments is a JSON-encoded STRING"
+        Check ($toolT1.Finish -eq "tool_calls") "tool round trip: finish_reason == 'tool_calls'"
+        $callArgs = $call.function.arguments | ConvertFrom-Json
+        Check ([string]$callArgs.location -match 'Bangkok') "tool round trip: parsed arguments carry location ~ Bangkok (got '$($callArgs.location)')"
+        Check ((Get-RequestLogLine $toolT1.Chat.id) -match ' tools=1') "tool round trip: the request log line shows tools=1"
+
+        $toolHistory = @(
+            @{ role = "user"; content = $toolQ },
+            @{ role = "assistant"; content = $null; tool_calls = @($call) },
+            @{ role = "tool"; tool_call_id = $call.id; content = '{"temperature_c": 31, "condition": "partly cloudy"}' }
+        )
+        $toolT2 = Invoke-InkChat @{ messages = $toolHistory; tools = @($weatherTool); max_tokens = 1536; temperature = 0; stream = $false }
+        Check ($toolT2.Status -eq 200) "tool round trip: the role:'tool' follow-up returns 200"
+        Check ([bool]$toolT2.Content -and $toolT2.Finish -eq "stop") "tool round trip: the final answer has content and finish_reason 'stop' (finish '$($toolT2.Finish)')"
+        if ($toolT2.Content -notmatch '31') { Write-Output "  [info] the final answer does not mention the 31 degrees: '$($toolT2.Content)'" }
+        if ($toolT2.Status -eq 200) {
+            Check ($toolT2.Chat.timings.prompt_n -lt $toolT2.Chat.usage.prompt_tokens) `
+                "tool round trip: the tool-result turn reused a cached prefix (timings.prompt_n $($toolT2.Chat.timings.prompt_n) < usage.prompt_tokens $($toolT2.Chat.usage.prompt_tokens))"
+            Write-Output "  [info] $(Get-RequestLogLine $toolT2.Chat.id)"
+        }
+    }
+
+    # The same tool-offering turn, streamed: reasoning deltas, one complete tool_calls delta, no marker in any delta.
+    $sTool = Get-InkStream @{ messages = @(@{ role = "user"; content = $toolQ }); tools = @($weatherTool); max_tokens = 1536; temperature = 0 }
+    Check ($sTool.ToolCalls.Count -ge 1) "tool round trip (streaming): a delta carries a complete tool_calls entry"
+    Check (-not $sTool.Leak) "tool round trip (streaming): no part marker in any reasoning/content delta"
+    Check ($sTool.Finish -eq "tool_calls" -and $sTool.Done) "tool round trip (streaming): finish_reason == 'tool_calls' and data: [DONE] (got '$($sTool.Finish)')"
+    if ($sTool.ToolCalls.Count -ge 1) {
+        Check ($sTool.ToolCalls[0].function.name -eq "get_current_weather" -and $sTool.ToolCalls[0].function.arguments -is [string]) `
+            "tool round trip (streaming): delta.tool_calls[0] is get_current_weather with STRING arguments"
+    }
+
+    # Two calls in one turn (the model may or may not parallelise; both shapes must be well formed).
+    $timeTool = @{ type = "function"; function = @{ name = "get_local_time"; description = "Get the local time in a city."
+                   parameters = @{ type = "object"; properties = @{ city = @{ type = "string" } }; required = @("city") } } }
+    $rTwo = Invoke-InkChat @{ messages = @(@{ role = "user"; content = "In ONE turn call BOTH tools: get_current_weather for Bangkok and get_local_time for Tokyo." })
+                              tools = @($weatherTool, $timeTool); max_tokens = 1536; temperature = 0; stream = $false }
+    Check ($rTwo.Status -eq 200 -and ($rTwo.ToolCalls.Count -ge 1 -and $null -ne $rTwo.ToolCalls[0])) "two tool calls: request returns 200 with at least one call (finish '$($rTwo.Finish)')"
+    if ($rTwo.ToolCalls.Count -ge 2) {
+        $ids = @($rTwo.ToolCalls | ForEach-Object { $_.id })
+        Check (($ids | Select-Object -Unique).Count -eq $ids.Count) "two tool calls: every call has its own id"
+        Check ($rTwo.Finish -eq "tool_calls") "two tool calls: finish_reason == 'tool_calls'"
+    } else {
+        Write-Output "  [info] the model made $($rTwo.ToolCalls.Count) call(s) in the two-tool turn"
+    }
+
+    # ---- max_tokens truncation inside a part: finish 'length', whatever was generated is returned -----------------------
+    $rCut = Invoke-InkChat @{ messages = @(@{ role = "user"; content = "Count from 1 to 200, separated by spaces." }); max_tokens = 24; temperature = 0; stream = $false }
+    Check ($rCut.Status -eq 200 -and $rCut.Finish -eq "length" -and $rCut.Chat.usage.completion_tokens -eq 24) "max_tokens 24: finish_reason 'length' with exactly 24 completion tokens (finish '$($rCut.Finish)')"
+    Check ([bool]$rCut.Content -or [bool]$rCut.Reasoning) "max_tokens 24: the partial part is returned as content or reasoning_content"
+
+    # ---- Thai: UTF-8 intact through the part parser, streamed == non-streamed ---------------------------------------------
+    $thaiQuestion = -join ([char[]](0x0E40,0x0E21,0x0E37,0x0E2D,0x0E07,0x0E2B,0x0E25,0x0E27,0x0E07,0x0E02,0x0E2D,0x0E07,0x0E1B,0x0E23,0x0E30,0x0E40,0x0E17,0x0E28,0x0E44,0x0E17,0x0E22,0x0E04,0x0E37,0x0E2D,0x0E2D,0x0E30,0x0E44,0x0E23,0x0020,0x0E15,0x0E2D,0x0E1A,0x0E2A,0x0E31,0x0E49,0x0E19,0x0E46,0x0020,0x0E40,0x0E1B,0x0E47,0x0E19,0x0E20,0x0E32,0x0E29,0x0E32,0x0E44,0x0E17,0x0E22))
+    $thaiBody = { @{ messages = @(@{ role = "user"; content = $thaiQuestion }); max_tokens = 1536; temperature = 0; stream = $false } }
+    $rThai = Invoke-InkChat (& $thaiBody)
+    Check ($rThai.Status -eq 200 -and [bool]$rThai.Content -and $rThai.Content -match '\p{IsThai}') "thai: 200 with Thai characters in the answer"
+    Check (-not ($rThai.Content.Contains([string][char]0xFFFD) -or $rThai.Reasoning.Contains([string][char]0xFFFD))) "thai: no U+FFFD replacement character"
+    $sThai = Get-InkStream (& $thaiBody)
+    Check ($sThai.Done -and -not $sThai.Leak -and $sThai.Content -ceq $rThai.Content) "thai (streaming): the streamed answer equals the non-streaming one (no multi-byte character split or lost)"
+
+    # ---- generation_config sampling default: temperature 1.0 when the request leaves it unset ---------------------------
+    $rSamp = Invoke-InkChat @{ messages = @(@{ role = "user"; content = "Name three colors." }); max_tokens = 64; stream = $false; seed = 1234 }
+    Check ($rSamp.Status -eq 200 -and (Get-RequestLogLine $rSamp.Chat.id) -match ' temperature=1 ') "sampling default: a request without temperature runs at temperature 1 (log line)"
 
     } else {
     # =====================================================================================================

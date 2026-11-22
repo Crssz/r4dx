@@ -600,7 +600,64 @@ void TestGemmaStreamingSink() {
 
 }  // namespace
 
+// Inkling-2 (structured_parts): the engine hands typed events over; the sinks do no splitting of their own.
+void TestInkling2BufferingSink() {
+  const auto& d = r4dx::server::Inkling2Dialect();
+  BufferingSink sink(/*enable_thinking=*/true, /*emit_reasoning=*/true, &d);
+  sink.OnStart(10, false);
+  sink.OnReasoningDelta("  think ");
+  sink.OnToken("<think>literal</think> answer");  // a structured sink never scans text for tags
+  sink.OnReasoningDelta("more\n");
+  sink.OnDone("stop", 4, {}, 2);
+  CHECK(sink.text == "<think>literal</think> answer");
+  CHECK(sink.reasoning_text == "think more");
+  CHECK(sink.reasoning_tokens == 2);
+  BufferingSink hidden(true, /*emit_reasoning=*/false, &d);
+  hidden.OnReasoningDelta("secret");
+  hidden.OnToken("shown");
+  hidden.OnDone("stop", 2);
+  CHECK(hidden.text == "shown" && hidden.reasoning_text.empty());
+}
+
+void TestInkling2StreamingSink() {
+  const auto& d = r4dx::server::Inkling2Dialect();
+  StreamingSink sink(StreamingSink::Kind::kChat, "id", "m", 1, /*include_usage=*/true, true, true, &d);
+  sink.OnStart(5, false);
+  sink.OnReasoningDelta("a");
+  sink.OnReasoningDelta("b");
+  sink.OnToken("x");
+  sink.OnToolCalls({{"call_1", "f", "{}"}});
+  sink.OnDone("tool_calls", 6, {}, 3);
+  std::string all, ev;
+  std::vector<nlohmann::json> chunks;
+  while (sink.Next(ev)) {
+    all += ev;
+    if (ev.rfind("data: {", 0) == 0) chunks.push_back(nlohmann::json::parse(ev.substr(6)));
+  }
+  // role, reasoning a, reasoning b, content x, tool_calls, finish, usage
+  CHECK(chunks.size() == 7);
+  if (chunks.size() == 7) {
+    CHECK(chunks[1]["choices"][0]["delta"]["reasoning_content"] == "a");
+    CHECK(chunks[2]["choices"][0]["delta"]["reasoning_content"] == "b");
+    CHECK(chunks[3]["choices"][0]["delta"]["content"] == "x");
+    CHECK(chunks[4]["choices"][0]["delta"].contains("tool_calls"));
+    CHECK(chunks[5]["choices"][0]["finish_reason"] == "tool_calls");
+    CHECK(chunks[6]["usage"]["completion_tokens_details"]["reasoning_tokens"] == 3);
+  }
+  // The same sink with emit_reasoning false drops the reasoning deltas only.
+  StreamingSink quiet(StreamingSink::Kind::kChat, "id", "m", 1, false, true, /*emit_reasoning=*/false, &d);
+  quiet.OnStart(5, false);
+  quiet.OnReasoningDelta("hidden");
+  quiet.OnToken("shown");
+  quiet.OnDone("stop", 2);
+  std::string q;
+  while (quiet.Next(ev)) q += ev;
+  CHECK(q.find("hidden") == std::string::npos && q.find("shown") != std::string::npos);
+}
+
 int main() {
+  TestInkling2BufferingSink();
+  TestInkling2StreamingSink();
   TestGemmaBufferingSink();
   TestGemmaStreamingSink();
   TestBufferingSinkHappyPath();

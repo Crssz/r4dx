@@ -165,12 +165,17 @@ class Engine {
   int64_t MaxTokensDefault() const { return opts_.max_tokens_default; }
   const SamplingParams& SamplingDefaults() const { return opts_.sampling_defaults; }
   // The server's thinking default as /v1/models reports it: always on for a dialect that forces thinking.
-  bool DefaultThinking() const { return opts_.default_thinking || dialect_->forces_thinking; }
+  bool DefaultThinking() const { return opts_.default_thinking || dialect_->forces_thinking || dialect_->structured_parts; }
   // The resolved `enable_thinking` of a chat request (http_server.cpp and RunRequest both call this so they
   // cannot drift): ResolveEnableThinking, except a dialect that forces thinking (LFM2.5: the generation prompt
   // always opens "<think>") ignores the request and --think.
+  // Inkling-2 (structured_parts): thinking is the model's own default (the template's effort 0.9), so a request that names no
+  // control is "on" whatever `--think` says (it is a bool defaulting to off, so an operator's choice cannot be told from no
+  // choice); the request can still turn it off (enable_thinking=false / effort "none" or 0 -> template effort "none").
   bool ResolveThinking(const ThinkingControls& t) const {
-    return dialect_->forces_thinking ? true : ResolveEnableThinking(t, opts_.default_thinking);
+    if (dialect_->forces_thinking) return true;
+    if (dialect_->structured_parts) return ResolveEnableThinking(t, /*default_thinking=*/true);
+    return ResolveEnableThinking(t, opts_.default_thinking);
   }
   // The image preprocessing policy every image content part is decoded with (docs/vision.md
   // "Large images", --image-max-pixels) -- read by http_server.cpp so ParseChatCompletionRequest

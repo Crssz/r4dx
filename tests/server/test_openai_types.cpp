@@ -1264,7 +1264,37 @@ void TestRepetitionPenalty() {
   CHECK(listed);
 }
 
+// Inkling-2's dialect hook: a numeric reasoning_effort is accepted (only there); every other dialect keeps the 400.
+void TestNumericReasoningEffortOnlyForTheDialectHook() {
+  const json body = {{"messages", {{{"role", "user"}, {"content", "hi"}}}}, {"reasoning_effort", 0.5}};
+  CHECK(ThrowsApiError([&] { ParseChatCompletionRequest(body); }, 400));
+  CHECK(ThrowsApiError([&] { ParseChatCompletionRequest(body, {}, r4dx::vision::ImageProcessorConfig(), false); }, 400));
+  const auto req = ParseChatCompletionRequest(body, {}, r4dx::vision::ImageProcessorConfig(), true);
+  CHECK(!req.thinking.enabled.has_value() || *req.thinking.enabled);
+  CHECK(req.thinking.enabled.has_value() && *req.thinking.enabled);
+  CHECK(!req.thinking.template_effort.has_value());
+  CHECK(req.thinking.request_effort == json(0.5));
+  // 0 means thinking off; the raw value still travels.
+  const json zero = {{"messages", {{{"role", "user"}, {"content", "hi"}}}}, {"reasoning", {{"effort", 0}}}};
+  const auto z = ParseChatCompletionRequest(zero, {}, r4dx::vision::ImageProcessorConfig(), true);
+  CHECK(z.thinking.enabled.has_value() && !*z.thinking.enabled && z.thinking.request_effort == json(0));
+  CHECK(ThrowsApiError([&] { ParseChatCompletionRequest(zero); }, 400));
+  // Out-of-range numbers are not rejected here (ResolveInkling2ReasoningEffort does it at render time) but are never "off".
+  const json big = {{"messages", {{{"role", "user"}, {"content", "hi"}}}}, {"reasoning_effort", -3}};
+  const auto b = ParseChatCompletionRequest(big, {}, r4dx::vision::ImageProcessorConfig(), true);
+  CHECK(b.thinking.enabled.has_value() && *b.thinking.enabled && b.thinking.request_effort == json(-3));
+  // A string effort keeps its Qwen mapping untouched and the raw value is carried only with the hook.
+  const json str = {{"messages", {{{"role", "user"}, {"content", "hi"}}}}, {"reasoning_effort", "max"}};
+  CHECK(ParseChatCompletionRequest(str).thinking.template_effort == std::string("xhigh"));
+  CHECK(ParseChatCompletionRequest(str).thinking.request_effort.is_null());
+  CHECK(ParseChatCompletionRequest(str, {}, r4dx::vision::ImageProcessorConfig(), true).thinking.request_effort == json("max"));
+  // A non-number, non-string effort stays a 400 with the hook on.
+  const json badtype = {{"messages", {{{"role", "user"}, {"content", "hi"}}}}, {"reasoning_effort", true}};
+  CHECK(ThrowsApiError([&] { ParseChatCompletionRequest(badtype, {}, r4dx::vision::ImageProcessorConfig(), true); }, 400));
+}
+
 int main() {
+  TestNumericReasoningEffortOnlyForTheDialectHook();
   TestRepetitionPenalty();
   TestChatMinimal();
   TestChatSamplingDefaultsApplyOnlyWhenOmitted();

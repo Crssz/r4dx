@@ -15,6 +15,7 @@
 #include "mtp_round.hpp"
 #include "r4dx/kernels/rep_penalty.hpp"
 #include "r4dx/kernels/sampler.hpp"
+#include "inkling2_stream_parser.h"  // structured_parts dialects (Inkling-2): the typed-part stream parser + request normalisation
 #include "reasoning_splitter.h"
 #include "tool_call_parser.h"
 #include "tool_stream_gate.h"
@@ -210,11 +211,13 @@ void Engine::LoadAndStart() {
   model_ = opts_.model_loader ? opts_.model_loader(opts_.model_opts, opts_.tp)
                               : r4dx::model::LoadTextModel(opts_.model_opts, opts_.tp, opts_.pp);
   model_id_ = model_->ModelId();
+#ifndef R4DX_TEST_SKIP_MODEL_ARCH_CHECK  // set only by tests/server's test_engine_inkling2 while Arch has no Inkling-2 enumerator
   {
     const std::string err =
         CheckDialectAgainstArch(*dialect_, r4dx::model::ArchName(model_->Config().arch));
     if (!err.empty()) throw std::runtime_error(err);
   }
+#endif
   tp_model_ = dynamic_cast<r4dx::model::TpDiagnostics*>(model_.get());
   if (tp_model_ != nullptr) {
     // One line per rank (docs/tp.md 9.1's --stats VRAM lines): which HIP device each rank landed on
@@ -393,6 +396,9 @@ void Engine::RunRequest(PendingRequest& req, r4dx::model::TextModel* port) {
                                       : false;
     if (rec != nullptr) rec->thinking = enable_thinking;
     const ModelDialect& dialect = *dialect_;
+    // Inkling-2: the generation is a stream of typed parts that Inkling2StreamParser splits (reasoning / answer / tool calls), in
+    // place of ReasoningSplitter + ToolStreamGate; the sink then receives typed events (ResponseSink::OnReasoningDelta).
+    const bool structured = dialect.structured_parts && req.kind == RequestKind::kChat;
     // The chat template's output, kept past the chat branch: the dialect decides from its tail where
     // generated text starts relative to reasoning, and what the checkpoint must stay clear of.
     std::string rendered;
@@ -534,7 +540,20 @@ void Engine::RunRequest(PendingRequest& req, r4dx::model::TextModel* port) {
       // (ThinkingControls::template_effort). An explicit `chat_template_kwargs.reasoning_effort`
       // still wins, same passthrough rule as above; absent both, the template applies its own
       // default ("xhigh").
-      if (dialect.has_reasoning_effort) {
+      if (dialect.structured_parts) {
+        // Inkling-2: the template takes a level name or a number (not Qwen's three levels), enable_thinking=false means effort
+        // "none", and the template has no generation prompt (so the checkpoint suffix is empty, see CheckpointSuffix).
+        try {
+          CanonicalizeInkling2Messages(messages);
+          const std::optional<r4dx::ChatJson> effort =
+              ResolveInkling2ReasoningEffort(extra_context, std::optional<bool>(enable_thinking), req.thinking.request_effort);
+          if (effort) extra_context["reasoning_effort"] = *effort;
+        } catch (const std::invalid_argument& e) {
+          note_error(400);
+          req.sink->OnError(400, e.what());
+          return;
+        }
+      } else if (dialect.has_reasoning_effort) {
         if (req.thinking.template_effort && !extra_context.contains("reasoning_effort")) {
           extra_context["reasoning_effort"] = *req.thinking.template_effort;
         }
@@ -848,7 +867,7 @@ void Engine::RunRequest(PendingRequest& req, r4dx::model::TextModel* port) {
         req.kind == RequestKind::kChat ? dialect.ReasoningStart(enable_thinking, rendered)
                                        : ReasoningSplitter::StartState::kAnswer;
     req.sink->OnStart(static_cast<int64_t>(full_tokens_i32.size()),
-                      req.kind == RequestKind::kChat && dialect.ReasoningOpenInPrompt(enable_thinking, rendered));
+                      req.kind == RequestKind::kChat && !structured && dialect.ReasoningOpenInPrompt(enable_thinking, rendered));
 
     // --prompt-checkpoint: the state after the first `ckpt_len` tokens of this prompt is saved for
     // the next request's Plan() -- after a prefill, before any decode step moves the GDN state into a
@@ -966,6 +985,28 @@ void Engine::RunRequest(PendingRequest& req, r4dx::model::TextModel* port) {
     ReasoningLocator locator(dialect.reasoning, reasoning_start);
     bool reasoning_open = locator.reasoning_open();
     int64_t reasoning_tokens = 0;
+    // Inkling-2 (structured): the typed-part parser fed by `forward` below. `reasoning_start` is kAnswer for this dialect, so the
+    // locator above is inert (no reasoning-gated stop search, think_end 0); usage.reasoning_tokens is counted from the parser's
+    // thinking state instead. Tool calls are collected and delivered once, before OnDone, exactly like the other dialects'.
+    Inkling2StreamParser structured_parser;
+    std::vector<ToolCallOut> structured_calls;
+    bool structured_prev_thinking = false;
+    size_t structured_counted = 0;
+    auto DispatchStructured = [&](const std::vector<Inkling2StreamParser::Event>& events) {
+      for (const auto& ev : events) {
+        switch (ev.kind) {
+          case Inkling2StreamParser::Event::Kind::kReasoning:
+            req.sink->OnReasoningDelta(ev.text);
+            break;
+          case Inkling2StreamParser::Event::Kind::kContent:
+            req.sink->OnToken(ev.text);
+            break;
+          case Inkling2StreamParser::Event::Kind::kToolCall:
+            structured_calls.push_back(ToolCallOut{GenerateRequestId("call_"), ev.call.name, ev.call.arguments_json});
+            break;
+        }
+      }
+    };
     size_t stop_search_floor = reasoning_open ? std::string::npos : 0;
     // The offset in `accumulated` of the first byte AFTER "</think>" -- the same position
     // `stop_search_floor` ends up holding, tracked separately because the two answer very different
@@ -974,6 +1015,16 @@ void Engine::RunRequest(PendingRequest& req, r4dx::model::TextModel* port) {
     // `0` from the start when thinking is off: the whole generation is answer text then.
     size_t think_end = reasoning_open ? std::string::npos : 0;
     auto NoteReasoningProgress = [&]() {
+      if (structured) {
+        // A token is a reasoning token when it opened, sat inside, or closed a thinking part (called after every generated token).
+        const bool now = structured_parser.in_thinking();
+        if (structured_counted < generated_tokens.size()) {
+          if (structured_prev_thinking || now) ++reasoning_tokens;
+          structured_counted = generated_tokens.size();
+        }
+        structured_prev_thinking = now;
+        return;
+      }
       if (!reasoning_open) return;
       locator.Update(accumulated);
       if (locator.reasoning_open()) return;
@@ -1000,7 +1051,7 @@ void Engine::RunRequest(PendingRequest& req, r4dx::model::TextModel* port) {
     //                                     case buffered the whole generation too, which made every
     //                                     turn of a client that always sends `tools` (Unsloth
     //                                     Studio does) arrive in one lump after the fact.
-    const bool tool_mode = req.kind == RequestKind::kChat && !req.tools.empty();
+    const bool tool_mode = req.kind == RequestKind::kChat && !req.tools.empty() && !structured;
     const bool live_tool_stream = tool_mode && req.stream;
 
     // Raw-offset bookkeeping for `live_tool_stream`. The sink is fed RAW generated bytes exactly as
@@ -1053,6 +1104,10 @@ void Engine::RunRequest(PendingRequest& req, r4dx::model::TextModel* port) {
     };
     // The one per-request router every EmitToken call below hands its surviving text to.
     auto forward = [&](const std::string& text) {
+      if (structured) {
+        DispatchStructured(structured_parser.Push(text));
+        return;
+      }
       if (!tool_mode) {
         req.sink->OnToken(text);
         return;
@@ -1351,6 +1406,36 @@ void Engine::RunRequest(PendingRequest& req, r4dx::model::TextModel* port) {
 
     prefix.Commit(full_tokens_i32, committed_tokens, image_keys,
                    checkpointed ? std::optional<size_t>(ckpt_len) : std::nullopt);
+
+    if (structured) {
+      // End of generation (EOS, max_tokens, --stop, cancel): flush the parser's held bytes; a part cut off here keeps what was
+      // streamed (reasoning / text), a cut-off tool call degrades to content (had_malformed). Then the tool calls, whole, once.
+      DispatchStructured(structured_parser.Finish());
+      std::vector<std::string> known_names;
+      for (const auto& t : req.tools) {
+        if (t.is_object() && t.contains("function") && t.at("function").is_object() &&
+            t.at("function").contains("name") && t.at("function").at("name").is_string()) {
+          known_names.push_back(t.at("function").at("name").get<std::string>());
+        }
+      }
+      // The same "drop calls to undefined tools" rule the other dialects apply (DropUnknownToolCalls), noted as content.
+      std::vector<ToolCallOut> kept;
+      std::string dropped_note;
+      for (auto& c : structured_calls) {
+        const bool known = known_names.empty() ||
+                           std::find(known_names.begin(), known_names.end(), c.name) != known_names.end();
+        if (known) {
+          kept.push_back(std::move(c));
+        } else {
+          dropped_note += "[dropped call to undefined tool '" + c.name + "': " + c.arguments_json + "]";
+        }
+      }
+      if (!dropped_note.empty()) req.sink->OnToken(dropped_note);
+      if (!kept.empty()) {
+        req.sink->OnToolCalls(kept);
+        if (finish_reason != "cancelled") finish_reason = "tool_calls";
+      }
+    }
 
     if (tool_mode) {
       // Parse this checkpoint's real tool-call surface syntax (src/server/tool_call_parser.h,

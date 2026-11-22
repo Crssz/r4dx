@@ -56,6 +56,7 @@ void BufferingSink::OnDone(const std::string& finish_reason_in, int64_t completi
     // still ran, so `text` is the answer alone -- only the reasoning TEXT is withheld.
     if (emit_reasoning_) reasoning_text = TrimReasoningWhitespace(reasoning_raw_);
   }
+  if (structured_ && emit_reasoning_) reasoning_text = TrimReasoningWhitespace(reasoning_raw_);
   finish_reason = finish_reason_in;
   completion_tokens = completion_tokens_in;
   reasoning_tokens = reasoning_tokens_in;
@@ -90,6 +91,11 @@ void BufferingSink::OnReasoningContent(const std::string& text_in) {
   reasoning_delivered_ = true;
 }
 
+void BufferingSink::OnReasoningDelta(const std::string& text_in) {
+  std::lock_guard<std::mutex> lock(mu_);
+  reasoning_raw_ += text_in;  // trimmed (and withheld when !emit_reasoning_) once OnDone runs
+}
+
 // ---- StreamingSink ---------------------------------------------------------------------------
 
 StreamingSink::StreamingSink(Kind kind, std::string id, std::string model_id, int64_t created_unix,
@@ -98,7 +104,7 @@ StreamingSink::StreamingSink(Kind kind, std::string id, std::string model_id, in
     : kind_(kind), id_(std::move(id)), model_id_(std::move(model_id)), created_unix_(created_unix),
       include_usage_(include_usage), enable_thinking_(enable_thinking && kind == Kind::kChat),
       emit_reasoning_(emit_reasoning), dialect_(dialect),
-      split_active_(kind == Kind::kChat &&
+      split_active_(kind == Kind::kChat && !(dialect != nullptr && dialect->structured_parts) &&
                     (enable_thinking || (dialect != nullptr && dialect->kind == DialectKind::kGemma4))),
       queue_(/*max_size=*/256) {
   if (kind == Kind::kChat && dialect_ != nullptr && dialect_->kind == DialectKind::kGemma4) {
@@ -171,6 +177,11 @@ void StreamingSink::OnReasoningContent(const std::string& text) {
   if (kind_ != Kind::kChat) return;
   reasoning_delivered_ = true;
   PushSplitDelta(/*is_reasoning=*/true, text);
+}
+
+void StreamingSink::OnReasoningDelta(const std::string& text) {
+  if (kind_ != Kind::kChat) return;
+  PushSplitDelta(/*is_reasoning=*/true, text);  // empty text and !emit_reasoning_ are dropped there
 }
 
 void StreamingSink::OnDone(const std::string& finish_reason, int64_t completion_tokens,

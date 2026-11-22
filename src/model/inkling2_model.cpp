@@ -54,6 +54,11 @@ bool MoeCheckOffsetsEnabled() {
   return kEnabled;
 }
 
+bool AttnFusedEnabled() {
+  static const bool kEnabled = InkEnvFlag("R4DX_INK_ATTN_FUSED", true);
+  return kEnabled;
+}
+
 float SummaryInvTemperature(const kernels::SampleParams& params) {
   if (!(params.temperature > 0.0f) || params.temperature < kMinSummaryTemperature) return 0.0f;
   const float inv = 1.0f / params.temperature;
@@ -190,7 +195,8 @@ Inkling2Model Inkling2Model::Load(const Inkling2ModelOptions& opts) {
             << " visits, max_ctx " << m.max_ctx_ << ", KV bf16 = " << static_cast<double>(m.kv_bytes_) / gib
             << " GiB (sliding ring " << m.ring_blocks_ * bs << " positions), conv states "
             << static_cast<double>(m.conv_.bytes()) / (1024.0 * 1024.0) << " MiB, layout " << LayoutName(opts.layout)
-            << ", residual fp32, attention reference (bias + sink), MoE "
+            << ", residual fp32, attention "
+            << (AttnFusedEnabled() ? "fused h128 (on-the-fly bias + sink)" : "reference (bias + sink)") << ", MoE "
             << (MoeGroupedDecodeEnabled() ? "grouped decode (mxfp8)" : "staged (host sync per visit)");
   if (is_tp) std::cerr << ", TP rank " << opts.tp_rank << "/" << opts.tp_world << " (head rows " << vl << ")";
   std::cerr << "\n";
@@ -346,9 +352,12 @@ void Inkling2Model::Attention(const Inkling2Visit& v, const uint16_t* xq, const 
   });
   // relative bias (every rank computes all heads' relative states; this rank's heads are read at h0 * d_rel)
   const int64_t rel_all = g.num_attention_heads * drel;
+  const int64_t gqa = hl / kvl;
+  const bool use_fused_attn = AttnFusedEnabled() && hd == 128 && drel <= 32 && hl % kvl == 0 &&
+                              (gqa == 1 || gqa == 2 || gqa == 3 || gqa == 4 || gqa == 6 || gqa == 8);
   uint16_t* rlin = arena_.Alloc<uint16_t>(static_cast<size_t>(T * rel_all), 16);
   float* r = arena_.Alloc<float>(static_cast<size_t>(T * hl * drel), 16);
-  float* rel = arena_.Alloc<float>(static_cast<size_t>(T * hl * ext), 16);
+  float* rel = use_fused_attn ? nullptr : arena_.Alloc<float>(static_cast<size_t>(T * hl * ext), 16);
   float* sink = arena_.Alloc<float>(static_cast<size_t>(T * hl), 16);
   ProfiledCall(prof, sr, "attn.rel_sink", [&] {
     Lin(a.rel, xq, rlin, T);
@@ -360,8 +369,10 @@ void Inkling2Model::Attention(const Inkling2Visit& v, const uint16_t* xq, const 
     r4dx_inkling2_head_clip(P(rlin + cfg.tp_rank * hl * drel), 1, rel_all, P(a.rel_scale.data()),
                             static_cast<float>(cfg.rel_clip), pos0, log_alpha, log_floor, &dense_r, static_cast<int>(T),
                             static_cast<int>(hl), static_cast<int>(drel), s);
-    r4dx_inkling2_rel_logits_f32(P(r), P(a.rel_proj.data()), P(rel), static_cast<int>(T * hl), static_cast<int>(drel),
-                                 static_cast<int>(ext), s);
+    if (!use_fused_attn) {
+      r4dx_inkling2_rel_logits_f32(P(r), P(a.rel_proj.data()), P(rel), static_cast<int>(T * hl), static_cast<int>(drel),
+                                   static_cast<int>(ext), s);
+    }
     r4dx_inkling2_dense_bf16(P(xq), H, P(a.sink.data()), P(sink), 0, hl, static_cast<int>(T), static_cast<int>(hl),
                              static_cast<int>(H), s);
   });
@@ -369,26 +380,55 @@ void Inkling2Model::Attention(const Inkling2Visit& v, const uint16_t* xq, const 
   uint16_t* ao = arena_.Alloc<uint16_t>(static_cast<size_t>(T * hl * hd), 16);
   uint16_t* gt = arena_.Alloc<uint16_t>(static_cast<size_t>(T * hl * hd), 16);
   ProfiledCall(prof, sr, "attn.core", [&] {
-    R4dxInkling2AttnRefArgs ar{};
-    ar.q = P(q);
-    ar.kv = P(kv);
-    ar.block_table = P(table);
-    ar.out = P(ao);
-    ar.rel = P(rel);
-    ar.sink = P(sink);
-    ar.q_len = static_cast<int>(T);
-    ar.q_heads = static_cast<int>(hl);
-    ar.kv_heads = static_cast<int>(kvl);
-    ar.head_dim = static_cast<int>(hd);
-    ar.block_size = bs;
-    ar.ctx = static_cast<int>(pos0 + T);
-    ar.window = static_cast<int>(cfg.Window(v.layer));
-    ar.rel_extent = static_cast<int>(ext);
-    ar.scale = 1.0f / std::sqrt(static_cast<float>(hd));
-    ar.kv_block_stride = kvl * bs * 2 * hd;
-    ar.kv_head_stride = static_cast<int64_t>(bs) * 2 * hd;
-    const int rc = r4dx_inkling2_attn_ref_bf16kv(&ar, s);
-    if (rc != 0) throw std::runtime_error("Inkling2Model: r4dx_inkling2_attn_ref_bf16kv refused the launch (" + std::to_string(rc) + ")");
+    if (use_fused_attn) {
+      constexpr int kMaxSplits = 32;
+      float* attn_ws = (T == 1) ? arena_.Alloc<float>(static_cast<size_t>(hl * kMaxSplits * (hd + 2)), 16) : nullptr;
+      R4dxInkling2AttnFusedArgs af{};
+      af.q = P(q);
+      af.kv = P(kv);
+      af.block_table = P(table);
+      af.out = P(ao);
+      af.r = P(r);
+      af.rel_proj = P(a.rel_proj.data());
+      af.sink = P(sink);
+      af.workspace = P(attn_ws);
+      af.q_len = static_cast<int>(T);
+      af.q_heads = static_cast<int>(hl);
+      af.kv_heads = static_cast<int>(kvl);
+      af.head_dim = static_cast<int>(hd);
+      af.block_size = bs;
+      af.ctx = static_cast<int>(pos0 + T);
+      af.window = static_cast<int>(cfg.Window(v.layer));
+      af.d_rel = static_cast<int>(drel);
+      af.rel_extent = static_cast<int>(ext);
+      af.max_splits = kMaxSplits;
+      af.scale = 1.0f / std::sqrt(static_cast<float>(hd));
+      af.kv_block_stride = kvl * bs * 2 * hd;
+      af.kv_head_stride = static_cast<int64_t>(bs) * 2 * hd;
+      const int rc = r4dx_inkling2_attn_fused_bf16kv(&af, s);
+      if (rc != 0) throw std::runtime_error("Inkling2Model: r4dx_inkling2_attn_fused_bf16kv refused the launch (" + std::to_string(rc) + ")");
+    } else {
+      R4dxInkling2AttnRefArgs ar{};
+      ar.q = P(q);
+      ar.kv = P(kv);
+      ar.block_table = P(table);
+      ar.out = P(ao);
+      ar.rel = P(rel);
+      ar.sink = P(sink);
+      ar.q_len = static_cast<int>(T);
+      ar.q_heads = static_cast<int>(hl);
+      ar.kv_heads = static_cast<int>(kvl);
+      ar.head_dim = static_cast<int>(hd);
+      ar.block_size = bs;
+      ar.ctx = static_cast<int>(pos0 + T);
+      ar.window = static_cast<int>(cfg.Window(v.layer));
+      ar.rel_extent = static_cast<int>(ext);
+      ar.scale = 1.0f / std::sqrt(static_cast<float>(hd));
+      ar.kv_block_stride = kvl * bs * 2 * hd;
+      ar.kv_head_stride = static_cast<int64_t>(bs) * 2 * hd;
+      const int rc = r4dx_inkling2_attn_ref_bf16kv(&ar, s);
+      if (rc != 0) throw std::runtime_error("Inkling2Model: r4dx_inkling2_attn_ref_bf16kv refused the launch (" + std::to_string(rc) + ")");
+    }
   });
   ProfiledCall(prof, sr, "gemm:attn.gate_o", [&] {
     Lin(a.gate, xq, gt, T);

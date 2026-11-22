@@ -431,6 +431,118 @@ void TestAttention() {
   Check(r4dx_inkling2_attn_ref_bf16kv(&bad, 0) < 0, "attn: zero shapes refused");
 }
 
+// ---- S3 fused h128 attention vs reference kernel & CPU spec (contexts 1..9000, window/sink/bias on/off) ------------
+void TestFusedAttention() {
+  const int qh = 24, kvh = 8, d = 128, bs = 16, drel = 16, ext = 1024;
+  struct FCase {
+    int ctx, q_len, window;
+    bool ring, sink, bias;
+  };
+  const FCase cases[] = {
+      {1, 1, 0, false, true, true},
+      {17, 1, 0, false, true, true},
+      {17, 17, 0, false, true, true},
+      {1023, 1, 0, false, true, true},
+      {1024, 1, 1024, true, true, true},
+      {1025, 1, 1024, true, true, true},
+      {1536, 1, 1024, true, true, true},
+      {1536, 17, 1024, true, true, true},
+      {4096, 1, 0, false, true, true},
+      {4096, 1, 0, false, false, false},
+      {9000, 1, 0, false, true, true},
+      {300, 64, 0, false, true, true},
+      {300, 64, 128, true, true, true},
+  };
+  const std::vector<float> proj = Rand(static_cast<size_t>(drel * ext), 0.2f);
+  DeviceBuffer<float> proj_d = Dev(proj);
+  DeviceBuffer<float> ws_d(static_cast<size_t>(qh * 32 * (d + 2)));
+
+  for (const FCase& c : cases) {
+    const int ring_blocks = c.window > 0 ? (c.window + c.q_len - 1 + bs - 1) / bs + 1 : 0;
+    const int lblocks = (c.ctx + bs - 1) / bs;
+    const int nblk = c.ring ? std::min(lblocks, ring_blocks) : lblocks;
+    std::vector<int32_t> table(static_cast<size_t>(lblocks));
+    for (int b = 0; b < lblocks; ++b) table[static_cast<size_t>(b)] = c.ring ? b % nblk : b;
+    const std::vector<float> q = RoundBf16(Rand(static_cast<size_t>(c.q_len * qh * d), 0.3f));
+    const std::vector<float> r = Rand(static_cast<size_t>(c.q_len * qh * drel), 0.5f);
+    const std::vector<float> sink = Rand(static_cast<size_t>(c.q_len * qh), 1.0f);
+    const int64_t blk_stride = static_cast<int64_t>(kvh) * bs * 2 * d, head_stride = static_cast<int64_t>(bs) * 2 * d;
+    std::vector<uint16_t> cache(static_cast<size_t>(nblk * blk_stride), 0);
+    // Fill only the active blocks (the last nblk blocks of ctx) so 9000-ctx test stays fast on CPU setup.
+    const int p_start = c.ring ? std::max(0, c.ctx - nblk * bs) : 0;
+    const std::vector<float> kv_rand = RoundBf16(Rand(static_cast<size_t>((c.ctx - p_start) * kvh * 2 * d), 0.3f));
+    for (int p = p_start; p < c.ctx; ++p) {
+      const int64_t src_p = static_cast<int64_t>(p - p_start) * kvh * 2 * d;
+      for (int h = 0; h < kvh; ++h) {
+        const int64_t base = table[static_cast<size_t>(p / bs)] * blk_stride + h * head_stride + (p % bs) * 2 * d;
+        for (int i = 0; i < 2 * d; ++i)
+          cache[static_cast<size_t>(base + i)] = FloatToBf16(kv_rand[static_cast<size_t>(src_p + h * 2 * d + i)]);
+      }
+    }
+    DeviceBuffer<uint16_t> qd = Dev(ToBf16(q)), kvd = Dev(cache), o_ref(static_cast<size_t>(c.q_len * qh * d)),
+                           o_fus(static_cast<size_t>(c.q_len * qh * d));
+    DeviceBuffer<int32_t> td = Dev(table);
+    DeviceBuffer<float> rd = Dev(r), sd = Dev(sink);
+    DeviceBuffer<float> rel_d(static_cast<size_t>(c.q_len * qh * ext));
+    if (c.bias) {
+      r4dx_inkling2_rel_logits_f32(P(rd.data()), P(proj_d.data()), P(rel_d.data()), c.q_len * qh, drel, ext, 0);
+    }
+
+    R4dxInkling2AttnRefArgs ar{};
+    ar.q = P(qd.data());
+    ar.kv = P(kvd.data());
+    ar.block_table = P(td.data());
+    ar.out = P(o_ref.data());
+    ar.rel = c.bias ? P(rel_d.data()) : 0;
+    ar.sink = c.sink ? P(sd.data()) : 0;
+    ar.q_len = c.q_len;
+    ar.q_heads = qh;
+    ar.kv_heads = kvh;
+    ar.head_dim = d;
+    ar.block_size = bs;
+    ar.ctx = c.ctx;
+    ar.window = c.window;
+    ar.rel_extent = ext;
+    ar.scale = 1.0f / std::sqrt(static_cast<float>(d));
+    ar.kv_block_stride = blk_stride;
+    ar.kv_head_stride = head_stride;
+    Check(r4dx_inkling2_attn_ref_bf16kv(&ar, 0) == 0, "fused_attn ref launch ctx=" + std::to_string(c.ctx));
+
+    R4dxInkling2AttnFusedArgs af{};
+    af.q = P(qd.data());
+    af.kv = P(kvd.data());
+    af.block_table = P(td.data());
+    af.out = P(o_fus.data());
+    af.r = c.bias ? P(rd.data()) : 0;
+    af.rel_proj = c.bias ? P(proj_d.data()) : 0;
+    af.sink = c.sink ? P(sd.data()) : 0;
+    af.workspace = P(ws_d.data());
+    af.q_len = c.q_len;
+    af.q_heads = qh;
+    af.kv_heads = kvh;
+    af.head_dim = d;
+    af.block_size = bs;
+    af.ctx = c.ctx;
+    af.window = c.window;
+    af.d_rel = drel;
+    af.rel_extent = ext;
+    af.max_splits = 32;
+    af.scale = 1.0f / std::sqrt(static_cast<float>(d));
+    af.kv_block_stride = blk_stride;
+    af.kv_head_stride = head_stride;
+    const int rc = r4dx_inkling2_attn_fused_bf16kv(&af, 0);
+    const std::string tag = "fused_attn ctx " + std::to_string(c.ctx) + " q_len " + std::to_string(c.q_len) +
+                            " win " + std::to_string(c.window) + (c.bias ? " +bias" : "") + (c.sink ? " +sink" : "");
+    Check(rc == 0, tag + ": launch accepted");
+    Check(rc == 0 && Bf16Close(HostBf16(o_fus, static_cast<size_t>(c.q_len * qh * d)),
+                               HostBf16(o_ref, static_cast<size_t>(c.q_len * qh * d)), 2),
+          tag + ": matches ref kernel within 2 bf16 ULP");
+  }
+  R4dxInkling2AttnFusedArgs bad{};
+  Check(r4dx_inkling2_attn_fused_bf16kv(nullptr, 0) < 0, "fused_attn: null args refused");
+  Check(r4dx_inkling2_attn_fused_bf16kv(&bad, 0) < 0, "fused_attn: zero shapes refused");
+}
+
 }  // namespace
 
 int main() {
@@ -446,6 +558,7 @@ int main() {
   TestRelGateMsg();
   TestRouterSwigluSoftcapDense();
   TestAttention();
+  TestFusedAttention();
   if (g_fail != 0) {
     std::printf("%d check(s) FAILED\n", g_fail);
     return 1;

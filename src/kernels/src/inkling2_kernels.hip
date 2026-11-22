@@ -565,6 +565,388 @@ __global__ __launch_bounds__(kThreads) void Inkling2AttnRefKernel(const R4dxInkl
   if (threadIdx.x + kThreads < hd) orow[threadIdx.x + kThreads] = r4dx::core::FloatToBf16(acc1 * inv);
 }
 
+// ---- fused h128 attention with on-the-fly relative bias, sink, window, paged bf16 KV (S3) --------------------------
+constexpr int kFusedHd = 128;
+constexpr int kFusedMaxGqa = 8;
+constexpr int kFusedMaxDrel = 32;
+constexpr int kFusedWaves = 4;  // 128 threads = 4 wave32s
+
+__device__ __forceinline__ void Unpack4Bf16(uint2 v, float& f0, float& f1, float& f2, float& f3) {
+  f0 = r4dx::core::Bf16ToFloat(static_cast<uint16_t>(v.x & 0xFFFFu));
+  f1 = r4dx::core::Bf16ToFloat(static_cast<uint16_t>(v.x >> 16));
+  f2 = r4dx::core::Bf16ToFloat(static_cast<uint16_t>(v.y & 0xFFFFu));
+  f3 = r4dx::core::Bf16ToFloat(static_cast<uint16_t>(v.y >> 16));
+}
+
+__device__ __forceinline__ uint2 Pack4Bf16(float f0, float f1, float f2, float f3) {
+  const uint32_t lo = static_cast<uint32_t>(r4dx::core::FloatToBf16(f0)) |
+                      (static_cast<uint32_t>(r4dx::core::FloatToBf16(f1)) << 16);
+  const uint32_t hi = static_cast<uint32_t>(r4dx::core::FloatToBf16(f2)) |
+                      (static_cast<uint32_t>(r4dx::core::FloatToBf16(f3)) << 16);
+  return make_uint2(lo, hi);
+}
+
+// Decode kernel (q_len == 1): grid = (kv_heads, n_splits), block = (128) = 4 waves.
+// Exact two-pass softmax per 256-key tile in LDS: K is read once (Pass 1 writes scores[GQA][256] and finds exact
+// tile max), V is read once (Pass 2 accumulates exp(s - m) * V with zero per-key rescaling).
+// If n_splits == 1, merges waves in LDS, applies sink, and writes bf16 out directly.
+// If n_splits > 1, merges waves in LDS and writes (m, l, o[128]) per (q_head, split) to workspace.
+constexpr int kDecTile = 128;
+template <int GQA>
+__global__ __launch_bounds__(kFusedWaves * 32) void Inkling2AttnDecodeSplitKernel(
+    const R4dxInkling2AttnFusedArgs a, int n_splits) {
+  __shared__ float s_tile[GQA][kDecTile];
+  __shared__ float sm[kFusedWaves];
+  __shared__ float sl[kFusedWaves];
+  __shared__ float so[kFusedWaves][kFusedHd];
+
+  const int kvh = static_cast<int>(blockIdx.x);
+  const int split = static_cast<int>(blockIdx.y);
+  const int wave = threadIdx.x >> 5;
+  const int lane = threadIdx.x & 31;
+  const int qh0 = kvh * GQA;
+  const int qpos = a.ctx - 1;
+  const int klow = r4d_win_klow(qpos, a.window);
+  const int klen = qpos - klow + 1;
+  const int per_split = (klen + n_splits - 1) / n_splits;
+  const int s_begin = klow + split * per_split;
+  const int s_end = (s_begin + per_split < qpos + 1) ? (s_begin + per_split) : (qpos + 1);
+
+  const uint16_t* q_ptr = reinterpret_cast<const uint16_t*>(a.q);
+  const uint16_t* kv_ptr = reinterpret_cast<const uint16_t*>(a.kv);
+  const int* bt = reinterpret_cast<const int*>(a.block_table);
+  const float* r_ptr = a.r ? reinterpret_cast<const float*>(a.r) : nullptr;
+  const float* proj_ptr = a.rel_proj ? reinterpret_cast<const float*>(a.rel_proj) : nullptr;
+  const bool has_rel = (r_ptr != nullptr && proj_ptr != nullptr && a.d_rel > 0 && a.rel_extent > 0);
+
+  float q0[GQA], q1[GQA], q2[GQA], q3[GQA];
+  float o0[GQA], o1[GQA], o2[GQA], o3[GQA];
+  float mv[GQA], lv[GQA];
+  float rv[GQA];
+#pragma unroll
+  for (int g = 0; g < GQA; ++g) {
+    const uint2 qv = *reinterpret_cast<const uint2*>(q_ptr + static_cast<int64_t>(qh0 + g) * kFusedHd + lane * 4);
+    Unpack4Bf16(qv, q0[g], q1[g], q2[g], q3[g]);
+    o0[g] = o1[g] = o2[g] = o3[g] = 0.0f;
+    mv[g] = -INFINITY;
+    lv[g] = 0.0f;
+    rv[g] = (has_rel && lane < a.d_rel) ? r_ptr[static_cast<int64_t>(qh0 + g) * a.d_rel + lane] : 0.0f;
+  }
+
+  const int bs = a.block_size;
+  for (int tb = s_begin; tb < s_end; tb += kDecTile) {
+    const int tlen = (s_end - tb < kDecTile) ? (s_end - tb) : kDecTile;
+    // Pass 1: read K once, compute scores and tile max per wave.
+    float tm[GQA];
+#pragma unroll
+    for (int g = 0; g < GQA; ++g) tm[g] = -INFINITY;
+    for (int j = wave; j < tlen; j += kFusedWaves) {
+      const int k = tb + j;
+      const int64_t base = static_cast<int64_t>(bt[k / bs]) * a.kv_block_stride +
+                           static_cast<int64_t>(kvh) * a.kv_head_stride +
+                           static_cast<int64_t>(k % bs) * (2 * kFusedHd);
+      const uint2 kv_k = *reinterpret_cast<const uint2*>(kv_ptr + base + lane * 4);
+      float k0, k1, k2, k3;
+      Unpack4Bf16(kv_k, k0, k1, k2, k3);
+      const int dist = qpos - k;
+      const bool use_rel = has_rel && dist < a.rel_extent;
+      const float pj = (use_rel && lane < a.d_rel) ? proj_ptr[static_cast<int64_t>(lane) * a.rel_extent + dist] : 0.0f;
+#pragma unroll
+      for (int g = 0; g < GQA; ++g) {
+        float dot = q0[g] * k0 + q1[g] * k1 + q2[g] * k2 + q3[g] * k3;
+        dot = WaveSum(dot) * a.scale;
+        if (use_rel) {
+          float rb = rv[g] * pj;
+          rb = WaveSum(rb);
+          dot += rb;
+        }
+        if (lane == 0) s_tile[g][j] = dot;
+        tm[g] = fmaxf(tm[g], dot);
+      }
+    }
+    // Reduce tile max across the 4 waves via sm[].
+    float tile_m[GQA];
+#pragma unroll
+    for (int g = 0; g < GQA; ++g) {
+      if (lane == 0) sm[wave] = tm[g];
+      __syncthreads();
+      float mg = sm[0];
+#pragma unroll
+      for (int w = 1; w < kFusedWaves; ++w) mg = fmaxf(mg, sm[w]);
+      tile_m[g] = mg;
+      __syncthreads();
+    }
+    // Pass 2: read V once, accumulate exp(s - tile_m) * V with zero per-key rescaling.
+    float tl[GQA], to0[GQA], to1[GQA], to2[GQA], to3[GQA];
+#pragma unroll
+    for (int g = 0; g < GQA; ++g) {
+      tl[g] = 0.0f;
+      to0[g] = to1[g] = to2[g] = to3[g] = 0.0f;
+    }
+    for (int j = wave; j < tlen; j += kFusedWaves) {
+      const int k = tb + j;
+      const int64_t base = static_cast<int64_t>(bt[k / bs]) * a.kv_block_stride +
+                           static_cast<int64_t>(kvh) * a.kv_head_stride +
+                           static_cast<int64_t>(k % bs) * (2 * kFusedHd);
+      const uint2 kv_v = *reinterpret_cast<const uint2*>(kv_ptr + base + kFusedHd + lane * 4);
+      float v0, v1, v2, v3;
+      Unpack4Bf16(kv_v, v0, v1, v2, v3);
+#pragma unroll
+      for (int g = 0; g < GQA; ++g) {
+        const float p = expf(s_tile[g][j] - tile_m[g]);
+        tl[g] += p;
+        to0[g] += p * v0;
+        to1[g] += p * v1;
+        to2[g] += p * v2;
+        to3[g] += p * v3;
+      }
+    }
+    // Fold this tile into (mv, lv, o) (only happens >1 time if s_end - s_begin > 256).
+#pragma unroll
+    for (int g = 0; g < GQA; ++g) {
+      if (mv[g] == -INFINITY) {
+        mv[g] = tile_m[g];
+        lv[g] = tl[g];
+        o0[g] = to0[g];
+        o1[g] = to1[g];
+        o2[g] = to2[g];
+        o3[g] = to3[g];
+      } else {
+        const float mn = fmaxf(mv[g], tile_m[g]);
+        const float a0 = expf(mv[g] - mn);
+        const float a1 = expf(tile_m[g] - mn);
+        lv[g] = lv[g] * a0 + tl[g] * a1;
+        o0[g] = o0[g] * a0 + to0[g] * a1;
+        o1[g] = o1[g] * a0 + to1[g] * a1;
+        o2[g] = o2[g] * a0 + to2[g] * a1;
+        o3[g] = o3[g] * a0 + to3[g] * a1;
+        mv[g] = mn;
+      }
+    }
+    __syncthreads();
+  }
+
+  const float* sink_ptr = a.sink ? reinterpret_cast<const float*>(a.sink) : nullptr;
+  uint16_t* out_ptr = reinterpret_cast<uint16_t*>(a.out);
+  float* ws_ptr = reinterpret_cast<float*>(a.workspace);
+
+#pragma unroll
+  for (int g = 0; g < GQA; ++g) {
+    if (lane == 0) {
+      sm[wave] = mv[g];
+      sl[wave] = lv[g];
+    }
+    so[wave][lane * 4 + 0] = o0[g];
+    so[wave][lane * 4 + 1] = o1[g];
+    so[wave][lane * 4 + 2] = o2[g];
+    so[wave][lane * 4 + 3] = o3[g];
+    __syncthreads();
+
+    if (wave == 0) {
+      float m_all = -INFINITY;
+#pragma unroll
+      for (int w = 0; w < kFusedWaves; ++w) m_all = fmaxf(m_all, sm[w]);
+      float l_all = 0.0f;
+      float r0 = 0.0f, r1 = 0.0f, r2 = 0.0f, r3 = 0.0f;
+#pragma unroll
+      for (int w = 0; w < kFusedWaves; ++w) {
+        if (sl[w] > 0.0f) {
+          const float scale_w = expf(sm[w] - m_all);
+          l_all += sl[w] * scale_w;
+          r0 += so[w][lane * 4 + 0] * scale_w;
+          r1 += so[w][lane * 4 + 1] * scale_w;
+          r2 += so[w][lane * 4 + 2] * scale_w;
+          r3 += so[w][lane * 4 + 3] * scale_w;
+        }
+      }
+      const int h = qh0 + g;
+      if (n_splits == 1) {
+        if (sink_ptr != nullptr) {
+          const float sv = sink_ptr[h];
+          const float mn = fmaxf(m_all, sv);
+          const float alpha = (m_all == -INFINITY) ? 0.0f : expf(m_all - mn);
+          l_all = l_all * alpha + expf(sv - mn);
+          r0 *= alpha;
+          r1 *= alpha;
+          r2 *= alpha;
+          r3 *= alpha;
+        }
+        const float inv = (l_all > 0.0f) ? (1.0f / l_all) : 0.0f;
+        *reinterpret_cast<uint2*>(out_ptr + static_cast<int64_t>(h) * kFusedHd + lane * 4) =
+            Pack4Bf16(r0 * inv, r1 * inv, r2 * inv, r3 * inv);
+      } else {
+        // Workspace layout per (h, split): [m, l, o[0..127]] (130 floats).
+        float* dst = ws_ptr + (static_cast<int64_t>(h) * n_splits + split) * (kFusedHd + 2);
+        if (lane == 0) {
+          dst[0] = m_all;
+          dst[1] = l_all;
+        }
+        dst[2 + lane * 4 + 0] = r0;
+        dst[2 + lane * 4 + 1] = r1;
+        dst[2 + lane * 4 + 2] = r2;
+        dst[2 + lane * 4 + 3] = r3;
+      }
+    }
+    __syncthreads();
+  }
+}
+
+// Combine kernel for split-K decode: grid = (q_heads), block = (32).
+__global__ __launch_bounds__(32) void Inkling2AttnDecodeCombineKernel(
+    const float* __restrict__ ws, const float* __restrict__ sink, uint16_t* __restrict__ out, int n_splits) {
+  const int h = static_cast<int>(blockIdx.x);
+  const int lane = threadIdx.x;
+  const float* base = ws + static_cast<int64_t>(h) * n_splits * (kFusedHd + 2);
+  float m_all = (sink != nullptr) ? sink[h] : -INFINITY;
+  for (int s = 0; s < n_splits; ++s) {
+    const float ms = base[static_cast<int64_t>(s) * (kFusedHd + 2) + 0];
+    m_all = fmaxf(m_all, ms);
+  }
+  float l_all = (sink != nullptr) ? expf(sink[h] - m_all) : 0.0f;
+  float r0 = 0.0f, r1 = 0.0f, r2 = 0.0f, r3 = 0.0f;
+  for (int s = 0; s < n_splits; ++s) {
+    const float* src = base + static_cast<int64_t>(s) * (kFusedHd + 2);
+    const float ls = src[1];
+    if (ls > 0.0f) {
+      const float sc = expf(src[0] - m_all);
+      l_all += ls * sc;
+      r0 += src[2 + lane * 4 + 0] * sc;
+      r1 += src[2 + lane * 4 + 1] * sc;
+      r2 += src[2 + lane * 4 + 2] * sc;
+      r3 += src[2 + lane * 4 + 3] * sc;
+    }
+  }
+  const float inv = (l_all > 0.0f) ? (1.0f / l_all) : 0.0f;
+  *reinterpret_cast<uint2*>(out + static_cast<int64_t>(h) * kFusedHd + lane * 4) =
+      Pack4Bf16(r0 * inv, r1 * inv, r2 * inv, r3 * inv);
+}
+
+// Prefill kernel (q_len > 1): grid = (kv_heads, ceil(q_len / 4)), block = (128) = 4 waves.
+// Wave w handles query row t = t0 + w across all GQA query heads; all 4 waves cooperatively load BK = 16
+// K/V rows into LDS (8 KiB total) so every K/V load is reused across 4 * GQA = 12 query vectors.
+constexpr int kPrefillBK = 16;
+template <int GQA>
+__global__ __launch_bounds__(kFusedWaves * 32) void Inkling2AttnPrefillKernel(const R4dxInkling2AttnFusedArgs a) {
+  __shared__ uint2 sk[kPrefillBK][32];  // 16 x 128 bf16 = 4 KiB
+  __shared__ uint2 sv[kPrefillBK][32];  // 16 x 128 bf16 = 4 KiB
+
+  const int kvh = static_cast<int>(blockIdx.x);
+  const int t0 = static_cast<int>(blockIdx.y) * kFusedWaves;
+  const int wave = threadIdx.x >> 5;
+  const int lane = threadIdx.x & 31;
+  const int t = t0 + wave;
+  const bool valid_t = t < a.q_len;
+  const int qh0 = kvh * GQA;
+  const int qpos = a.ctx - a.q_len + t;
+  const int klow = valid_t ? r4d_win_klow(qpos, a.window) : a.ctx;
+  const int khigh = valid_t ? (qpos < a.ctx - 1 ? qpos : a.ctx - 1) : -1;
+
+  // Tile K range covering all valid queries in this block [t0 .. min(t0+3, q_len-1)].
+  const int t_last = (t0 + kFusedWaves - 1 < a.q_len) ? (t0 + kFusedWaves - 1) : (a.q_len - 1);
+  const int k_tile_begin = r4d_win_klow(a.ctx - a.q_len + t0, a.window);
+  const int k_tile_end_raw = a.ctx - a.q_len + t_last;
+  const int k_tile_end = (k_tile_end_raw < a.ctx - 1 ? k_tile_end_raw : a.ctx - 1) + 1;
+
+  const uint16_t* q_ptr = reinterpret_cast<const uint16_t*>(a.q);
+  const uint16_t* kv_ptr = reinterpret_cast<const uint16_t*>(a.kv);
+  const int* bt = reinterpret_cast<const int*>(a.block_table);
+  const float* r_ptr = a.r ? reinterpret_cast<const float*>(a.r) : nullptr;
+  const float* proj_ptr = a.rel_proj ? reinterpret_cast<const float*>(a.rel_proj) : nullptr;
+  const bool has_rel = (r_ptr != nullptr && proj_ptr != nullptr && a.d_rel > 0 && a.rel_extent > 0);
+
+  float q0[GQA], q1[GQA], q2[GQA], q3[GQA];
+  float o0[GQA], o1[GQA], o2[GQA], o3[GQA];
+  float mv[GQA], lv[GQA];
+  float rv[GQA];
+#pragma unroll
+  for (int g = 0; g < GQA; ++g) {
+    if (valid_t) {
+      const int64_t qoff = (static_cast<int64_t>(t) * a.q_heads + qh0 + g) * kFusedHd + lane * 4;
+      Unpack4Bf16(*reinterpret_cast<const uint2*>(q_ptr + qoff), q0[g], q1[g], q2[g], q3[g]);
+      rv[g] = (has_rel && lane < a.d_rel)
+                  ? r_ptr[(static_cast<int64_t>(t) * a.q_heads + qh0 + g) * a.d_rel + lane]
+                  : 0.0f;
+    } else {
+      q0[g] = q1[g] = q2[g] = q3[g] = 0.0f;
+      rv[g] = 0.0f;
+    }
+    o0[g] = o1[g] = o2[g] = o3[g] = 0.0f;
+    mv[g] = -INFINITY;
+    lv[g] = 0.0f;
+  }
+
+  const int bs = a.block_size;
+  for (int kb = k_tile_begin; kb < k_tile_end; kb += kPrefillBK) {
+    const int n_tile = (k_tile_end - kb < kPrefillBK) ? (k_tile_end - kb) : kPrefillBK;
+    // Cooperative load of n_tile K and V rows into LDS (4 waves x 32 lanes = 128 threads; 4 rows per wave).
+    for (int j = wave; j < n_tile; j += kFusedWaves) {
+      const int k = kb + j;
+      const int64_t base = static_cast<int64_t>(bt[k / bs]) * a.kv_block_stride +
+                           static_cast<int64_t>(kvh) * a.kv_head_stride +
+                           static_cast<int64_t>(k % bs) * (2 * kFusedHd);
+      sk[j][lane] = *reinterpret_cast<const uint2*>(kv_ptr + base + lane * 4);
+      sv[j][lane] = *reinterpret_cast<const uint2*>(kv_ptr + base + kFusedHd + lane * 4);
+    }
+    __syncthreads();
+
+    if (valid_t) {
+      for (int j = 0; j < n_tile; ++j) {
+        const int k = kb + j;
+        if (k < klow || k > khigh) continue;
+        float k0, k1, k2, k3, v0, v1, v2, v3;
+        Unpack4Bf16(sk[j][lane], k0, k1, k2, k3);
+        Unpack4Bf16(sv[j][lane], v0, v1, v2, v3);
+
+        const int dist = qpos - k;
+        const bool use_rel = has_rel && dist < a.rel_extent;
+        const float pj = (use_rel && lane < a.d_rel) ? proj_ptr[static_cast<int64_t>(lane) * a.rel_extent + dist] : 0.0f;
+
+#pragma unroll
+        for (int g = 0; g < GQA; ++g) {
+          float dot = q0[g] * k0 + q1[g] * k1 + q2[g] * k2 + q3[g] * k3;
+          dot = WaveSum(dot) * a.scale;
+          if (use_rel) {
+            float rb = rv[g] * pj;
+            rb = WaveSum(rb);
+            dot += rb;
+          }
+          const float mn = fmaxf(mv[g], dot);
+          const float alpha = (mv[g] == -INFINITY) ? 0.0f : expf(mv[g] - mn);
+          const float p = expf(dot - mn);
+          lv[g] = lv[g] * alpha + p;
+          o0[g] = o0[g] * alpha + p * v0;
+          o1[g] = o1[g] * alpha + p * v1;
+          o2[g] = o2[g] * alpha + p * v2;
+          o3[g] = o3[g] * alpha + p * v3;
+          mv[g] = mn;
+        }
+      }
+    }
+    __syncthreads();
+  }
+
+  if (!valid_t) return;
+  const float* sink_ptr = a.sink ? reinterpret_cast<const float*>(a.sink) : nullptr;
+  uint16_t* out_ptr = reinterpret_cast<uint16_t*>(a.out);
+#pragma unroll
+  for (int g = 0; g < GQA; ++g) {
+    const int h = qh0 + g;
+    if (sink_ptr != nullptr) {
+      const float sv_s = sink_ptr[static_cast<int64_t>(t) * a.q_heads + h];
+      const float mn = fmaxf(mv[g], sv_s);
+      const float alpha = (mv[g] == -INFINITY) ? 0.0f : expf(mv[g] - mn);
+      lv[g] = lv[g] * alpha + expf(sv_s - mn);
+      o0[g] *= alpha;
+      o1[g] *= alpha;
+      o2[g] *= alpha;
+      o3[g] *= alpha;
+    }
+    const float inv = (lv[g] > 0.0f) ? (1.0f / lv[g]) : 0.0f;
+    const int64_t ooff = (static_cast<int64_t>(t) * a.q_heads + h) * kFusedHd + lane * 4;
+    *reinterpret_cast<uint2*>(out_ptr + ooff) = Pack4Bf16(o0[g] * inv, o1[g] * inv, o2[g] * inv, o3[g] * inv);
+  }
+}
+
 // ---- small dense GEMM: one wave per output element ----------------------------------------------------------------
 __global__ __launch_bounds__(kThreads) void DenseBf16Kernel(const uint16_t* __restrict__ x, int64_t xs,
                                                             const uint16_t* __restrict__ w, void* __restrict__ out,
@@ -826,6 +1208,72 @@ int r4dx_inkling2_attn_ref_bf16kv(const R4dxInkling2AttnRefArgs* a, int64_t stre
   if (a->rel != 0 && a->rel_extent <= 0) return -5;
   hipLaunchKernelGGL(Inkling2AttnRefKernel, dim3(static_cast<unsigned>(a->q_heads), static_cast<unsigned>(a->q_len)),
                      dim3(kThreads), 0, reinterpret_cast<hipStream_t>(stream), *a);
+  const hipError_t e = hipGetLastError();
+  if (e != hipSuccess) return -100 - static_cast<int>(e);
+  r4dx_kernel_launch_counter_add(1);
+  return 0;
+}
+
+int r4dx_inkling2_attn_fused_bf16kv(const R4dxInkling2AttnFusedArgs* a, int64_t stream) {
+  if (a == nullptr) return -1;
+  if (a->q == 0 || a->kv == 0 || a->block_table == 0 || a->out == 0) return -2;
+  if (a->q_len <= 0 || a->q_heads <= 0 || a->kv_heads <= 0 || a->head_dim != kFusedHd || a->block_size <= 0) return -3;
+  if (a->q_heads % a->kv_heads != 0) return -4;
+  const int gqa = a->q_heads / a->kv_heads;
+  if (gqa < 1 || gqa > kFusedMaxGqa) return -4;
+  if (a->ctx < a->q_len || a->window < 0) return -5;
+  if (a->r != 0 && (a->rel_proj == 0 || a->d_rel <= 0 || a->d_rel > kFusedMaxDrel || a->rel_extent <= 0)) return -6;
+  hipStream_t st = reinterpret_cast<hipStream_t>(stream);
+  if (a->q_len == 1) {
+    const int qpos = a->ctx - 1;
+    const int klow = r4d_win_klow(qpos, a->window);
+    const int klen = qpos - klow + 1;
+    int n_splits = 1;
+    if (klen > 128 && a->workspace != 0 && a->max_splits > 1) {
+      n_splits = (klen + 127) / 128;
+      if (n_splits > a->max_splits) n_splits = a->max_splits;
+    }
+    const dim3 grid(static_cast<unsigned>(a->kv_heads), static_cast<unsigned>(n_splits));
+    const dim3 block(kFusedWaves * 32);
+#define INK2_DEC_CASE(G) \
+  case G: hipLaunchKernelGGL((Inkling2AttnDecodeSplitKernel<G>), grid, block, 0, st, *a, n_splits); break
+    switch (gqa) {
+      INK2_DEC_CASE(1);
+      INK2_DEC_CASE(2);
+      INK2_DEC_CASE(3);
+      INK2_DEC_CASE(4);
+      INK2_DEC_CASE(6);
+      INK2_DEC_CASE(8);
+      default: return -4;
+    }
+#undef INK2_DEC_CASE
+    hipError_t e = hipGetLastError();
+    if (e != hipSuccess) return -100 - static_cast<int>(e);
+    r4dx_kernel_launch_counter_add(1);
+    if (n_splits > 1) {
+      hipLaunchKernelGGL(Inkling2AttnDecodeCombineKernel, dim3(static_cast<unsigned>(a->q_heads)), dim3(32), 0, st,
+                         reinterpret_cast<const float*>(a->workspace), reinterpret_cast<const float*>(a->sink),
+                         reinterpret_cast<uint16_t*>(a->out), n_splits);
+      e = hipGetLastError();
+      if (e != hipSuccess) return -100 - static_cast<int>(e);
+      r4dx_kernel_launch_counter_add(1);
+    }
+    return 0;
+  }
+  const dim3 grid(static_cast<unsigned>(a->kv_heads), static_cast<unsigned>((a->q_len + kFusedWaves - 1) / kFusedWaves));
+  const dim3 block(kFusedWaves * 32);
+#define INK2_PF_CASE(G) \
+  case G: hipLaunchKernelGGL((Inkling2AttnPrefillKernel<G>), grid, block, 0, st, *a); break
+  switch (gqa) {
+    INK2_PF_CASE(1);
+    INK2_PF_CASE(2);
+    INK2_PF_CASE(3);
+    INK2_PF_CASE(4);
+    INK2_PF_CASE(6);
+    INK2_PF_CASE(8);
+    default: return -4;
+  }
+#undef INK2_PF_CASE
   const hipError_t e = hipGetLastError();
   if (e != hipSuccess) return -100 - static_cast<int>(e);
   r4dx_kernel_launch_counter_add(1);

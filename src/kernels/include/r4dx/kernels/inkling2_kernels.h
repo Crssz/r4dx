@@ -145,4 +145,31 @@ struct R4dxInkling2AttnRefArgs {
 // q_heads % kv_heads, non-positive sizes, window < 0, ctx < q_len, rel without rel_extent > 0, null pointers).
 int r4dx_inkling2_attn_ref_bf16kv(const R4dxInkling2AttnRefArgs* a, int64_t stream);
 
+// ---- fused h128 attention with on-the-fly relative bias, sink, window, paged bf16 KV (S3) --------------------------
+// Computes the same fp32 attention as r4dx_inkling2_attn_ref_bf16kv, without materializing rel[T, H, extent]:
+// bias(t, h, dist) = sum_{j=0..d_rel-1} r[t, h, j] * rel_proj[j, dist] for 0 <= dist < rel_extent.
+// Decode (q_len == 1) uses split-K over context (needs workspace of q_heads * max_splits * (head_dim + 2) floats
+// when ctx > 128); prefill (q_len > 1) tiles K/V in LDS with online softmax across 4 query rows x GQA heads.
+// Supports head_dim == 128, q_heads % kv_heads == 0, 1 <= q_heads/kv_heads <= 8, d_rel <= 32. Returns < 0 otherwise.
+struct R4dxInkling2AttnFusedArgs {
+  int64_t q;            // [q_len, q_heads, 128] bf16
+  int64_t kv;           // paged bf16 cache
+  int64_t block_table;  // int32
+  int64_t out;          // [q_len, q_heads, 128] bf16
+  int64_t r;            // fp32 [q_len, q_heads, d_rel] or 0
+  int64_t rel_proj;     // fp32 [d_rel, rel_extent] or 0
+  int64_t sink;         // fp32 [q_len, q_heads] or 0
+  int64_t workspace;    // fp32 [q_heads * max_splits * (head_dim + 2)] (for q_len == 1 split-K)
+  int q_len, q_heads, kv_heads, head_dim, block_size;
+  int ctx;
+  int window;           // 0 = full causal
+  int d_rel;            // <= 32 (16 for Inkling2)
+  int rel_extent;       // > 0 when r != 0
+  int max_splits;       // >= 1 (e.g. 32)
+  float scale;          // head_dim^-0.5
+  int64_t kv_block_stride;
+  int64_t kv_head_stride;
+};
+int r4dx_inkling2_attn_fused_bf16kv(const R4dxInkling2AttnFusedArgs* a, int64_t stream);
+
 }  // extern "C"

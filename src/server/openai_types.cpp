@@ -10,6 +10,7 @@
 
 #include "image_decode.h"  // src/vision: DecodeImageBytes (docs/vision.md)
 #include "audio_wav.h"     // src/audio: DecodeWav (docs/gemma4-audio.md)
+#include "inkling2_stream_parser.h"  // Inkling2RequestEffort (numeric reasoning_effort dialects)
 
 namespace r4dx::server {
 
@@ -547,6 +548,11 @@ std::string NormalizeEffort(const std::string& raw) {
   return out;
 }
 
+// A numeric effort (only for a dialect with numeric_reasoning_effort) reduced to the string key the on/off logic below reads:
+// 0 is "none" (thinking off), any other number (an out-of-range one included: the dialect's resolver rejects it) is a level of its
+// own that TemplateEffortFor maps to nothing.
+std::string NumericEffortKey(const nlohmann::json& v) { return v.get<double>() == 0.0 ? "none" : "numeric"; }
+
 // Maps the de-facto OpenAI/OpenRouter effort scale onto the THREE levels
 // C:\AI\models\Qwen3.8-27B\chat_template.jinja itself accepts -- its own
 // `{%- if resolved_reasoning_effort not in ('xhigh', 'medium', 'low') %}{{- raise_exception(...) }}`
@@ -618,9 +624,12 @@ bool ResolveEnableThinking(const ThinkingControls& thinking, bool default_thinki
   return thinking.enabled.value_or(default_thinking);
 }
 
-ThinkingControls ParseThinkingControls(const nlohmann::json& body) {
+ThinkingControls ParseThinkingControls(const nlohmann::json& body, bool allow_numeric_effort) {
   ThinkingControls out;
   if (!body.is_object()) return out;
+  // A dialect that takes a numeric effort (ModelDialect::numeric_reasoning_effort) also wants the raw value (any JSON type, the
+  // dialect's own resolver validates it); `template_effort` stays unset for it.
+  if (allow_numeric_effort) out.request_effort = Inkling2RequestEffort(body);
 
   // Everything is validated up front, whatever the precedence below ends up reading: a caller that
   // sends a malformed `thinking` object alongside a well-formed `reasoning` one still gets the 400
@@ -652,7 +661,9 @@ ThinkingControls ParseThinkingControls(const nlohmann::json& body) {
       }
       reasoning_enabled = r.at("enabled").get<bool>();
     }
-    if (r.contains("effort") && !r.at("effort").is_null()) {
+    if (allow_numeric_effort && r.contains("effort") && r.at("effort").is_number()) {
+      reasoning_effort_in_object = NumericEffortKey(r.at("effort"));
+    } else if (r.contains("effort") && !r.at("effort").is_null()) {
       if (!r.at("effort").is_string()) {
         throw ApiError{400, "invalid_request_error", "'reasoning.effort' must be a string"};
       }
@@ -706,7 +717,9 @@ ThinkingControls ParseThinkingControls(const nlohmann::json& body) {
 
   // 5. reasoning_effort (top level) -- OpenAI's own field name.
   std::optional<std::string> top_effort;
-  if (body.contains("reasoning_effort") && !body.at("reasoning_effort").is_null()) {
+  if (allow_numeric_effort && body.contains("reasoning_effort") && body.at("reasoning_effort").is_number()) {
+    top_effort = NumericEffortKey(body.at("reasoning_effort"));
+  } else if (body.contains("reasoning_effort") && !body.at("reasoning_effort").is_null()) {
     if (!body.at("reasoning_effort").is_string()) {
       throw ApiError{400, "invalid_request_error", "'reasoning_effort' must be a string"};
     }
@@ -751,7 +764,8 @@ ThinkingControls ParseThinkingControls(const nlohmann::json& body) {
 
 ChatCompletionRequest ParseChatCompletionRequest(const nlohmann::json& body,
                                                   const SamplingParams& sampling_defaults,
-                                                  const vision::ImageProcessorConfig& image_cfg) {
+                                                  const vision::ImageProcessorConfig& image_cfg,
+                                                  bool numeric_reasoning_effort) {
   if (!body.is_object()) throw ApiError{400, "invalid_request_error", "request body must be a JSON object"};
 
   ChatCompletionRequest req;
@@ -867,7 +881,7 @@ ChatCompletionRequest ParseChatCompletionRequest(const nlohmann::json& body,
   }
   req.tool_choice = ParseToolChoice(body, req.tools);
   // Parsed AFTER chat_template_kwargs above, since its highest-precedence source lives inside it.
-  req.thinking = ParseThinkingControls(body);
+  req.thinking = ParseThinkingControls(body, numeric_reasoning_effort);
 
   return req;
 }

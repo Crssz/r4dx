@@ -111,6 +111,7 @@ ModelDialect MakeInkling2() {
   d.kind = DialectKind::kInkling2;
   d.name = "inkling2";
   d.structured_parts = true;
+  d.numeric_reasoning_effort = true;
   // Not used (the typed-part parser replaces the splitter/gate); kept consistent for code that prints them.
   d.reasoning.open = "<|message_model|><|content_thinking|>";
   d.reasoning.close = "<|end_message|>";

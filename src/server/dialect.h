@@ -59,6 +59,9 @@ struct ModelDialect {
   // <|content_invoke_tool_json|> ... <|end_message|>), parsed by Inkling2StreamParser (inkling2_stream_parser.h). The text
   // ReasoningSplitter / ReasoningLocator / ToolStreamGate and the `reasoning` / `tool_*` markers below do not apply to it.
   bool structured_parts = false;
+  // Inkling-2: `reasoning_effort` / `reasoning.effort` may be a JSON number (the template renders "Thinking effort level: <n>",
+  // range [0, 0.99], validated by ResolveInkling2ReasoningEffort). Every other dialect keeps the 400 on a non-string effort.
+  bool numeric_reasoning_effort = false;
   // The model's own generation_config sampling defaults, applied to a request that leaves the field out (and
   // only where the operator did not pass the matching --default-* flag). Empty (every field nullopt) for Qwen
   // and Gemma: their requests keep exactly the server's --default-* values, as before this struct existed.

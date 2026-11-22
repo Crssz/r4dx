@@ -143,6 +143,44 @@ if(R4DX_BUILD_SERVER)
     SKIP_RETURN_CODE 77
   )
 
+  # test_engine_inkling2: the Inkling-2 (structured_parts) output path through engine.cpp + http_server.cpp -- scripted token streams
+  # (thinking + text, tool calls, malformed / truncated parts, streaming deltas, reasoning_effort) against the checkpoint's real
+  # tokenizer + chat template (R4DX_INKLING2_TOKENIZER_DIR; exits 77 without it). Same GPU-free setup and link line as test_http_server.
+  # While src/model/arch.h has no Inkling-2 enumerator the engine's post-load dialect/arch cross-check cannot pass for a fake model, so
+  # engine.cpp is built with R4DX_TEST_SKIP_MODEL_ARCH_CHECK for this target only; once the enumerator exists (the first name starting
+  # kInkling2) the fake reports it instead and the check runs for real.
+  add_executable(test_engine_inkling2 test_engine_inkling2.cpp
+    ${CMAKE_SOURCE_DIR}/src/server/engine.cpp
+    ${CMAKE_SOURCE_DIR}/src/server/http_server.cpp
+  )
+  target_include_directories(test_engine_inkling2 PRIVATE
+    ${CMAKE_SOURCE_DIR}/third_party
+    ${CMAKE_SOURCE_DIR}/third_party/httplib
+    ${CMAKE_SOURCE_DIR}/src/server
+  )
+  target_compile_definitions(test_engine_inkling2 PRIVATE R4DX_INKLING2_TOKENIZER_DIR="${R4DX_INKLING2_TOKENIZER_DIR}")
+  file(STRINGS "${CMAKE_SOURCE_DIR}/src/model/arch.h" _r4dx_arch_inkling2 REGEX "kInkling2")
+  string(REGEX MATCH "kInkling2[A-Za-z0-9_]*" _r4dx_arch_inkling2_name "${_r4dx_arch_inkling2}")
+  if(_r4dx_arch_inkling2_name)
+    target_compile_definitions(test_engine_inkling2 PRIVATE R4DX_TEST_INKLING2_ARCH=r4dx::model::Arch::${_r4dx_arch_inkling2_name})
+  else()
+    target_compile_definitions(test_engine_inkling2 PRIVATE R4DX_TEST_SKIP_MODEL_ARCH_CHECK=1)
+  endif()
+  target_link_libraries(test_engine_inkling2 PRIVATE
+    r4dx_server_core
+    r4dx_model
+    r4dx_tokenizer
+    r4dx_core
+    r4dx_kernels
+    r4d_core
+    r4dx_hip_runtime
+  )
+  add_test(NAME test_engine_inkling2 COMMAND test_engine_inkling2)
+  set_tests_properties(test_engine_inkling2 PROPERTIES
+    ENVIRONMENT "HIP_VISIBLE_DEVICES=1"
+    SKIP_RETURN_CODE 77
+  )
+
   # test_http_server: http_server.cpp's routes end to end -- a real Engine and HttpServer on an
   # OS-chosen loopback port (HttpServer::BindToAnyPort), a scripted CPU fake of the TP=1 model,
   # httplib's own client (the response Content-Type charset, and streamed vs non-streamed content as

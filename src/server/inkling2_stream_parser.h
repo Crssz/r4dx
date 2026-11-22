@@ -57,6 +57,8 @@ class Inkling2StreamParser {
   size_t tool_call_count() const { return tool_calls_; }
   // True iff some part (a tool call, or a header with no content kind) was malformed/truncated and degraded to content.
   bool had_malformed() const { return malformed_; }
+  // True while inside a <|content_thinking|> part (the engine counts usage.reasoning_tokens from it, token by token).
+  bool in_thinking() const { return state_ == State::kThinking; }
 
  private:
   enum class State { kBetween, kHeader, kThinking, kText, kTool };

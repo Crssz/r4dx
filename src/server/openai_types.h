@@ -88,6 +88,10 @@ struct ThinkingControls {
   // the answer only) and `usage.completion_tokens_details.reasoning_tokens` is still reported --
   // only the `reasoning_content` field/deltas are suppressed.
   bool include_reasoning = true;
+  // The raw effort value (`reasoning.effort` wins over top-level `reasoning_effort`; any JSON type, null when absent), filled ONLY
+  // when ParseThinkingControls was told the dialect takes a numeric effort (ModelDialect::numeric_reasoning_effort, Inkling-2):
+  // the dialect's own resolver (ResolveInkling2ReasoningEffort) validates and renders it. Null for every other dialect.
+  nlohmann::json request_effort;
 };
 
 // Thrown by every Parse* function below on any invalid input; the HTTP layer (http_server.cpp)
@@ -254,9 +258,12 @@ inline constexpr size_t kMaxAudioBase64Chars = 8 * 1024 * 1024;
 // An image part is decoded/preprocessed (never merely validated) here regardless of whether the
 // loaded container actually has a vision tower -- ParseChatCompletionRequest has no Model to ask;
 // Engine::RunRequest is what returns "this model/container has no vision tower" once it knows.
+// `numeric_reasoning_effort` (ModelDialect::numeric_reasoning_effort, Inkling-2 only): `reasoning_effort` / `reasoning.effort` may be a
+// number; every other dialect keeps the 400 on a non-string effort.
 ChatCompletionRequest ParseChatCompletionRequest(
     const nlohmann::json& body, const SamplingParams& sampling_defaults = {},
-    const vision::ImageProcessorConfig& image_cfg = vision::ImageProcessorConfig());
+    const vision::ImageProcessorConfig& image_cfg = vision::ImageProcessorConfig(),
+    bool numeric_reasoning_effort = false);
 CompletionRequest ParseCompletionRequest(const nlohmann::json& body,
                                           const SamplingParams& sampling_defaults = {});
 
@@ -297,7 +304,9 @@ bool ResolveEnableThinking(const nlohmann::json& chat_template_kwargs, bool defa
 // `thinking`, a non-boolean `enabled`/`exclude`/`enable_thinking`/`include_reasoning`, a
 // non-string or empty `effort`/`reasoning_effort`, a `thinking.type` that is neither "enabled" nor
 // "disabled", or a negative/non-integer `reasoning.max_tokens`/`thinking.budget_tokens`.
-ThinkingControls ParseThinkingControls(const nlohmann::json& body);
+// `allow_numeric_effort` (a dialect with numeric_reasoning_effort): a numeric effort is accepted (0 means thinking off, any other
+// number on, with no template_effort) and ThinkingControls::request_effort carries the raw value.
+ThinkingControls ParseThinkingControls(const nlohmann::json& body, bool allow_numeric_effort = false);
 
 // The resolved `enable_thinking` for a request: whatever ParseThinkingControls decided, else the
 // server's `--think` default. Shared by http_server.cpp (which must pick the ResponseSink's

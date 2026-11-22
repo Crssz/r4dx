@@ -84,6 +84,12 @@ class ResponseSink {
   // never calls it, is unaffected.
   virtual void OnReasoningContent(const std::string& /*text*/) {}
 
+  // Inkling-2 (ModelDialect::structured_parts): the engine runs Inkling2StreamParser itself and hands each typed event over
+  // instead of raw text. OnReasoningDelta carries the next piece of a thinking part (called any number of times, interleaved with
+  // OnToken, which then carries ONLY answer text); a tool call travels through OnToolCalls as usual (once, before OnDone). A sink
+  // built with a structured dialect does no splitting of its own. Default no-op for every other sink.
+  virtual void OnReasoningDelta(const std::string& /*text*/) {}
+
   // The worker polls this between decode steps; true means stop generating now. Only
   // StreamingSink ever returns true (set by Cancel() when the HTTP layer detects the client is
   // gone); BufferingSink's non-streaming request has no analogous "give up early" signal.
@@ -112,7 +118,9 @@ class BufferingSink : public ResponseSink {
   explicit BufferingSink(bool enable_thinking = false, bool emit_reasoning = true,
                          const ModelDialect* dialect = nullptr)
       : enable_thinking_(enable_thinking), emit_reasoning_(emit_reasoning), dialect_(dialect),
-        split_active_(enable_thinking || (dialect != nullptr && dialect->kind == DialectKind::kGemma4)) {
+        structured_(dialect != nullptr && dialect->structured_parts),
+        split_active_(!(dialect != nullptr && dialect->structured_parts) &&
+                      (enable_thinking || (dialect != nullptr && dialect->kind == DialectKind::kGemma4))) {
     if (dialect_ != nullptr && dialect_->kind == DialectKind::kGemma4) {
       splitter_ = ReasoningSplitter(dialect_->reasoning, ReasoningSplitter::StartState::kExpectOpener);
     }
@@ -130,6 +138,7 @@ class BufferingSink : public ResponseSink {
 
   void OnToolCalls(const std::vector<ToolCallOut>& calls) override;
   void OnReasoningContent(const std::string& text) override;
+  void OnReasoningDelta(const std::string& text) override;
 
   // With `enable_thinking` false (the default), `text` behaves exactly as before this field
   // existed: every OnToken piece appended verbatim. With it true, `text` holds only the ANSWER
@@ -152,7 +161,8 @@ class BufferingSink : public ResponseSink {
   const bool enable_thinking_;
   const bool emit_reasoning_;
   const ModelDialect* dialect_;
-  const bool split_active_;  // enable_thinking_, or a Gemma dialect (always splits)
+  const bool structured_;    // Inkling-2: typed events from the engine (OnReasoningDelta), no splitter
+  const bool split_active_;  // enable_thinking_, or a Gemma dialect (always splits); never for a structured dialect
   ReasoningSplitter splitter_;
   std::string reasoning_raw_;     // un-trimmed accumulation of every kReasoning event
   bool reasoning_delivered_ = false;  // true once OnReasoningContent ran (tool_mode) -- OnToken
@@ -195,6 +205,7 @@ class StreamingSink : public ResponseSink {
   void OnError(int http_status, const std::string& message) override;
   void OnToolCalls(const std::vector<ToolCallOut>& calls) override;
   void OnReasoningContent(const std::string& text) override;
+  void OnReasoningDelta(const std::string& text) override;
   bool IsCancelled() const override { return cancelled_.load(std::memory_order_relaxed); }
 
   // Called by the HTTP handler thread (httplib's chunked-content-provider callback) to pull the
@@ -219,7 +230,7 @@ class StreamingSink : public ResponseSink {
   bool enable_thinking_;
   bool emit_reasoning_;
   const ModelDialect* dialect_;
-  bool split_active_;  // chat && (enable_thinking_ || Gemma dialect)
+  bool split_active_;  // chat && (enable_thinking_ || Gemma dialect) && !structured dialect
   ReasoningSplitter splitter_;
   bool reasoning_delivered_ = false;  // true once OnReasoningContent ran (tool_mode) -- OnToken
                                        // then bypasses the splitter entirely, see OnToken's body

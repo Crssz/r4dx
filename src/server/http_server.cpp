@@ -186,7 +186,8 @@ HttpServer::HttpServer(Engine& engine) : impl_(std::make_unique<Impl>(engine)) {
     try {
       const nlohmann::json body = ParseJsonBody(httpreq);
       ChatCompletionRequest req = ParseChatCompletionRequest(body, engine_ref.SamplingDefaults(),
-                                                              engine_ref.ImagePreprocessing());
+                                                              engine_ref.ImagePreprocessing(),
+                                                              engine_ref.Dialect().numeric_reasoning_effort);
       const std::string model_id = req.model.empty() ? engine_ref.ModelId() : req.model;
       const int64_t max_tokens = req.max_tokens.value_or(engine_ref.MaxTokensDefault());
       const std::string id = GenerateRequestId("chatcmpl-");
@@ -205,7 +206,9 @@ HttpServer::HttpServer(Engine& engine) : impl_(std::make_unique<Impl>(engine)) {
       // reasoning_content unless the client excluded it (an empty one is not put on the wire below).
       const ModelDialect& dialect = engine_ref.Dialect();
       const bool gemma = dialect.kind == DialectKind::kGemma4;
-      const bool emit_reasoning = (enable_thinking || gemma) && req.thinking.include_reasoning;
+      // Inkling-2 (structured_parts): the model decides per turn whether to emit a thinking part, effort named or not (like Gemma's
+      // own spans), so its reasoning always travels as reasoning_content unless the client excluded it.
+      const bool emit_reasoning = (enable_thinking || gemma || dialect.structured_parts) && req.thinking.include_reasoning;
 
       auto pending = std::make_shared<PendingRequest>();
       pending->kind = RequestKind::kChat;

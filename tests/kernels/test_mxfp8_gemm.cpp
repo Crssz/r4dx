@@ -379,6 +379,118 @@ void TestIllegal() {
   Check(!throws(256, 256, 64, 1, 8, 4, 4, 0), "legal: M 256 K 256 SK 8 MB 4 NPW 4 runs");
   R4DX_HIP_CHECK(hipDeviceSynchronize());
   Check(r4dx_gemm_mxfp8_group() == 32 && r4dx_gemm_mxfp8_max_m() == 256, "exports: group 32, max_m 256");
+
+  DeviceBuffer<uint64_t> ptrs(8);
+  DeviceBuffer<int32_t> ids(16);
+  auto throws_moe = [&](int n_pairs, int a_row_group, int n_experts, int K, int N, int WV, int SK, int NPW, int NT,
+                        bool null_ids = false) {
+    try {
+      r4dx_gemm_mxfp8_moe_decode(P(a.data()), P(ptrs.data()), P(ptrs.data()), null_ids ? 0 : P(ids.data()), P(c.data()),
+                                 n_pairs, a_row_group, n_experts, K, N, WV, SK, NPW, NT, 0);
+    } catch (const std::exception&) {
+      return true;
+    }
+    return false;
+  };
+  Check(throws_moe(0, 1, 8, 256, 64, 1, 1, 1, 1), "illegal moe_decode: n_pairs = 0 throws");
+  Check(throws_moe(16385, 1, 8, 256, 64, 1, 1, 1, 1), "illegal moe_decode: n_pairs = 16385 throws");
+  Check(throws_moe(8, 3, 8, 256, 64, 1, 1, 1, 1), "illegal moe_decode: a_row_group 3 not dividing 8 throws");
+  Check(throws_moe(8, 0, 8, 256, 64, 1, 1, 1, 1), "illegal moe_decode: a_row_group = 0 throws");
+  Check(throws_moe(8, 1, 0, 256, 64, 1, 1, 1, 1), "illegal moe_decode: n_experts = 0 throws");
+  Check(throws_moe(8, 1, 257, 256, 64, 1, 1, 1, 1), "illegal moe_decode: n_experts = 257 throws");
+  Check(throws_moe(8, 1, 8, 96, 64, 1, 2, 1, 1), "illegal moe_decode: K % (SK*32) != 0 throws");
+  Check(throws_moe(8, 1, 8, 256, 24, 1, 1, 1, 1), "illegal moe_decode: N % 16 != 0 throws");
+  Check(throws_moe(8, 1, 8, 256, 64, 1, 1, 2, 1), "illegal moe_decode: NPW = 2 throws");
+  Check(throws_moe(8, 1, 8, 256, 64, 1, 1, 1, 1, true), "illegal moe_decode: null ids throws");
+}
+
+void TestMoeDecode(std::mt19937& rng, bool quick) {
+  struct MoeShape {
+    const char* name;
+    int N, K, a_row_group, n_pairs;
+  };
+  const MoeShape shapes[] = {
+      {"tiny.gate_up", 64, 64, 4, 8},
+      {"tiny.down", 64, 32, 1, 8},
+      {"inkling.gate_up", 2304, 2304, 8, 8},
+      {"inkling.down", 2304, 1152, 1, 8},
+      {"inkling.gate_up.t3", 2304, 2304, 8, 24},
+      {"tp2.gate_up", 1152, 2304, 8, 8},
+      {"tp2.down", 2304, 576, 1, 8},
+  };
+  const int n_experts = 10;
+  for (const auto& s : shapes) {
+    if (quick && std::string(s.name).find("tp2") != std::string::npos) continue;
+    std::vector<Problem> experts(static_cast<size_t>(n_experts));
+    std::vector<uint64_t> wq_h(static_cast<size_t>(n_experts)), ws_h(static_cast<size_t>(n_experts));
+    for (int e = 0; e < n_experts; ++e) {
+      experts[static_cast<size_t>(e)].N = s.N;
+      experts[static_cast<size_t>(e)].K = s.K;
+      experts[static_cast<size_t>(e)].cols = {0};
+      MakeWeight(rng, experts[static_cast<size_t>(e)]);
+      wq_h[static_cast<size_t>(e)] = static_cast<uint64_t>(P(experts[static_cast<size_t>(e)].wq.data()));
+      ws_h[static_cast<size_t>(e)] = static_cast<uint64_t>(P(experts[static_cast<size_t>(e)].ws.data()));
+    }
+    DeviceBuffer<uint64_t> wq_ptrs(wq_h.size()), ws_ptrs(ws_h.size());
+    wq_ptrs.CopyFromHost(wq_h);
+    ws_ptrs.CopyFromHost(ws_h);
+
+    const int n_a_rows = s.n_pairs / s.a_row_group;
+    std::vector<uint16_t> a_h(static_cast<size_t>(n_a_rows) * s.K);
+    std::normal_distribution<float> nd(0.0f, 1.0f);
+    for (auto& v : a_h) v = FloatToBf16Rne(std::clamp(nd(rng), -4.0f, 4.0f));
+    DeviceBuffer<uint16_t> a_d(a_h.size());
+    a_d.CopyFromHost(a_h);
+
+    // Random ids including repeats and out-of-range sentinel ids (-1 and n_experts).
+    std::vector<int32_t> ids_h(static_cast<size_t>(s.n_pairs));
+    std::uniform_int_distribution<int> de(0, n_experts - 1);
+    for (int p = 0; p < s.n_pairs; ++p) ids_h[static_cast<size_t>(p)] = de(rng);
+    if (s.n_pairs >= 4) {
+      ids_h[1] = ids_h[0];  // repeat
+      ids_h[2] = -1;        // out-of-range low
+      ids_h[3] = n_experts; // out-of-range high
+    }
+    DeviceBuffer<int32_t> ids_d(ids_h.size());
+    ids_d.CopyFromHost(ids_h);
+
+    const uint16_t kSentinel = 0x5A5Au;
+    std::vector<uint16_t> init_c(static_cast<size_t>(s.n_pairs) * s.N, kSentinel);
+    DeviceBuffer<uint16_t> c_grp(init_c.size()), c_ref(init_c.size());
+
+    const int fsk = FallbackSk(s.K, 1, s.N);
+    std::vector<Geo> geos = {Fallback(1, s.N, fsk)};
+    if (!quick) {
+      for (int sk : {1, 2, 4, 8}) {
+        for (int npw : {1, 4}) {
+          for (int nt : {0, 1}) {
+            Geo g{1, sk, 1, npw, nt};
+            if (Legal(g, s.K)) geos.push_back(g);
+          }
+        }
+      }
+    }
+    for (const Geo& g : geos) {
+      c_grp.CopyFromHost(init_c);
+      c_ref.CopyFromHost(init_c);
+      r4dx_gemm_mxfp8_moe_decode(P(a_d.data()), P(wq_ptrs.data()), P(ws_ptrs.data()), P(ids_d.data()), P(c_grp.data()),
+                                 s.n_pairs, s.a_row_group, n_experts, s.K, s.N, g.WV, g.SK, g.NPW, g.NT, 0);
+      for (int p = 0; p < s.n_pairs; ++p) {
+        const int e = ids_h[static_cast<size_t>(p)];
+        if (e < 0 || e >= n_experts) continue;
+        const int64_t ap = P(a_d.data() + static_cast<size_t>(p / s.a_row_group) * s.K);
+        const int64_t cp = P(c_ref.data() + static_cast<size_t>(p) * s.N);
+        r4dx_gemm_mxfp8_nt(ap, P(experts[static_cast<size_t>(e)].wq.data()), P(experts[static_cast<size_t>(e)].ws.data()),
+                           cp, 1, s.K, s.N, g.WV, g.SK, 1, g.NPW, g.NT, 0);
+      }
+      R4DX_HIP_CHECK(hipDeviceSynchronize());
+      const auto got = c_grp.CopyToHost();
+      const auto ref = c_ref.CopyToHost();
+      Check(got == ref, std::string("moe_decode ") + s.name + " [" + std::to_string(s.N) + "x" + std::to_string(s.K) +
+                            "] pairs=" + std::to_string(s.n_pairs) + " grp=" + std::to_string(s.a_row_group) + " " +
+                            GeoStr(g) + ": bit-identical to per-pair nt");
+    }
+  }
 }
 
 }  // namespace
@@ -404,6 +516,7 @@ int main(int argc, char** argv) {
     };
     for (const auto& s : shapes) TestProblem(rng, s.name, s.N, s.K, Ms, quick);
     if (!quick) TestProblem(rng, "lm_head (200058 rounded to 200064)", 200064, 2304, {1}, false);
+    TestMoeDecode(rng, quick);
   } catch (const std::exception& e) {
     std::printf("EXCEPTION: %s\n", e.what());
     return 1;

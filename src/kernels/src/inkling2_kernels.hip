@@ -374,6 +374,88 @@ __global__ __launch_bounds__(kThreads) void RouterKernel(const uint16_t* __restr
   }
 }
 
+// Multi-block decode router (bit-identical to RouterKernel): 4 waves (128 threads) per block, 1 wave per expert ->
+// E/4 blocks spread across CUs instead of 1 CU doing all E experts serially.
+constexpr int kRouterWavesPerBlock = 4;
+__global__ __launch_bounds__(kRouterWavesPerBlock * 32) void RouterDotsKernel(
+    const uint16_t* __restrict__ x, const uint16_t* __restrict__ gw, float* __restrict__ logits_out,
+    int H, int E, int64_t x_row_stride) {
+  const int64_t t = blockIdx.y;
+  const int wave = threadIdx.x >> 5, lane = threadIdx.x & 31;
+  const int e = static_cast<int>(blockIdx.x) * kRouterWavesPerBlock + wave;
+  if (e >= E) return;
+  const uint16_t* xr = x + t * x_row_stride;
+  const uint16_t* wr = gw + static_cast<int64_t>(e) * H;
+  float a = 0.0f;
+  for (int h = lane; h < H; h += 32) a += r4dx::core::Bf16ToFloat(xr[h]) * r4dx::core::Bf16ToFloat(wr[h]);
+  a = WaveSum(a);
+  if (lane == 0) logits_out[t * E + e] = a;
+}
+
+// Parallel wave32 top-k (bit-identical to RouterKernel: strict >, ties keep lower index; zero local array / scratch spill).
+__global__ __launch_bounds__(32) void RouterTopkKernel(
+    const float* __restrict__ logits, const float* __restrict__ bias, int32_t* __restrict__ ids,
+    float* __restrict__ wout, int E, int K, float scale) {
+  const int64_t t = blockIdx.x;
+  const int lane = threadIdx.x;
+  float sv[8], sc[8];
+#pragma unroll
+  for (int i = 0; i < 8; ++i) {
+    const int e = lane + i * 32;
+    if (e < E) {
+      sv[i] = SigmoidF(logits[t * E + e]);
+      sc[i] = sv[i] + (bias != nullptr ? bias[e] : 0.0f);
+    } else {
+      sv[i] = 0.0f;
+      sc[i] = 0.0f;
+    }
+  }
+  unsigned taken = 0u;
+  __shared__ int sel_id[kMaxTopK];
+  __shared__ float sel_s[kMaxTopK];
+  float sum = 0.0f;
+  for (int j = 0; j < K; ++j) {
+    float best_v = 0.0f;
+    int best_e = E;
+#pragma unroll
+    for (int i = 0; i < 8; ++i) {
+      const int e = lane + i * 32;
+      if (e < E && !(taken & (1u << i)) && (best_e >= E || sc[i] > best_v)) {
+        best_v = sc[i];
+        best_e = e;
+      }
+    }
+#pragma unroll
+    for (int o = 16; o > 0; o >>= 1) {
+      const float ov = __shfl_xor(best_v, o, 32);
+      const int oe = __shfl_xor(best_e, o, 32);
+      if (oe < E && (best_e >= E || ov > best_v || (ov == best_v && oe < best_e))) {
+        best_v = ov;
+        best_e = oe;
+      }
+    }
+    const int win_lane = best_e & 31;
+    const int win_slot = best_e >> 5;
+    float my_s = 0.0f;
+#pragma unroll
+    for (int i = 0; i < 8; ++i) {
+      if (i == win_slot) my_s = sv[i];
+    }
+    if (lane == win_lane) taken |= (1u << win_slot);
+    const float win_s = __shfl(my_s, win_lane, 32);
+    if (lane == 0) {
+      sel_id[j] = best_e;
+      sel_s[j] = win_s;
+      sum += win_s;
+    }
+  }
+  if (lane < K) {
+    const float tot = __shfl(sum, 0, 32);
+    ids[t * K + lane] = sel_id[lane];
+    wout[t * K + lane] = sel_s[lane] / (tot + 1e-20f) * scale;
+  }
+}
+
 __global__ __launch_bounds__(kThreads) void SwigluSoftcapKernel(const uint16_t* __restrict__ gu, uint16_t* __restrict__ out,
                                                                 int64_t inter, int64_t in_row_stride) {
   const int64_t r = blockIdx.y;
@@ -669,6 +751,20 @@ void r4dx_inkling2_router_f32(int64_t x, int64_t gate_w, int64_t bias, int64_t i
   if (E < 1 || E > kMaxExperts) Fail(fn, "E must be 1..256");
   if (top_k < 1 || top_k > kMaxTopK || top_k > E) Fail(fn, "top_k must be 1..min(16, E)");
   if (H < 1 || H > 8192 || x_row_stride < H) Fail(fn, "H must be 1..8192 and x_row_stride >= H");
+  if (T < 16 && logits_out != 0 && E >= 16) {
+    const unsigned blocks_e = static_cast<unsigned>((E + kRouterWavesPerBlock - 1) / kRouterWavesPerBlock);
+    hipLaunchKernelGGL(RouterDotsKernel, dim3(blocks_e, static_cast<unsigned>(T)), dim3(kRouterWavesPerBlock * 32), 0,
+                       reinterpret_cast<hipStream_t>(stream), reinterpret_cast<const uint16_t*>(x),
+                       reinterpret_cast<const uint16_t*>(gate_w), reinterpret_cast<float*>(logits_out), H, E,
+                       x_row_stride);
+    CheckLaunch(fn);
+    hipLaunchKernelGGL(RouterTopkKernel, dim3(static_cast<unsigned>(T)), dim3(32), 0,
+                       reinterpret_cast<hipStream_t>(stream), reinterpret_cast<const float*>(logits_out),
+                       reinterpret_cast<const float*>(bias), reinterpret_cast<int32_t*>(ids),
+                       reinterpret_cast<float*>(w), E, top_k, route_scale);
+    CheckLaunch(fn);
+    return;
+  }
   hipLaunchKernelGGL(RouterKernel, dim3(static_cast<unsigned>(T)), dim3(kThreads), 0,
                      reinterpret_cast<hipStream_t>(stream), reinterpret_cast<const uint16_t*>(x),
                      reinterpret_cast<const uint16_t*>(gate_w), reinterpret_cast<const float*>(bias),

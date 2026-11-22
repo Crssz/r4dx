@@ -34,6 +34,8 @@ namespace {
 constexpr int kMaxM = 256;
 constexpr int kGroup = 32;  // K per scale = K per packed block: 2 k steps, 16 bytes per lane
 constexpr int kWave = 32;
+constexpr int kMaxMoePairs = 16384;
+constexpr int kMaxMoeExperts = 256;
 
 typedef _Float16 v8h __attribute__((ext_vector_type(8)));
 typedef unsigned uint4v __attribute__((ext_vector_type(4)));
@@ -256,6 +258,127 @@ void Launch(int64_t a, int64_t wq, int64_t ws, int64_t c, int M, int K, int N, i
   if (err != hipSuccess) Fail(std::string("launch failed: ") + hipGetErrorString(err));
 }
 
+template <int NPW, bool NT>
+__global__ __launch_bounds__(1024) void mxfp8_gemm_moe_decode_kernel(
+    const unsigned short* __restrict__ A, const uint64_t* __restrict__ wq_ptrs,
+    const uint64_t* __restrict__ ws_ptrs, const int32_t* __restrict__ ids,
+    __hip_bfloat16* __restrict__ C, int a_row_group, int n_experts, int K, int N, int WV, int SK) {
+  extern __shared__ float red[];  // WV*NPW*SK*256 floats
+  const int p = blockIdx.z;
+  const int e = ids[p];
+  if (e < 0 || e >= n_experts) return;
+  const unsigned char* Wq = reinterpret_cast<const unsigned char*>(wq_ptrs[e]);
+  const unsigned char* Ws = reinterpret_cast<const unsigned char*>(ws_ptrs[e]);
+  if (!Wq || !Ws) return;
+  const unsigned short* Ap = A + (size_t)(p / a_row_group) * (size_t)K;
+  __hip_bfloat16* Cp = C + (size_t)p * (size_t)N;
+
+  const int tid = threadIdx.x, wave = tid / kWave, lane = tid % kWave;
+  const int col_local = wave / SK, ksplit = wave % SK;
+  const int nt0 = (blockIdx.x * WV + col_local) * NPW;
+  const int n0 = nt0 * 16;
+  const int Ks = K / SK;
+  const int groups = Ks / kGroup;
+  const int kbase = ksplit * Ks;
+
+  v8f acc[NPW][1];
+#pragma unroll
+  for (int j = 0; j < NPW; j++) acc[j][0] = (v8f)(0.f);
+
+  if (n0 < N) {
+    const unsigned off = rowGo((unsigned)K, 0, 0, lane) + (unsigned)kbase;
+    gu2 pa[1] = {(gu2)(const unsigned long long*)(Ap + off)};
+
+    const int kpb = K / kGroup;
+    gw4 pw[NPW];
+    gub ps[NPW];
+    const int ntlast = N / 16 - 1;
+#pragma unroll
+    for (int j = 0; j < NPW; j++) {
+      const int t = (nt0 + j) < ntlast ? (nt0 + j) : ntlast;
+      pw[j] = (gw4)(const uint4v*)(Wq) + (size_t)(t * (size_t)kpb + kbase / kGroup) * kWave + lane;
+      ps[j] = (gub)(Ws) + (size_t)(t * (size_t)kpb + kbase / kGroup) * 16 + (lane & 15);
+    }
+
+    int g = 0;
+    for (; g + 1 < groups; g += 2) {
+      uint4v wv0[NPW], wv1[NPW];
+      float sc0[NPW], sc1[NPW];
+#pragma unroll
+      for (int j = 0; j < NPW; j++) {
+        const size_t o = (size_t)g * kWave;
+        wv0[j] = NT ? __builtin_nontemporal_load(&pw[j][o]) : pw[j][o];
+        wv1[j] = NT ? __builtin_nontemporal_load(&pw[j][o + kWave]) : pw[j][o + kWave];
+        sc0[j] = e8m0_value(ps[j][(size_t)g * 16]);
+        sc1[j] = e8m0_value(ps[j][(size_t)(g + 1) * 16]);
+      }
+      group_step<1, NPW>(acc, wv0, sc0, pa, 2 * g);
+      group_step<1, NPW>(acc, wv1, sc1, pa, 2 * g + 2);
+    }
+    if (g < groups) {
+      uint4v wv0[NPW];
+      float sc0[NPW];
+#pragma unroll
+      for (int j = 0; j < NPW; j++) {
+        const size_t o = (size_t)g * kWave;
+        wv0[j] = NT ? __builtin_nontemporal_load(&pw[j][o]) : pw[j][o];
+        sc0[j] = e8m0_value(ps[j][(size_t)g * 16]);
+      }
+      group_step<1, NPW>(acc, wv0, sc0, pa, 2 * g);
+    }
+  }
+
+  const int ncols = WV * NPW;
+  const int nthreads = WV * SK * kWave;
+  __syncthreads();
+#pragma unroll
+  for (int j = 0; j < NPW; j++) {
+    const int slot = ((col_local * NPW + j) * SK + ksplit) * 256;
+#pragma unroll
+    for (int e_idx = 0; e_idx < 8; e_idx++) red[slot + e_idx * kWave + lane] = acc[j][0][e_idx];
+  }
+  __syncthreads();
+  for (int idx = tid; idx < ncols * 256; idx += nthreads) {
+    const int col = idx >> 8, off = idx & 255;
+    float v = 0.f;
+    for (int s = 0; s < SK; s++) v += red[(col * SK + s) * 256 + off];
+    const int l = off & 31;
+    const int n = (blockIdx.x * ncols + col) * 16 + (l & 15);
+    const int m = 8 * (l >> 4) + (off >> 5);
+    if (n < N && m < 1) Cp[n] = __float2bfloat16(v);
+  }
+}
+
+[[noreturn]] void FailMoe(const std::string& what) {
+  throw std::runtime_error("r4dx_gemm_mxfp8_moe_decode: " + what);
+}
+
+void LaunchMoeDecode(int64_t a, int64_t wq_ptrs, int64_t ws_ptrs, int64_t ids, int64_t c, int n_pairs,
+                     int a_row_group, int n_experts, int K, int N, int WV, int SK, int NPW, int NT,
+                     int64_t stream) {
+  const int ntiles = N / 16;
+  const int ncols = WV * NPW;
+  dim3 grid((ntiles + ncols - 1) / ncols, 1, n_pairs), block(WV * SK * kWave);
+  const size_t smem = (size_t)ncols * SK * 256 * sizeof(float);
+  auto Ap = (const unsigned short*)a;
+  auto Wqp = (const uint64_t*)wq_ptrs;
+  auto Wsp = (const uint64_t*)ws_ptrs;
+  auto Idp = (const int32_t*)ids;
+  auto Cp = (__hip_bfloat16*)c;
+  hipStream_t st = (hipStream_t)stream;
+#define MX8_MOE_LAUNCH(NP, TT)                                                                          \
+  hipLaunchKernelGGL((mxfp8_gemm_moe_decode_kernel<NP, TT>), grid, block, smem, st, Ap, Wqp, Wsp, Idp,  \
+                     Cp, a_row_group, n_experts, K, N, WV, SK)
+  if (NPW == 1) {
+    if (NT) { MX8_MOE_LAUNCH(1, true); } else { MX8_MOE_LAUNCH(1, false); }
+  } else {
+    if (NT) { MX8_MOE_LAUNCH(4, true); } else { MX8_MOE_LAUNCH(4, false); }
+  }
+#undef MX8_MOE_LAUNCH
+  const hipError_t err = hipGetLastError();
+  if (err != hipSuccess) FailMoe(std::string("launch failed: ") + hipGetErrorString(err));
+}
+
 }  // namespace
 
 extern "C" {
@@ -278,5 +401,31 @@ void r4dx_gemm_mxfp8_nt(int64_t a_bf16, int64_t wq, int64_t ws, int64_t c, int M
 
 int r4dx_gemm_mxfp8_group(void) { return kGroup; }
 int r4dx_gemm_mxfp8_max_m(void) { return kMaxM; }
+
+void r4dx_gemm_mxfp8_moe_decode(int64_t a_bf16, int64_t wq_ptrs, int64_t ws_ptrs, int64_t ids, int64_t c,
+                                int n_pairs, int a_row_group, int n_experts, int K, int N, int WV, int SK,
+                                int NPW, int NT, int64_t stream) {
+  if (n_pairs < 1 || n_pairs > kMaxMoePairs) {
+    FailMoe("n_pairs must be 1.." + std::to_string(kMaxMoePairs) + " (got " + std::to_string(n_pairs) + ")");
+  }
+  if (a_row_group < 1 || a_row_group > n_pairs || n_pairs % a_row_group != 0) {
+    FailMoe("a_row_group must divide n_pairs in 1..n_pairs (a_row_group " + std::to_string(a_row_group) +
+            ", n_pairs " + std::to_string(n_pairs) + ")");
+  }
+  if (n_experts < 1 || n_experts > kMaxMoeExperts) {
+    FailMoe("n_experts must be 1.." + std::to_string(kMaxMoeExperts) + " (got " + std::to_string(n_experts) + ")");
+  }
+  if (N < 16 || N % 16) FailMoe("N must be a positive multiple of 16 (got " + std::to_string(N) + ")");
+  if (WV < 1 || SK < 1) FailMoe("WV and SK must be >= 1");
+  if (K < 1 || K % (SK * kGroup)) {
+    FailMoe("K must be a positive multiple of SK*32 (K " + std::to_string(K) + ", SK " + std::to_string(SK) + ")");
+  }
+  if (WV * SK * kWave > 1024) FailMoe("WV*SK*32 > 1024 threads per block");
+  if (NPW != 1 && NPW != 4) FailMoe("NPW must be 1 or 4");
+  if ((size_t)WV * NPW * SK * 256 * sizeof(float) > 64 * 1024) FailMoe("LDS WV*NPW*SK KiB > 64");
+  if (!a_bf16 || !wq_ptrs || !ws_ptrs || !ids || !c) FailMoe("null pointer");
+  LaunchMoeDecode(a_bf16, wq_ptrs, ws_ptrs, ids, c, n_pairs, a_row_group, n_experts, K, N, WV, SK, NPW, NT, stream);
+  r4dx_kernel_launch_counter_add(1);
+}
 
 }  // extern "C"

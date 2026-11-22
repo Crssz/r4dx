@@ -20,6 +20,7 @@
 #include "r4dx/kernels/inkling2_kernels.h"
 #include "r4dx/kernels/kernels.h"
 #include "r4dx/kernels/lfm2_kernels.h"
+#include "r4dx/kernels/mxfp8_gemm.h"
 #include "tp/tp_vocab.h"
 
 namespace r4dx::model {
@@ -30,6 +31,18 @@ inline int64_t P(const void* p) { return reinterpret_cast<int64_t>(p); }
 constexpr float kMinSummaryTemperature = 0.01f;
 constexpr uint32_t kNegInfBits = 0xFF800000u;
 constexpr int kPoolBuffers = 12;
+
+bool InkEnvFlag(const char* name, bool default_val) {
+  const char* v = std::getenv(name);
+  if (v == nullptr || v[0] == '\0') return default_val;
+  if (std::strcmp(v, "0") == 0 || std::strcmp(v, "off") == 0 || std::strcmp(v, "false") == 0) return false;
+  return true;
+}
+
+bool MoeGroupedDecodeEnabled() {
+  static const bool kEnabled = InkEnvFlag("R4DX_INK_MOE_DECODE", true);
+  return kEnabled;
+}
 
 float SummaryInvTemperature(const kernels::SampleParams& params) {
   if (!(params.temperature > 0.0f) || params.temperature < kMinSummaryTemperature) return 0.0f;
@@ -167,7 +180,8 @@ Inkling2Model Inkling2Model::Load(const Inkling2ModelOptions& opts) {
             << " visits, max_ctx " << m.max_ctx_ << ", KV bf16 = " << static_cast<double>(m.kv_bytes_) / gib
             << " GiB (sliding ring " << m.ring_blocks_ * bs << " positions), conv states "
             << static_cast<double>(m.conv_.bytes()) / (1024.0 * 1024.0) << " MiB, layout " << LayoutName(opts.layout)
-            << ", residual fp32, attention reference (bias + sink), MoE staged (host sync per visit)";
+            << ", residual fp32, attention reference (bias + sink), MoE "
+            << (MoeGroupedDecodeEnabled() ? "grouped decode (mxfp8)" : "staged (host sync per visit)");
   if (is_tp) std::cerr << ", TP rank " << opts.tp_rank << "/" << opts.tp_world << " (head rows " << vl << ")";
   std::cerr << "\n";
   return m;
@@ -384,10 +398,12 @@ void Inkling2Model::Moe(int64_t layer, const uint16_t* x, uint16_t* out, int64_t
   int32_t* ids = arena_.Alloc<int32_t>(static_cast<size_t>(Pn), 16);
   float* wts = arena_.Alloc<float>(static_cast<size_t>(Pn), 16);
   uint16_t* ys = arena_.Alloc<uint16_t>(static_cast<size_t>(Pn * H), 16);
+  float* router_logits =
+      (T < 16 && MoeGroupedDecodeEnabled()) ? arena_.Alloc<float>(static_cast<size_t>(T * E), 16) : nullptr;
   ProfiledCall(prof, sr, "moe.router", [&] {
     r4dx_inkling2_router_f32(P(x), P(w.router.data()), P(w.bias.data()), P(ids), P(wts), static_cast<int>(T),
                              static_cast<int>(H), static_cast<int>(E), static_cast<int>(K),
-                             static_cast<float>(cfg.route_scale), H, 0, s);
+                             static_cast<float>(cfg.route_scale), H, P(router_logits), s);
   });
   if (trace_.enabled) {
     std::vector<int32_t> h(static_cast<size_t>(Pn));
@@ -398,21 +414,45 @@ void Inkling2Model::Moe(int64_t layer, const uint16_t* x, uint16_t* out, int64_t
     dst.insert(dst.end(), h.begin(), h.end());
   }
   if (T == 1) {
-    uint16_t* gu = arena_.Alloc<uint16_t>(static_cast<size_t>(2 * I), 16);
-    uint16_t* act = arena_.Alloc<uint16_t>(static_cast<size_t>(I), 16);
-    ProfiledCall(prof, sr, "moe.readback", [&] {
-      R4DX_HIP_CHECK(hipMemcpyAsync(moe_ids_host_.data(), ids, static_cast<size_t>(Pn) * sizeof(int32_t),
-                                    hipMemcpyDeviceToHost, sr));
-      R4DX_HIP_CHECK(hipStreamSynchronize(sr));
-    });
-    const size_t mark = arena_.Mark();
-    for (int64_t j = 0; j < K; ++j) {
-      arena_.Rewind(mark);
-      const int32_t e = moe_ids_host_.data()[j];
-      if (e < 0 || e >= E) throw std::runtime_error("Inkling2Model: router returned expert id " + std::to_string(e));
-      ProfiledCall(prof, sr, "gemm:moe.gate_up", [&] { Lin(w.gate_up[static_cast<size_t>(e)], x, gu, 1); });
-      ProfiledCall(prof, sr, "moe.act", [&] { r4dx_inkling2_swiglu_softcap_bf16(P(gu), P(act), 1, I, 2 * I, s); });
-      ProfiledCall(prof, sr, "gemm:moe.down", [&] { Lin(w.down[static_cast<size_t>(e)], act, ys + j * H, 1); });
+    const bool grouped_mx = MoeGroupedDecodeEnabled() && !w.gate_up_ptrs0.empty() && !w.gate_up_ptrs1.empty() &&
+                            !w.down_ptrs0.empty() && !w.down_ptrs1.empty() && !w.gate_up.empty() &&
+                            w.gate_up[0].layout == Layout::kMxfp8 && w.down[0].layout == Layout::kMxfp8;
+    if (grouped_mx) {
+      uint16_t* gu = arena_.Alloc<uint16_t>(static_cast<size_t>(K * 2 * I), 16);
+      uint16_t* act = arena_.Alloc<uint16_t>(static_cast<size_t>(K * I), 16);
+      const LinearTuning t_gu = PickTuning(Layout::kMxfp8, w.gate_up[0].N, w.gate_up[0].K, 1);
+      const LinearTuning t_dn = PickTuning(Layout::kMxfp8, w.down[0].N, w.down[0].K, 1);
+      ProfiledCall(prof, sr, "gemm:moe.gate_up", [&] {
+        r4dx_gemm_mxfp8_moe_decode(P(x), P(w.gate_up_ptrs0.data()), P(w.gate_up_ptrs1.data()), P(ids), P(gu),
+                                   static_cast<int>(K), static_cast<int>(K), static_cast<int>(E),
+                                   static_cast<int>(w.gate_up[0].K), static_cast<int>(w.gate_up[0].N), t_gu.WV, t_gu.SK,
+                                   t_gu.NPW, t_gu.NT, s);
+      });
+      ProfiledCall(prof, sr, "moe.act", [&] {
+        r4dx_inkling2_swiglu_softcap_bf16(P(gu), P(act), K, I, 2 * I, s);
+      });
+      ProfiledCall(prof, sr, "gemm:moe.down", [&] {
+        r4dx_gemm_mxfp8_moe_decode(P(act), P(w.down_ptrs0.data()), P(w.down_ptrs1.data()), P(ids), P(ys),
+                                   static_cast<int>(K), 1, static_cast<int>(E), static_cast<int>(w.down[0].K),
+                                   static_cast<int>(w.down[0].N), t_dn.WV, t_dn.SK, t_dn.NPW, t_dn.NT, s);
+      });
+    } else {
+      uint16_t* gu = arena_.Alloc<uint16_t>(static_cast<size_t>(2 * I), 16);
+      uint16_t* act = arena_.Alloc<uint16_t>(static_cast<size_t>(I), 16);
+      ProfiledCall(prof, sr, "moe.readback", [&] {
+        R4DX_HIP_CHECK(hipMemcpyAsync(moe_ids_host_.data(), ids, static_cast<size_t>(Pn) * sizeof(int32_t),
+                                      hipMemcpyDeviceToHost, sr));
+        R4DX_HIP_CHECK(hipStreamSynchronize(sr));
+      });
+      const size_t mark = arena_.Mark();
+      for (int64_t j = 0; j < K; ++j) {
+        arena_.Rewind(mark);
+        const int32_t e = moe_ids_host_.data()[j];
+        if (e < 0 || e >= E) throw std::runtime_error("Inkling2Model: router returned expert id " + std::to_string(e));
+        ProfiledCall(prof, sr, "gemm:moe.gate_up", [&] { Lin(w.gate_up[static_cast<size_t>(e)], x, gu, 1); });
+        ProfiledCall(prof, sr, "moe.act", [&] { r4dx_inkling2_swiglu_softcap_bf16(P(gu), P(act), 1, I, 2 * I, s); });
+        ProfiledCall(prof, sr, "gemm:moe.down", [&] { Lin(w.down[static_cast<size_t>(e)], act, ys + j * H, 1); });
+      }
     }
     ProfiledCall(prof, sr, "moe.combine", [&] {
       r4dx_lfm2_moe_combine_bf16(P(ys), 0, P(wts), P(out), static_cast<int>(T), static_cast<int>(K), static_cast<int>(H), s);

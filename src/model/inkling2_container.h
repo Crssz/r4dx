@@ -44,6 +44,11 @@ struct Inkling2AttnWeights {
   core::DeviceBuffer<float> k_conv, v_conv;           // sliding: fp32 [kvd_local, 4]
   core::DeviceBuffer<float> k_conv_static, v_conv_static;  // full: fp32 [4, kvd_local]
   core::DeviceBuffer<uint16_t> k_conv_proj, v_conv_proj;   // full: bf16 [kv_local * 4, H]
+  // S4.1: concatenated MXFP8 weight in row order [q, gate, rel, k, v] (zero duplicate VRAM: when populated,
+  // q/gate/rel/k/v have their mx_wq/mx_ws cleared and slice into this contiguous 16-row-tile buffer).
+  core::DeviceBuffer<uint8_t> qgrkv_wq, qgrkv_ws;
+  int64_t qgrkv_n = 0, qgr_n = 0;
+  int64_t q_row0 = 0, gate_row0 = 0, rel_row0 = 0, k_row0 = 0, v_row0 = 0;
 };
 
 struct Inkling2MsgGateWeights {

@@ -62,6 +62,7 @@ __global__ __launch_bounds__(kThreads) void AttnResKernel(AttnResPtrs st, int n_
   __shared__ float red[kWaves * (kMaxStates + kMaxStates * kMaxQueries)];
   __shared__ float inv[kMaxStates];
   __shared__ float p[kMaxQueries][kMaxStates];
+  __shared__ float lg_s[kMaxQueries][kMaxStates];
   const int t = blockIdx.x;
   // 1. per state: the sum of squares -> inv
   float ss[kMaxStates];
@@ -78,12 +79,15 @@ __global__ __launch_bounds__(kThreads) void AttnResKernel(AttnResPtrs st, int n_
   }
 #pragma unroll
   for (int i = 0; i < kMaxStates; ++i) {
-    const float v = WaveSum(ss[i]);
-    if ((threadIdx.x & 31) == 0) red[i * kWaves + (threadIdx.x >> 5)] = v;
+    if (i < n_states) {
+      const float v = WaveSum(ss[i]);
+      if ((threadIdx.x & 31) == 0) red[i * kWaves + (threadIdx.x >> 5)] = v;
+    }
   }
   __syncthreads();
   if (threadIdx.x < n_states) {
     float a = 0.0f;
+#pragma unroll
     for (int w = 0; w < kWaves; ++w) a += red[threadIdx.x * kWaves + w];
     inv[threadIdx.x] = 1.0f / sqrtf(a / static_cast<float>(H) + eps);
   }
@@ -107,40 +111,50 @@ __global__ __launch_bounds__(kThreads) void AttnResKernel(AttnResPtrs st, int n_
   }
   float* red2 = red + kWaves * kMaxStates;
 #pragma unroll
-  for (int qi = 0; qi < kMaxQueries; ++qi)
+  for (int qi = 0; qi < kMaxQueries; ++qi) {
+    if (qi < nq) {
 #pragma unroll
-    for (int i = 0; i < kMaxStates; ++i) {
-      const float v = WaveSum(d[qi][i]);
-      if ((threadIdx.x & 31) == 0) red2[(qi * kMaxStates + i) * kWaves + (threadIdx.x >> 5)] = v;
+      for (int i = 0; i < kMaxStates; ++i) {
+        if (i < n_states) {
+          const float v = WaveSum(d[qi][i]);
+          if ((threadIdx.x & 31) == 0) red2[(qi * kMaxStates + i) * kWaves + (threadIdx.x >> 5)] = v;
+        }
+      }
     }
+  }
   __syncthreads();
   if (threadIdx.x < nq) {
     const int qi = threadIdx.x;
     const float scale = 1.0f / sqrtf(static_cast<float>(H));
-    float lg[kMaxStates];
     float m = -INFINITY;
     for (int i = 0; i < n_states; ++i) {
       float a = 0.0f;
+#pragma unroll
       for (int w = 0; w < kWaves; ++w) a += red2[(qi * kMaxStates + i) * kWaves + w];
-      lg[i] = a * scale;
-      m = fmaxf(m, lg[i]);
+      const float v = a * scale;
+      lg_s[qi][i] = v;
+      m = fmaxf(m, v);
     }
     float l = 0.0f;
     for (int i = 0; i < n_states; ++i) {
-      lg[i] = expf(lg[i] - m);
-      l += lg[i];
+      const float e = expf(lg_s[qi][i] - m);
+      lg_s[qi][i] = e;
+      l += e;
     }
-    for (int i = 0; i < n_states; ++i) p[qi][i] = lg[i] / l;
+    for (int i = 0; i < n_states; ++i) p[qi][i] = lg_s[qi][i] / l;
   }
   __syncthreads();
-  // 3. the mix of the normalized states
+  // 3. the mix of the normalized states (statically unrolled over kMaxStates -> zero scratch spill)
   for (int h = threadIdx.x; h < H; h += kThreads) {
     float r[kMaxStates];
 #pragma unroll
     for (int i = 0; i < kMaxStates; ++i) r[i] = i < n_states ? st.s[i][static_cast<int64_t>(t) * H + h] * inv[i] : 0.0f;
     for (int qi = 0; qi < nq; ++qi) {
       float a = 0.0f;
-      for (int i = 0; i < n_states; ++i) a += p[qi][i] * r[i];
+#pragma unroll
+      for (int i = 0; i < kMaxStates; ++i) {
+        if (i < n_states) a += p[qi][i] * r[i];
+      }
       out[(static_cast<int64_t>(qi) * T + t) * H + h] = a;
     }
   }
@@ -947,7 +961,27 @@ __global__ __launch_bounds__(kFusedWaves * 32) void Inkling2AttnPrefillKernel(co
   }
 }
 
-// ---- small dense GEMM: one wave per output element ----------------------------------------------------------------
+// ---- small dense GEMM: one wave per output element (1 wave/block at small M for CU spread, bit-identical) ----------
+__global__ __launch_bounds__(32) void DenseBf16DecodeKernel(const uint16_t* __restrict__ x, int64_t xs,
+                                                            const uint16_t* __restrict__ w, void* __restrict__ out,
+                                                            int out_bf16, int64_t os, int N, int K) {
+  const int64_t m = blockIdx.y;
+  const int n = static_cast<int>(blockIdx.x);
+  const int lane = threadIdx.x;
+  if (n >= N) return;
+  const uint16_t* xr = x + m * xs;
+  const uint16_t* wr = w + static_cast<int64_t>(n) * K;
+  float a = 0.0f;
+  for (int k = lane; k < K; k += 32) a += r4dx::core::Bf16ToFloat(xr[k]) * r4dx::core::Bf16ToFloat(wr[k]);
+  a = WaveSum(a);
+  if (lane != 0) return;
+  if (out_bf16) {
+    static_cast<uint16_t*>(out)[m * os + n] = r4dx::core::FloatToBf16(a);
+  } else {
+    static_cast<float*>(out)[m * os + n] = a;
+  }
+}
+
 __global__ __launch_bounds__(kThreads) void DenseBf16Kernel(const uint16_t* __restrict__ x, int64_t xs,
                                                             const uint16_t* __restrict__ w, void* __restrict__ out,
                                                             int out_bf16, int64_t os, int N, int K) {
@@ -1189,6 +1223,13 @@ void r4dx_inkling2_dense_bf16(int64_t x, int64_t x_row_stride, int64_t w, int64_
   if (x == 0 || w == 0 || out == 0) Fail(fn, "null pointer");
   if (K < 1 || x_row_stride < K || out_row_stride < N) Fail(fn, "K >= 1, x_row_stride >= K, out_row_stride >= N");
   if (M > 65535) Fail(fn, "M > 65535");
+  if (M <= 4 && N >= 16) {
+    hipLaunchKernelGGL(DenseBf16DecodeKernel, dim3(static_cast<unsigned>(N), static_cast<unsigned>(M)), dim3(32), 0,
+                       reinterpret_cast<hipStream_t>(stream), reinterpret_cast<const uint16_t*>(x), x_row_stride,
+                       reinterpret_cast<const uint16_t*>(w), reinterpret_cast<void*>(out), out_bf16, out_row_stride, N, K);
+    CheckLaunch(fn);
+    return;
+  }
   hipLaunchKernelGGL(DenseBf16Kernel, dim3(static_cast<unsigned>((N + kWaves - 1) / kWaves), static_cast<unsigned>(M)),
                      dim3(kThreads), 0, reinterpret_cast<hipStream_t>(stream), reinterpret_cast<const uint16_t*>(x),
                      x_row_stride, reinterpret_cast<const uint16_t*>(w), reinterpret_cast<void*>(out), out_bf16,

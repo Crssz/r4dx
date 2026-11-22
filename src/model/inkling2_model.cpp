@@ -298,10 +298,71 @@ void Inkling2Model::Attention(const Inkling2Visit& v, const uint16_t* xq, const 
   const int32_t* table = full ? table_full_.data() : table_ring_.data();
   uint16_t* kv = kv_.at(static_cast<size_t>(slot)).data();
 
-  // q
-  uint16_t* qlin = arena_.Alloc<uint16_t>(static_cast<size_t>(T * hl * hd), 16);
+  // Helper to run an MXFP8 linear from a contiguous 16-row-tile slice of a.qgrkv_{wq,ws}.
+  const auto lin_slice = [&](int64_t row0, int64_t N_slice, const uint16_t* x_in, uint16_t* y_out) {
+    constexpr int64_t kMxfp8ChunkM = 256;
+    const uint8_t* wq_p = a.qgrkv_wq.data() + static_cast<size_t>(row0 * H);
+    const uint8_t* ws_p = a.qgrkv_ws.data() + static_cast<size_t>(row0 * (H / 32));
+    for (int64_t m0 = 0; m0 < T; m0 += kMxfp8ChunkM) {
+      const int m = static_cast<int>(std::min(kMxfp8ChunkM, T - m0));
+      const LinearTuning t = PickTuning(Layout::kMxfp8, N_slice, H, std::min<int64_t>(m, 64));
+      r4dx_gemm_mxfp8_nt(P(x_in + m0 * H), P(wq_p), P(ws_p), P(y_out + m0 * N_slice), m, static_cast<int>(H),
+                         static_cast<int>(N_slice), t.WV, t.SK, t.MB, t.NPW, t.NT, s);
+    }
+  };
+  const bool has_concat = !a.qgrkv_wq.empty();
+  const bool concat_all5 = has_concat && T == 1 && xk == xq && xv == xq;
+  const bool concat_qgr = has_concat && T == 1 && !concat_all5;
+
+  const int64_t rel_all = g.num_attention_heads * drel;
+  uint16_t* qlin = nullptr;
+  uint16_t* klin = nullptr;
+  uint16_t* vlin = nullptr;
+  uint16_t* rlin = nullptr;
+  uint16_t* gt = nullptr;
+  if (concat_all5) {
+    uint16_t* all = arena_.Alloc<uint16_t>(static_cast<size_t>(a.qgrkv_n), 16);
+    ProfiledCall(prof, sr, "gemm:attn.q", [&] { lin_slice(0, a.qgrkv_n, xq, all); });
+    qlin = all + a.q_row0;
+    gt = all + a.gate_row0;
+    rlin = all + a.rel_row0;
+    klin = all + a.k_row0;
+    vlin = all + a.v_row0;
+  } else if (concat_qgr) {
+    uint16_t* qgr = arena_.Alloc<uint16_t>(static_cast<size_t>(a.qgr_n), 16);
+    ProfiledCall(prof, sr, "gemm:attn.q", [&] { lin_slice(0, a.qgr_n, xq, qgr); });
+    qlin = qgr + a.q_row0;
+    gt = qgr + a.gate_row0;
+    rlin = qgr + a.rel_row0;
+    klin = arena_.Alloc<uint16_t>(static_cast<size_t>(T * C), 16);
+    vlin = arena_.Alloc<uint16_t>(static_cast<size_t>(T * C), 16);
+    ProfiledCall(prof, sr, "gemm:attn.kv", [&] {
+      lin_slice(a.k_row0, C, xk, klin);
+      lin_slice(a.v_row0, C, xv, vlin);
+    });
+  } else {
+    qlin = arena_.Alloc<uint16_t>(static_cast<size_t>(T * hl * hd), 16);
+    klin = arena_.Alloc<uint16_t>(static_cast<size_t>(T * C), 16);
+    vlin = arena_.Alloc<uint16_t>(static_cast<size_t>(T * C), 16);
+    rlin = arena_.Alloc<uint16_t>(static_cast<size_t>(T * rel_all), 16);
+    gt = arena_.Alloc<uint16_t>(static_cast<size_t>(T * hl * hd), 16);
+    ProfiledCall(prof, sr, "gemm:attn.q", [&] {
+      if (has_concat) lin_slice(a.q_row0, hl * hd, xq, qlin);
+      else Lin(a.q, xq, qlin, T);
+    });
+    ProfiledCall(prof, sr, "gemm:attn.kv", [&] {
+      if (has_concat) {
+        lin_slice(a.k_row0, C, xk, klin);
+        lin_slice(a.v_row0, C, xv, vlin);
+      } else {
+        Lin(a.k, xk, klin, T);
+        Lin(a.v, xv, vlin, T);
+      }
+    });
+  }
+
+  // q clip
   uint16_t* q = arena_.Alloc<uint16_t>(static_cast<size_t>(T * hl * hd), 16);
-  ProfiledCall(prof, sr, "gemm:attn.q", [&] { Lin(a.q, xq, qlin, T); });
   R4dxInkling2HeadOut dense_q{};
   dense_q.kind = 0;
   dense_q.out_bf16 = 1;
@@ -309,15 +370,9 @@ void Inkling2Model::Attention(const Inkling2Visit& v, const uint16_t* xq, const 
   dense_q.out_row_stride = hl * hd;
   r4dx_inkling2_head_clip(P(qlin), 1, hl * hd, P(a.q_scale.data()), static_cast<float>(cfg.qk_clip), pos0, log_alpha,
                           log_floor, &dense_q, static_cast<int>(T), static_cast<int>(hl), static_cast<int>(hd), s);
-  // k, v: linear -> short conv -> clip / rms -> the paged cache
-  uint16_t* klin = arena_.Alloc<uint16_t>(static_cast<size_t>(T * C), 16);
-  uint16_t* vlin = arena_.Alloc<uint16_t>(static_cast<size_t>(T * C), 16);
+  // k, v: short conv -> clip / rms -> the paged cache
   float* kc = arena_.Alloc<float>(static_cast<size_t>(T * C), 16);
   float* vc = arena_.Alloc<float>(static_cast<size_t>(T * C), 16);
-  ProfiledCall(prof, sr, "gemm:attn.kv", [&] {
-    Lin(a.k, xk, klin, T);
-    Lin(a.v, xv, vlin, T);
-  });
   ProfiledCall(prof, sr, "attn.kv_conv", [&] {
     if (full) {
       float* dk = arena_.Alloc<float>(static_cast<size_t>(T * kvl * 4), 16);
@@ -351,16 +406,17 @@ void Inkling2Model::Attention(const Inkling2Visit& v, const uint16_t* xq, const 
                            static_cast<int>(kvl), static_cast<int>(hd), s);
   });
   // relative bias (every rank computes all heads' relative states; this rank's heads are read at h0 * d_rel)
-  const int64_t rel_all = g.num_attention_heads * drel;
   const int64_t gqa = hl / kvl;
   const bool use_fused_attn = AttnFusedEnabled() && hd == 128 && drel <= 32 && hl % kvl == 0 &&
                               (gqa == 1 || gqa == 2 || gqa == 3 || gqa == 4 || gqa == 6 || gqa == 8);
-  uint16_t* rlin = arena_.Alloc<uint16_t>(static_cast<size_t>(T * rel_all), 16);
   float* r = arena_.Alloc<float>(static_cast<size_t>(T * hl * drel), 16);
   float* rel = use_fused_attn ? nullptr : arena_.Alloc<float>(static_cast<size_t>(T * hl * ext), 16);
   float* sink = arena_.Alloc<float>(static_cast<size_t>(T * hl), 16);
   ProfiledCall(prof, sr, "attn.rel_sink", [&] {
-    Lin(a.rel, xq, rlin, T);
+    if (!concat_all5 && !concat_qgr) {
+      if (has_concat) lin_slice(a.rel_row0, rel_all, xq, rlin);
+      else Lin(a.rel, xq, rlin, T);
+    }
     R4dxInkling2HeadOut dense_r{};
     dense_r.kind = 0;
     dense_r.out_bf16 = 0;
@@ -378,7 +434,6 @@ void Inkling2Model::Attention(const Inkling2Visit& v, const uint16_t* xq, const 
   });
   // attention, gate, o
   uint16_t* ao = arena_.Alloc<uint16_t>(static_cast<size_t>(T * hl * hd), 16);
-  uint16_t* gt = arena_.Alloc<uint16_t>(static_cast<size_t>(T * hl * hd), 16);
   ProfiledCall(prof, sr, "attn.core", [&] {
     if (use_fused_attn) {
       constexpr int kMaxSplits = 32;
@@ -431,7 +486,10 @@ void Inkling2Model::Attention(const Inkling2Visit& v, const uint16_t* xq, const 
     }
   });
   ProfiledCall(prof, sr, "gemm:attn.gate_o", [&] {
-    Lin(a.gate, xq, gt, T);
+    if (!concat_all5 && !concat_qgr) {
+      if (has_concat) lin_slice(a.gate_row0, hl * hd, xq, gt);
+      else Lin(a.gate, xq, gt, T);
+    }
     r4dx_inkling2_sigmoid_gate_mul_bf16(P(ao), P(gt), P(ao), T * hl * hd, s);
     Lin(a.o, ao, out, T);
   });

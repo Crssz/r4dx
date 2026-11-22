@@ -240,6 +240,35 @@ Inkling2Container Inkling2Container::Load(const std::string& path, const Inkling
     a.v = lin(b + "attn.v", g.KvDim(), H, RowRule({g.KvDim()}));
     a.o = lin(b + "attn.o", H, g.QDim(), ColRule(g.QDim()));
     a.rel = lin(b + "attn.rel", g.num_attention_heads * g.d_rel, H, Replicated());
+    // S4.1: concatenate [q, gate, rel, k, v] into one contiguous MXFP8 buffer (zero duplicate VRAM).
+    const bool concat_qkv = [] {
+      const char* e = std::getenv("R4DX_INK_CONCAT_QKV");
+      return !(e != nullptr && (std::strcmp(e, "0") == 0 || std::strcmp(e, "off") == 0));
+    }();
+    if (concat_qkv && a.q.layout == Layout::kMxfp8 && a.gate.layout == Layout::kMxfp8 && a.rel.layout == Layout::kMxfp8 &&
+        a.k.layout == Layout::kMxfp8 && a.v.layout == Layout::kMxfp8 && a.q.K == H && a.gate.K == H && a.rel.K == H &&
+        a.k.K == H && a.v.K == H && (a.q.N % 16) == 0 && (a.gate.N % 16) == 0 && (a.rel.N % 16) == 0 &&
+        (a.k.N % 16) == 0 && (a.v.N % 16) == 0) {
+      QuantLinear* parts[5] = {&a.q, &a.gate, &a.rel, &a.k, &a.v};
+      int64_t* row0s[5] = {&a.q_row0, &a.gate_row0, &a.rel_row0, &a.k_row0, &a.v_row0};
+      int64_t total_n = 0;
+      for (int p = 0; p < 5; ++p) {
+        *row0s[p] = total_n;
+        total_n += parts[p]->N;
+      }
+      a.qgr_n = a.q.N + a.gate.N + a.rel.N;
+      a.qgrkv_n = total_n;
+      a.qgrkv_wq = core::DeviceBuffer<uint8_t>(static_cast<size_t>(total_n * H));
+      a.qgrkv_ws = core::DeviceBuffer<uint8_t>(static_cast<size_t>(total_n * (H / 32)));
+      for (int p = 0; p < 5; ++p) {
+        R4DX_HIP_CHECK(hipMemcpy(a.qgrkv_wq.data() + static_cast<size_t>(*row0s[p] * H), parts[p]->mx_wq.data(),
+                                 parts[p]->mx_wq.bytes(), hipMemcpyDeviceToDevice));
+        R4DX_HIP_CHECK(hipMemcpy(a.qgrkv_ws.data() + static_cast<size_t>(*row0s[p] * (H / 32)), parts[p]->mx_ws.data(),
+                                 parts[p]->mx_ws.bytes(), hipMemcpyDeviceToDevice));
+        parts[p]->mx_wq = {};
+        parts[p]->mx_ws = {};
+      }
+    }
     a.sink = Upload(Rows(HostBf16(r, b + "attn.sink", g.num_attention_heads * H), H, h0, hl));
     a.q_scale = Upload(Rows(HostBf16AsF32(r, b + "attn.q_scale", g.num_attention_heads * hd), hd, h0, hl));
     a.rel_scale = Upload(Rows(HostBf16AsF32(r, b + "attn.rel_scale", g.num_attention_heads * g.d_rel), g.d_rel, h0, hl));

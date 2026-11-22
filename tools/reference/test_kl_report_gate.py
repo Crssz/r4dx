@@ -210,6 +210,58 @@ def test_lfm2_gate_epsilon_is_a_parameter():
             sys.argv = argv0
 
 
+def test_inkling2_gate_default_epsilon():
+    """--gate inkling2-fp32: the lfm2 rule with a DEFAULT epsilon of 0.005 (still overridable), groups
+    english / thai / code / tool / chat-ALL, noise report without --test-dir, pass/fail through the exit status."""
+    import contextlib
+    import io
+
+    with tempfile.TemporaryDirectory() as t:
+        tmp = Path(t)
+        w = World(tmp)
+        w.dump("noise", 0.1, 41)         # HF bf16 eager stand-in
+        w.dump("good", 0.1, 42)          # same noise level: passes
+        w.dump("bad", 0.9, 43)           # far noisier: fails
+        pc, pr = w.tokens()
+        doc = json.loads(pc.read_text())
+        doc["tokenizer_arch"] = "inkling2"
+        for s in doc["segments"]:
+            if s["name"] == "c1":
+                s["group"] = "tool"          # the corpus' tool conversations form their own gate group
+        pc.write_text(json.dumps(doc))
+        kw = dict(truth_dir=tmp / "truth", noise_dir=tmp / "noise", chat_tokens=pc)
+        good = K.gate_gemma_fp32(test_dir=tmp / "good", slack=K.INKLING2_EPSILON, gate_name="inkling2-fp32", **kw)
+        assert K.INKLING2_EPSILON == K.GATE_KL_SLACK == 0.005
+        assert [g["name"] for g in good["groups"]] == ["chat-code", "chat-english", "chat-thai", "chat-tool", "chat-ALL"]
+        a = next(g for g in good["groups"] if g["name"] == "chat-ALL")
+        assert abs(a["thresholds"]["kl_max"] - (1.5 * a["noise"]["mean_kl"] + 0.005)) < 1e-12
+        assert abs(a["thresholds"]["top1_min_pct"] - (a["noise"]["top1_pct"] - 1.0)) < 1e-12
+        assert good["pass"] and good["gate"] == "inkling2-fp32"
+        md = K.gate_gemma_fp32_markdown(good)
+        assert "# Inkling2 fp32-truth gate" in md and "HF bf16 eager" in md and "noise KL + 0.005;" in md
+        argv0 = sys.argv
+
+        def cli(*extra):
+            sys.argv = ["kl_report.py", "--gate", "inkling2-fp32", "--truth-dir", str(tmp / "truth"), "--noise-dir",
+                        str(tmp / "noise"), "--tokens", str(pc), *extra]
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                rc = K.main()
+            return rc, buf.getvalue()
+
+        try:
+            rc, out = cli("--test-dir", str(tmp / "good"))              # no --epsilon: the default 0.005 is used
+            assert rc == 0 and "noise KL + 0.005;" in out and "# Inkling2 fp32-truth gate" in out, out
+            rc, out = cli("--test-dir", str(tmp / "bad"))
+            assert rc == 1 and "FAIL" in out
+            rc, out = cli("--test-dir", str(tmp / "bad"), "--epsilon", "100")   # an explicit epsilon overrides the default
+            assert "noise KL + 100.0;" in out
+            rc, out = cli()                                               # noise report
+            assert rc == 0 and "# Inkling2 noise term" in out and "HF-bf16-eager" in out and "chat-tool" in out
+        finally:
+            sys.argv = argv0
+
+
 def test_existing_behaviour_unchanged_without_mask():
     with tempfile.TemporaryDirectory() as t:
         w = World(Path(t))

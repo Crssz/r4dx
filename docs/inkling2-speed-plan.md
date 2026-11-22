@@ -248,3 +248,4 @@ Fill in as stages land (date, commit, device, prompt length, tok/s, launches/tok
 | stage | commit | decode tok/s (short) | decode tok/s (4k) | prefill tok/s (2k) | launches/token | KL chat-ALL / worst | notes |
 |---|---|---|---|---|---|---|---|
 | M1 (baseline from inkling2.md) | f3e58ef | 23.6 | | | | 0.00573 / tool 0.00740 | 25-token prefill 218 tok/s |
+| S0 (baseline profile, 2026-11-23) | 088fa74 | 25.31 (med of 25.45/25.31/24.79) | prof wall 119.8 ms (attn.core 37.6 ms) | 242.8 (2922 tok, prof wall 12.04 s) | 2693 | (same as M1) | dev 1, `--max-ctx 8192`, 31.45 GiB; short prof: gpu_sum 69.87 ms, host_enq 91.28 ms, wall 94.53 ms (MoE 51.7 ms = 74%: router 14.9, readback 6.7, gate_up 13.9, act 4.8, down 10.1, combine 1.3); 2k prefill: 195,918 launches (attn.core 3.36 s, MoE gate_up/down/act 3.79 s across 176k calls) |

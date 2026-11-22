@@ -3,6 +3,7 @@
 #include <fstream>
 #include <iterator>
 
+#include "inkling2_stream_parser.h"
 #include "nlohmann/json.hpp"
 
 namespace r4dx::server {
@@ -104,6 +105,30 @@ ModelDialect MakeNanbeige() {
   return d;
 }
 
+ModelDialect MakeInkling2() {
+  // docs/inkling2-plan.md section 6; every fact below is read from the checkpoint's chat_template.jinja / generation_config.json.
+  ModelDialect d;
+  d.kind = DialectKind::kInkling2;
+  d.name = "inkling2";
+  d.structured_parts = true;
+  // Not used (the typed-part parser replaces the splitter/gate); kept consistent for code that prints them.
+  d.reasoning.open = "<|message_model|><|content_thinking|>";
+  d.reasoning.close = "<|end_message|>";
+  d.reasoning.skip_blank_after_close = false;
+  d.prompt_reasoning_open = "";
+  d.prompt_reasoning_closed = "";
+  d.tool_open = "<|content_invoke_tool_json|>";
+  d.tool_close = "<|end_message|>";
+  d.keep_special_on_decode = Inkling2KeepSpecial();
+  d.chat_template_polyfills = false;  // tests/tokenizer/chat_inkling2_golden.json renders exactly without them
+  d.bos_on_raw_prompt = false;        // tokenizer.json has no post-processor BOS; the template never emits <|begin_of_text|>
+  d.has_reasoning_effort = true;      // `reasoning_effort`: level name or number (ResolveInkling2ReasoningEffort), not Qwen's 3 levels
+  d.sampling.temperature = 1.0f;      // generation_config.json: do_sample true, temperature 1.0 (no top_k/top_p/penalty)
+  d.eos_ids = {200006};               // generation_config.json: <|content_model_end_sampling|>
+  d.default_tokenizer_dir = r4dx::ModelsPath("OpenUncensored/Inkling-2-Mini-Uncensored");
+  return d;
+}
+
 }  // namespace
 
 const ModelDialect& Qwen35Dialect() {
@@ -131,6 +156,11 @@ const ModelDialect& NanbeigeDialect() {
   return d;
 }
 
+const ModelDialect& Inkling2Dialect() {
+  static const ModelDialect d = MakeInkling2();
+  return d;
+}
+
 const ModelDialect& DialectFor(DialectKind kind) {
   switch (kind) {
     case DialectKind::kGemma4:
@@ -141,6 +171,8 @@ const ModelDialect& DialectFor(DialectKind kind) {
       return Qwen4ExpDialect();
     case DialectKind::kNanbeige:
       return NanbeigeDialect();
+    case DialectKind::kInkling2:
+      return Inkling2Dialect();
     case DialectKind::kQwen35:
       break;
   }
@@ -168,10 +200,15 @@ bool ParseDialectName(std::string_view s, DialectKind* out) {
     if (out) *out = DialectKind::kNanbeige;
     return true;
   }
+  if (s == "inkling2") {
+    if (out) *out = DialectKind::kInkling2;
+    return true;
+  }
   return false;
 }
 
-DialectKind DetectDialect(std::string_view tokenizer_config_json, bool has_turn_token, bool has_tool_call_token) {
+DialectKind DetectDialect(std::string_view tokenizer_config_json, bool has_turn_token, bool has_tool_call_token,
+                          bool has_inkling2_tokens) {
   bool gemma = has_turn_token;
   bool lfm2_bos = false, nanbeige = false;
   const nlohmann::json j = nlohmann::json::parse(tokenizer_config_json.begin(), tokenizer_config_json.end(),
@@ -186,6 +223,7 @@ DialectKind DetectDialect(std::string_view tokenizer_config_json, bool has_turn_
   }
   if (gemma) return DialectKind::kGemma4;
   if (lfm2_bos && has_tool_call_token) return DialectKind::kLfm2;
+  if (has_inkling2_tokens) return DialectKind::kInkling2;
   if (nanbeige) return DialectKind::kNanbeige;
   return DialectKind::kQwen35;
 }
@@ -220,6 +258,7 @@ DialectKind ResolveDialectKindForArch(std::optional<DialectKind> requested, cons
   const DialectKind qwen_kind = container_arch == "qwen4_exp" ? DialectKind::kQwen4Exp : DialectKind::kQwen35;
   if (tokenizer_dir.empty()) {
     if (container_arch == "llama") return DialectKind::kNanbeige;
+    if (ArchNameIsInkling2(container_arch)) return DialectKind::kInkling2;
     return container_is_gemma ? DialectKind::kGemma4 : container_is_lfm2 ? DialectKind::kLfm2 : qwen_kind;
   }
   const std::string config = ReadFileIfPresent(JoinPath(tokenizer_dir, "tokenizer_config.json"));
@@ -228,7 +267,9 @@ DialectKind ResolveDialectKindForArch(std::optional<DialectKind> requested, cons
   const std::string vocab = ReadFileIfPresent(JoinPath(tokenizer_dir, "tokenizer.json"));
   const bool has_turn_token = vocab.find("\"<|turn>\"") != std::string::npos;
   const bool has_tool_call_token = vocab.find("\"<|tool_call_start|>\"") != std::string::npos;
-  const DialectKind detected = DetectDialect(config, has_turn_token, has_tool_call_token);
+  const bool has_inkling2_tokens = vocab.find("\"<|message_model|>\"") != std::string::npos &&
+                                   vocab.find("\"<|content_model_end_sampling|>\"") != std::string::npos;
+  const DialectKind detected = DetectDialect(config, has_turn_token, has_tool_call_token, has_inkling2_tokens);
   // The tokenizer says Gemma or LFM2: that wins. Otherwise it is a Qwen tokenizer, and the container picks which Qwen dialect.
   return detected == DialectKind::kQwen35 ? qwen_kind : detected;
 }
@@ -239,6 +280,8 @@ std::string ResolveTokenizerDir(const ModelDialect& d, const std::string& reques
 }
 
 bool ArchNameIsLfm2(std::string_view model_arch) { return model_arch.substr(0, 4) == "lfm2"; }
+
+bool ArchNameIsInkling2(std::string_view model_arch) { return model_arch == "inkling2_loop"; }
 
 std::string CheckDefaultTokenizerDir(const ModelDialect& d, const std::string& resolved_dir, bool user_given) {
   if (d.kind != DialectKind::kQwen4Exp || user_given) return "";
@@ -303,6 +346,14 @@ std::string CheckDialectAgainstArch(const ModelDialect& d, std::string_view mode
   if (d.kind != DialectKind::kNanbeige && arch_is_llama) {
     return std::string("dialect ") + d.name + " does not match model architecture 'llama' (pass --dialect nanbeige)";
   }
+  // Inkling-2 likewise: the typed-part output, EOS 200006 and the effort-message template are this checkpoint's alone.
+  const bool arch_is_inkling2 = ArchNameIsInkling2(model_arch);
+  if (d.kind == DialectKind::kInkling2 && !arch_is_inkling2) {
+    return std::string("dialect inkling2 does not match model architecture '") + std::string(model_arch) + "'";
+  }
+  if (d.kind != DialectKind::kInkling2 && arch_is_inkling2) {
+    return std::string("dialect ") + d.name + " does not match model architecture 'inkling2_loop' (pass --dialect inkling2)";
+  }
   return "";
 }
 
@@ -313,6 +364,8 @@ bool ModelDialect::ReasoningOpenInPrompt(bool enable_thinking, std::string_view 
 ReasoningSplitter::StartState ModelDialect::ReasoningStart(bool enable_thinking,
                                                            std::string_view rendered_prompt) const {
   using S = ReasoningSplitter::StartState;
+  // Inkling-2 has no ReasoningSplitter flow (structured_parts): everything is answer text as far as it is concerned.
+  if (kind == DialectKind::kInkling2) return S::kAnswer;
   if (kind == DialectKind::kGemma4) {
     return ReasoningOpenInPrompt(enable_thinking, rendered_prompt) ? S::kInReasoning : S::kExpectOpener;
   }
@@ -321,7 +374,16 @@ ReasoningSplitter::StartState ModelDialect::ReasoningStart(bool enable_thinking,
   return enable_thinking ? S::kInReasoning : S::kAnswer;
 }
 
+// Inkling-2: always empty. The template has no generation prompt, so a rendered prompt ends with the last message's
+// <|end_message|> and the model's reply (its own <|message_model|> ... parts, then <|content_model_end_sampling|>) starts
+// strictly AFTER it. A later turn replays the conversation with that reply appended (reasoning dropped or kept, tool-call
+// JSON re-sorted by the template), so every difference sits after the previous prompt's last token: the previous prompt is
+// always a token prefix of the next one, and a checkpoint at the prompt end is always reusable (ckpt_back 0). Qwen and LFM2
+// differ because their prompts END inside the assistant turn ("<think>\n" / "<think>"), which a replay rewrites. The
+// "Thinking effort level" system message sits before the FIRST non-system message (not at the tail), so it only breaks the
+// prefix when the effort itself changes between turns.
 std::string ModelDialect::CheckpointSuffix(bool /*enable_thinking*/, std::string_view rendered_prompt) const {
+  if (kind == DialectKind::kInkling2) return "";
   if (kind == DialectKind::kGemma4) {
     // Thinking on ends "<|turn>model\n" (no reasoning suffix) or, after a tool response,
     // "<|channel>thought\n" (replays identically, so no holdback either): 0 tokens.

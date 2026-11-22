@@ -78,6 +78,37 @@ int main() {
         expect_eq("polyfills on (default) rewrites tool_calls", render(tmpl, messages), "assistant:-;");
     }
 
+    // 5. Inkling-2 patches: trailing commas in dict/array literals, dictsort(case_sensitive=true),
+    // tojson(sort_keys=..., separators=...), and the `float` filter.
+    {
+        ChatTemplateOptions off;
+        off.apply_polyfills = false;
+        expect_eq("dict trailing comma", render("{% set d = {'a': 1, 'b': 2,} %}{{ d | length }}", ChatJson::array(), ChatJson::object(), off), "2");
+        expect_eq("array trailing comma", render("{% set l = [1, 2,] %}{{ l | length }}", ChatJson::array(), ChatJson::object(), off), "2");
+        const ChatJson extra = ChatJson::parse(R"({"d": {"b": 1, "Z": 2, "a": 3, "B": 4}})");
+        expect_eq("dictsort case_sensitive=true",
+                  render("{% for k, v in d | dictsort(case_sensitive=true) %}{{ k }}{{ v }} {% endfor %}", ChatJson::array(), extra, off),
+                  "B4 Z2 a3 b1 ");
+        expect_eq("dictsort case_sensitive=false",
+                  render("{% for k, v in d | dictsort(case_sensitive=false) %}{{ k }}{{ v }} {% endfor %}", ChatJson::array(), extra, off),
+                  "a3 b1 B4 Z2 ");
+        const ChatJson nested = ChatJson::parse(R"({"v": {"b": [1, {"z": null, "a": "é\n"}], "a": true}})");
+        expect_eq("tojson sort_keys + compact separators",
+                  render("{{ v | tojson(sort_keys=true, separators=(',', ':')) }}", ChatJson::array(), nested, off),
+                  "{\"a\":true,\"b\":[1,{\"a\":\"\xC3\xA9\\n\",\"z\":null}]}");
+        expect_eq("tojson separators only keeps insertion order",
+                  render("{{ v | tojson(separators=(',', ':')) }}", ChatJson::array(), nested, off),
+                  "{\"b\":[1,{\"z\":null,\"a\":\"\xC3\xA9\\n\"}],\"a\":true}");
+        expect_eq("tojson sort_keys default separators",
+                  render("{{ v | tojson(sort_keys=true) }}", ChatJson::array(), nested, off),
+                  "{\"a\": true, \"b\": [1, {\"a\": \"\xC3\xA9\\n\", \"z\": null}]}");
+        expect_eq("tojson plain unchanged", render("{{ v | tojson }}", ChatJson::array(), nested, off),
+                  "{\"b\": [1, {\"z\": null, \"a\": \"\xC3\xA9\\n\"}], \"a\": true}");
+        expect_eq("float filter",
+                  render("{{ 3 | float }}|{{ '0.25' | float }}|{{ 'x' | float }}|{{ 1.5 | float }}", ChatJson::array(), ChatJson::object(), off),
+                  "3.0|0.25|0.0|1.5");
+    }
+
     std::printf("tokenizer_minja_patches: %d failure(s)\n", g_failures);
     return g_failures == 0 ? 0 : 1;
 }

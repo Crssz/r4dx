@@ -1,5 +1,7 @@
 #include "tool_call_parser.h"
 
+#include "inkling2_stream_parser.h"
+
 #include <algorithm>
 #include <cctype>
 #include <optional>
@@ -146,6 +148,16 @@ ToolCallParseResult ParseToolCalls(const std::string& text) {
 ToolCallParseResult ParseToolCalls(const std::string& text, const ModelDialect& dialect) {
   if (dialect.kind == DialectKind::kGemma4) return ParseGemmaToolCalls(text, dialect);
   if (dialect.kind == DialectKind::kLfm2) return ParseLfm2ToolCalls(text, dialect);
+  if (dialect.kind == DialectKind::kInkling2) {
+    // Typed parts: `content` is the answer text, the calls are the parsed invoke parts. The reasoning part has no slot in this
+    // result (use ParseInkling2Generation / Inkling2StreamParser when it is needed) and is not part of `content`.
+    Inkling2Parsed p = ParseInkling2Generation(text);
+    ToolCallParseResult r;
+    r.content = std::move(p.content);
+    r.tool_calls = std::move(p.tool_calls);
+    r.had_malformed_call = p.had_malformed;
+    return r;
+  }
   return ParseToolCalls(text);
 }
 

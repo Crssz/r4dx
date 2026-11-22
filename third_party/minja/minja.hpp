@@ -2354,6 +2354,8 @@ private:
 
         while (it != end) {
             if (!consumeToken(",").empty()) {
+              // r4dx patch (Inkling-2): a trailing comma in an array literal.
+              if (!consumeToken("]").empty()) return std::make_shared<ArrayExpr>(get_location(), std::move(elements));
               auto expr = parseExpression();
               if (!expr) throw std::runtime_error("Expected expression in array");
               elements.push_back(std::move(expr));
@@ -2387,6 +2389,8 @@ private:
 
         while (it != end) {
             if (!consumeToken(",").empty()) {
+                // r4dx patch (Inkling-2): Python/Jinja allow a trailing comma in a dict literal.
+                if (!consumeToken("}").empty()) return std::make_shared<DictExpr>(get_location(), std::move(elements));
                 parseKeyValuePair();
             } else if (!consumeToken("}").empty()) {
                 return std::make_shared<DictExpr>(get_location(), std::move(elements));
@@ -2791,8 +2795,53 @@ inline std::shared_ptr<Context> Context::builtins() {
   globals.set("raise_exception", simple_function("raise_exception", { "message" }, [](const std::shared_ptr<Context> &, Value & args) -> Value {
     throw std::runtime_error(args.at("message").get<std::string>());
   }));
-  globals.set("tojson", simple_function("tojson", { "value", "indent" }, [](const std::shared_ptr<Context> &, Value & args) {
-    return Value(args.at("value").dump(args.get<int64_t>("indent", -1), /* to_json= */ true));
+  // r4dx patch (Inkling-2): `tojson(sort_keys=true, separators=(",", ":"))` as transformers' tojson takes them
+  // (json.dumps semantics: keys sorted by code point, item/key separators, default ", " / ": "). Only used when
+  // `sort_keys` or `separators` is given and no `indent`; every other call keeps the original dump.
+  globals.set("tojson", simple_function("tojson", { "value", "indent", "sort_keys", "separators", "ensure_ascii" }, [](const std::shared_ptr<Context> &, Value & args) {
+    const int64_t indent = args.get<int64_t>("indent", -1);
+    const bool sort_keys = args.contains("sort_keys") && args.at("sort_keys").to_bool();
+    const bool has_sep = args.contains("separators") && !args.at("separators").is_null();
+    if (indent >= 0 || (!sort_keys && !has_sep)) {
+      return Value(args.at("value").dump(indent, /* to_json= */ true));
+    }
+    std::string item_sep = ", ", key_sep = ": ";
+    if (has_sep) {
+      auto & sep = args.at("separators");
+      if (!sep.is_array() || sep.size() != 2) throw std::runtime_error("tojson: separators must be a pair");
+      item_sep = sep.at(0).get<std::string>();
+      key_sep = sep.at(1).get<std::string>();
+    }
+    std::string out;
+    std::function<void(Value &)> emit = [&](Value & v) {
+      if (v.is_array()) {
+        out += '[';
+        for (size_t i = 0; i < v.size(); ++i) {
+          if (i) out += item_sep;
+          Value e = v.at(i);
+          emit(e);
+        }
+        out += ']';
+      } else if (v.is_object() && !v.is_callable()) {
+        auto keys = v.keys();
+        std::vector<std::pair<std::string, Value>> kv;
+        for (auto & k : keys) kv.emplace_back(k.is_string() ? k.get<std::string>() : k.dump(), v.at(k));
+        if (sort_keys) std::stable_sort(kv.begin(), kv.end(), [](const auto & a, const auto & b) { return a.first < b.first; });
+        out += '{';
+        for (size_t i = 0; i < kv.size(); ++i) {
+          if (i) out += item_sep;
+          out += Value(kv[i].first).dump(-1, true);
+          out += key_sep;
+          emit(kv[i].second);
+        }
+        out += '}';
+      } else {
+        out += v.dump(-1, true);
+      }
+    };
+    Value root = args.at("value");
+    emit(root);
+    return Value(out);
   }));
   globals.set("items", simple_function("items", { "object" }, [](const std::shared_ptr<Context> &, Value & args) {
     auto items = Value::array();
@@ -2890,10 +2939,20 @@ inline std::shared_ptr<Context> Context::builtins() {
   globals.set("count", simple_function("count", { "items" }, [](const std::shared_ptr<Context> &, Value & args) {
     return Value((int64_t) args.at("items").size());
   }));
-  globals.set("dictsort", simple_function("dictsort", { "value" }, [](const std::shared_ptr<Context> &, Value & args) {
-    if (args.size() != 1) throw std::runtime_error("dictsort expects exactly 1 argument (TODO: fix implementation)");
+  globals.set("dictsort", simple_function("dictsort", { "value", "case_sensitive" }, [](const std::shared_ptr<Context> &, Value & args) {
+    if (args.size() > 2) throw std::runtime_error("dictsort expects exactly 1 argument (TODO: fix implementation)");
     auto & value = args.at("value");
     auto keys = value.keys();
+    // r4dx patch (Inkling-2): `dictsort(case_sensitive=true)` compares the keys as they are (Python str order,
+    // which equals byte order for UTF-8).
+    if (args.contains("case_sensitive") && args.at("case_sensitive").to_bool()) {
+      std::stable_sort(keys.begin(), keys.end(), [](const Value & a, const Value & b) {
+        return (a.is_string() ? a.get<std::string>() : a.dump()) < (b.is_string() ? b.get<std::string>() : b.dump());
+      });
+      auto res = Value::array();
+      for (auto & key : keys) res.push_back(Value::array({key, value.at(key)}));
+      return res;
+    }
     // r4dx patch: Jinja's dictsort defaults to case_sensitive=False (compare the lowercased key);
     // upstream minja sorted byte-wise. ASCII lowercase only; stable so keys differing only in case
     // keep insertion order, as in Python's sort.
@@ -2960,6 +3019,19 @@ inline std::shared_ptr<Context> Context::builtins() {
   }));
   globals.set("int", simple_function("int", { "value" }, [](const std::shared_ptr<Context> &, Value & args) -> Value {
       return args.at("value").to_int();
+  }));
+  // r4dx patch (Inkling-2): Jinja's `float` filter (`x | float`): a number converts, a numeric string parses,
+  // anything else gives the default 0.0 (Jinja's behaviour on a failed conversion).
+  globals.set("float", simple_function("float", { "value", "default" }, [](const std::shared_ptr<Context> &, Value & args) -> Value {
+      auto & v = args.at("value");
+      if (v.is_number()) return Value(v.get<double>());
+      if (v.is_string()) {
+        const std::string s = v.get<std::string>();
+        char * endp = nullptr;
+        const double d = std::strtod(s.c_str(), &endp);
+        if (endp != s.c_str() && *endp == '\0') return Value(d);
+      }
+      return args.contains("default") ? args.at("default") : Value(0.0);
   }));
   globals.set("list", simple_function("list", { "items" }, [](const std::shared_ptr<Context> &, Value & args) -> Value {
       auto & items = args.at("items");

@@ -21,7 +21,7 @@
 
 namespace r4dx::server {
 
-enum class DialectKind { kQwen35, kGemma4, kLfm2, kQwen4Exp, kNanbeige };
+enum class DialectKind { kQwen35, kGemma4, kLfm2, kQwen4Exp, kNanbeige, kInkling2 };
 
 // The historical tokenizer directory (server_args.h / src/cli/cli_args.h defaults), <R4DX_MODELS_ROOT>\Huihui-Qwen3.8-27B-abliterated (root default E:\models): what an empty
 // --tokenizer-dir resolves to for the Qwen dialect, whose ModelDialect::default_tokenizer_dir is empty.
@@ -55,6 +55,10 @@ struct ModelDialect {
   // thinking-off prompt), so the request's enable_thinking / reasoning_effort / --think are ignored and
   // the resolved enable_thinking is true (usage.reasoning_tokens is always reported). False elsewhere.
   bool forces_thinking = false;
+  // Inkling-2: the generation is a stream of typed PARTS (<|message_model|> [name] <|content_thinking|> | <|content_text|> |
+  // <|content_invoke_tool_json|> ... <|end_message|>), parsed by Inkling2StreamParser (inkling2_stream_parser.h). The text
+  // ReasoningSplitter / ReasoningLocator / ToolStreamGate and the `reasoning` / `tool_*` markers below do not apply to it.
+  bool structured_parts = false;
   // The model's own generation_config sampling defaults, applied to a request that leaves the field out (and
   // only where the operator did not pass the matching --default-* flag). Empty (every field nullopt) for Qwen
   // and Gemma: their requests keep exactly the server's --default-* values, as before this struct existed.
@@ -101,9 +105,15 @@ const ModelDialect& Qwen4ExpDialect();
 // without them), BOS <|im_start|> on raw prompts (the tokenizer's post-processor; chat prompts carry it as text),
 // default tokenizer directory <R4DX_MODELS_ROOT>\Nanbeige\Nanbeige4.3-33B-tok (chat_template.jinja extracted there).
 const ModelDialect& NanbeigeDialect();
+// Inkling-2-Mini (arch "inkling2_loop", docs/inkling2-plan.md section 6): typed-part output (structured_parts), the five part
+// markers kept by decode, EOS <|content_model_end_sampling|> (200006), sampling temperature 1.0 (generation_config.json), no BOS,
+// no polyfills (the chat template renders as written), the template takes `reasoning_effort` (a level name or a number in
+// [0, 0.99]; enable_thinking=false means effort "none"), and it has NO generation prompt: the prompt ends after the last message and
+// the model emits its own <|message_model|>, so CheckpointSuffix is always empty (see its definition for why).
+const ModelDialect& Inkling2Dialect();
 const ModelDialect& DialectFor(DialectKind kind);
 
-// "qwen35" / "gemma4" / "lfm2" / "qwen4_exp" / "nanbeige" (case-sensitive). Returns false for anything else (including "auto").
+// "qwen35" / "gemma4" / "lfm2" / "qwen4_exp" / "nanbeige" / "inkling2" (case-sensitive). Returns false for anything else (including "auto").
 bool ParseDialectName(std::string_view s, DialectKind* out);
 
 // `--dialect auto`: Gemma iff tokenizer_config.json says `tokenizer_class == "GemmaTokenizer"` or
@@ -114,8 +124,10 @@ bool ParseDialectName(std::string_view s, DialectKind* out);
 // `bos_token == "<|startoftext|>"` AND the vocab has that tool token (checked after Gemma, so a Gemma
 // config still wins). The default for `has_tool_call_token` keeps every existing two-argument call as is.
 // Nanbeige: tokenizer_config.json has `tokenizer_class == "LlamaTokenizer"` AND `bos_token == "<|im_start|>"`.
+// Inkling-2 (`has_inkling2_tokens`: the vocab contains BOTH "<|message_model|>" and "<|content_model_end_sampling|>"; checked
+// after Gemma and LFM2).
 DialectKind DetectDialect(std::string_view tokenizer_config_json, bool has_turn_token,
-                          bool has_tool_call_token = false);
+                          bool has_tool_call_token = false, bool has_inkling2_tokens = false);
 
 // The dialect a run uses (shared by r4dx-server's Engine and r4dx-cli, task M1-14): `requested` (an
 // explicit --dialect) wins; otherwise, when `tokenizer_dir` is non-empty, DetectDialect over its
@@ -129,7 +141,8 @@ DialectKind ResolveDialectKind(std::optional<DialectKind> requested, const std::
 // container_is_lfm2, ArchNameIsLfm2). Same rules, plus: a "qwen4_exp"
 // container resolves to kQwen4Exp whenever the tokenizer (or its absence) does not say Gemma. A Gemma
 // tokenizer on a qwen4_exp container still resolves to kGemma4, which CheckDialectAgainstArch then refuses.
-// A "llama" container with no tokenizer dir resolves to kNanbeige (the only llama checkpoint r4dx serves).
+// A "llama" container with no tokenizer dir resolves to kNanbeige (the only llama checkpoint r4dx serves); an "inkling2_loop"
+// container with no tokenizer dir resolves to kInkling2.
 DialectKind ResolveDialectKindForArch(std::optional<DialectKind> requested, const std::string& tokenizer_dir,
                                       std::string_view container_arch);
 
@@ -169,5 +182,8 @@ std::string CheckDialectAgainstArch(const ModelDialect& d, std::string_view mode
 // LFM2 family: the "lfm2" prefix ("lfm2_moe"). String-only on purpose: server code must not depend on
 // Arch::kLfm2Moe (lane C's arch.h change), only on the spelling it writes.
 bool ArchNameIsLfm2(std::string_view model_arch);
+// True iff `model_arch` is the Inkling-2 container spelling "inkling2_loop" (string-only, like ArchNameIsLfm2: the model lane owns
+// the Arch enum).
+bool ArchNameIsInkling2(std::string_view model_arch);
 
 }  // namespace r4dx::server

@@ -34,6 +34,13 @@ endforeach()
 target_compile_definitions(test_lfm2_tool_call_parser PRIVATE
   R4DX_LFM2_GOLDEN="${CMAKE_SOURCE_DIR}/tests/tokenizer/golden_lfm2.json")
 
+# test_inkling2_dialect (docs/inkling2-plan.md section 6): dialect table / detection / arch check, the typed-part stream parser
+# (token-level replay vectors at every chunk boundary), request normalisation; with the checkpoint's tokenizer files present it
+# also drives the parser with real token ids through the real tokenizer and chat template (that part reports SKIPPED itself).
+add_executable(test_inkling2_dialect test_inkling2_dialect.cpp)
+target_link_libraries(test_inkling2_dialect PRIVATE r4dx_server_core r4dx_tokenizer)
+target_compile_definitions(test_inkling2_dialect PRIVATE R4DX_INKLING2_TOKENIZER_DIR="${R4DX_INKLING2_TOKENIZER_DIR}")
+add_test(NAME test_inkling2_dialect COMMAND test_inkling2_dialect)
 # qwen4_exp (docs/qwen4exp.md), CPU only. test_q4exp_dialect: dialect resolution / arch refusal from synthetic
 # container headers (needs the arch library). test_q4exp_template: the Swift chat_template.jinja renders
 # byte-identically to the 27B's through ChatTemplate; exits 77 (SKIPPED) when either checkpoint directory is absent.

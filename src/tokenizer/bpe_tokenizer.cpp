@@ -46,6 +46,7 @@
 #include <unordered_set>
 
 #include "nlohmann/json.hpp"
+#include "o200k_split.h"
 #include "vendor/llamacpp_unicode/unicode.h"
 
 namespace r4dx {
@@ -172,6 +173,8 @@ struct Tokenizer::Impl {
     // kQwen35SplitTrigger, chosen in load_impl() by tokenizer_config.json's tokenizer_class (see
     // the block comment above those constants).
     std::string split_trigger;
+    // Inkling-2: the o200k-style regex with its own splitter (o200k_split.h); split_trigger is unused then.
+    bool o200k = false;
 
     // Added tokens for fragment splitting, sorted longest-surface-text-first (ties broken by
     // ascending id) so a longer added token is never shadowed by a shorter one that happens to be
@@ -716,10 +719,11 @@ void validate_pretokenizer(const json& root, const Tokenizer::Options& options) 
         throw std::runtime_error("Tokenizer: pre_tokenizer.pretokenizers[0] is not a Regex Split");
     }
     const std::string regex = split["pattern"]["Regex"].get<std::string>();
-    if (regex != kQwen2SplitExpected && regex != kQwen35SplitExpected && regex != kLlama3SplitExpected) {
+    if (regex != kQwen2SplitExpected && regex != kQwen35SplitExpected && regex != kLlama3SplitExpected &&
+        regex != kO200kInkling2Regex) {
         throw std::runtime_error(
             "Tokenizer: pre_tokenizer regex does not match any pattern this tokenizer "
-            "implements (Qwen2, Qwen3.5 or Llama-3; got: " +
+            "implements (Qwen2, Qwen3.5, Llama-3 or the Inkling-2 o200k variant; got: " +
             regex + ")");
     }
     // Split.behavior must be Isolated (every regex match its own piece; the regexes tile the text,
@@ -1057,6 +1061,7 @@ Tokenizer::Impl load_impl(const std::string& tokenizer_json_path, const std::str
     if (!spm) {
         const std::string regex =
             root["pre_tokenizer"]["pretokenizers"][0]["pattern"]["Regex"].get<std::string>();
+        impl.o200k = (regex == kO200kInkling2Regex);
         impl.split_trigger = (regex == kQwen2SplitExpected)   ? kQwen2SplitTrigger
                              : (regex == kLlama3SplitExpected) ? kLlama3SplitTrigger
                                                                : kQwen35SplitTrigger;
@@ -1167,7 +1172,7 @@ Tokenizer::Impl load_impl(const std::string& tokenizer_json_path, const std::str
             }
         }
     }
-    if (!spm) verify_split_dispatch(impl.split_trigger);
+    if (!spm && !impl.o200k) verify_split_dispatch(impl.split_trigger);
 
     if (!tc_bos_text.empty()) impl.bos = impl.lookup(tc_bos_text);
     if (!tc_eos_text.empty()) impl.eos = impl.lookup(tc_eos_text);
@@ -1262,6 +1267,10 @@ std::vector<TokenId> Tokenizer::encode(std::string_view text, bool parse_special
             continue;
         }
         const std::string chunk(frag.text);
+        if (impl_->o200k) {
+            for (const std::string& word : o200k_split_byte_encoded(chunk)) bpe_merge_word(*impl_, word, out);
+            continue;
+        }
         for (const std::string& word : unicode_regex_split(chunk, {impl_->split_trigger}, /*byte_encode=*/true)) {
             bpe_merge_word(*impl_, word, out);
         }

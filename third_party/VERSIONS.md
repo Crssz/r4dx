@@ -73,3 +73,17 @@ re-run the build + tests.
   a call result could not be subscripted or have a method called on it: `visible_text(c).startswith(...)`
   threw "Expected comma in tuple". The call is now one more link of the postfix loop; every chain the old
   grammar accepted parses to the same tree, so the Qwen / Gemma / LFM2 goldens are unaffected.
+- **minja.hpp, Inkling-2-Mini patches (4 local changes, all needed by OpenUncensored/Inkling-2-Mini-Uncensored's
+  `chat_template.jinja`; covered by `tests/tokenizer/test_minja_patches.cpp` section 5 and the `tokenizer_chat_inkling2`
+  goldens):**
+  1. *Trailing comma in dict and array literals* (`Parser::parseDictionary`, `parseArray`): the template's `{% set spec = {...,} %}`
+     ends with one; upstream threw "Expected value expression" at parse time.
+  2. *`tojson(sort_keys=..., separators=(item, key))`* (the `tojson` global): json.dumps semantics (keys sorted by code point,
+     given separators, default `", "` / `": "`); a call with neither keyword (nor `indent`) keeps the original dump, so the other
+     templates are unchanged. Compact separators are what the model's tool-call JSON uses.
+  3. *`dictsort(case_sensitive=true)`* (the `dictsort` global): compares keys as they are; the default stays the case-insensitive
+     one the Gemma patch added.
+  4. *`float` filter* (`x | float`): number -> double, numeric string -> parsed, otherwise the default (0.0), as in Jinja.
+  Related: the template needs `ChatTemplateOptions{.apply_polyfills = false}` (it has its own tool-call format and the polyfills
+  would rewrite `tool_calls`). `{% generation %}` / `{% endgeneration %}` (already a no-op here), `namespace`, `{% set %}...{% endset %}`
+  blocks and `~` needed nothing. On a re-vendor, re-apply 1-4 if upstream still lacks them.

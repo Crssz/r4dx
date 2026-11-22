@@ -1,0 +1,5143 @@
+{
+ "generated_by": "tools/tok_ref/gen_chat_golden_inkling2.py",
+ "model_dir": "E:\\models\\OpenUncensored\\Inkling-2-Mini-Uncensored",
+ "tokenizer_class": "TokenizersBackend",
+ "vocab_size": 200058,
+ "eos_token_id": 200006,
+ "eos_token_ids": [
+  200006
+ ],
+ "apply_polyfills": false,
+ "cases": [
+  {
+   "kind": "chat",
+   "name": "system_user",
+   "messages": [
+    {
+     "role": "system",
+     "content": "You are concise."
+    },
+    {
+     "role": "user",
+     "content": "Hi"
+    }
+   ],
+   "tools": null,
+   "add_generation_prompt": false,
+   "extra_context": {},
+   "prompt": "<|message_system|><|content_text|>You are concise.<|end_message|><|message_system|><|content_text|>Thinking effort level: 0.9<|end_message|><|message_user|><|content_text|>Hi<|end_message|>",
+   "ids": [
+    200002,
+    200004,
+    1735,
+    149914,
+    149911,
+    4123,
+    13,
+    200010,
+    200002,
+    200004,
+    34182,
+    279,
+    154554,
+    150628,
+    25,
+    220,
+    15,
+    13,
+    24,
+    200010,
+    200000,
+    200004,
+    4896,
+    200010
+   ]
+  },
+  {
+   "kind": "chat",
+   "name": "user_only",
+   "messages": [
+    {
+     "role": "user",
+     "content": "What is the capital of Thailand?"
+    }
+   ],
+   "tools": null,
+   "add_generation_prompt": false,
+   "extra_context": {},
+   "prompt": "<|message_system|><|content_text|>Thinking effort level: 0.9<|end_message|><|message_user|><|content_text|>What is the capital of Thailand?<|end_message|>",
+   "ids": [
+    200002,
+    200004,
+    34182,
+    279,
+    154554,
+    150628,
+    25,
+    220,
+    15,
+    13,
+    24,
+    200010,
+    200000,
+    200004,
+    1775,
+    149884,
+    149876,
+    151451,
+    149879,
+    187726,
+    30,
+    200010
+   ]
+  },
+  {
+   "kind": "chat",
+   "name": "user_only_gen_prompt_true",
+   "messages": [
+    {
+     "role": "user",
+     "content": "Hi"
+    }
+   ],
+   "tools": null,
+   "add_generation_prompt": true,
+   "extra_context": {},
+   "prompt": "<|message_system|><|content_text|>Thinking effort level: 0.9<|end_message|><|message_user|><|content_text|>Hi<|end_message|>",
+   "ids": [
+    200002,
+    200004,
+    34182,
+    279,
+    154554,
+    150628,
+    25,
+    220,
+    15,
+    13,
+    24,
+    200010,
+    200000,
+    200004,
+    4896,
+    200010
+   ]
+  },
+  {
+   "kind": "chat",
+   "name": "system_only_effort_at_end",
+   "messages": [
+    {
+     "role": "system",
+     "content": "Only a system prompt."
+    }
+   ],
+   "tools": null,
+   "add_generation_prompt": false,
+   "extra_context": {},
+   "prompt": "<|message_system|><|content_text|>Only a system prompt.<|end_message|><|message_system|><|content_text|>Thinking effort level: 0.9<|end_message|>",
+   "ids": [
+    200002,
+    200004,
+    74790,
+    149878,
+    150200,
+    157282,
+    13,
+    200010,
+    200002,
+    200004,
+    34182,
+    279,
+    154554,
+    150628,
+    25,
+    220,
+    15,
+    13,
+    24,
+    200010
+   ]
+  },
+  {
+   "kind": "chat",
+   "name": "two_system_then_user",
+   "messages": [
+    {
+     "role": "system",
+     "content": "a"
+    },
+    {
+     "role": "system",
+     "content": "b"
+    },
+    {
+     "role": "user",
+     "content": "c"
+    }
+   ],
+   "tools": null,
+   "add_generation_prompt": false,
+   "extra_context": {},
+   "prompt": "<|message_system|><|content_text|>a<|end_message|><|message_system|><|content_text|>b<|end_message|><|message_system|><|content_text|>Thinking effort level: 0.9<|end_message|><|message_user|><|content_text|>c<|end_message|>",
+   "ids": [
+    200002,
+    200004,
+    64,
+    200010,
+    200002,
+    200004,
+    65,
+    200010,
+    200002,
+    200004,
+    34182,
+    279,
+    154554,
+    150628,
+    25,
+    220,
+    15,
+    13,
+    24,
+    200010,
+    200000,
+    200004,
+    66,
+    200010
+   ]
+  },
+  {
+   "kind": "chat",
+   "name": "user_then_system",
+   "messages": [
+    {
+     "role": "user",
+     "content": "u"
+    },
+    {
+     "role": "system",
+     "content": "late system"
+    }
+   ],
+   "tools": null,
+   "add_generation_prompt": false,
+   "extra_context": {},
+   "prompt": "<|message_system|><|content_text|>Thinking effort level: 0.9<|end_message|><|message_user|><|content_text|>u<|end_message|><|message_system|><|content_text|>late system<|end_message|>",
+   "ids": [
+    200002,
+    200004,
+    34182,
+    279,
+    154554,
+    150628,
+    25,
+    220,
+    15,
+    13,
+    24,
+    200010,
+    200000,
+    200004,
+    84,
+    200010,
+    200002,
+    200004,
+    1344,
+    150200,
+    200010
+   ]
+  },
+  {
+   "kind": "chat",
+   "name": "assistant_first",
+   "messages": [
+    {
+     "role": "assistant",
+     "content": "hello"
+    }
+   ],
+   "tools": null,
+   "add_generation_prompt": false,
+   "extra_context": {},
+   "prompt": "<|message_system|><|content_text|>Thinking effort level: 0.9<|end_message|><|message_model|><|content_text|>hello<|end_message|><|content_model_end_sampling|>",
+   "ids": [
+    200002,
+    200004,
+    34182,
+    279,
+    154554,
+    150628,
+    25,
+    220,
+    15,
+    13,
+    24,
+    200010,
+    200001,
+    200004,
+    32205,
+    200010,
+    200006
+   ]
+  },
+  {
+   "kind": "chat",
+   "name": "empty_user",
+   "messages": [
+    {
+     "role": "user",
+     "content": ""
+    }
+   ],
+   "tools": null,
+   "add_generation_prompt": false,
+   "extra_context": {},
+   "prompt": "<|message_system|><|content_text|>Thinking effort level: 0.9<|end_message|><|message_user|><|content_text|><|end_message|>",
+   "ids": [
+    200002,
+    200004,
+    34182,
+    279,
+    154554,
+    150628,
+    25,
+    220,
+    15,
+    13,
+    24,
+    200010,
+    200000,
+    200004,
+    200010
+   ]
+  },
+  {
+   "kind": "chat",
+   "name": "unicode",
+   "messages": [
+    {
+     "role": "system",
+     "content": "สวัสดี 😀 <|end_message|> \"q\" \\ \n"
+    },
+    {
+     "role": "user",
+     "content": "你好，世界 café مرحبا"
+    }
+   ],
+   "tools": null,
+   "add_generation_prompt": false,
+   "extra_context": {},
+   "prompt": "<|message_system|><|content_text|>สวัสดี 😀 <|end_message|> \"q\" \\ \n<|end_message|><|message_system|><|content_text|>Thinking effort level: 0.9<|end_message|><|message_user|><|content_text|>你好，世界 café مرحبا<|end_message|>",
+   "ids": [
+    200002,
+    200004,
+    11634,
+    93776,
+    11634,
+    92094,
+    220,
+    110689,
+    220,
+    200010,
+    196980,
+    80,
+    1,
+    196978,
+    197045,
+    200010,
+    200002,
+    200004,
+    34182,
+    279,
+    154554,
+    150628,
+    25,
+    220,
+    15,
+    13,
+    24,
+    200010,
+    200000,
+    200004,
+    11739,
+    23643,
+    6633,
+    110174,
+    162389,
+    163115,
+    200010
+   ]
+  },
+  {
+   "kind": "chat",
+   "name": "multi_turn",
+   "messages": [
+    {
+     "role": "system",
+     "content": "s"
+    },
+    {
+     "role": "user",
+     "content": "Hi there!"
+    },
+    {
+     "role": "assistant",
+     "content": "Hello! How can I help?"
+    },
+    {
+     "role": "user",
+     "content": "Tell me a joke."
+    },
+    {
+     "role": "assistant",
+     "content": "Why did the GPU cross the road?"
+    },
+    {
+     "role": "user",
+     "content": "Explain it."
+    }
+   ],
+   "tools": null,
+   "add_generation_prompt": false,
+   "extra_context": {},
+   "prompt": "<|message_system|><|content_text|>s<|end_message|><|message_system|><|content_text|>Thinking effort level: 0.9<|end_message|><|message_user|><|content_text|>Hi there!<|end_message|><|message_model|><|content_text|>Hello! How can I help?<|end_message|><|content_model_end_sampling|><|message_user|><|content_text|>Tell me a joke.<|end_message|><|message_model|><|content_text|>Why did the GPU cross the road?<|end_message|><|content_model_end_sampling|><|message_user|><|content_text|>Explain it.<|end_message|>",
+   "ids": [
+    200002,
+    200004,
+    82,
+    200010,
+    200002,
+    200004,
+    34182,
+    279,
+    154554,
+    150628,
+    25,
+    220,
+    15,
+    13,
+    24,
+    200010,
+    200000,
+    200004,
+    4896,
+    150102,
+    0,
+    200010,
+    200001,
+    200004,
+    32269,
+    0,
+    151337,
+    149951,
+    149904,
+    150572,
+    30,
+    200010,
+    200006,
+    200000,
+    200004,
+    34751,
+    149991,
+    149878,
+    193279,
+    13,
+    200010,
+    200001,
+    200004,
+    4492,
+    150439,
+    149876,
+    198531,
+    151458,
+    149876,
+    155569,
+    30,
+    200010,
+    200006,
+    200000,
+    200004,
+    100887,
+    149921,
+    13,
+    200010
+   ]
+  },
+  {
+   "kind": "chat",
+   "name": "multi_turn_reasoning",
+   "messages": [
+    {
+     "role": "user",
+     "content": "2+2?"
+    },
+    {
+     "role": "assistant",
+     "content": "4",
+     "reasoning_content": "two plus two is four"
+    },
+    {
+     "role": "user",
+     "content": "3+3?"
+    },
+    {
+     "role": "assistant",
+     "content": "6",
+     "reasoning_content": "three plus three\nis six"
+    },
+    {
+     "role": "user",
+     "content": "thanks"
+    }
+   ],
+   "tools": null,
+   "add_generation_prompt": false,
+   "extra_context": {},
+   "prompt": "<|message_system|><|content_text|>Thinking effort level: 0.9<|end_message|><|message_user|><|content_text|>2+2?<|end_message|><|message_model|><|content_thinking|>two plus two is four<|end_message|><|message_model|><|content_text|>4<|end_message|><|content_model_end_sampling|><|message_user|><|content_text|>3+3?<|end_message|><|message_model|><|content_thinking|>three plus three\nis six<|end_message|><|message_model|><|content_text|>6<|end_message|><|content_model_end_sampling|><|message_user|><|content_text|>thanks<|end_message|>",
+   "ids": [
+    200002,
+    200004,
+    34182,
+    279,
+    154554,
+    150628,
+    25,
+    220,
+    15,
+    13,
+    24,
+    200010,
+    200000,
+    200004,
+    17,
+    10,
+    17,
+    30,
+    200010,
+    200001,
+    200008,
+    1286,
+    150196,
+    150103,
+    149884,
+    150792,
+    200010,
+    200001,
+    200004,
+    19,
+    200010,
+    200006,
+    200000,
+    200004,
+    18,
+    10,
+    18,
+    30,
+    200010,
+    200001,
+    200008,
+    2194,
+    150196,
+    150396,
+    198,
+    272,
+    151894,
+    200010,
+    200001,
+    200004,
+    21,
+    200010,
+    200006,
+    200000,
+    200004,
+    75162,
+    200010
+   ]
+  },
+  {
+   "kind": "chat",
+   "name": "assistant_reasoning_only",
+   "messages": [
+    {
+     "role": "user",
+     "content": "q"
+    },
+    {
+     "role": "assistant",
+     "content": "",
+     "reasoning_content": "thinking only"
+    },
+    {
+     "role": "user",
+     "content": "q2"
+    }
+   ],
+   "tools": null,
+   "add_generation_prompt": false,
+   "extra_context": {},
+   "prompt": "<|message_system|><|content_text|>Thinking effort level: 0.9<|end_message|><|message_user|><|content_text|>q<|end_message|><|message_model|><|content_thinking|>thinking only<|end_message|><|content_model_end_sampling|><|message_user|><|content_text|>q2<|end_message|>",
+   "ids": [
+    200002,
+    200004,
+    34182,
+    279,
+    154554,
+    150628,
+    25,
+    220,
+    15,
+    13,
+    24,
+    200010,
+    200000,
+    200004,
+    80,
+    200010,
+    200001,
+    200008,
+    78168,
+    150130,
+    200010,
+    200006,
+    200000,
+    200004,
+    80,
+    17,
+    200010
+   ]
+  },
+  {
+   "kind": "chat",
+   "name": "assistant_reasoning_none_content",
+   "messages": [
+    {
+     "role": "user",
+     "content": "q"
+    },
+    {
+     "role": "assistant",
+     "content": null,
+     "reasoning_content": "t"
+    },
+    {
+     "role": "user",
+     "content": "q2"
+    }
+   ],
+   "tools": null,
+   "add_generation_prompt": false,
+   "extra_context": {},
+   "prompt": "<|message_system|><|content_text|>Thinking effort level: 0.9<|end_message|><|message_user|><|content_text|>q<|end_message|><|message_model|><|content_thinking|>t<|end_message|><|content_model_end_sampling|><|message_user|><|content_text|>q2<|end_message|>",
+   "ids": [
+    200002,
+    200004,
+    34182,
+    279,
+    154554,
+    150628,
+    25,
+    220,
+    15,
+    13,
+    24,
+    200010,
+    200000,
+    200004,
+    80,
+    200010,
+    200001,
+    200008,
+    83,
+    200010,
+    200006,
+    200000,
+    200004,
+    80,
+    17,
+    200010
+   ]
+  },
+  {
+   "kind": "chat",
+   "name": "assistant_empty_no_reasoning",
+   "messages": [
+    {
+     "role": "user",
+     "content": "q"
+    },
+    {
+     "role": "assistant",
+     "content": ""
+    },
+    {
+     "role": "user",
+     "content": "q2"
+    }
+   ],
+   "tools": null,
+   "add_generation_prompt": false,
+   "extra_context": {},
+   "prompt": "<|message_system|><|content_text|>Thinking effort level: 0.9<|end_message|><|message_user|><|content_text|>q<|end_message|><|message_model|><|content_text|><|end_message|><|content_model_end_sampling|><|message_user|><|content_text|>q2<|end_message|>",
+   "ids": [
+    200002,
+    200004,
+    34182,
+    279,
+    154554,
+    150628,
+    25,
+    220,
+    15,
+    13,
+    24,
+    200010,
+    200000,
+    200004,
+    80,
+    200010,
+    200001,
+    200004,
+    200010,
+    200006,
+    200000,
+    200004,
+    80,
+    17,
+    200010
+   ]
+  },
+  {
+   "kind": "chat",
+   "name": "assistant_named",
+   "messages": [
+    {
+     "role": "user",
+     "content": "q"
+    },
+    {
+     "role": "assistant",
+     "content": "answer",
+     "name": "inkling"
+    },
+    {
+     "role": "user",
+     "content": "q2"
+    }
+   ],
+   "tools": null,
+   "add_generation_prompt": false,
+   "extra_context": {},
+   "prompt": "<|message_system|><|content_text|>Thinking effort level: 0.9<|end_message|><|message_user|><|content_text|>q<|end_message|><|message_model|>inkling<|content_text|>answer<|end_message|><|content_model_end_sampling|><|message_user|><|content_text|>q2<|end_message|>",
+   "ids": [
+    200002,
+    200004,
+    34182,
+    279,
+    154554,
+    150628,
+    25,
+    220,
+    15,
+    13,
+    24,
+    200010,
+    200000,
+    200004,
+    80,
+    200010,
+    200001,
+    1025,
+    2531,
+    200004,
+    1765,
+    200010,
+    200006,
+    200000,
+    200004,
+    80,
+    17,
+    200010
+   ]
+  },
+  {
+   "kind": "chat",
+   "name": "effort_high",
+   "messages": [
+    {
+     "role": "system",
+     "content": "s"
+    },
+    {
+     "role": "user",
+     "content": "x"
+    }
+   ],
+   "tools": null,
+   "add_generation_prompt": false,
+   "extra_context": {
+    "reasoning_effort": "high"
+   },
+   "prompt": "<|message_system|><|content_text|>s<|end_message|><|message_system|><|content_text|>Thinking effort level: 0.9<|end_message|><|message_user|><|content_text|>x<|end_message|>",
+   "ids": [
+    200002,
+    200004,
+    82,
+    200010,
+    200002,
+    200004,
+    34182,
+    279,
+    154554,
+    150628,
+    25,
+    220,
+    15,
+    13,
+    24,
+    200010,
+    200000,
+    200004,
+    87,
+    200010
+   ]
+  },
+  {
+   "kind": "chat",
+   "name": "effort_none",
+   "messages": [
+    {
+     "role": "system",
+     "content": "s"
+    },
+    {
+     "role": "user",
+     "content": "x"
+    }
+   ],
+   "tools": null,
+   "add_generation_prompt": false,
+   "extra_context": {
+    "reasoning_effort": "none"
+   },
+   "prompt": "<|message_system|><|content_text|>s<|end_message|><|message_system|><|content_text|>Thinking effort level: 0<|end_message|><|message_user|><|content_text|>x<|end_message|>",
+   "ids": [
+    200002,
+    200004,
+    82,
+    200010,
+    200002,
+    200004,
+    34182,
+    279,
+    154554,
+    150628,
+    25,
+    220,
+    15,
+    200010,
+    200000,
+    200004,
+    87,
+    200010
+   ]
+  },
+  {
+   "kind": "chat",
+   "name": "effort_minimal",
+   "messages": [
+    {
+     "role": "system",
+     "content": "s"
+    },
+    {
+     "role": "user",
+     "content": "x"
+    }
+   ],
+   "tools": null,
+   "add_generation_prompt": false,
+   "extra_context": {
+    "reasoning_effort": "minimal"
+   },
+   "prompt": "<|message_system|><|content_text|>s<|end_message|><|message_system|><|content_text|>Thinking effort level: 0.1<|end_message|><|message_user|><|content_text|>x<|end_message|>",
+   "ids": [
+    200002,
+    200004,
+    82,
+    200010,
+    200002,
+    200004,
+    34182,
+    279,
+    154554,
+    150628,
+    25,
+    220,
+    15,
+    13,
+    16,
+    200010,
+    200000,
+    200004,
+    87,
+    200010
+   ]
+  },
+  {
+   "kind": "chat",
+   "name": "effort_low",
+   "messages": [
+    {
+     "role": "system",
+     "content": "s"
+    },
+    {
+     "role": "user",
+     "content": "x"
+    }
+   ],
+   "tools": null,
+   "add_generation_prompt": false,
+   "extra_context": {
+    "reasoning_effort": "low"
+   },
+   "prompt": "<|message_system|><|content_text|>s<|end_message|><|message_system|><|content_text|>Thinking effort level: 0.2<|end_message|><|message_user|><|content_text|>x<|end_message|>",
+   "ids": [
+    200002,
+    200004,
+    82,
+    200010,
+    200002,
+    200004,
+    34182,
+    279,
+    154554,
+    150628,
+    25,
+    220,
+    15,
+    13,
+    17,
+    200010,
+    200000,
+    200004,
+    87,
+    200010
+   ]
+  },
+  {
+   "kind": "chat",
+   "name": "effort_medium",
+   "messages": [
+    {
+     "role": "system",
+     "content": "s"
+    },
+    {
+     "role": "user",
+     "content": "x"
+    }
+   ],
+   "tools": null,
+   "add_generation_prompt": false,
+   "extra_context": {
+    "reasoning_effort": "medium"
+   },
+   "prompt": "<|message_system|><|content_text|>s<|end_message|><|message_system|><|content_text|>Thinking effort level: 0.7<|end_message|><|message_user|><|content_text|>x<|end_message|>",
+   "ids": [
+    200002,
+    200004,
+    82,
+    200010,
+    200002,
+    200004,
+    34182,
+    279,
+    154554,
+    150628,
+    25,
+    220,
+    15,
+    13,
+    22,
+    200010,
+    200000,
+    200004,
+    87,
+    200010
+   ]
+  },
+  {
+   "kind": "chat",
+   "name": "effort_xhigh",
+   "messages": [
+    {
+     "role": "system",
+     "content": "s"
+    },
+    {
+     "role": "user",
+     "content": "x"
+    }
+   ],
+   "tools": null,
+   "add_generation_prompt": false,
+   "extra_context": {
+    "reasoning_effort": "xhigh"
+   },
+   "prompt": "<|message_system|><|content_text|>s<|end_message|><|message_system|><|content_text|>Thinking effort level: 0.99<|end_message|><|message_user|><|content_text|>x<|end_message|>",
+   "ids": [
+    200002,
+    200004,
+    82,
+    200010,
+    200002,
+    200004,
+    34182,
+    279,
+    154554,
+    150628,
+    25,
+    220,
+    15,
+    13,
+    68436,
+    200010,
+    200000,
+    200004,
+    87,
+    200010
+   ]
+  },
+  {
+   "kind": "chat",
+   "name": "effort_max",
+   "messages": [
+    {
+     "role": "system",
+     "content": "s"
+    },
+    {
+     "role": "user",
+     "content": "x"
+    }
+   ],
+   "tools": null,
+   "add_generation_prompt": false,
+   "extra_context": {
+    "reasoning_effort": "max"
+   },
+   "prompt": "<|message_system|><|content_text|>s<|end_message|><|message_system|><|content_text|>Thinking effort level: 0.99<|end_message|><|message_user|><|content_text|>x<|end_message|>",
+   "ids": [
+    200002,
+    200004,
+    82,
+    200010,
+    200002,
+    200004,
+    34182,
+    279,
+    154554,
+    150628,
+    25,
+    220,
+    15,
+    13,
+    68436,
+    200010,
+    200000,
+    200004,
+    87,
+    200010
+   ]
+  },
+  {
+   "kind": "chat",
+   "name": "effort_padded_upper_ws",
+   "messages": [
+    {
+     "role": "system",
+     "content": "s"
+    },
+    {
+     "role": "user",
+     "content": "x"
+    }
+   ],
+   "tools": null,
+   "add_generation_prompt": false,
+   "extra_context": {
+    "reasoning_effort": "  high "
+   },
+   "prompt": "<|message_system|><|content_text|>s<|end_message|><|message_system|><|content_text|>Thinking effort level: 0.9<|end_message|><|message_user|><|content_text|>x<|end_message|>",
+   "ids": [
+    200002,
+    200004,
+    82,
+    200010,
+    200002,
+    200004,
+    34182,
+    279,
+    154554,
+    150628,
+    25,
+    220,
+    15,
+    13,
+    24,
+    200010,
+    200000,
+    200004,
+    87,
+    200010
+   ]
+  },
+  {
+   "kind": "chat",
+   "name": "effort_f0",
+   "messages": [
+    {
+     "role": "system",
+     "content": "s"
+    },
+    {
+     "role": "user",
+     "content": "x"
+    }
+   ],
+   "tools": null,
+   "add_generation_prompt": false,
+   "extra_context": {
+    "reasoning_effort": 0.0
+   },
+   "prompt": "<|message_system|><|content_text|>s<|end_message|><|message_system|><|content_text|>Thinking effort level: 0<|end_message|><|message_user|><|content_text|>x<|end_message|>",
+   "ids": [
+    200002,
+    200004,
+    82,
+    200010,
+    200002,
+    200004,
+    34182,
+    279,
+    154554,
+    150628,
+    25,
+    220,
+    15,
+    200010,
+    200000,
+    200004,
+    87,
+    200010
+   ]
+  },
+  {
+   "kind": "chat",
+   "name": "effort_i0",
+   "messages": [
+    {
+     "role": "system",
+     "content": "s"
+    },
+    {
+     "role": "user",
+     "content": "x"
+    }
+   ],
+   "tools": null,
+   "add_generation_prompt": false,
+   "extra_context": {
+    "reasoning_effort": 0
+   },
+   "prompt": "<|message_system|><|content_text|>s<|end_message|><|message_system|><|content_text|>Thinking effort level: 0<|end_message|><|message_user|><|content_text|>x<|end_message|>",
+   "ids": [
+    200002,
+    200004,
+    82,
+    200010,
+    200002,
+    200004,
+    34182,
+    279,
+    154554,
+    150628,
+    25,
+    220,
+    15,
+    200010,
+    200000,
+    200004,
+    87,
+    200010
+   ]
+  },
+  {
+   "kind": "chat",
+   "name": "effort_f05",
+   "messages": [
+    {
+     "role": "system",
+     "content": "s"
+    },
+    {
+     "role": "user",
+     "content": "x"
+    }
+   ],
+   "tools": null,
+   "add_generation_prompt": false,
+   "extra_context": {
+    "reasoning_effort": 0.5
+   },
+   "prompt": "<|message_system|><|content_text|>s<|end_message|><|message_system|><|content_text|>Thinking effort level: 0.5<|end_message|><|message_user|><|content_text|>x<|end_message|>",
+   "ids": [
+    200002,
+    200004,
+    82,
+    200010,
+    200002,
+    200004,
+    34182,
+    279,
+    154554,
+    150628,
+    25,
+    220,
+    15,
+    13,
+    20,
+    200010,
+    200000,
+    200004,
+    87,
+    200010
+   ]
+  },
+  {
+   "kind": "chat",
+   "name": "effort_f099",
+   "messages": [
+    {
+     "role": "system",
+     "content": "s"
+    },
+    {
+     "role": "user",
+     "content": "x"
+    }
+   ],
+   "tools": null,
+   "add_generation_prompt": false,
+   "extra_context": {
+    "reasoning_effort": 0.99
+   },
+   "prompt": "<|message_system|><|content_text|>s<|end_message|><|message_system|><|content_text|>Thinking effort level: 0.99<|end_message|><|message_user|><|content_text|>x<|end_message|>",
+   "ids": [
+    200002,
+    200004,
+    82,
+    200010,
+    200002,
+    200004,
+    34182,
+    279,
+    154554,
+    150628,
+    25,
+    220,
+    15,
+    13,
+    68436,
+    200010,
+    200000,
+    200004,
+    87,
+    200010
+   ]
+  },
+  {
+   "kind": "chat",
+   "name": "effort_f0123",
+   "messages": [
+    {
+     "role": "system",
+     "content": "s"
+    },
+    {
+     "role": "user",
+     "content": "x"
+    }
+   ],
+   "tools": null,
+   "add_generation_prompt": false,
+   "extra_context": {
+    "reasoning_effort": 0.123
+   },
+   "prompt": "<|message_system|><|content_text|>s<|end_message|><|message_system|><|content_text|>Thinking effort level: 0.123<|end_message|><|message_user|><|content_text|>x<|end_message|>",
+   "ids": [
+    200002,
+    200004,
+    82,
+    200010,
+    200002,
+    200004,
+    34182,
+    279,
+    154554,
+    150628,
+    25,
+    220,
+    15,
+    13,
+    70904,
+    200010,
+    200000,
+    200004,
+    87,
+    200010
+   ]
+  },
+  {
+   "kind": "chat",
+   "name": "effort_f07",
+   "messages": [
+    {
+     "role": "system",
+     "content": "s"
+    },
+    {
+     "role": "user",
+     "content": "x"
+    }
+   ],
+   "tools": null,
+   "add_generation_prompt": false,
+   "extra_context": {
+    "reasoning_effort": 0.7
+   },
+   "prompt": "<|message_system|><|content_text|>s<|end_message|><|message_system|><|content_text|>Thinking effort level: 0.7<|end_message|><|message_user|><|content_text|>x<|end_message|>",
+   "ids": [
+    200002,
+    200004,
+    82,
+    200010,
+    200002,
+    200004,
+    34182,
+    279,
+    154554,
+    150628,
+    25,
+    220,
+    15,
+    13,
+    22,
+    200010,
+    200000,
+    200004,
+    87,
+    200010
+   ]
+  },
+  {
+   "kind": "chat",
+   "name": "effort_f001",
+   "messages": [
+    {
+     "role": "system",
+     "content": "s"
+    },
+    {
+     "role": "user",
+     "content": "x"
+    }
+   ],
+   "tools": null,
+   "add_generation_prompt": false,
+   "extra_context": {
+    "reasoning_effort": 0.01
+   },
+   "prompt": "<|message_system|><|content_text|>s<|end_message|><|message_system|><|content_text|>Thinking effort level: 0.01<|end_message|><|message_user|><|content_text|>x<|end_message|>",
+   "ids": [
+    200002,
+    200004,
+    82,
+    200010,
+    200002,
+    200004,
+    34182,
+    279,
+    154554,
+    150628,
+    25,
+    220,
+    15,
+    13,
+    68340,
+    200010,
+    200000,
+    200004,
+    87,
+    200010
+   ]
+  },
+  {
+   "kind": "chat",
+   "name": "effort_f0_9",
+   "messages": [
+    {
+     "role": "system",
+     "content": "s"
+    },
+    {
+     "role": "user",
+     "content": "x"
+    }
+   ],
+   "tools": null,
+   "add_generation_prompt": false,
+   "extra_context": {
+    "reasoning_effort": 0.9
+   },
+   "prompt": "<|message_system|><|content_text|>s<|end_message|><|message_system|><|content_text|>Thinking effort level: 0.9<|end_message|><|message_user|><|content_text|>x<|end_message|>",
+   "ids": [
+    200002,
+    200004,
+    82,
+    200010,
+    200002,
+    200004,
+    34182,
+    279,
+    154554,
+    150628,
+    25,
+    220,
+    15,
+    13,
+    24,
+    200010,
+    200000,
+    200004,
+    87,
+    200010
+   ]
+  },
+  {
+   "kind": "chat_error",
+   "name": "effort_s_numeric_text_err",
+   "messages": [
+    {
+     "role": "user",
+     "content": "x"
+    }
+   ],
+   "tools": null,
+   "add_generation_prompt": false,
+   "extra_context": {
+    "reasoning_effort": "0.5"
+   },
+   "hf_error": "Unknown reasoning_effort: 0.5"
+  },
+  {
+   "kind": "chat",
+   "name": "effort_none_value_is_default",
+   "messages": [
+    {
+     "role": "user",
+     "content": "x"
+    }
+   ],
+   "tools": null,
+   "add_generation_prompt": false,
+   "extra_context": {
+    "reasoning_effort": null
+   },
+   "prompt": "<|message_system|><|content_text|>Thinking effort level: 0.9<|end_message|><|message_user|><|content_text|>x<|end_message|>",
+   "ids": [
+    200002,
+    200004,
+    34182,
+    279,
+    154554,
+    150628,
+    25,
+    220,
+    15,
+    13,
+    24,
+    200010,
+    200000,
+    200004,
+    87,
+    200010
+   ]
+  },
+  {
+   "kind": "chat",
+   "name": "effort_with_only_system",
+   "messages": [
+    {
+     "role": "system",
+     "content": "s"
+    }
+   ],
+   "tools": null,
+   "add_generation_prompt": false,
+   "extra_context": {
+    "reasoning_effort": "low"
+   },
+   "prompt": "<|message_system|><|content_text|>s<|end_message|><|message_system|><|content_text|>Thinking effort level: 0.2<|end_message|>",
+   "ids": [
+    200002,
+    200004,
+    82,
+    200010,
+    200002,
+    200004,
+    34182,
+    279,
+    154554,
+    150628,
+    25,
+    220,
+    15,
+    13,
+    17,
+    200010
+   ]
+  },
+  {
+   "kind": "chat_error",
+   "name": "effort_bogus",
+   "messages": [
+    {
+     "role": "user",
+     "content": "x"
+    }
+   ],
+   "tools": null,
+   "add_generation_prompt": false,
+   "extra_context": {
+    "reasoning_effort": "bogus"
+   },
+   "hf_error": "Unknown reasoning_effort: bogus"
+  },
+  {
+   "kind": "chat_error",
+   "name": "effort_too_high_float",
+   "messages": [
+    {
+     "role": "user",
+     "content": "x"
+    }
+   ],
+   "tools": null,
+   "add_generation_prompt": false,
+   "extra_context": {
+    "reasoning_effort": 1.0
+   },
+   "hf_error": "reasoning_effort must be in [0.0, 0.99]"
+  },
+  {
+   "kind": "chat_error",
+   "name": "effort_too_high_int",
+   "messages": [
+    {
+     "role": "user",
+     "content": "x"
+    }
+   ],
+   "tools": null,
+   "add_generation_prompt": false,
+   "extra_context": {
+    "reasoning_effort": 1
+   },
+   "hf_error": "reasoning_effort must be in [0.0, 0.99]"
+  },
+  {
+   "kind": "chat_error",
+   "name": "effort_negative",
+   "messages": [
+    {
+     "role": "user",
+     "content": "x"
+    }
+   ],
+   "tools": null,
+   "add_generation_prompt": false,
+   "extra_context": {
+    "reasoning_effort": -0.1
+   },
+   "hf_error": "reasoning_effort must be in [0.0, 0.99]"
+  },
+  {
+   "kind": "chat_error",
+   "name": "effort_just_over",
+   "messages": [
+    {
+     "role": "user",
+     "content": "x"
+    }
+   ],
+   "tools": null,
+   "add_generation_prompt": false,
+   "extra_context": {
+    "reasoning_effort": 0.991
+   },
+   "hf_error": "reasoning_effort must be in [0.0, 0.99]"
+  },
+  {
+   "kind": "chat",
+   "name": "tools",
+   "messages": [
+    {
+     "role": "user",
+     "content": "Weather in Bangkok?"
+    }
+   ],
+   "tools": [
+    {
+     "type": "function",
+     "function": {
+      "name": "get_weather",
+      "description": "Get the current weather for a city.",
+      "parameters": {
+       "type": "object",
+       "properties": {
+        "units": {
+         "type": "string",
+         "enum": [
+          "celsius",
+          "fahrenheit"
+         ]
+        },
+        "city": {
+         "type": "string",
+         "description": "City name"
+        }
+       },
+       "required": [
+        "city"
+       ]
+      }
+     }
+    }
+   ],
+   "add_generation_prompt": false,
+   "extra_context": {},
+   "prompt": "<|message_system|>tool_declare<|content_xml|>[{\"description\":\"Get the current weather for a city.\",\"name\":\"get_weather\",\"parameters\":{\"properties\":{\"city\":{\"description\":\"City name\",\"type\":\"string\"},\"units\":{\"enum\":[\"celsius\",\"fahrenheit\"],\"type\":\"string\"}},\"required\":[\"city\"],\"type\":\"object\"},\"type\":\"function\"}]<|end_message|><|message_system|><|content_text|>Thinking effort level: 0.9<|end_message|><|message_user|><|content_text|>Weather in Bangkok?<|end_message|>",
+   "ids": [
+    200002,
+    2251,
+    62,
+    76529,
+    200024,
+    58,
+    90,
+    1,
+    70469,
+    1,
+    25,
+    1,
+    2131,
+    149876,
+    150517,
+    154046,
+    149887,
+    149878,
+    152652,
+    13,
+    1,
+    11,
+    1,
+    930,
+    1,
+    25,
+    1,
+    832,
+    62,
+    30847,
+    1,
+    11,
+    1,
+    71968,
+    1,
+    25,
+    90,
+    1,
+    71961,
+    1,
+    25,
+    90,
+    1,
+    2958,
+    1,
+    25,
+    90,
+    1,
+    70469,
+    1,
+    25,
+    1,
+    3278,
+    150231,
+    1,
+    11,
+    1,
+    1008,
+    1,
+    25,
+    1,
+    1485,
+    1,
+    92,
+    11,
+    1,
+    74370,
+    1,
+    25,
+    90,
+    1,
+    32529,
+    1,
+    25,
+    58,
+    1,
+    41276,
+    1,
+    11,
+    1,
+    45272,
+    36358,
+    1,
+    60,
+    11,
+    1,
+    1008,
+    1,
+    25,
+    1,
+    1485,
+    1,
+    92,
+    92,
+    11,
+    1,
+    69812,
+    1,
+    25,
+    58,
+    1,
+    2958,
+    1,
+    60,
+    11,
+    1,
+    1008,
+    1,
+    25,
+    1,
+    3156,
+    1,
+    92,
+    11,
+    1,
+    1008,
+    1,
+    25,
+    1,
+    36404,
+    1,
+    92,
+    60,
+    200010,
+    200002,
+    200004,
+    34182,
+    279,
+    154554,
+    150628,
+    25,
+    220,
+    15,
+    13,
+    24,
+    200010,
+    200000,
+    200004,
+    35120,
+    149881,
+    220,
+    43459,
+    30,
+    200010
+   ]
+  },
+  {
+   "kind": "chat",
+   "name": "tools_two_system",
+   "messages": [
+    {
+     "role": "system",
+     "content": "Be brief."
+    },
+    {
+     "role": "user",
+     "content": "Weather in Bangkok?"
+    }
+   ],
+   "tools": [
+    {
+     "type": "function",
+     "function": {
+      "name": "get_weather",
+      "description": "Get the current weather for a city.",
+      "parameters": {
+       "type": "object",
+       "properties": {
+        "units": {
+         "type": "string",
+         "enum": [
+          "celsius",
+          "fahrenheit"
+         ]
+        },
+        "city": {
+         "type": "string",
+         "description": "City name"
+        }
+       },
+       "required": [
+        "city"
+       ]
+      }
+     }
+    },
+    {
+     "type": "function",
+     "function": {
+      "name": "search",
+      "description": "Search the web (你好, café, 😀).",
+      "parameters": {
+       "type": "object",
+       "properties": {
+        "q": {
+         "type": "string"
+        },
+        "Filters": {
+         "type": "array",
+         "items": {
+          "type": "string"
+         }
+        },
+        "opts": {
+         "type": "object",
+         "properties": {
+          "limit": {
+           "type": "integer"
+          },
+          "Z": {
+           "type": "number"
+          }
+         }
+        }
+       }
+      }
+     }
+    }
+   ],
+   "add_generation_prompt": false,
+   "extra_context": {},
+   "prompt": "<|message_system|>tool_declare<|content_xml|>[{\"description\":\"Get the current weather for a city.\",\"name\":\"get_weather\",\"parameters\":{\"properties\":{\"city\":{\"description\":\"City name\",\"type\":\"string\"},\"units\":{\"enum\":[\"celsius\",\"fahrenheit\"],\"type\":\"string\"}},\"required\":[\"city\"],\"type\":\"object\"},\"type\":\"function\"},{\"description\":\"Search the web (你好, café, 😀).\",\"name\":\"search\",\"parameters\":{\"properties\":{\"Filters\":{\"items\":{\"type\":\"string\"},\"type\":\"array\"},\"opts\":{\"properties\":{\"Z\":{\"type\":\"number\"},\"limit\":{\"type\":\"integer\"}},\"type\":\"object\"},\"q\":{\"type\":\"string\"}},\"type\":\"object\"},\"type\":\"function\"}]<|end_message|><|message_system|><|content_text|>Be brief.<|end_message|><|message_system|><|content_text|>Thinking effort level: 0.9<|end_message|><|message_user|><|content_text|>Weather in Bangkok?<|end_message|>",
+   "ids": [
+    200002,
+    2251,
+    62,
+    76529,
+    200024,
+    58,
+    90,
+    1,
+    70469,
+    1,
+    25,
+    1,
+    2131,
+    149876,
+    150517,
+    154046,
+    149887,
+    149878,
+    152652,
+    13,
+    1,
+    11,
+    1,
+    930,
+    1,
+    25,
+    1,
+    832,
+    62,
+    30847,
+    1,
+    11,
+    1,
+    71968,
+    1,
+    25,
+    90,
+    1,
+    71961,
+    1,
+    25,
+    90,
+    1,
+    2958,
+    1,
+    25,
+    90,
+    1,
+    70469,
+    1,
+    25,
+    1,
+    3278,
+    150231,
+    1,
+    11,
+    1,
+    1008,
+    1,
+    25,
+    1,
+    1485,
+    1,
+    92,
+    11,
+    1,
+    74370,
+    1,
+    25,
+    90,
+    1,
+    32529,
+    1,
+    25,
+    58,
+    1,
+    41276,
+    1,
+    11,
+    1,
+    45272,
+    36358,
+    1,
+    60,
+    11,
+    1,
+    1008,
+    1,
+    25,
+    1,
+    1485,
+    1,
+    92,
+    92,
+    11,
+    1,
+    69812,
+    1,
+    25,
+    58,
+    1,
+    2958,
+    1,
+    60,
+    11,
+    1,
+    1008,
+    1,
+    25,
+    1,
+    3156,
+    1,
+    92,
+    11,
+    1,
+    1008,
+    1,
+    25,
+    1,
+    36404,
+    1,
+    92,
+    11,
+    90,
+    1,
+    70469,
+    1,
+    25,
+    1,
+    4245,
+    149876,
+    150630,
+    196976,
+    11739,
+    23643,
+    11,
+    162389,
+    11,
+    220,
+    110689,
+    8,
+    13,
+    1,
+    11,
+    1,
+    930,
+    1,
+    25,
+    1,
+    1404,
+    1,
+    11,
+    1,
+    71968,
+    1,
+    25,
+    90,
+    1,
+    71961,
+    1,
+    25,
+    90,
+    1,
+    35407,
+    82,
+    1,
+    25,
+    90,
+    1,
+    70681,
+    1,
+    25,
+    90,
+    1,
+    1008,
+    1,
+    25,
+    1,
+    1485,
+    1,
+    92,
+    11,
+    1,
+    1008,
+    1,
+    25,
+    1,
+    1525,
+    1,
+    92,
+    11,
+    1,
+    97135,
+    1,
+    25,
+    90,
+    1,
+    71961,
+    1,
+    25,
+    90,
+    1,
+    57,
+    1,
+    25,
+    90,
+    1,
+    1008,
+    1,
+    25,
+    1,
+    1158,
+    1,
+    92,
+    11,
+    1,
+    1982,
+    1,
+    25,
+    90,
+    1,
+    1008,
+    1,
+    25,
+    1,
+    4252,
+    1,
+    92,
+    92,
+    11,
+    1,
+    1008,
+    1,
+    25,
+    1,
+    3156,
+    1,
+    92,
+    11,
+    1,
+    80,
+    1,
+    25,
+    90,
+    1,
+    1008,
+    1,
+    25,
+    1,
+    1485,
+    1,
+    92,
+    92,
+    11,
+    1,
+    1008,
+    1,
+    25,
+    1,
+    3156,
+    1,
+    92,
+    11,
+    1,
+    1008,
+    1,
+    25,
+    1,
+    36404,
+    1,
+    92,
+    60,
+    200010,
+    200002,
+    200004,
+    1618,
+    156834,
+    13,
+    200010,
+    200002,
+    200004,
+    34182,
+    279,
+    154554,
+    150628,
+    25,
+    220,
+    15,
+    13,
+    24,
+    200010,
+    200000,
+    200004,
+    35120,
+    149881,
+    220,
+    43459,
+    30,
+    200010
+   ]
+  },
+  {
+   "kind": "chat",
+   "name": "tools_bare_and_nodesc",
+   "messages": [
+    {
+     "role": "user",
+     "content": "x"
+    }
+   ],
+   "tools": [
+    {
+     "name": "bare",
+     "parameters": {
+      "type": "object",
+      "properties": {}
+     }
+    },
+    {
+     "type": "function",
+     "function": {
+      "name": "nodesc"
+     }
+    }
+   ],
+   "add_generation_prompt": false,
+   "extra_context": {},
+   "prompt": "<|message_system|>tool_declare<|content_xml|>[{\"description\":\"\",\"name\":\"bare\",\"parameters\":{\"properties\":{},\"type\":\"object\"},\"type\":\"function\"},{\"description\":\"\",\"name\":\"nodesc\",\"parameters\":{},\"type\":\"function\"}]<|end_message|><|message_system|><|content_text|>Thinking effort level: 0.9<|end_message|><|message_user|><|content_text|>x<|end_message|>",
+   "ids": [
+    200002,
+    2251,
+    62,
+    76529,
+    200024,
+    58,
+    90,
+    1,
+    70469,
+    1,
+    25,
+    68723,
+    11,
+    1,
+    930,
+    1,
+    25,
+    1,
+    37640,
+    1,
+    11,
+    1,
+    71968,
+    1,
+    25,
+    90,
+    1,
+    71961,
+    1,
+    25,
+    70044,
+    11,
+    1,
+    1008,
+    1,
+    25,
+    1,
+    3156,
+    1,
+    92,
+    11,
+    1,
+    1008,
+    1,
+    25,
+    1,
+    36404,
+    1,
+    92,
+    11,
+    90,
+    1,
+    70469,
+    1,
+    25,
+    68723,
+    11,
+    1,
+    930,
+    1,
+    25,
+    1,
+    2164,
+    796,
+    1,
+    11,
+    1,
+    71968,
+    1,
+    25,
+    70044,
+    11,
+    1,
+    1008,
+    1,
+    25,
+    1,
+    36404,
+    1,
+    92,
+    60,
+    200010,
+    200002,
+    200004,
+    34182,
+    279,
+    154554,
+    150628,
+    25,
+    220,
+    15,
+    13,
+    24,
+    200010,
+    200000,
+    200004,
+    87,
+    200010
+   ]
+  },
+  {
+   "kind": "chat",
+   "name": "tools_empty_list",
+   "messages": [
+    {
+     "role": "user",
+     "content": "x"
+    }
+   ],
+   "tools": [],
+   "add_generation_prompt": false,
+   "extra_context": {},
+   "prompt": "<|message_system|><|content_text|>Thinking effort level: 0.9<|end_message|><|message_user|><|content_text|>x<|end_message|>",
+   "ids": [
+    200002,
+    200004,
+    34182,
+    279,
+    154554,
+    150628,
+    25,
+    220,
+    15,
+    13,
+    24,
+    200010,
+    200000,
+    200004,
+    87,
+    200010
+   ]
+  },
+  {
+   "kind": "chat",
+   "name": "tools_only_system",
+   "messages": [
+    {
+     "role": "system",
+     "content": ""
+    }
+   ],
+   "tools": [
+    {
+     "type": "function",
+     "function": {
+      "name": "search",
+      "description": "Search the web (你好, café, 😀).",
+      "parameters": {
+       "type": "object",
+       "properties": {
+        "q": {
+         "type": "string"
+        },
+        "Filters": {
+         "type": "array",
+         "items": {
+          "type": "string"
+         }
+        },
+        "opts": {
+         "type": "object",
+         "properties": {
+          "limit": {
+           "type": "integer"
+          },
+          "Z": {
+           "type": "number"
+          }
+         }
+        }
+       }
+      }
+     }
+    }
+   ],
+   "add_generation_prompt": false,
+   "extra_context": {},
+   "prompt": "<|message_system|>tool_declare<|content_xml|>[{\"description\":\"Search the web (你好, café, 😀).\",\"name\":\"search\",\"parameters\":{\"properties\":{\"Filters\":{\"items\":{\"type\":\"string\"},\"type\":\"array\"},\"opts\":{\"properties\":{\"Z\":{\"type\":\"number\"},\"limit\":{\"type\":\"integer\"}},\"type\":\"object\"},\"q\":{\"type\":\"string\"}},\"type\":\"object\"},\"type\":\"function\"}]<|end_message|><|message_system|><|content_text|><|end_message|><|message_system|><|content_text|>Thinking effort level: 0.9<|end_message|>",
+   "ids": [
+    200002,
+    2251,
+    62,
+    76529,
+    200024,
+    58,
+    90,
+    1,
+    70469,
+    1,
+    25,
+    1,
+    4245,
+    149876,
+    150630,
+    196976,
+    11739,
+    23643,
+    11,
+    162389,
+    11,
+    220,
+    110689,
+    8,
+    13,
+    1,
+    11,
+    1,
+    930,
+    1,
+    25,
+    1,
+    1404,
+    1,
+    11,
+    1,
+    71968,
+    1,
+    25,
+    90,
+    1,
+    71961,
+    1,
+    25,
+    90,
+    1,
+    35407,
+    82,
+    1,
+    25,
+    90,
+    1,
+    70681,
+    1,
+    25,
+    90,
+    1,
+    1008,
+    1,
+    25,
+    1,
+    1485,
+    1,
+    92,
+    11,
+    1,
+    1008,
+    1,
+    25,
+    1,
+    1525,
+    1,
+    92,
+    11,
+    1,
+    97135,
+    1,
+    25,
+    90,
+    1,
+    71961,
+    1,
+    25,
+    90,
+    1,
+    57,
+    1,
+    25,
+    90,
+    1,
+    1008,
+    1,
+    25,
+    1,
+    1158,
+    1,
+    92,
+    11,
+    1,
+    1982,
+    1,
+    25,
+    90,
+    1,
+    1008,
+    1,
+    25,
+    1,
+    4252,
+    1,
+    92,
+    92,
+    11,
+    1,
+    1008,
+    1,
+    25,
+    1,
+    3156,
+    1,
+    92,
+    11,
+    1,
+    80,
+    1,
+    25,
+    90,
+    1,
+    1008,
+    1,
+    25,
+    1,
+    1485,
+    1,
+    92,
+    92,
+    11,
+    1,
+    1008,
+    1,
+    25,
+    1,
+    3156,
+    1,
+    92,
+    11,
+    1,
+    1008,
+    1,
+    25,
+    1,
+    36404,
+    1,
+    92,
+    60,
+    200010,
+    200002,
+    200004,
+    200010,
+    200002,
+    200004,
+    34182,
+    279,
+    154554,
+    150628,
+    25,
+    220,
+    15,
+    13,
+    24,
+    200010
+   ]
+  },
+  {
+   "kind": "chat",
+   "name": "toolcall_basic",
+   "messages": [
+    {
+     "role": "user",
+     "content": "Weather?"
+    },
+    {
+     "role": "assistant",
+     "content": "",
+     "tool_calls": [
+      {
+       "id": "call_1",
+       "type": "function",
+       "function": {
+        "name": "get_weather",
+        "arguments": {
+         "city": "Bangkok",
+         "units": "celsius"
+        }
+       }
+      }
+     ]
+    },
+    {
+     "role": "tool",
+     "name": "get_weather",
+     "content": "{\"temp_c\": 33}"
+    }
+   ],
+   "tools": [
+    {
+     "type": "function",
+     "function": {
+      "name": "get_weather",
+      "description": "Get the current weather for a city.",
+      "parameters": {
+       "type": "object",
+       "properties": {
+        "units": {
+         "type": "string",
+         "enum": [
+          "celsius",
+          "fahrenheit"
+         ]
+        },
+        "city": {
+         "type": "string",
+         "description": "City name"
+        }
+       },
+       "required": [
+        "city"
+       ]
+      }
+     }
+    }
+   ],
+   "add_generation_prompt": false,
+   "extra_context": {},
+   "prompt": "<|message_system|>tool_declare<|content_xml|>[{\"description\":\"Get the current weather for a city.\",\"name\":\"get_weather\",\"parameters\":{\"properties\":{\"city\":{\"description\":\"City name\",\"type\":\"string\"},\"units\":{\"enum\":[\"celsius\",\"fahrenheit\"],\"type\":\"string\"}},\"required\":[\"city\"],\"type\":\"object\"},\"type\":\"function\"}]<|end_message|><|message_system|><|content_text|>Thinking effort level: 0.9<|end_message|><|message_user|><|content_text|>Weather?<|end_message|><|message_model|>get_weather<|content_invoke_tool_json|>{\"name\":\"get_weather\",\"args\":{\"city\":\"Bangkok\",\"units\":\"celsius\"}}<|end_message|><|content_model_end_sampling|><|message_tool|>get_weather<|content_text|>{\"temp_c\": 33}<|end_message|>",
+   "ids": [
+    200002,
+    2251,
+    62,
+    76529,
+    200024,
+    58,
+    90,
+    1,
+    70469,
+    1,
+    25,
+    1,
+    2131,
+    149876,
+    150517,
+    154046,
+    149887,
+    149878,
+    152652,
+    13,
+    1,
+    11,
+    1,
+    930,
+    1,
+    25,
+    1,
+    832,
+    62,
+    30847,
+    1,
+    11,
+    1,
+    71968,
+    1,
+    25,
+    90,
+    1,
+    71961,
+    1,
+    25,
+    90,
+    1,
+    2958,
+    1,
+    25,
+    90,
+    1,
+    70469,
+    1,
+    25,
+    1,
+    3278,
+    150231,
+    1,
+    11,
+    1,
+    1008,
+    1,
+    25,
+    1,
+    1485,
+    1,
+    92,
+    11,
+    1,
+    74370,
+    1,
+    25,
+    90,
+    1,
+    32529,
+    1,
+    25,
+    58,
+    1,
+    41276,
+    1,
+    11,
+    1,
+    45272,
+    36358,
+    1,
+    60,
+    11,
+    1,
+    1008,
+    1,
+    25,
+    1,
+    1485,
+    1,
+    92,
+    92,
+    11,
+    1,
+    69812,
+    1,
+    25,
+    58,
+    1,
+    2958,
+    1,
+    60,
+    11,
+    1,
+    1008,
+    1,
+    25,
+    1,
+    3156,
+    1,
+    92,
+    11,
+    1,
+    1008,
+    1,
+    25,
+    1,
+    36404,
+    1,
+    92,
+    60,
+    200010,
+    200002,
+    200004,
+    34182,
+    279,
+    154554,
+    150628,
+    25,
+    220,
+    15,
+    13,
+    24,
+    200010,
+    200000,
+    200004,
+    35120,
+    30,
+    200010,
+    200001,
+    832,
+    62,
+    30847,
+    200049,
+    90,
+    1,
+    930,
+    1,
+    25,
+    1,
+    832,
+    62,
+    30847,
+    1,
+    11,
+    1,
+    70747,
+    1,
+    25,
+    90,
+    1,
+    2958,
+    1,
+    25,
+    1,
+    43459,
+    1,
+    11,
+    1,
+    74370,
+    1,
+    25,
+    1,
+    41276,
+    1,
+    92,
+    92,
+    200010,
+    200006,
+    200003,
+    832,
+    62,
+    30847,
+    200004,
+    90,
+    1,
+    3286,
+    62,
+    66,
+    1,
+    25,
+    220,
+    68278,
+    92,
+    200010
+   ]
+  },
+  {
+   "kind": "chat",
+   "name": "toolcall_with_text_and_reasoning",
+   "messages": [
+    {
+     "role": "user",
+     "content": "Weather?"
+    },
+    {
+     "role": "assistant",
+     "content": "Let me check.",
+     "reasoning_content": "need the tool",
+     "tool_calls": [
+      {
+       "id": "call_1",
+       "type": "function",
+       "function": {
+        "name": "get_weather",
+        "arguments": {
+         "city": "Chiang Mai"
+        }
+       }
+      }
+     ]
+    },
+    {
+     "role": "tool",
+     "name": "get_weather",
+     "content": "sunny"
+    },
+    {
+     "role": "assistant",
+     "content": "It is sunny."
+    },
+    {
+     "role": "user",
+     "content": "ok"
+    }
+   ],
+   "tools": [
+    {
+     "type": "function",
+     "function": {
+      "name": "get_weather",
+      "description": "Get the current weather for a city.",
+      "parameters": {
+       "type": "object",
+       "properties": {
+        "units": {
+         "type": "string",
+         "enum": [
+          "celsius",
+          "fahrenheit"
+         ]
+        },
+        "city": {
+         "type": "string",
+         "description": "City name"
+        }
+       },
+       "required": [
+        "city"
+       ]
+      }
+     }
+    }
+   ],
+   "add_generation_prompt": false,
+   "extra_context": {},
+   "prompt": "<|message_system|>tool_declare<|content_xml|>[{\"description\":\"Get the current weather for a city.\",\"name\":\"get_weather\",\"parameters\":{\"properties\":{\"city\":{\"description\":\"City name\",\"type\":\"string\"},\"units\":{\"enum\":[\"celsius\",\"fahrenheit\"],\"type\":\"string\"}},\"required\":[\"city\"],\"type\":\"object\"},\"type\":\"function\"}]<|end_message|><|message_system|><|content_text|>Thinking effort level: 0.9<|end_message|><|message_user|><|content_text|>Weather?<|end_message|><|message_model|><|content_thinking|>need the tool<|end_message|><|message_model|><|content_text|>Let me check.<|end_message|><|message_model|>get_weather<|content_invoke_tool_json|>{\"name\":\"get_weather\",\"args\":{\"city\":\"Chiang Mai\"}}<|end_message|><|content_model_end_sampling|><|message_tool|>get_weather<|content_text|>sunny<|end_message|><|message_model|><|content_text|>It is sunny.<|end_message|><|content_model_end_sampling|><|message_user|><|content_text|>ok<|end_message|>",
+   "ids": [
+    200002,
+    2251,
+    62,
+    76529,
+    200024,
+    58,
+    90,
+    1,
+    70469,
+    1,
+    25,
+    1,
+    2131,
+    149876,
+    150517,
+    154046,
+    149887,
+    149878,
+    152652,
+    13,
+    1,
+    11,
+    1,
+    930,
+    1,
+    25,
+    1,
+    832,
+    62,
+    30847,
+    1,
+    11,
+    1,
+    71968,
+    1,
+    25,
+    90,
+    1,
+    71961,
+    1,
+    25,
+    90,
+    1,
+    2958,
+    1,
+    25,
+    90,
+    1,
+    70469,
+    1,
+    25,
+    1,
+    3278,
+    150231,
+    1,
+    11,
+    1,
+    1008,
+    1,
+    25,
+    1,
+    1485,
+    1,
+    92,
+    11,
+    1,
+    74370,
+    1,
+    25,
+    90,
+    1,
+    32529,
+    1,
+    25,
+    58,
+    1,
+    41276,
+    1,
+    11,
+    1,
+    45272,
+    36358,
+    1,
+    60,
+    11,
+    1,
+    1008,
+    1,
+    25,
+    1,
+    1485,
+    1,
+    92,
+    92,
+    11,
+    1,
+    69812,
+    1,
+    25,
+    58,
+    1,
+    2958,
+    1,
+    60,
+    11,
+    1,
+    1008,
+    1,
+    25,
+    1,
+    3156,
+    1,
+    92,
+    11,
+    1,
+    1008,
+    1,
+    25,
+    1,
+    36404,
+    1,
+    92,
+    60,
+    200010,
+    200002,
+    200004,
+    34182,
+    279,
+    154554,
+    150628,
+    25,
+    220,
+    15,
+    13,
+    24,
+    200010,
+    200000,
+    200004,
+    35120,
+    30,
+    200010,
+    200001,
+    200008,
+    1281,
+    149876,
+    151955,
+    200010,
+    200001,
+    200004,
+    2918,
+    149991,
+    150918,
+    13,
+    200010,
+    200001,
+    832,
+    62,
+    30847,
+    200049,
+    90,
+    1,
+    930,
+    1,
+    25,
+    1,
+    832,
+    62,
+    30847,
+    1,
+    11,
+    1,
+    70747,
+    1,
+    25,
+    90,
+    1,
+    2958,
+    1,
+    25,
+    1,
+    44453,
+    155600,
+    1,
+    92,
+    92,
+    200010,
+    200006,
+    200003,
+    832,
+    62,
+    30847,
+    200004,
+    3705,
+    3900,
+    200010,
+    200001,
+    200004,
+    1256,
+    149884,
+    151483,
+    3900,
+    13,
+    200010,
+    200006,
+    200000,
+    200004,
+    873,
+    200010
+   ]
+  },
+  {
+   "kind": "chat",
+   "name": "toolcall_nested_args",
+   "messages": [
+    {
+     "role": "user",
+     "content": "go"
+    },
+    {
+     "role": "assistant",
+     "content": "",
+     "tool_calls": [
+      {
+       "id": "call_1",
+       "type": "function",
+       "function": {
+        "name": "search",
+        "arguments": {
+         "q": "plain",
+         "Filters": [
+          "a",
+          "b",
+          {
+           "k": [
+            1,
+            2.5,
+            null,
+            true,
+            false
+           ]
+          }
+         ],
+         "opts": {
+          "Z": 1.5,
+          "limit": 3,
+          "a": {
+           "x": {
+            "y": []
+           }
+          }
+         },
+         "s_quote": "it's \"q\"",
+         "s_back": "a\\b",
+         "s_nl": "l1\nl2\r\tx",
+         "s_uni": "café ไทย 😀",
+         "i": 7,
+         "neg": -3,
+         "f": 1.5,
+         "f_exp": 1e-07,
+         "f_big": 1e+16,
+         "f_int": 3.0,
+         "t": true,
+         "fa": false,
+         "n": null,
+         "empty_lst": [],
+         "empty_dct": {},
+         "B_upper": 1,
+         "a_lower": 2,
+         "_under": 3,
+         "10": "numeric-key",
+         "9": "nine",
+         "éclair": "non-ascii key",
+         "ZZ": {
+          "b": 1,
+          "B": 2,
+          "a": 3
+         }
+        }
+       }
+      }
+     ]
+    }
+   ],
+   "tools": [
+    {
+     "type": "function",
+     "function": {
+      "name": "search",
+      "description": "Search the web (你好, café, 😀).",
+      "parameters": {
+       "type": "object",
+       "properties": {
+        "q": {
+         "type": "string"
+        },
+        "Filters": {
+         "type": "array",
+         "items": {
+          "type": "string"
+         }
+        },
+        "opts": {
+         "type": "object",
+         "properties": {
+          "limit": {
+           "type": "integer"
+          },
+          "Z": {
+           "type": "number"
+          }
+         }
+        }
+       }
+      }
+     }
+    }
+   ],
+   "add_generation_prompt": false,
+   "extra_context": {},
+   "prompt": "<|message_system|>tool_declare<|content_xml|>[{\"description\":\"Search the web (你好, café, 😀).\",\"name\":\"search\",\"parameters\":{\"properties\":{\"Filters\":{\"items\":{\"type\":\"string\"},\"type\":\"array\"},\"opts\":{\"properties\":{\"Z\":{\"type\":\"number\"},\"limit\":{\"type\":\"integer\"}},\"type\":\"object\"},\"q\":{\"type\":\"string\"}},\"type\":\"object\"},\"type\":\"function\"}]<|end_message|><|message_system|><|content_text|>Thinking effort level: 0.9<|end_message|><|message_user|><|content_text|>go<|end_message|><|message_model|>search<|content_invoke_tool_json|>{\"name\":\"search\",\"args\":{\"10\":\"numeric-key\",\"9\":\"nine\",\"B_upper\":1,\"Filters\":[\"a\",\"b\",{\"k\":[1,2.5,null,true,false]}],\"ZZ\":{\"b\":1,\"B\":2,\"a\":3},\"_under\":3,\"a_lower\":2,\"empty_dct\":{},\"empty_lst\":[],\"f\":1.5,\"f_big\":1e+16,\"f_exp\":1e-07,\"f_int\":3.0,\"fa\":false,\"i\":7,\"n\":null,\"neg\":-3,\"opts\":{\"Z\":1.5,\"limit\":3,\"a\":{\"x\":{\"y\":[]}}},\"q\":\"plain\",\"s_back\":\"a\\\\b\",\"s_nl\":\"l1\\nl2\\r\\tx\",\"s_quote\":\"it's \\\"q\\\"\",\"s_uni\":\"café ไทย 😀\",\"t\":true,\"éclair\":\"non-ascii key\"}}<|end_message|><|content_model_end_sampling|>",
+   "ids": [
+    200002,
+    2251,
+    62,
+    76529,
+    200024,
+    58,
+    90,
+    1,
+    70469,
+    1,
+    25,
+    1,
+    4245,
+    149876,
+    150630,
+    196976,
+    11739,
+    23643,
+    11,
+    162389,
+    11,
+    220,
+    110689,
+    8,
+    13,
+    1,
+    11,
+    1,
+    930,
+    1,
+    25,
+    1,
+    1404,
+    1,
+    11,
+    1,
+    71968,
+    1,
+    25,
+    90,
+    1,
+    71961,
+    1,
+    25,
+    90,
+    1,
+    35407,
+    82,
+    1,
+    25,
+    90,
+    1,
+    70681,
+    1,
+    25,
+    90,
+    1,
+    1008,
+    1,
+    25,
+    1,
+    1485,
+    1,
+    92,
+    11,
+    1,
+    1008,
+    1,
+    25,
+    1,
+    1525,
+    1,
+    92,
+    11,
+    1,
+    97135,
+    1,
+    25,
+    90,
+    1,
+    71961,
+    1,
+    25,
+    90,
+    1,
+    57,
+    1,
+    25,
+    90,
+    1,
+    1008,
+    1,
+    25,
+    1,
+    1158,
+    1,
+    92,
+    11,
+    1,
+    1982,
+    1,
+    25,
+    90,
+    1,
+    1008,
+    1,
+    25,
+    1,
+    4252,
+    1,
+    92,
+    92,
+    11,
+    1,
+    1008,
+    1,
+    25,
+    1,
+    3156,
+    1,
+    92,
+    11,
+    1,
+    80,
+    1,
+    25,
+    90,
+    1,
+    1008,
+    1,
+    25,
+    1,
+    1485,
+    1,
+    92,
+    92,
+    11,
+    1,
+    1008,
+    1,
+    25,
+    1,
+    3156,
+    1,
+    92,
+    11,
+    1,
+    1008,
+    1,
+    25,
+    1,
+    36404,
+    1,
+    92,
+    60,
+    200010,
+    200002,
+    200004,
+    34182,
+    279,
+    154554,
+    150628,
+    25,
+    220,
+    15,
+    13,
+    24,
+    200010,
+    200000,
+    200004,
+    850,
+    200010,
+    200001,
+    1404,
+    200049,
+    90,
+    1,
+    930,
+    1,
+    25,
+    1,
+    1404,
+    1,
+    11,
+    1,
+    70747,
+    1,
+    25,
+    90,
+    1,
+    68026,
+    1,
+    25,
+    1,
+    79671,
+    12,
+    1277,
+    1,
+    11,
+    1,
+    24,
+    1,
+    25,
+    1,
+    4130,
+    1,
+    11,
+    1,
+    33,
+    62,
+    39525,
+    1,
+    25,
+    16,
+    11,
+    1,
+    35407,
+    82,
+    1,
+    25,
+    58,
+    1,
+    64,
+    1,
+    11,
+    1,
+    65,
+    1,
+    11,
+    90,
+    1,
+    74,
+    1,
+    25,
+    58,
+    16,
+    11,
+    17,
+    13,
+    20,
+    11,
+    2451,
+    11,
+    1750,
+    11,
+    2121,
+    60,
+    92,
+    60,
+    11,
+    1,
+    146509,
+    1,
+    25,
+    90,
+    1,
+    65,
+    1,
+    25,
+    16,
+    11,
+    1,
+    33,
+    1,
+    25,
+    17,
+    11,
+    1,
+    64,
+    1,
+    25,
+    18,
+    92,
+    11,
+    1,
+    62,
+    1088,
+    1,
+    25,
+    18,
+    11,
+    1,
+    64,
+    62,
+    41254,
+    1,
+    25,
+    17,
+    11,
+    1,
+    3741,
+    62,
+    47424,
+    1,
+    25,
+    70044,
+    11,
+    1,
+    3741,
+    62,
+    65056,
+    1,
+    25,
+    69231,
+    11,
+    1,
+    69,
+    1,
+    25,
+    16,
+    13,
+    20,
+    11,
+    1,
+    69,
+    62,
+    3197,
+    1,
+    25,
+    16,
+    68,
+    10,
+    68080,
+    11,
+    1,
+    69,
+    62,
+    4841,
+    1,
+    25,
+    16,
+    68,
+    12,
+    68620,
+    11,
+    1,
+    69,
+    62,
+    407,
+    1,
+    25,
+    18,
+    13,
+    15,
+    11,
+    1,
+    1073,
+    1,
+    25,
+    2121,
+    11,
+    1,
+    72,
+    1,
+    25,
+    22,
+    11,
+    1,
+    77,
+    1,
+    25,
+    2451,
+    11,
+    1,
+    3101,
+    1,
+    25,
+    12,
+    18,
+    11,
+    1,
+    97135,
+    1,
+    25,
+    90,
+    1,
+    57,
+    1,
+    25,
+    16,
+    13,
+    20,
+    11,
+    1,
+    1982,
+    1,
+    25,
+    18,
+    11,
+    1,
+    64,
+    1,
+    25,
+    90,
+    1,
+    87,
+    1,
+    25,
+    90,
+    1,
+    88,
+    1,
+    25,
+    69231,
+    92,
+    92,
+    92,
+    11,
+    1,
+    80,
+    1,
+    25,
+    1,
+    2550,
+    1,
+    11,
+    1,
+    82,
+    62,
+    1257,
+    1,
+    25,
+    1,
+    64,
+    68566,
+    65,
+    1,
+    11,
+    1,
+    82,
+    62,
+    32168,
+    1,
+    25,
+    1,
+    75,
+    16,
+    59,
+    32168,
+    17,
+    59,
+    81,
+    59,
+    32911,
+    1,
+    11,
+    1,
+    82,
+    62,
+    31000,
+    1,
+    25,
+    1,
+    271,
+    6,
+    82,
+    196978,
+    1,
+    80,
+    59,
+    68723,
+    11,
+    1,
+    82,
+    62,
+    2879,
+    1,
+    25,
+    1,
+    85593,
+    220,
+    98064,
+    220,
+    110689,
+    1,
+    11,
+    1,
+    83,
+    1,
+    25,
+    1750,
+    11,
+    1,
+    109441,
+    1,
+    25,
+    1,
+    3932,
+    12,
+    39886,
+    150452,
+    1,
+    92,
+    92,
+    200010,
+    200006
+   ]
+  },
+  {
+   "kind": "chat",
+   "name": "toolcall_multi_and_empty_args",
+   "messages": [
+    {
+     "role": "user",
+     "content": "go"
+    },
+    {
+     "role": "assistant",
+     "content": "",
+     "tool_calls": [
+      {
+       "id": "c1",
+       "type": "function",
+       "function": {
+        "name": "a",
+        "arguments": {}
+       }
+      },
+      {
+       "id": "c2",
+       "type": "function",
+       "function": {
+        "name": "b",
+        "arguments": {
+         "x": 1
+        }
+       }
+      },
+      {
+       "id": "c3",
+       "type": "function",
+       "function": {
+        "name": "c",
+        "arguments": {
+         "y": "z"
+        }
+       }
+      }
+     ]
+    },
+    {
+     "role": "tool",
+     "tool_call_id": "c1",
+     "content": "r1"
+    },
+    {
+     "role": "tool",
+     "tool_call_id": "c2",
+     "content": "r2"
+    },
+    {
+     "role": "tool",
+     "tool_call_id": "c3",
+     "content": "r3"
+    }
+   ],
+   "tools": null,
+   "add_generation_prompt": false,
+   "extra_context": {},
+   "prompt": "<|message_system|><|content_text|>Thinking effort level: 0.9<|end_message|><|message_user|><|content_text|>go<|end_message|><|message_model|>a<|content_invoke_tool_json|>{\"name\":\"a\",\"args\":{}}<|end_message|><|message_model|>b<|content_invoke_tool_json|>{\"name\":\"b\",\"args\":{\"x\":1}}<|end_message|><|message_model|>c<|content_invoke_tool_json|>{\"name\":\"c\",\"args\":{\"y\":\"z\"}}<|end_message|><|content_model_end_sampling|><|message_tool|>a<|content_text|>r1<|end_message|><|message_tool|>b<|content_text|>r2<|end_message|><|message_tool|>c<|content_text|>r3<|end_message|>",
+   "ids": [
+    200002,
+    200004,
+    34182,
+    279,
+    154554,
+    150628,
+    25,
+    220,
+    15,
+    13,
+    24,
+    200010,
+    200000,
+    200004,
+    850,
+    200010,
+    200001,
+    64,
+    200049,
+    90,
+    1,
+    930,
+    1,
+    25,
+    1,
+    64,
+    1,
+    11,
+    1,
+    70747,
+    1,
+    25,
+    70044,
+    92,
+    200010,
+    200001,
+    65,
+    200049,
+    90,
+    1,
+    930,
+    1,
+    25,
+    1,
+    65,
+    1,
+    11,
+    1,
+    70747,
+    1,
+    25,
+    90,
+    1,
+    87,
+    1,
+    25,
+    16,
+    92,
+    92,
+    200010,
+    200001,
+    66,
+    200049,
+    90,
+    1,
+    930,
+    1,
+    25,
+    1,
+    66,
+    1,
+    11,
+    1,
+    70747,
+    1,
+    25,
+    90,
+    1,
+    88,
+    1,
+    25,
+    1,
+    89,
+    1,
+    92,
+    92,
+    200010,
+    200006,
+    200003,
+    64,
+    200004,
+    81,
+    16,
+    200010,
+    200003,
+    65,
+    200004,
+    81,
+    17,
+    200010,
+    200003,
+    66,
+    200004,
+    81,
+    18,
+    200010
+   ]
+  },
+  {
+   "kind": "chat",
+   "name": "toolcall_missing_arguments",
+   "messages": [
+    {
+     "role": "user",
+     "content": "go"
+    },
+    {
+     "role": "assistant",
+     "content": "",
+     "tool_calls": [
+      {
+       "id": "c",
+       "type": "function",
+       "function": {
+        "name": "a"
+       }
+      }
+     ]
+    }
+   ],
+   "tools": null,
+   "add_generation_prompt": false,
+   "extra_context": {},
+   "prompt": "<|message_system|><|content_text|>Thinking effort level: 0.9<|end_message|><|message_user|><|content_text|>go<|end_message|><|message_model|>a<|content_invoke_tool_json|>{\"name\":\"a\",\"args\":{}}<|end_message|><|content_model_end_sampling|>",
+   "ids": [
+    200002,
+    200004,
+    34182,
+    279,
+    154554,
+    150628,
+    25,
+    220,
+    15,
+    13,
+    24,
+    200010,
+    200000,
+    200004,
+    850,
+    200010,
+    200001,
+    64,
+    200049,
+    90,
+    1,
+    930,
+    1,
+    25,
+    1,
+    64,
+    1,
+    11,
+    1,
+    70747,
+    1,
+    25,
+    70044,
+    92,
+    200010,
+    200006
+   ]
+  },
+  {
+   "kind": "chat",
+   "name": "toolcall_arguments_none",
+   "messages": [
+    {
+     "role": "user",
+     "content": "go"
+    },
+    {
+     "role": "assistant",
+     "content": "",
+     "tool_calls": [
+      {
+       "id": "call_1",
+       "type": "function",
+       "function": {
+        "name": "a",
+        "arguments": null
+       }
+      }
+     ]
+    }
+   ],
+   "tools": null,
+   "add_generation_prompt": false,
+   "extra_context": {},
+   "prompt": "<|message_system|><|content_text|>Thinking effort level: 0.9<|end_message|><|message_user|><|content_text|>go<|end_message|><|message_model|>a<|content_invoke_tool_json|>{\"name\":\"a\",\"args\":{}}<|end_message|><|content_model_end_sampling|>",
+   "ids": [
+    200002,
+    200004,
+    34182,
+    279,
+    154554,
+    150628,
+    25,
+    220,
+    15,
+    13,
+    24,
+    200010,
+    200000,
+    200004,
+    850,
+    200010,
+    200001,
+    64,
+    200049,
+    90,
+    1,
+    930,
+    1,
+    25,
+    1,
+    64,
+    1,
+    11,
+    1,
+    70747,
+    1,
+    25,
+    70044,
+    92,
+    200010,
+    200006
+   ]
+  },
+  {
+   "kind": "chat",
+   "name": "toolcall_named_assistant_match",
+   "messages": [
+    {
+     "role": "user",
+     "content": "go"
+    },
+    {
+     "role": "assistant",
+     "content": "",
+     "name": "a",
+     "tool_calls": [
+      {
+       "id": "call_1",
+       "type": "function",
+       "function": {
+        "name": "a",
+        "arguments": {
+         "k": "v"
+        }
+       }
+      }
+     ]
+    }
+   ],
+   "tools": null,
+   "add_generation_prompt": false,
+   "extra_context": {},
+   "prompt": "<|message_system|><|content_text|>Thinking effort level: 0.9<|end_message|><|message_user|><|content_text|>go<|end_message|><|message_model|>a<|content_invoke_tool_json|>{\"name\":\"a\",\"args\":{\"k\":\"v\"}}<|end_message|><|content_model_end_sampling|>",
+   "ids": [
+    200002,
+    200004,
+    34182,
+    279,
+    154554,
+    150628,
+    25,
+    220,
+    15,
+    13,
+    24,
+    200010,
+    200000,
+    200004,
+    850,
+    200010,
+    200001,
+    64,
+    200049,
+    90,
+    1,
+    930,
+    1,
+    25,
+    1,
+    64,
+    1,
+    11,
+    1,
+    70747,
+    1,
+    25,
+    90,
+    1,
+    74,
+    1,
+    25,
+    1,
+    85,
+    1,
+    92,
+    92,
+    200010,
+    200006
+   ]
+  },
+  {
+   "kind": "chat",
+   "name": "toolcall_with_text_only_content",
+   "messages": [
+    {
+     "role": "user",
+     "content": "go"
+    },
+    {
+     "role": "assistant",
+     "content": "calling",
+     "tool_calls": [
+      {
+       "id": "call_1",
+       "type": "function",
+       "function": {
+        "name": "a",
+        "arguments": {
+         "k": "v"
+        }
+       }
+      }
+     ]
+    }
+   ],
+   "tools": null,
+   "add_generation_prompt": false,
+   "extra_context": {},
+   "prompt": "<|message_system|><|content_text|>Thinking effort level: 0.9<|end_message|><|message_user|><|content_text|>go<|end_message|><|message_model|><|content_text|>calling<|end_message|><|message_model|>a<|content_invoke_tool_json|>{\"name\":\"a\",\"args\":{\"k\":\"v\"}}<|end_message|><|content_model_end_sampling|>",
+   "ids": [
+    200002,
+    200004,
+    34182,
+    279,
+    154554,
+    150628,
+    25,
+    220,
+    15,
+    13,
+    24,
+    200010,
+    200000,
+    200004,
+    850,
+    200010,
+    200001,
+    200004,
+    93392,
+    200010,
+    200001,
+    64,
+    200049,
+    90,
+    1,
+    930,
+    1,
+    25,
+    1,
+    64,
+    1,
+    11,
+    1,
+    70747,
+    1,
+    25,
+    90,
+    1,
+    74,
+    1,
+    25,
+    1,
+    85,
+    1,
+    92,
+    92,
+    200010,
+    200006
+   ]
+  },
+  {
+   "kind": "chat",
+   "name": "tool_result_by_tool_call_id_unmatched",
+   "messages": [
+    {
+     "role": "user",
+     "content": "go"
+    },
+    {
+     "role": "assistant",
+     "content": "",
+     "tool_calls": [
+      {
+       "id": "c1",
+       "type": "function",
+       "function": {
+        "name": "a",
+        "arguments": {}
+       }
+      }
+     ]
+    },
+    {
+     "role": "tool",
+     "tool_call_id": "zzz",
+     "content": "r"
+    }
+   ],
+   "tools": null,
+   "add_generation_prompt": false,
+   "extra_context": {},
+   "prompt": "<|message_system|><|content_text|>Thinking effort level: 0.9<|end_message|><|message_user|><|content_text|>go<|end_message|><|message_model|>a<|content_invoke_tool_json|>{\"name\":\"a\",\"args\":{}}<|end_message|><|content_model_end_sampling|><|message_tool|><|content_text|>r<|end_message|>",
+   "ids": [
+    200002,
+    200004,
+    34182,
+    279,
+    154554,
+    150628,
+    25,
+    220,
+    15,
+    13,
+    24,
+    200010,
+    200000,
+    200004,
+    850,
+    200010,
+    200001,
+    64,
+    200049,
+    90,
+    1,
+    930,
+    1,
+    25,
+    1,
+    64,
+    1,
+    11,
+    1,
+    70747,
+    1,
+    25,
+    70044,
+    92,
+    200010,
+    200006,
+    200003,
+    200004,
+    81,
+    200010
+   ]
+  },
+  {
+   "kind": "chat",
+   "name": "tool_result_no_name_no_id",
+   "messages": [
+    {
+     "role": "user",
+     "content": "go"
+    },
+    {
+     "role": "tool",
+     "content": "r"
+    }
+   ],
+   "tools": null,
+   "add_generation_prompt": false,
+   "extra_context": {},
+   "prompt": "<|message_system|><|content_text|>Thinking effort level: 0.9<|end_message|><|message_user|><|content_text|>go<|end_message|><|message_tool|><|content_text|>r<|end_message|>",
+   "ids": [
+    200002,
+    200004,
+    34182,
+    279,
+    154554,
+    150628,
+    25,
+    220,
+    15,
+    13,
+    24,
+    200010,
+    200000,
+    200004,
+    850,
+    200010,
+    200003,
+    200004,
+    81,
+    200010
+   ]
+  },
+  {
+   "kind": "chat",
+   "name": "tool_result_name_wins_over_id",
+   "messages": [
+    {
+     "role": "user",
+     "content": "go"
+    },
+    {
+     "role": "assistant",
+     "content": "",
+     "tool_calls": [
+      {
+       "id": "c1",
+       "type": "function",
+       "function": {
+        "name": "a",
+        "arguments": {}
+       }
+      }
+     ]
+    },
+    {
+     "role": "tool",
+     "name": "explicit",
+     "tool_call_id": "c1",
+     "content": "r"
+    }
+   ],
+   "tools": null,
+   "add_generation_prompt": false,
+   "extra_context": {},
+   "prompt": "<|message_system|><|content_text|>Thinking effort level: 0.9<|end_message|><|message_user|><|content_text|>go<|end_message|><|message_model|>a<|content_invoke_tool_json|>{\"name\":\"a\",\"args\":{}}<|end_message|><|content_model_end_sampling|><|message_tool|>explicit<|content_text|>r<|end_message|>",
+   "ids": [
+    200002,
+    200004,
+    34182,
+    279,
+    154554,
+    150628,
+    25,
+    220,
+    15,
+    13,
+    24,
+    200010,
+    200000,
+    200004,
+    850,
+    200010,
+    200001,
+    64,
+    200049,
+    90,
+    1,
+    930,
+    1,
+    25,
+    1,
+    64,
+    1,
+    11,
+    1,
+    70747,
+    1,
+    25,
+    70044,
+    92,
+    200010,
+    200006,
+    200003,
+    76028,
+    200004,
+    81,
+    200010
+   ]
+  },
+  {
+   "kind": "chat",
+   "name": "tool_result_without_id_in_call",
+   "messages": [
+    {
+     "role": "user",
+     "content": "go"
+    },
+    {
+     "role": "assistant",
+     "content": "",
+     "tool_calls": [
+      {
+       "type": "function",
+       "function": {
+        "name": "a",
+        "arguments": {}
+       }
+      }
+     ]
+    },
+    {
+     "role": "tool",
+     "tool_call_id": "c1",
+     "content": "r"
+    }
+   ],
+   "tools": null,
+   "add_generation_prompt": false,
+   "extra_context": {},
+   "prompt": "<|message_system|><|content_text|>Thinking effort level: 0.9<|end_message|><|message_user|><|content_text|>go<|end_message|><|message_model|>a<|content_invoke_tool_json|>{\"name\":\"a\",\"args\":{}}<|end_message|><|content_model_end_sampling|><|message_tool|><|content_text|>r<|end_message|>",
+   "ids": [
+    200002,
+    200004,
+    34182,
+    279,
+    154554,
+    150628,
+    25,
+    220,
+    15,
+    13,
+    24,
+    200010,
+    200000,
+    200004,
+    850,
+    200010,
+    200001,
+    64,
+    200049,
+    90,
+    1,
+    930,
+    1,
+    25,
+    1,
+    64,
+    1,
+    11,
+    1,
+    70747,
+    1,
+    25,
+    70044,
+    92,
+    200010,
+    200006,
+    200003,
+    200004,
+    81,
+    200010
+   ]
+  },
+  {
+   "kind": "chat",
+   "name": "tool_result_json_content",
+   "messages": [
+    {
+     "role": "user",
+     "content": "go"
+    },
+    {
+     "role": "tool",
+     "name": "a",
+     "content": "{\"a\": [1, 2]}"
+    }
+   ],
+   "tools": null,
+   "add_generation_prompt": false,
+   "extra_context": {},
+   "prompt": "<|message_system|><|content_text|>Thinking effort level: 0.9<|end_message|><|message_user|><|content_text|>go<|end_message|><|message_tool|>a<|content_text|>{\"a\": [1, 2]}<|end_message|>",
+   "ids": [
+    200002,
+    200004,
+    34182,
+    279,
+    154554,
+    150628,
+    25,
+    220,
+    15,
+    13,
+    24,
+    200010,
+    200000,
+    200004,
+    850,
+    200010,
+    200003,
+    64,
+    200004,
+    90,
+    1,
+    64,
+    1,
+    25,
+    196989,
+    16,
+    11,
+    220,
+    17,
+    60,
+    92,
+    200010
+   ]
+  },
+  {
+   "kind": "chat_error",
+   "name": "toolcall_string_arguments",
+   "messages": [
+    {
+     "role": "user",
+     "content": "go"
+    },
+    {
+     "role": "assistant",
+     "content": "",
+     "tool_calls": [
+      {
+       "id": "call_1",
+       "type": "function",
+       "function": {
+        "name": "a",
+        "arguments": "{\"x\": 1}"
+       }
+      }
+     ]
+    }
+   ],
+   "tools": null,
+   "add_generation_prompt": false,
+   "extra_context": {},
+   "hf_error": "tool call arguments must be a parsed object, not a JSON string; canonicalize upstream"
+  },
+  {
+   "kind": "chat_error",
+   "name": "toolcall_list_arguments",
+   "messages": [
+    {
+     "role": "user",
+     "content": "go"
+    },
+    {
+     "role": "assistant",
+     "content": "",
+     "tool_calls": [
+      {
+       "id": "call_1",
+       "type": "function",
+       "function": {
+        "name": "a",
+        "arguments": [
+         1,
+         2
+        ]
+       }
+      }
+     ]
+    }
+   ],
+   "tools": null,
+   "add_generation_prompt": false,
+   "extra_context": {},
+   "hf_error": "tool call arguments must be an object"
+  },
+  {
+   "kind": "chat_error",
+   "name": "toolcall_name_mismatch",
+   "messages": [
+    {
+     "role": "user",
+     "content": "go"
+    },
+    {
+     "role": "assistant",
+     "content": "",
+     "name": "other",
+     "tool_calls": [
+      {
+       "id": "call_1",
+       "type": "function",
+       "function": {
+        "name": "a",
+        "arguments": {}
+       }
+      }
+     ]
+    }
+   ],
+   "tools": null,
+   "add_generation_prompt": false,
+   "extra_context": {},
+   "hf_error": "assistant name other does not match its tool call a"
+  },
+  {
+   "kind": "chat_error",
+   "name": "toolcall_missing_name",
+   "messages": [
+    {
+     "role": "user",
+     "content": "go"
+    },
+    {
+     "role": "assistant",
+     "content": "",
+     "tool_calls": [
+      {
+       "id": "c",
+       "type": "function",
+       "function": {
+        "arguments": {}
+       }
+      }
+     ]
+    }
+   ],
+   "tools": null,
+   "add_generation_prompt": false,
+   "extra_context": {},
+   "hf_error": "tool call function name must be a string"
+  },
+  {
+   "kind": "chat",
+   "name": "parts_text",
+   "messages": [
+    {
+     "role": "system",
+     "content": "sys"
+    },
+    {
+     "role": "user",
+     "content": [
+      {
+       "type": "text",
+       "text": "look: "
+      },
+      "tail",
+      {
+       "text": "no type"
+      },
+      {
+       "type": "input_text",
+       "text": "it"
+      }
+     ]
+    }
+   ],
+   "tools": null,
+   "add_generation_prompt": false,
+   "extra_context": {},
+   "prompt": "<|message_system|><|content_text|>sys<|end_message|><|message_system|><|content_text|>Thinking effort level: 0.9<|end_message|><|message_user|><|content_text|>look: <|end_message|><|message_user|><|content_text|>tail<|end_message|><|message_user|><|content_text|>no type<|end_message|><|message_user|><|content_text|>it<|end_message|>",
+   "ids": [
+    200002,
+    200004,
+    4496,
+    200010,
+    200002,
+    200004,
+    34182,
+    279,
+    154554,
+    150628,
+    25,
+    220,
+    15,
+    13,
+    24,
+    200010,
+    200000,
+    200004,
+    1782,
+    25,
+    220,
+    200010,
+    200000,
+    200004,
+    1641,
+    200010,
+    200000,
+    200004,
+    316,
+    150227,
+    200010,
+    200000,
+    200004,
+    271,
+    200010
+   ]
+  },
+  {
+   "kind": "chat",
+   "name": "part_image_user",
+   "messages": [
+    {
+     "role": "user",
+     "content": [
+      {
+       "type": "text",
+       "text": "what is this?"
+      },
+      {
+       "type": "image"
+      }
+     ]
+    }
+   ],
+   "tools": null,
+   "add_generation_prompt": false,
+   "extra_context": {},
+   "prompt": "<|message_system|><|content_text|>Thinking effort level: 0.9<|end_message|><|message_user|><|content_text|>what is this?<|end_message|><|message_user|><|content_image|><|unused_200054|><|end_message|>",
+   "ids": [
+    200002,
+    200004,
+    34182,
+    279,
+    154554,
+    150628,
+    25,
+    220,
+    15,
+    13,
+    24,
+    200010,
+    200000,
+    200004,
+    1420,
+    149884,
+    149928,
+    30,
+    200010,
+    200000,
+    200005,
+    200054,
+    200010
+   ]
+  },
+  {
+   "kind": "chat",
+   "name": "part_image_url_user",
+   "messages": [
+    {
+     "role": "user",
+     "content": [
+      {
+       "type": "image_url",
+       "image_url": {
+        "url": "data:image/png;base64,AAAA"
+       }
+      },
+      {
+       "type": "text",
+       "text": "x"
+      }
+     ]
+    }
+   ],
+   "tools": null,
+   "add_generation_prompt": false,
+   "extra_context": {},
+   "prompt": "<|message_system|><|content_text|>Thinking effort level: 0.9<|end_message|><|message_user|><|content_image|><|unused_200054|><|end_message|><|message_user|><|content_text|>x<|end_message|>",
+   "ids": [
+    200002,
+    200004,
+    34182,
+    279,
+    154554,
+    150628,
+    25,
+    220,
+    15,
+    13,
+    24,
+    200010,
+    200000,
+    200005,
+    200054,
+    200010,
+    200000,
+    200004,
+    87,
+    200010
+   ]
+  },
+  {
+   "kind": "chat",
+   "name": "part_image_only",
+   "messages": [
+    {
+     "role": "user",
+     "content": [
+      {
+       "type": "input_image"
+      }
+     ]
+    }
+   ],
+   "tools": null,
+   "add_generation_prompt": false,
+   "extra_context": {},
+   "prompt": "<|message_system|><|content_text|>Thinking effort level: 0.9<|end_message|><|message_user|><|content_image|><|unused_200054|><|end_message|>",
+   "ids": [
+    200002,
+    200004,
+    34182,
+    279,
+    154554,
+    150628,
+    25,
+    220,
+    15,
+    13,
+    24,
+    200010,
+    200000,
+    200005,
+    200054,
+    200010
+   ]
+  },
+  {
+   "kind": "chat",
+   "name": "part_image_tool",
+   "messages": [
+    {
+     "role": "user",
+     "content": "go"
+    },
+    {
+     "role": "tool",
+     "name": "shot",
+     "content": [
+      {
+       "type": "image"
+      }
+     ]
+    }
+   ],
+   "tools": null,
+   "add_generation_prompt": false,
+   "extra_context": {},
+   "prompt": "<|message_system|><|content_text|>Thinking effort level: 0.9<|end_message|><|message_user|><|content_text|>go<|end_message|><|message_tool|>shot<|content_image|><|unused_200054|><|end_message|>",
+   "ids": [
+    200002,
+    200004,
+    34182,
+    279,
+    154554,
+    150628,
+    25,
+    220,
+    15,
+    13,
+    24,
+    200010,
+    200000,
+    200004,
+    850,
+    200010,
+    200003,
+    3679,
+    200005,
+    200054,
+    200010
+   ]
+  },
+  {
+   "kind": "chat",
+   "name": "part_empty_list_content",
+   "messages": [
+    {
+     "role": "user",
+     "content": []
+    }
+   ],
+   "tools": null,
+   "add_generation_prompt": false,
+   "extra_context": {},
+   "prompt": "<|message_system|><|content_text|>Thinking effort level: 0.9<|end_message|>",
+   "ids": [
+    200002,
+    200004,
+    34182,
+    279,
+    154554,
+    150628,
+    25,
+    220,
+    15,
+    13,
+    24,
+    200010
+   ]
+  },
+  {
+   "kind": "chat",
+   "name": "part_non_string_text",
+   "messages": [
+    {
+     "role": "user",
+     "content": [
+      {
+       "type": "text",
+       "text": 5
+      }
+     ]
+    }
+   ],
+   "tools": null,
+   "add_generation_prompt": false,
+   "extra_context": {},
+   "prompt": "<|message_system|><|content_text|>Thinking effort level: 0.9<|end_message|><|message_user|><|content_text|><|end_message|>",
+   "ids": [
+    200002,
+    200004,
+    34182,
+    279,
+    154554,
+    150628,
+    25,
+    220,
+    15,
+    13,
+    24,
+    200010,
+    200000,
+    200004,
+    200010
+   ]
+  },
+  {
+   "kind": "chat",
+   "name": "assistant_parts",
+   "messages": [
+    {
+     "role": "user",
+     "content": "q"
+    },
+    {
+     "role": "assistant",
+     "content": [
+      {
+       "type": "text",
+       "text": "a1"
+      },
+      {
+       "type": "text",
+       "text": "a2"
+      }
+     ]
+    },
+    {
+     "role": "user",
+     "content": "q2"
+    }
+   ],
+   "tools": null,
+   "add_generation_prompt": false,
+   "extra_context": {},
+   "prompt": "<|message_system|><|content_text|>Thinking effort level: 0.9<|end_message|><|message_user|><|content_text|>q<|end_message|><|message_model|><|content_text|>a1<|end_message|><|message_model|><|content_text|>a2<|end_message|><|content_model_end_sampling|><|message_user|><|content_text|>q2<|end_message|>",
+   "ids": [
+    200002,
+    200004,
+    34182,
+    279,
+    154554,
+    150628,
+    25,
+    220,
+    15,
+    13,
+    24,
+    200010,
+    200000,
+    200004,
+    80,
+    200010,
+    200001,
+    200004,
+    64,
+    16,
+    200010,
+    200001,
+    200004,
+    64,
+    17,
+    200010,
+    200006,
+    200000,
+    200004,
+    80,
+    17,
+    200010
+   ]
+  },
+  {
+   "kind": "chat",
+   "name": "assistant_parts_with_reasoning_and_call",
+   "messages": [
+    {
+     "role": "user",
+     "content": "q"
+    },
+    {
+     "role": "assistant",
+     "content": [
+      {
+       "type": "text",
+       "text": "part"
+      }
+     ],
+     "reasoning_content": "r",
+     "tool_calls": [
+      {
+       "id": "call_1",
+       "type": "function",
+       "function": {
+        "name": "a",
+        "arguments": {
+         "k": 1
+        }
+       }
+      }
+     ]
+    }
+   ],
+   "tools": null,
+   "add_generation_prompt": false,
+   "extra_context": {},
+   "prompt": "<|message_system|><|content_text|>Thinking effort level: 0.9<|end_message|><|message_user|><|content_text|>q<|end_message|><|message_model|><|content_thinking|>r<|end_message|><|message_model|><|content_text|>part<|end_message|><|message_model|>a<|content_invoke_tool_json|>{\"name\":\"a\",\"args\":{\"k\":1}}<|end_message|><|content_model_end_sampling|>",
+   "ids": [
+    200002,
+    200004,
+    34182,
+    279,
+    154554,
+    150628,
+    25,
+    220,
+    15,
+    13,
+    24,
+    200010,
+    200000,
+    200004,
+    80,
+    200010,
+    200001,
+    200008,
+    81,
+    200010,
+    200001,
+    200004,
+    863,
+    200010,
+    200001,
+    64,
+    200049,
+    90,
+    1,
+    930,
+    1,
+    25,
+    1,
+    64,
+    1,
+    11,
+    1,
+    70747,
+    1,
+    25,
+    90,
+    1,
+    74,
+    1,
+    25,
+    16,
+    92,
+    92,
+    200010,
+    200006
+   ]
+  },
+  {
+   "kind": "chat_error",
+   "name": "part_image_assistant",
+   "messages": [
+    {
+     "role": "user",
+     "content": "q"
+    },
+    {
+     "role": "assistant",
+     "content": [
+      {
+       "type": "image"
+      }
+     ]
+    }
+   ],
+   "tools": null,
+   "add_generation_prompt": false,
+   "extra_context": {},
+   "hf_error": "Image content is only supported for user and tool messages"
+  },
+  {
+   "kind": "chat_error",
+   "name": "part_image_system",
+   "messages": [
+    {
+     "role": "system",
+     "content": [
+      {
+       "type": "image"
+      }
+     ]
+    },
+    {
+     "role": "user",
+     "content": "x"
+    }
+   ],
+   "tools": null,
+   "add_generation_prompt": false,
+   "extra_context": {},
+   "hf_error": "Image content is only supported for user and tool messages"
+  },
+  {
+   "kind": "chat_error",
+   "name": "part_audio",
+   "messages": [
+    {
+     "role": "user",
+     "content": [
+      {
+       "type": "audio"
+      }
+     ]
+    }
+   ],
+   "tools": null,
+   "add_generation_prompt": false,
+   "extra_context": {},
+   "hf_error": "Inkling 2 does not accept audio input"
+  },
+  {
+   "kind": "chat_error",
+   "name": "part_unknown_type",
+   "messages": [
+    {
+     "role": "user",
+     "content": [
+      {
+       "type": "video"
+      }
+     ]
+    }
+   ],
+   "tools": null,
+   "add_generation_prompt": false,
+   "extra_context": {},
+   "hf_error": "Unsupported content part type: video"
+  },
+  {
+   "kind": "chat_error",
+   "name": "unknown_role",
+   "messages": [
+    {
+     "role": "user",
+     "content": "q"
+    },
+    {
+     "role": "ipython",
+     "content": "out"
+    }
+   ],
+   "tools": null,
+   "add_generation_prompt": false,
+   "extra_context": {},
+   "hf_error": "Unknown message role: ipython"
+  }
+ ]
+}

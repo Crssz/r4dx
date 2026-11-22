@@ -77,6 +77,30 @@ add_test(NAME tokenizer_golden_nanbeige
                                   --model-dir ${R4DX_NANBEIGE_TOKENIZER_DIR})
 set_tests_properties(tokenizer_golden_nanbeige PROPERTIES SKIP_RETURN_CODE 77)
 
+# Inkling-2-Mini (byte-level BPE with the o200k-style split regex -- hand-written splitter src/tokenizer/o200k_split.cpp --,
+# ignore_merges, 60 special added tokens, no normalizer, no automatic BOS): golden_inkling2.json from
+# tools/tok_ref/gen_golden_inkling2.py and the chat-template goldens chat_inkling2_golden.json from
+# tools/tok_ref/gen_chat_golden_inkling2.py. The model dir is the checkpoint dir (tokenizer.json, tokenizer_config.json,
+# chat_template.jinja, generation_config.json). Override with R4DX_INKLING2_TOKENIZER_DIR.
+if(DEFINED ENV{R4DX_INKLING2_TOKENIZER_DIR})
+  set(_r4dx_inkling2_tok_default "$ENV{R4DX_INKLING2_TOKENIZER_DIR}")
+else()
+  set(_r4dx_inkling2_tok_default "${R4DX_MODELS_ROOT}/OpenUncensored/Inkling-2-Mini-Uncensored")
+endif()
+set(R4DX_INKLING2_TOKENIZER_DIR "${_r4dx_inkling2_tok_default}" CACHE PATH
+    "Directory containing the Inkling-2-Mini tokenizer.json/tokenizer_config.json/chat_template.jinja/generation_config.json")
+add_test(NAME tokenizer_golden_inkling2
+         COMMAND tokenizer_golden --golden ${CMAKE_CURRENT_SOURCE_DIR}/golden_inkling2.json
+                                  --model-dir ${R4DX_INKLING2_TOKENIZER_DIR})
+set_tests_properties(tokenizer_golden_inkling2 PROPERTIES SKIP_RETURN_CODE 77)
+add_test(NAME tokenizer_chat_inkling2
+         COMMAND tokenizer_golden --golden ${CMAKE_CURRENT_SOURCE_DIR}/chat_inkling2_golden.json
+                                  --model-dir ${R4DX_INKLING2_TOKENIZER_DIR})
+set_tests_properties(tokenizer_chat_inkling2 PROPERTIES SKIP_RETURN_CODE 77)
+
+# Fuzz of the o200k splitter + BPE against HF (tools/tok_ref/fuzz_inkling2.py drives the CLI below; not a CTest test).
+add_executable(tokenizer_fuzz_inkling2 fuzz_inkling2.cpp)
+target_link_libraries(tokenizer_fuzz_inkling2 PRIVATE r4dx_tokenizer)
 if(NOT EXISTS "${R4DX_TOKENIZER_MODEL_DIR}/tokenizer.json")
   message(WARNING "tests/tokenizer: ${R4DX_TOKENIZER_MODEL_DIR}/tokenizer.json not found; "
                    "'tokenizer_golden' is registered but will report SKIPPED at run time. Set "

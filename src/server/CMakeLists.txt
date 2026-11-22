@@ -18,6 +18,7 @@ add_library(r4dx_server_core STATIC
   tool_call_parser.cpp
   gemma_tool_call_parser.cpp
   lfm2_tool_call_parser.cpp
+  inkling2_stream_parser.cpp
   dialect.cpp
   tool_stream_gate.cpp
   reasoning_splitter.cpp

@@ -7,6 +7,7 @@
 add_library(r4dx_tokenizer STATIC
   bpe_tokenizer.cpp
   chat_template.cpp
+  o200k_split.cpp
   vendor/llamacpp_unicode/unicode.cpp
   vendor/llamacpp_unicode/unicode-data.cpp
 )

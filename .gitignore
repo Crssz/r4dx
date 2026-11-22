@@ -12,6 +12,9 @@ __pycache__/
 # Committed test fixtures are an intentional exception to the blanket *.safetensors rule above
 # (they're tiny, hand-generated inputs the convert tests read at runtime, not model checkpoints).
 !tests/convert/fixtures/*.safetensors
+# The 1.4 MB synthetic inkling2_loop checkpoint (tools/convert_ref/make_tiny_inkling2.py, deterministic; its HF logits are
+# logits.npy next to it) that convert_inkling2_layout and the tiny e2e read; without it the layout test aborts.
+!tests/convert/data/inkling2_tiny/model.safetensors
 
 # tests/kernels/test_kernel_bandwidth.cpp's --capture golden (review finding, 2026-09-20): a
 # ~19 MB binary, fully regenerable by `test_kernel_bandwidth --capture <path>` against the pre-P6

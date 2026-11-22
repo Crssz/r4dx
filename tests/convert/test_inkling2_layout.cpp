@@ -917,14 +917,27 @@ void TestExe() {
 }  // namespace
 
 int main() {
-  TestConfig();
-  TestMerge();
-  TestRealGeometry();
+  // An exception escaping a stage would otherwise end in std::terminate (0xc0000409 on Windows) with the buffered
+  // stdout lost, which tells nothing about where it failed.
+  const char* stage = "start";
+  try {
+    stage = "TestConfig";
+    TestConfig();
+    stage = "TestMerge";
+    TestMerge();
+    stage = "TestRealGeometry";
+    TestRealGeometry();
 #if defined(R4DX_CONVERT_EXE)
-  TestExe();
+    stage = "TestExe";
+    TestExe();
 #else
-  std::printf("SKIP: (b) needs the r4dx-convert target\n");
+    std::printf("SKIP: (b) needs the r4dx-convert target\n");
 #endif
+  } catch (const std::exception& e) {
+    std::fflush(stdout);
+    std::fprintf(stderr, "uncaught exception in %s: %s\n", stage, e.what());
+    return 1;
+  }
   if (g_failures != 0) {
     std::fprintf(stderr, "%d check(s) FAILED\n", g_failures);
     return 1;

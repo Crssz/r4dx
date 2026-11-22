@@ -478,9 +478,10 @@ def build_gate_groups(chat_items: list[dict], raw_items: list[dict]) -> list[tup
 def gate_gemma_fp32_markdown(res: dict) -> str:
     quant = res["mode"] == "quantized-increment"
     slack = res["rule"]["kl_slack"]
-    title = {"gemma-fp32": "Gemma", "lfm2-fp32": "LFM2"}.get(res["gate"], res["gate"])
+    title = {"gemma-fp32": "Gemma", "lfm2-fp32": "LFM2", "inkling2-fp32": "Inkling2"}.get(res["gate"], res["gate"])
     L = [f"# {title} fp32-truth gate -- test `{res['test_dir']}`",
-         f"- truth `{res['truth_dir']}`; noise (HF bf16 sdpa) `{res['noise_dir']}`"
+         f"- truth `{res['truth_dir']}`; noise (HF bf16 {'eager' if res['gate'] == 'inkling2-fp32' else 'sdpa'}) "
+         f"`{res['noise_dir']}`"
          + (f"; base (r4dx bf16) `{res['base_dir']}`" if quant else ""),
          "- rule: " + ("KL(truth||quant) - KL(truth||r4dx-bf16) <= 0.01 per group (quantized: increment)" if quant else
                       f"mean KL <= {GATE_KL_FACTOR} x noise KL + {slack}; top-1 >= noise top-1 - "
@@ -572,6 +573,9 @@ def gate_gemma_fp32(truth_dir: Path, noise_dir: Path, test_dir: Path, chat_token
 
 LFM2_EPS_CANDIDATES = (0.0025, 0.005, 0.01)
 
+#: `--gate inkling2-fp32` (docs/inkling2-plan.md 7): the lfm2-fp32 rule, but with a DEFAULT epsilon (Gemma's 0.005).
+INKLING2_EPSILON = GATE_KL_SLACK
+
 
 def lfm2_noise_term(truth_dir: Path, noise_dir: Path, chat_tokens: Path, raw_tokens: Path | None = None,
                     raw_max_tokens: int = 512, raw_names: list[str] | None = None, row_chunk: int = 32,
@@ -610,9 +614,9 @@ def lfm2_noise_term(truth_dir: Path, noise_dir: Path, chat_tokens: Path, raw_tok
                             for i in items + raw_items]}
 
 
-def lfm2_noise_markdown(res: dict) -> str:
+def lfm2_noise_markdown(res: dict, title: str = "LFM2", noise_label: str = "HF-bf16-sdpa") -> str:
     cands = [f"{e:g}" for e in res["epsilon_candidates"]]
-    L = [f"# LFM2 noise term KL(truth||HF-bf16-sdpa) -- noise `{res['noise_dir']}`", f"- truth `{res['truth_dir']}`",
+    L = [f"# {title} noise term KL(truth||{noise_label}) -- noise `{res['noise_dir']}`", f"- truth `{res['truth_dir']}`",
          f"- gate rule (epsilon to be chosen from this): mean KL <= {res['kl_factor']} x noise KL + epsilon; "
          f"top-1 >= noise top-1 - {res['top1_slack_pts']:g} pt", "",
          "| group | rows | noise mean KL | median | p99 | noise top-1 | top-1 min | "
@@ -759,14 +763,17 @@ def main() -> int:
     ap.add_argument("--use-score-mask", action="store_true",
                     help="score-mask aware mode for the plain report: segments of --tokens that carry a "
                          "`score_mask` are aggregated over the model-turn rows only")
-    ap.add_argument("--gate", choices=["gemma-fp32", "lfm2-fp32"], default=None,
+    ap.add_argument("--gate", choices=["gemma-fp32", "lfm2-fp32", "inkling2-fp32"], default=None,
                     help="gemma-fp32: the M1 gate against the fp32 truth (see the section comment above "
                          "gate_gemma_fp32); needs --truth-dir --noise-dir --test-dir and --tokens=chat_gemma.json. "
                          "lfm2-fp32: the same rule with an EXPLICIT --epsilon (no default); without --test-dir it "
-                         "prints the measured noise term and the thresholds implied by --epsilon-candidates")
+                         "prints the measured noise term and the thresholds implied by --epsilon-candidates. "
+                         "inkling2-fp32: the lfm2 rule with a DEFAULT epsilon of 0.005 (--epsilon overrides); "
+                         "truth = fp32 CPU dump, noise = HF bf16 eager dump (tools/reference/inkling2/ref.py)")
     ap.add_argument("--epsilon", type=float, default=None,
                     help="lfm2-fp32: the KL slack of the rule (set from the measured noise term; required with "
-                         "--test-dir unless --base-dir judges a quantized increment)")
+                         "--test-dir unless --base-dir judges a quantized increment); inkling2-fp32: optional "
+                         "override of the default 0.005")
     ap.add_argument("--epsilon-candidates", default=",".join(f"{e:g}" for e in LFM2_EPS_CANDIDATES),
                     help="lfm2-fp32 noise report: comma list of epsilons to show thresholds for")
     ap.add_argument("--truth-dir", type=Path, help="gate: fp32-truth dump dir")
@@ -819,6 +826,35 @@ def main() -> int:
         res = gate_gemma_fp32(args.truth_dir, args.noise_dir, args.test_dir, args.tokens, args.raw_tokens,
                               args.raw_max_tokens, raw_names, args.base_dir, args.row_chunk, strict=strict,
                               slack=0.0 if args.epsilon is None else args.epsilon, gate_name="lfm2-fp32")
+        print(gate_gemma_fp32_markdown(res))
+        if args.out:
+            args.out.parent.mkdir(parents=True, exist_ok=True)
+            args.out.write_text(json.dumps({"generated_at": dt.datetime.now(dt.timezone.utc).isoformat(), **res},
+                                           indent=2), encoding="utf-8")
+            print(f"\n[kl_report] wrote {args.out}")
+        return 0 if res["pass"] else 1
+    if args.gate == "inkling2-fp32":
+        # Inkling-2-Mini (docs/inkling2-plan.md 7): the lfm2-fp32 rule with the DEFAULT epsilon 0.005 (Gemma's), still
+        # overridable with --epsilon; the HF-bf16 noise side is the eager bf16 dump (this model has no sdpa).
+        missing = [n for n, v in (("--truth-dir", args.truth_dir), ("--noise-dir", args.noise_dir),
+                                  ("--tokens", args.tokens)) if v is None]
+        if missing:
+            raise SystemExit(f"[kl_report] --gate inkling2-fp32 needs {', '.join(missing)}")
+        raw_names = None if args.raw_segment is None else args.raw_segment.split(",")
+        strict = not args.allow_mismatch
+        if args.test_dir is None:
+            cands = tuple(float(x) for x in args.epsilon_candidates.split(",") if x.strip())
+            res = lfm2_noise_term(args.truth_dir, args.noise_dir, args.tokens, args.raw_tokens, args.raw_max_tokens,
+                                  raw_names, args.row_chunk, strict, cands)
+            print(lfm2_noise_markdown(res, title="Inkling2", noise_label="HF-bf16-eager"))
+            if args.out:
+                args.out.parent.mkdir(parents=True, exist_ok=True)
+                args.out.write_text(json.dumps({"generated_at": dt.datetime.now(dt.timezone.utc).isoformat(), **res},
+                                               indent=2), encoding="utf-8")
+            return 0
+        res = gate_gemma_fp32(args.truth_dir, args.noise_dir, args.test_dir, args.tokens, args.raw_tokens,
+                              args.raw_max_tokens, raw_names, args.base_dir, args.row_chunk, strict=strict,
+                              slack=INKLING2_EPSILON if args.epsilon is None else args.epsilon, gate_name="inkling2-fp32")
         print(gate_gemma_fp32_markdown(res))
         if args.out:
             args.out.parent.mkdir(parents=True, exist_ok=True)

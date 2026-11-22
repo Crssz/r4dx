@@ -1,4 +1,4 @@
-﻿// r4dx::model::Layout / QuantLinear -- the on-disk-layout tag and one quantized linear weight's
+// r4dx::model::Layout / QuantLinear -- the on-disk-layout tag and one quantized linear weight's
 // device buffers (docs/container-format.md "Quantized layout tensors"). Split out of container.h
 // (decode-perf pass, 2026-09-19) so this type can be shared by both r4dx_model (Container/linear.h)
 // and r4dx_model_attention (AttentionLayer's qg/o linears) without either depending on the other's
@@ -12,7 +12,9 @@
 
 #include "r4d.h"  // r4d_gemm_w4a16_nt_m64_group()/_has_group() -- see CheckW4a16Group below
 #include "r4dx/core/device_buffer.hpp"
+#include "r4dx/kernels/mxfp8_gemm.h"  // r4dx_gemm_mxfp8_group -- CheckMxfp8Meta
 #include "r4dx/kernels/w8a16_gemm.h"  // r4dx_gemm_w8a16_has_group / _scale_log2_bias -- CheckW8a16Meta
+#include "mxfp8_meta.h"
 #include "w8a16_meta.h"
 
 namespace r4dx::model {
@@ -20,8 +22,8 @@ namespace r4dx::model {
 // The numeric values are load-bearing (PickTuning's cache key in linear.cpp, the tuning tables,
 // TP part serialisation) and predate the retirement of the mxfp4 (1) and w4a8 (3) layouts, so
 // they are pinned explicitly: kBf16 = 0, kW4a16 = 2, kTrellis = 4, kW8a16 = 5 (docs/w8a16.md 6.1;
-// it does not reuse the retired 1 or 3). Do not renumber.
-enum class Layout { kBf16 = 0, kW4a16 = 2, kTrellis = 4, kW8a16 = 5 };
+// it does not reuse the retired 1 or 3), kMxfp8 = 6 (docs/inkling2-plan.md 4.1). Do not renumber.
+enum class Layout { kBf16 = 0, kW4a16 = 2, kTrellis = 4, kW8a16 = 5, kMxfp8 = 6 };
 
 const char* LayoutName(Layout l);
 Layout LayoutFromName(const std::string& name);  // throws on an unrecognized name
@@ -92,6 +94,13 @@ inline void CheckTrellisRate(int bits, const std::string& base, const std::strin
 inline void CheckW8a16Meta(int group, int scale_log2_bias, const std::string& what) {
   CheckW8a16MetaAgainst(group, scale_log2_bias, r4dx_gemm_w8a16_has_group(group) != 0,
                         r4dx_gemm_w8a16_scale_log2_bias(), what);
+}
+
+// MXFP8 (docs/inkling2-plan.md 4.1): the container's `quant.mxfp8.group` against the group this build's
+// r4dx_gemm_mxfp8_nt reads (the decision is mxfp8_meta.h's CPU-testable CheckMxfp8MetaAgainst). Throws
+// Mxfp8FormatMismatch.
+inline void CheckMxfp8Meta(int group, const std::string& what) {
+  CheckMxfp8MetaAgainst(group, r4dx_gemm_mxfp8_group(), what);
 }
 
 // One linear weight W[N,K], uploaded in exactly one of the on-disk layouts
@@ -170,6 +179,13 @@ struct QuantLinear {
   core::DeviceBuffer<uint8_t> w8_wq;
   core::DeviceBuffer<uint16_t> w8_ws;
   int w8a16_group = 0;
+
+  // layout == kMxfp8 (docs/inkling2-plan.md 4.1, r4dx_convert/mxfp8_format.hpp): separate buffers again.
+  //   mx_wq: the e4m3fn codes in w8a16's fragment order, uint8[N*K].
+  //   mx_ws: one E8M0 byte per (row, 32-K group), uint8[N*K/32], w8a16's ws element order (row-tile major).
+  // N and K are the rank's under tensor parallelism (whole 16-row tiles, whole 32-K groups).
+  core::DeviceBuffer<uint8_t> mx_wq;
+  core::DeviceBuffer<uint8_t> mx_ws;
 };
 
 }  // namespace r4dx::model

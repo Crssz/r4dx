@@ -255,3 +255,40 @@ add_custom_command(
 )
 set_source_files_properties("${R4DX_W8A16_OBJ}" PROPERTIES EXTERNAL_OBJECT TRUE GENERATED TRUE)
 target_sources(r4dx_kernels PRIVATE "${R4DX_W8A16_OBJ}")
+# ---- Inkling2 (docs/inkling2-plan.md 4.1, 5) ------------------------------------------------------------------------
+# mxfp8_gemm.hip: r4dx_gemm_mxfp8_nt (include/r4dx/kernels/mxfp8_gemm.h), a copy-adapt of w8a16_gemm.hip for e4m3 weights
+# with E8M0 per-32 scales. inkling2_kernels.hip: the Inkling2 device pieces and the bias + sink reference attention
+# (include/r4dx/kernels/inkling2_kernels.h; spec: include/r4dx/kernels/inkling2_ref.hpp). Own hipcc objects,
+# r4dx_kernels.hip's flags, attached with target_sources (the add_library line is untouched).
+set(R4DX_MXFP8_SRC "${CMAKE_CURRENT_SOURCE_DIR}/src/mxfp8_gemm.hip")
+set(R4DX_MXFP8_OBJ "${R4DX_KERNELS_OBJ_DIR}/mxfp8_gemm.obj")
+add_custom_command(
+  OUTPUT "${R4DX_MXFP8_OBJ}"
+  COMMAND "${CMAKE_COMMAND}" -E env "PATH=${R4DX_KERNELS_HIPCC_PATH}"
+          "${R4DX_HIPCC}" ${R4DX_KERNELS_FLAGS} -c "${R4DX_MXFP8_SRC}" -o "${R4DX_MXFP8_OBJ}"
+  DEPENDS "${R4DX_MXFP8_SRC}"
+          "${CMAKE_CURRENT_SOURCE_DIR}/include/r4dx/kernels/mxfp8_gemm.h"
+          "${CMAKE_CURRENT_SOURCE_DIR}/include/r4dx/kernels/kernels.h"
+          "${CMAKE_CURRENT_SOURCE_DIR}/../../third_party/libr4d/r4d_gdn_wmma.h"
+  COMMENT "hipcc (${R4D_GFX_ARCH}) mxfp8_gemm.obj"
+  VERBATIM
+)
+set_source_files_properties("${R4DX_MXFP8_OBJ}" PROPERTIES EXTERNAL_OBJECT TRUE GENERATED TRUE)
+target_sources(r4dx_kernels PRIVATE "${R4DX_MXFP8_OBJ}")
+
+set(R4DX_INKLING2_SRC "${CMAKE_CURRENT_SOURCE_DIR}/src/inkling2_kernels.hip")
+set(R4DX_INKLING2_OBJ "${R4DX_KERNELS_OBJ_DIR}/inkling2_kernels.obj")
+add_custom_command(
+  OUTPUT "${R4DX_INKLING2_OBJ}"
+  COMMAND "${CMAKE_COMMAND}" -E env "PATH=${R4DX_KERNELS_HIPCC_PATH}"
+          "${R4DX_HIPCC}" ${R4DX_KERNELS_FLAGS} -c "${R4DX_INKLING2_SRC}" -o "${R4DX_INKLING2_OBJ}"
+  DEPENDS "${R4DX_INKLING2_SRC}"
+          "${CMAKE_CURRENT_SOURCE_DIR}/include/r4dx/kernels/inkling2_kernels.h"
+          "${CMAKE_CURRENT_SOURCE_DIR}/include/r4dx/kernels/kernels.h"
+          "${CMAKE_CURRENT_SOURCE_DIR}/../core/include/r4dx/core/dtype.hpp"
+          "${CMAKE_CURRENT_SOURCE_DIR}/../../third_party/libr4d/r4d_attn_window.h"
+  COMMENT "hipcc (${R4D_GFX_ARCH}) inkling2_kernels.obj"
+  VERBATIM
+)
+set_source_files_properties("${R4DX_INKLING2_OBJ}" PROPERTIES EXTERNAL_OBJECT TRUE GENERATED TRUE)
+target_sources(r4dx_kernels PRIVATE "${R4DX_INKLING2_OBJ}")

@@ -25,6 +25,7 @@
 #include "r4dx/core/dtype.hpp"
 #include "r4dx_convert/safetensors_reader.hpp"
 #include "rotation_meta.h"
+#include "mxfp8_meta.h"
 #include "trellis_meta.h"
 #include "w4a16_group_meta.h"
 #include "w8a16_meta.h"
@@ -98,6 +99,9 @@ struct LinearLoadMeta {
   // docs/w8a16.md 6.1: the parsed `quant.w8a16` block, set (by CheckW8a16Choice) only when this load
   // requested w8a16 for some linear; nullopt otherwise, and then no `.w8a16.*` tensor is ever read.
   std::optional<W8a16Spec> w8a16;
+  // docs/inkling2-plan.md 4.1: the parsed `quant.mxfp8` block, set (by CheckMxfp8Choice) only when this load
+  // requested mxfp8 for some linear; nullopt otherwise, and then no `.mxfp8.*` tensor is ever read.
+  std::optional<Mxfp8Spec> mxfp8;
 };
 
 // docs/w8a16.md 6.1 / 6.3 rules 1-2, run by every loader right after the metadata read, before any upload,
@@ -117,6 +121,18 @@ void LogW8a16(const W8a16Spec& spec, const std::string& path);
 // so the "N linears loaded as bf16" line counts body linears only; the caller says so on its own line.
 bool TakeW8a16Bf16Head(const LinearLoadMeta& meta, const QuantLinear& head, int fallbacks_before, int* fallbacks);
 void LogW8a16Bf16Head(const std::string& path);
+
+// MXFP8 (docs/inkling2-plan.md 4.1), the w8a16 rules above for `quant.mxfp8`: the strict parse, the refusal of
+// `--layout mxfp8` (body or a head) on a container without the block, and the kernel group check, before any
+// upload. Returns the block for LinearLoadMeta::mxfp8 (nullopt when no layout requested mxfp8). Any TP world.
+std::optional<Mxfp8Spec> CheckMxfp8Choice(const nlohmann::json& metadata, const std::string& path, Layout layout,
+                                          Layout lm_head_layout, Layout mtp_head_layout = Layout::kBf16);
+// `.mxfp8.wq` N*K and `.mxfp8.ws` N*K/32 bytes, N % 16, K % 32 (Mxfp8ShapeProblem), thrown naming the tensor.
+void CheckMxfp8Shape(const SafetensorsReader& r, const std::string& base, int64_t N, int64_t K);
+void LogMxfp8(const Mxfp8Spec& spec, const std::string& path);
+// TakeW8a16Bf16Head for an mxfp8 load: a head the container stores as bf16 only (converted with a bf16 head or
+// --keep-bf16 on it) falls back by design and is taken out of the body fallback count.
+bool TakeMxfp8Bf16Head(const LinearLoadMeta& meta, const QuantLinear& head, int fallbacks_before, int* fallbacks);
 
 // docs/trellis-kernel.md 2.5, the refusals that need only the metadata and the requested body layout.
 // `allow_rotated`: the Gemma loader accepts trellis + __metadata__.rotation (option A, docs/gemma4-plan.md 10.2);

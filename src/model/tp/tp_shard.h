@@ -82,11 +82,14 @@ enum class Part {
   // is one contiguous run of 16*K bytes; ws = u16 per (tile, group, row), 32 B per (tile, group).
   kW8Wq,
   kW8a16Ws,
+  // mxfp8 (docs/inkling2-plan.md 4.1): wq is kW8Wq (w8a16's byte order, e4m3 codes; group 32 = one 32-K block); ws = one
+  // E8M0 byte per (tile, group, row), 16 B per (tile, 32-K group). Rank ranges: whole 16-row tiles, whole 32-K groups.
+  kMxfp8Ws,
 };
 struct PartShape {
   Part part = Part::kBf16;
   int64_t N = 0, K = 0;   // the FULL logical W[N, K] the part belongs to (kElem: N rows, K unused)
-  int group = 0;          // kW4a16Wsz / kW8a16Ws: the group the scales are cut at
+  int group = 0;          // kW4a16Wsz / kW8a16Ws: the group the scales are cut at (kW8Wq: its K alignment, 32 for mxfp8)
   int64_t row_bytes = 0;  // kElem only: bytes per row (8 for conv1d_weight, 4 for fp32 vectors)
   int rate = 0;           // kTrellisW only: trellis bits per weight (KB)
 };

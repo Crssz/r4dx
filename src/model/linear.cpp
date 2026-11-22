@@ -118,8 +118,21 @@ bool W8a16RowFits(int64_t K, int group, const LinearTuning& t) {
   return group > 0 && K % (static_cast<int64_t>(t.SK) * group) == 0;
 }
 
+// MXFP8 (docs/inkling2-plan.md 4.1): W8a16FallbackTuning's rule at the fixed group of 32 (a split starts on a 32-K
+// group): SK the largest of {8, 4, 2, 1} with K % (SK * 32) == 0 inside the thread and LDS caps; WV 1 below 512 row
+// tiles, else 4; M <= 16: MB 1, NPW 1, NT 1; M > 16: MB min(4, ceil(M / 16)), NPW 4, NT 0. ApplyLinear asks with the
+// chunk's M capped at 64 (the cache key holds 8 bits of M); the M > 16 pick is the same for every M up to 256.
+// Starting points (UNVERIFIED), replaced by measured rows (gemm_tuning_table_mxfp8.inc).
+LinearTuning Mxfp8FallbackTuning(int64_t N, int64_t K, int64_t M) {
+  return W8a16FallbackTuning(N, K, M, 32);
+}
+
+// r4dx_gemm_mxfp8_nt's legality rules for a tuning row (group 32).
+bool Mxfp8RowFits(int64_t K, const LinearTuning& t) { return W8a16RowFits(K, 32, t); }
+
 LinearTuning FallbackTuning(Layout layout, int64_t N, int64_t K, int64_t M, int variant) {
   if (layout == Layout::kW8a16) return W8a16FallbackTuning(N, K, M, variant);
+  if (layout == Layout::kMxfp8) return Mxfp8FallbackTuning(N, K, M);
   if (layout == Layout::kTrellis) {
     if (K <= 0 || N <= 0 || K % 128 != 0 || N % 128 != 0) {
       throw std::runtime_error("r4dx::model::PickTuning: trellis [" + std::to_string(N) + ", " +
@@ -215,6 +228,11 @@ namespace w8a16 {
 #include "gemm_tuning_table_w8a16.inc"
 }  // namespace w8a16
 
+// MXFP8 (docs/inkling2-plan.md 4.1): its own rows, consulted for kMxfp8 only, after the TP and main tables.
+namespace mxfp8 {
+#include "gemm_tuning_table_mxfp8.inc"
+}  // namespace mxfp8
+
 thread_local bool t_tp2_tuning = false;
 
 // The trellis kernel's legality rules that depend on the tuning and the chunk
@@ -290,6 +308,7 @@ const GemmTuningRow* BestRow(const GemmTuningRow (&table)[kRows], Layout layout,
       if (row.group != variant) continue;
       if (!W8a16RowFits(K, variant, row.tuning)) continue;
     }
+    if (layout == Layout::kMxfp8 && !Mxfp8RowFits(K, row.tuning)) continue;
     if (best == nullptr || row.M < best->M) best = &row;
   }
   return best;
@@ -323,7 +342,7 @@ static LinearTuning ResolveTuning(Layout layout, int64_t N, int64_t K, int64_t M
   // M=1 band's NT as well (docs/trellis-kernel.md 10.1: its measured M <= 16 pick is NT 1).
   if (M > 1 && M <= kRowTile) {
     LinearTuning t = ResolveTuning(layout, N, K, 1, tp2, variant);
-    if (layout == Layout::kW4a16 || layout == Layout::kW8a16) t.NT = 0;  // docs/w8a16.md 4.4: w4a16's rule
+    if (layout == Layout::kW4a16 || layout == Layout::kW8a16 || layout == Layout::kMxfp8) t.NT = 0;  // docs/w8a16.md 4.4: w4a16's rule
     return t;
   }
   if (tp2) {
@@ -347,6 +366,11 @@ static LinearTuning ResolveTuning(Layout layout, int64_t N, int64_t K, int64_t M
   }
   if (layout == Layout::kW8a16) {
     if (const GemmTuningRow* row = BestRow(w8a16::kGemmTuningTable, layout, N, K, M, variant)) {
+      return row->tuning;
+    }
+  }
+  if (layout == Layout::kMxfp8) {
+    if (const GemmTuningRow* row = BestRow(mxfp8::kGemmTuningTable, layout, N, K, M, variant)) {
       return row->tuning;
     }
   }
@@ -425,6 +449,9 @@ int EpilogueForLayout(Layout layout) {
       return r4dx_epilogue_none;
     case Layout::kW8a16:
       // docs/w8a16.md 3.4: the bf16 -> f16 conversion of A is inside the GEMM, so nothing to fuse.
+      return r4dx_epilogue_none;
+    case Layout::kMxfp8:
+      // the same in-kernel bf16 -> f16 conversion (mxfp8_gemm.h).
       return r4dx_epilogue_none;
   }
   return r4dx_epilogue_none;
@@ -966,6 +993,25 @@ void ApplyLinear(hipStream_t stream, core::Arena& arena, const QuantLinear& w, c
         "trellis input transform (caller bug -- a trellis A is only valid for the linear whose suh "
         "made it)");
   }
+  if (w.layout == Layout::kMxfp8) {
+    // docs/inkling2-plan.md 4.1: one r4dx_gemm_mxfp8_nt launch per <= 256-row chunk, A read as bf16 straight from x
+    // (converted to f16 in registers), no scratch, no tickets. EpilogueForLayout is none, so `pre` never reaches here.
+    // The tuning is asked at min(m, 64) rows (the cache key's M field; every M > 16 resolves to one pick).
+    if (w.mx_wq.size() != static_cast<size_t>(N * K) || w.mx_ws.size() != static_cast<size_t>(N * K / 32)) {
+      throw std::runtime_error("r4dx::model::ApplyLinear: mxfp8 weight [" + std::to_string(N) + ", " +
+                               std::to_string(K) + "] is not a loaded one (wq N*K, ws N*K/32 bytes)");
+    }
+    constexpr int64_t kMxfp8ChunkM = 256;
+    for (int64_t m0 = 0; m0 < M; m0 += kMxfp8ChunkM) {
+      const int m = static_cast<int>(std::min(kMxfp8ChunkM, M - m0));
+      const LinearTuning t = PickTuning(Layout::kMxfp8, N, K, std::min<int64_t>(m, kMaxChunkM));
+      r4dx_gemm_mxfp8_nt(reinterpret_cast<int64_t>(x + m0 * K), reinterpret_cast<int64_t>(w.mx_wq.data()),
+                         reinterpret_cast<int64_t>(w.mx_ws.data()), reinterpret_cast<int64_t>(y + m0 * N), m,
+                         static_cast<int>(K), static_cast<int>(N), t.WV, t.SK, t.MB, t.NPW, t.NT,
+                         reinterpret_cast<int64_t>(s));
+    }
+    return;
+  }
   if (w.layout == Layout::kTrellis) {
     if (w.trellis_parts < 1 || w.trellis_parts > 2 || w.trellis_tickets == nullptr ||
         w.trellis_suh.size() != static_cast<size_t>(w.trellis_parts * K) ||
@@ -1146,6 +1192,7 @@ void ApplyLinear(hipStream_t stream, core::Arena& arena, const QuantLinear& w, c
     switch (w.layout) {
       case Layout::kBf16:
       case Layout::kW8a16:  // docs/w8a16.md 6.1: no arena scratch (A is converted in registers)
+      case Layout::kMxfp8:  // returned above
         break;
       case Layout::kW4a16:
         f16_scratch = arena.Alloc<uint16_t>(static_cast<size_t>(kMaxChunkM * K));
@@ -1299,6 +1346,8 @@ void ApplyLinear(hipStream_t stream, core::Arena& arena, const QuantLinear& w, c
                                t.NT, reinterpret_cast<int64_t>(s));
         break;
       }
+      case Layout::kMxfp8:
+        throw std::logic_error("r4dx::model::ApplyLinear: an mxfp8 linear reached the 64-row loop");
     }
   }
 }

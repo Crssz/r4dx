@@ -281,6 +281,7 @@
 #include "r4dx_convert/w4a16_groups.hpp"
 
 #include "gemma_layout.hpp"
+#include "inkling2_layout.hpp"
 #include "lfm2_layout.hpp"
 #include "llama_layout.hpp"
 #include "awq_source.hpp"
@@ -349,7 +350,7 @@ void ValidateKernelRuleGroups(const r4dx_convert::W4a16GroupRules& rules) {
 // `w8a16_group` > 0 adds the `quant.w8a16` block (docs/w8a16.md 3.1; only when some linear is w8a16, so
 // every other container's header is unchanged).
 nlohmann::json BuildQuantMetadata(const nlohmann::json& w4a16_groups = nlohmann::json::object(),
-                                  int w8a16_group = 0) {
+                                  int w8a16_group = 0, bool mxfp8_block = false) {
   nlohmann::json q = {
       {"w4a16",
        {{"group", r4dx_convert::kW4A16Group},
@@ -366,6 +367,14 @@ nlohmann::json BuildQuantMetadata(const nlohmann::json& w4a16_groups = nlohmann:
                             {"scale_log2_bias", w8::kScaleLog2Bias},
                             {"code", w8::kMetaCode},
                             {"fragment_permutation", w8::kMetaFragmentPermutation}};
+  }
+  if (mxfp8_block) {  // docs/inkling2-plan.md 4.1, mxfp8_format.hpp: only when some linear is ACTUALLY mxfp8
+    namespace mx = r4dx_convert::mxfp8;
+    q[mx::kMetaBlockKey] = {{"version", mx::kMetaVersion},
+                            {"group", mx::kGroup},
+                            {"elem", mx::kMetaElem},
+                            {"scale", mx::kMetaScale},
+                            {"fragment_permutation", mx::kMetaFragmentPermutation}};
   }
   return q;
 }
@@ -391,6 +400,7 @@ LayoutSet ParseLayoutList(const std::string& spec, bool bf16_default_on) {
   for (auto& t : tokens) {
     if (t == "w4a16") ls.w4a16 = true;
     else if (t == "w8a16") ls.w8a16 = true;
+    else if (t == "mxfp8") ls.mxfp8 = true;  // inkling2_loop only (RunConvert refuses it elsewhere)
     else if (t == "bf16") ls.bf16 = true;
     else if (t == "4bit") { ls.w4a16 = true; }
     else if (t == "none" || t.empty()) { /* no-op */ }
@@ -1855,13 +1865,16 @@ int RunConvert(const AppArgs& args) {
   // Dense Llama (llama_layout.hpp, docs/nanbeige-plan.md 4): flat config.json, no layer_types (every layer is full
   // attention), its own branch below.
   const bool is_llama = config.value("model_type", std::string()) == r4dx_convert::llama::kModelArch;
+  // inkling2_loop (inkling2_layout.hpp, docs/inkling2-plan.md 4): nested text_config WITHOUT layer_types (the layout
+  // derives the layer kinds itself), pre-quantized NVFP4 / MXFP8 experts, written as mxfp8 (or bf16).
+  const bool is_inkling2 = config.value("model_type", std::string()) == r4dx_convert::inkling2::kModelArch;
   const nlohmann::json& text_cfg = (is_lfm2 || is_llama) ? config : config.at("text_config");
 
   const int hidden = text_cfg.at("hidden_size").get<int>();
   const int num_layers_total = text_cfg.at("num_hidden_layers").get<int>();
   const int kv_heads = text_cfg.at("num_key_value_heads").get<int>();
   const std::vector<std::string> layer_types =
-      is_llama ? std::vector<std::string>(static_cast<size_t>(num_layers_total), "full_attention")
+      (is_llama || is_inkling2) ? std::vector<std::string>(static_cast<size_t>(num_layers_total), "full_attention")
                : text_cfg.at("layer_types").get<std::vector<std::string>>();
   const int layers = args.layers > 0 ? std::min(args.layers, num_layers_total) : num_layers_total;
   const bool full_run = (layers == num_layers_total);
@@ -1873,8 +1886,8 @@ int RunConvert(const AppArgs& args) {
   const bool is_q35moe = config.value("model_type", std::string()) == r4dx_convert::qwen35moe::kModelArch;
   if (!is_qwen4 && !args.ngram_sidecar.empty())
     throw std::runtime_error("--ngram-sidecar applies to qwen4_exp checkpoints only (this one is not qwen4_exp)");
-  if (!is_qwen4 && !is_q35moe && args.plan_only)
-    throw std::runtime_error("--plan-only applies to qwen4_exp and qwen3_5_moe checkpoints only");
+  if (!is_qwen4 && !is_q35moe && !is_inkling2 && args.plan_only)
+    throw std::runtime_error("--plan-only applies to qwen4_exp, qwen3_5_moe and inkling2_loop checkpoints only");
   r4dx_convert::qwen35moe::TextShape mshape;
   if (is_q35moe) {
     if (args.mtp == 1)
@@ -1963,22 +1976,50 @@ int RunConvert(const AppArgs& args) {
     if (refused != nullptr) throw std::runtime_error(std::string("r4dx-convert (llama): ") + refused + " is not supported");
     llshape = r4dx_convert::llama::ParseConfig(config);  // the strict checks, before any shard is opened
   }
+  r4dx_convert::inkling2::TextShape inkshape;
+  if (is_inkling2) {
+    // Text only, mxfp8 or bf16, the plain per-tensor flags. Everything else belongs to another family or a later
+    // milestone: refused rather than half-applied.
+    const char* refused = args.vision == 1       ? "--vision on (milestone 1 converts the text model only; model.visual.* is allow-listed)"
+                          : args.mtp == 1        ? "--mtp on (mtp.safetensors, the DSpark drafter, is a later milestone)"
+                          : !args.kv_calib.empty() ? "--kv-calib (the Inkling KV cache is bf16: no descale tensors)"
+                          : r4dx_convert::ParseRotationKind(args.rotate) != r4dx_convert::RotationKind::kNone
+                              ? "--rotate (the block attention residuals and RMS-normalized mixes have no rotation fold)"
+                          : (args.record_reuse_guard || !args.reuse_from.empty())
+                              ? "--record-reuse-guard / --reuse-tensors-from (the guard reads the Qwen checkpoint layout)"
+                          : !args.draft_vocab_ids.empty() ? "--draft-vocab-ids (the reduced-vocab head is an MTP feature)"
+                          : !args.trellis.from.empty() ? "--trellis-from (no trellis import for this arch yet)"
+                          : (!args.ldlq.empty() || !args.hessian_dir.empty()) ? "--ldlq / --hessian-dir (mxfp8 and bf16 have no LDLQ)"
+                          : (args.quant != "rtn" || !args.imatrix.empty()) ? "--quant search / --imatrix (mxfp8 is not an RTN grid)"
+                          : !args.w4a16_group_rules.empty() ? "--w4a16-group-rule (no w4a16 linear in this layout)"
+                          : args.w8a16_group_explicit ? "--w8a16-group (no w8a16 linear in this layout)"
+                          : args.layers > 0 && args.layers < num_layers_total
+                              ? "--layers N < the layer count (the loop and the block residuals need every layer)"
+                              : nullptr;
+    if (refused != nullptr) throw std::runtime_error(std::string("r4dx-convert (inkling2_loop): ") + refused + " is not supported");
+    inkshape = r4dx_convert::inkling2::ParseConfig(config);  // the strict checks, before any shard is opened
+  }
   const bool do_audio = is_gemma && args.audio == 1;
   // qwen3_5_moe: the tower is opt-in (--vision on), default off, so a container converted without the flag is byte-identical to before.
-  const bool do_vision = (is_lfm2 || is_llama)        ? false
+  const bool do_vision = (is_lfm2 || is_llama || is_inkling2) ? false
                          : (is_gemma || is_qwen4 || is_q35moe) ? (args.vision == 1)
                                                   : (args.vision >= 0 ? (args.vision == 1) : full_run);
   const bool do_mtp =
-      (is_gemma || is_lfm2 || is_llama || is_qwen4 || is_q35moe) ? false : (args.mtp >= 0 ? (args.mtp == 1) : full_run);
+      (is_gemma || is_lfm2 || is_llama || is_inkling2 || is_qwen4 || is_q35moe) ? false : (args.mtp >= 0 ? (args.mtp == 1) : full_run);
 
   LayoutSet layouts = ParseLayoutList(args.layouts_spec, /*bf16_default_on=*/true);
+  if (layouts.mxfp8 && !is_inkling2)
+    throw std::runtime_error("--layouts mxfp8 applies to inkling2_loop checkpoints only (this one is not)");
   // The head follows the body's quantized layout by default (docs/w8a16.md 5.2: "the head is w8a16 by
   // default"): the default --lm-head spec is "4bit+bf16", which for a w8a16-only run would quietly
   // give a 4-bit head, so it becomes "w8a16+bf16" (the bf16 half is dropped by --no-bf16 exactly as
   // before). An explicit --lm-head always wins (`--lm-head bf16` is the alternative).
+  // inkling2_loop: the head follows the body (mxfp8 body -> mxfp8 head, bf16 body -> bf16 head); an explicit
+  // `--lm-head bf16` keeps it bf16 under an mxfp8 body.
   const std::string lm_head_spec =
-      (!args.lm_head_spec_explicit && layouts.w8a16 && !layouts.w4a16) ? std::string("w8a16+bf16")
-                                                                       : args.lm_head_spec;
+      (is_inkling2 && !args.lm_head_spec_explicit) ? std::string(layouts.mxfp8 ? "mxfp8" : "bf16")
+      : (!args.lm_head_spec_explicit && layouts.w8a16 && !layouts.w4a16) ? std::string("w8a16+bf16")
+                                                                         : args.lm_head_spec;
   LayoutSet lm_head_layouts = ParseLayoutList(lm_head_spec, /*bf16_default_on=*/false);
   layouts.w8a16_group = args.w8a16_group;
   lm_head_layouts.w8a16_group = args.w8a16_group;
@@ -1996,6 +2037,18 @@ int RunConvert(const AppArgs& args) {
     // vocab-tail KL loss sits) -- only the DEFAULT lm_head spec is subject to --no-bf16.
     if (!args.lm_head_spec_explicit) lm_head_layouts.bf16 = false;
   }
+  if (is_inkling2) {
+    // One body layout per container: mxfp8 (`--layouts mxfp8 --no-bf16`) or dequantized bf16 (`--layouts bf16`). The
+    // default --layouts (w4a16) and a bf16 companion next to mxfp8 (which would double a 27 GB container) are refused.
+    if (layouts.w4a16 || layouts.w8a16 || lm_head_layouts.w4a16 || lm_head_layouts.w8a16)
+      throw std::runtime_error("r4dx-convert (inkling2_loop): --layouts / --lm-head take mxfp8 or bf16 only "
+                               "(e.g. `--layouts mxfp8 --no-bf16`)");
+    if (layouts.mxfp8 == layouts.bf16)
+      throw std::runtime_error("r4dx-convert (inkling2_loop): pick exactly one body layout: `--layouts mxfp8 --no-bf16` "
+                               "or `--layouts bf16` (a bf16 companion next to mxfp8 is refused)");
+    if (!lm_head_layouts.mxfp8 && !lm_head_layouts.bf16)
+      throw std::runtime_error("r4dx-convert (inkling2_loop): --lm-head resolves to no layout");
+  }
 
   std::cout << "[r4dx-convert] input=" << args.input << " output=" << args.output << "\n"
             << "[r4dx-convert] hidden=" << hidden << " layers=" << layers << "/" << num_layers_total
@@ -2006,6 +2059,9 @@ int RunConvert(const AppArgs& args) {
               << " audio=" << (do_audio ? "on" : "off") << "\n";
   if (is_lfm2) std::cout << "[r4dx-convert] arch=" << r4dx_convert::lfm2::kModelArch << "\n";
   if (is_llama) std::cout << "[r4dx-convert] arch=" << r4dx_convert::llama::kModelArch << "\n";
+  if (is_inkling2)
+    std::cout << "[r4dx-convert] arch=" << r4dx_convert::inkling2::kModelArch << " layout=" << (layouts.mxfp8 ? "mxfp8" : "bf16")
+              << " lm_head=" << (lm_head_layouts.mxfp8 ? "mxfp8" : "bf16") << "\n";
   if (is_q35moe) std::cout << "[r4dx-convert] arch=" << r4dx_convert::qwen35moe::kModelArch << "\n";
   if (is_qwen4)
     std::cout << "[r4dx-convert] arch=" << r4dx_convert::qwen4exp::kModelArch << " ngram-sidecar=" << ngram.path
@@ -2570,6 +2626,99 @@ int RunConvert(const AppArgs& args) {
     }
   }
 
+  // ---- inkling2_loop branch (inkling2_layout.cpp): the whole text stack -- bf16 linears, the NVFP4 / MXFP8 expert
+  // slices (decoded to f32 by inkling2_expert_codec.hpp, or copied bit-exact when already MXFP8), the padded head,
+  // the merged message queries -- through the same closures ----------------------------------------------------
+  size_t inkling_visual_skipped = 0;
+  if (is_inkling2) {
+    namespace ik = r4dx_convert::inkling2;
+    ik::Kit kit;
+    kit.all_names = [&model]() { return model.AllNames(); };
+    kit.has = [&model](const std::string& n) { return model.Has(n); };
+    kit.shape = [&model](const std::string& n) { return model.Meta(n).shape; };
+    kit.dtype = [&model](const std::string& n) { return model.Meta(n).dtype; };
+    kit.data = [&model](const std::string& n) { return model.Data(n); };
+    kit.add_bf16 = add_bf16;
+    kit.add_fp32_widen = add_fp32_widen;
+    // A relabelled bf16 passthrough (the conv taps [C,1,4] -> [C,4]): the bytes are copied unchanged.
+    kit.add_bf16_shaped = [&](const std::string& hf_name, const std::string& container_name,
+                              const std::vector<int64_t>& shape_no_width) {
+      plan_jobs.push_back([&writer, &model, hf_name, container_name, shape_no_width]() {
+        const auto& meta = model.Meta(hf_name);
+        int64_t n = 1;
+        for (int64_t d : shape_no_width) n *= d;
+        if (n != meta.ElemCount())
+          throw std::runtime_error("r4dx-convert (inkling2_loop): '" + hf_name + "' cannot be relabelled to " +
+                                   container_name + ": element count differs");
+        std::vector<int64_t> shape = shape_no_width;
+        shape.push_back(2);
+        writer.Plan(container_name, shape, static_cast<uint64_t>(meta.ElemCount()) * 2);
+      });
+      emit_jobs.push_back([&writer, &model, hf_name, container_name]() {
+        auto bytes = r4dx_convert::CopyRawBf16(model, hf_name);
+        writer.WriteTensor(container_name, bytes.data(), bytes.size());
+      });
+    };
+    kit.add_msg_queries = [&](const std::string& hf_q, const std::string& hf_kv, const std::string& container_name,
+                              int64_t loop_layers, int64_t hidden_size) {
+      plan_jobs.push_back([&writer, container_name, loop_layers, hidden_size]() {
+        writer.Plan(container_name, {loop_layers, 4, hidden_size, 4},
+                    static_cast<uint64_t>(loop_layers * 4 * hidden_size) * 4);
+      });
+      emit_jobs.push_back([&writer, &model, hf_q, hf_kv, container_name, loop_layers, hidden_size]() {
+        const std::vector<float> q = r4dx_convert::ReadTensorAsFloat(model, hf_q);
+        const std::vector<float> kv = r4dx_convert::ReadTensorAsFloat(model, hf_kv);
+        std::vector<float> merged(static_cast<size_t>(loop_layers * 4 * hidden_size));
+        ik::MergeMessageQueries(q.data(), kv.data(), loop_layers, hidden_size, merged.data());
+        auto bytes = r4dx_convert::EncodeFp32(merged);
+        writer.WriteTensor(container_name, bytes.data(), bytes.size());
+      });
+    };
+    kit.add_linear = [&](const std::vector<std::string>& hf_names, const std::string& base, bool head) {
+      add_linear(hf_names, base, head ? lm_head_layouts : layouts);
+    };
+    // A linear computed from checkpoint bytes: --keep-bf16 and the layout choice resolved once, here, and captured by both
+    // jobs (add_linear's discipline). An already-MXFP8 source goes to an mxfp8 container as its own codes and scale bytes.
+    kit.add_source_linear = [&](const std::string& base, bool head, ik::LinearSource src) {
+      const LayoutSet requested = head ? lm_head_layouts : layouts;
+      const bool kept = keep_bf16.Matches(base);
+      const LayoutSet ls = kept ? r4dx_convert::KeptBf16LayoutSet() : requested;
+      note_linear(base, ls);
+      const int N = static_cast<int>(src.N), K = static_cast<int>(src.K);
+      plan_jobs.push_back([&writer, &keep_bf16, base, ls, requested, kept, N, K]() {
+        if (kept) keep_bf16.Record(base, N, K, requested, std::cout);
+        r4dx_convert::PlanLinearLayouts(writer, base, N, K, ls);
+      });
+      emit_jobs.push_back([&writer, base, ls, src, N, K, threads]() {
+        if (ls.mxfp8 && src.raw_mxfp8) {
+          std::vector<uint8_t> codes(static_cast<size_t>(N) * K), scales(static_cast<size_t>(N) * K / 32);
+          src.raw_mxfp8(codes.data(), scales.data());
+          r4dx_convert::EmitMxfp8Prequantized(writer, base, codes, scales, N, K, threads);
+          return;
+        }
+        std::vector<float> w(static_cast<size_t>(N) * K);
+        src.read(w.data());
+        r4dx_convert::EmitLinearLayouts(writer, base, w, N, K, ls, threads);
+      });
+    };
+    const std::set<std::string> consumed = ik::AddInkling2TextStack(kit, inkshape);
+    // The coverage audit: nothing in the checkpoint may be silently left out of the container (model.visual.* is
+    // allow-listed and counted).
+    const std::vector<std::string> all = model.AllNames();
+    const std::vector<std::string> unconsumed = ik::UnconsumedTensors(all, consumed);
+    if (!unconsumed.empty()) {
+      std::string msg = "r4dx-convert (inkling2_loop): " + std::to_string(unconsumed.size()) +
+                        " checkpoint tensor(s) are not converted and not allow-listed (a mis-guessed tensor "
+                        "name, or a tensor this converter does not know):";
+      for (size_t k = 0; k < unconsumed.size() && k < 20; ++k) msg += "\n  " + unconsumed[k];
+      if (unconsumed.size() > 20) msg += "\n  ... and " + std::to_string(unconsumed.size() - 20) + " more";
+      throw std::runtime_error(msg);
+    }
+    for (const std::string& n : all) inkling_visual_skipped += ik::IsAllowListed(n) ? 1 : 0;
+    std::cout << "[r4dx-convert] inkling2_loop: " << consumed.size() << " checkpoint tensor(s) consumed, "
+              << inkling_visual_skipped << " allow-listed and skipped (model.visual.*: the ViT is a later milestone)\n";
+  }
+
   // ---- qwen4_exp branch (qwen4exp_layout.cpp): the whole text stack, through the closures above ---------
   if (is_qwen4) {
     namespace qw = r4dx_convert::qwen4exp;
@@ -2647,7 +2796,7 @@ int RunConvert(const AppArgs& args) {
     if (trellis.Enabled()) r4dx_convert::qwen4exp::CheckExpertKbUniform(trellis_kb);
   }
 
-  for (int i = 0; i < ((is_gemma || is_lfm2 || is_llama || is_qwen4 || is_q35moe) ? 0 : layers); ++i) {
+  for (int i = 0; i < ((is_gemma || is_lfm2 || is_llama || is_inkling2 || is_qwen4 || is_q35moe) ? 0 : layers); ++i) {
     const std::string hf = "model.language_model.layers." + std::to_string(i) + ".";
     const std::string base = "text.layers." + std::to_string(i) + ".";
     // --rotate folds (all kNone without it): input_layernorm's (1 + w) goes into this layer's token
@@ -2704,7 +2853,7 @@ int RunConvert(const AppArgs& args) {
   // Everything from here on is outside the rotated stack and is never folded: the runtime applies
   // x Q after the embedding gather and x Q^T before final_norm (docs/quant2.md section 3).
   // (the Gemma / LFM2 / qwen4_exp branches above registered these; LFM2's head comes from the tied embedding)
-  if (!is_gemma && !is_lfm2 && !is_llama && !is_qwen4 && !is_q35moe) {
+  if (!is_gemma && !is_lfm2 && !is_llama && !is_inkling2 && !is_qwen4 && !is_q35moe) {
     add_bf16("model.language_model.embed_tokens.weight", "text.embed_tokens");
     add_bf16("model.language_model.norm.weight", "text.final_norm");
     add_linear({"lm_head.weight"}, "lm_head", lm_head_layouts);
@@ -3090,6 +3239,44 @@ int RunConvert(const AppArgs& args) {
         {"vision.*, mtp.*", "not converted (text only)"},
     };
   }
+  // inkling2_loop: model_arch is what the loader dispatches on; `inkling2` records what the loader needs beyond the
+  // verbatim model_config (the head's stored rows, the expert row order, which source encoding each layer had).
+  bool any_mxfp8 = false;
+  for (const auto& kv : linear_layouts) any_mxfp8 = any_mxfp8 || kv.second.mxfp8;
+  if (is_inkling2) {
+    namespace fs = std::filesystem;
+    fs::path in = fs::u8path(args.input).lexically_normal();
+    if (!in.has_filename()) in = in.parent_path();
+    metadata["model_id"] = in.filename().u8string();  // e.g. Inkling-2-Mini-Uncensored
+    metadata["model_arch"] = r4dx_convert::inkling2::kModelArch;
+    metadata["norm_kind"] = "plain";
+    const std::string body = any_mxfp8 ? "mxfp8|bf16 (e4m3 + E8M0 per 32; --keep-bf16 linears bf16 only)" : "bf16";
+    metadata["quant_summary"] = {
+        {"text.layers.*.attn.q|k|v|gate|o|rel", body + " (wq_du, wk_dv, wv_dv, gate_attn, wo_ud, wr_du)"},
+        {"text.layers.*.moe.experts.*.gate_up|down",
+         body + " (w13 rows de-interleaved to [gate; up]; NVFP4 sources dequantized to f32 and re-encoded, MXFP8 sources "
+                "copied bit-exact)"},
+        {"text.layers.*.attn.sink|q_scale|rel_scale|rel_proj, *_conv*, *_norm, msg.*, moe.router, text.embed_tokens|embed_norm|final_norm",
+         "bf16 (conv taps [C,1,4] squeezed to [C,4]; norm weights plain, x * w)"},
+        {"text.layers.*.attn_query|mlp_query, text.final_query, text.msg_queries, moe.bias",
+         "fp32 (attn_query [3,H] on full layers; msg_queries [loop_layers,4,H] in order q,k,v,mlp)"},
+        {"lm_head", body + " (unembed rows [0, unpadded_vocab) zero-padded to a multiple of 16 rows)"},
+        {"model.visual.*, mtp.*", "not converted (milestone 1 is text only)"},
+    };
+    std::vector<std::string> nvfp4_layers, mxfp8_layers;
+    for (int64_t i = 0; i < inkshape.layers; ++i) {
+      const std::string n = "model.llm.layers." + std::to_string(i) + ".mlp.experts.w13_weight_amax";
+      (model.Has(n) ? nvfp4_layers : mxfp8_layers).push_back(std::to_string(i));
+    }
+    metadata["inkling2"] = {
+        {"lm_head_rows", inkshape.unpadded_vocab},
+        {"lm_head_rows_stored", inkshape.HeadRowsStored()},
+        {"expert_gate_up_order", "gate rows [0, I) then up rows [I, 2I) (checkpoint rows are interleaved gate, up, ...: "
+                                 "core_model_loading.py Interleave(dim=1), conversion_mapping.py line 2666)"},
+        {"expert_source_nvfp4_layers", nvfp4_layers},
+        {"expert_source_mxfp8_layers", mxfp8_layers},
+    };
+  }
   // w8a16 (docs/w8a16.md 3.1): the metadata block and the "w4a16|bf16" summary rows are touched only
   // when some linear is ACTUALLY written w8a16 (after --keep-bf16), so every other container keeps its
   // header byte for byte.
@@ -3104,7 +3291,7 @@ int RunConvert(const AppArgs& args) {
       item.value() = s;
     }
   }
-  metadata["quant"] = BuildQuantMetadata(w4a16_groups.GroupsJson(), any_w8a16 ? args.w8a16_group : 0);
+  metadata["quant"] = BuildQuantMetadata(w4a16_groups.GroupsJson(), any_w8a16 ? args.w8a16_group : 0, any_mxfp8);
   if (trellis.Enabled()) metadata["quant"]["trellis"] = trellis.QuantMetadata();
   metadata["model_config"] = config;
   metadata["r4dx_convert_run"] = {
@@ -3148,6 +3335,12 @@ int RunConvert(const AppArgs& args) {
   }
   if (is_lfm2) metadata["r4dx_convert_run"]["arch"] = r4dx_convert::lfm2::kModelArch;
   if (is_llama) metadata["r4dx_convert_run"]["arch"] = r4dx_convert::llama::kModelArch;
+  if (is_inkling2) {
+    metadata["r4dx_convert_run"]["arch"] = r4dx_convert::inkling2::kModelArch;
+    metadata["r4dx_convert_run"]["skipped"] = {
+        "model.visual.* (" + std::to_string(inkling_visual_skipped) + " tensors): the ViT is a later milestone",
+        "mtp.safetensors: the DSpark drafter is a later milestone"};
+  }
   if (is_q35moe) {
     metadata["r4dx_convert_run"]["arch"] = r4dx_convert::qwen35moe::kModelArch;
     metadata["r4dx_convert_run"]["fused_experts_source"] = fused_expert_tensors;

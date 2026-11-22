@@ -89,6 +89,34 @@ if(TARGET r4dx-convert)
 endif()
 add_test(NAME convert_lfm2_layout COMMAND convert_lfm2_layout)
 
+# mxfp8 (docs/inkling2-plan.md 4.1): the e4m3 / E8M0 codec, RNE ties, saturation, scale edges, the packers' byte layout, the
+# raw-copy rule for checkpoint MXFP8 groups, LayoutSetId / plan plumbing. CPU only, no data files.
+add_executable(convert_mxfp8_format test_mxfp8_format.cpp)
+target_link_libraries(convert_mxfp8_format PRIVATE r4dx_convert)
+add_test(NAME convert_mxfp8_format COMMAND convert_mxfp8_format)
+
+# inkling2 expert decoding (src/convert/include/r4dx_convert/inkling2_expert_codec.hpp): NVFP4 / MXFP8 -> f32 and the w13
+# gate/up de-interleave against goldens from transformers' Inkling2LoopDequantizeExperts + Interleave
+# (tools/convert_ref/make_inkling2_expert_golden.py -> tests/convert/data/inkling2_expert_golden.json). CPU only.
+add_executable(convert_inkling2_expert_codec test_inkling2_expert_codec.cpp)
+target_link_libraries(convert_inkling2_expert_codec PRIVATE r4dx_convert)
+target_compile_definitions(convert_inkling2_expert_codec PRIVATE R4DX_CONVERT_DATA_DIR="${CMAKE_CURRENT_SOURCE_DIR}/data")
+add_test(NAME convert_inkling2_expert_codec COMMAND convert_inkling2_expert_codec)
+
+# inkling2_loop converter branch (src/convert/inkling2_layout.{hpp,cpp}): the layout over the REAL 1244-tensor header
+# (tests/convert/data/inkling2_real_header.tsv + the real config.json) through a recording kit, and -- when r4dx-convert is
+# built -- the exe on the tiny synthetic checkpoint (tests/convert/data/inkling2_tiny, tools/convert_ref/make_tiny_inkling2.py):
+# exact tensor set / shapes / bytes, the bit-exact MXFP8 expert copy, NVFP4 -> mxfp8, bf16, --keep-bf16, the coverage audit,
+# every refusal. CPU-only; writes a few MB under %TEMP% and removes them.
+add_executable(convert_inkling2_layout test_inkling2_layout.cpp)
+target_link_libraries(convert_inkling2_layout PRIVATE r4dx_convert_inkling2)
+target_compile_definitions(convert_inkling2_layout PRIVATE R4DX_CONVERT_DATA_DIR="${CMAKE_CURRENT_SOURCE_DIR}/data")
+if(TARGET r4dx-convert)
+  target_compile_definitions(convert_inkling2_layout PRIVATE R4DX_CONVERT_EXE="$<TARGET_FILE:r4dx-convert>")
+  add_dependencies(convert_inkling2_layout r4dx-convert)
+endif()
+add_test(NAME convert_inkling2_layout COMMAND convert_inkling2_layout)
+
 # Llama converter branch (src/convert/llama_layout.{hpp,cpp}, docs/nanbeige-plan.md N1-4): the layout over the
 # real-geometry 471-tensor header (and the real Nanbeige4.3-33B header bytes when present) through a recording kit,
 # and -- when r4dx-convert is built -- the exe on a tiny synthetic llama checkpoint (flat config without layer_types,

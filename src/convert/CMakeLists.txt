@@ -44,7 +44,14 @@ add_library(r4dx_convert_qwen35moe STATIC qwen35moe_layout.cpp fused_experts_sou
 target_include_directories(r4dx_convert_qwen35moe PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(r4dx_convert_qwen35moe PUBLIC r4dx_convert r4dx_convert_qwen4exp)
 
+# r4dx_convert_inkling2: the inkling2_loop branch (docs/inkling2-plan.md 4) -- its tensor layout and coverage audit
+# (inkling2_layout.hpp) over the pure expert decoder (inkling2_expert_codec.hpp, NVFP4 / MXFP8 -> f32). Plain C++,
+# no HIP, no weights.
+add_library(r4dx_convert_inkling2 STATIC inkling2_layout.cpp)
+target_include_directories(r4dx_convert_inkling2 PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
+target_link_libraries(r4dx_convert_inkling2 PUBLIC r4dx_convert)
+
 if(R4DX_BUILD_CONVERT)
   add_executable(r4dx-convert main.cpp)
-  target_link_libraries(r4dx-convert PRIVATE r4dx_convert r4dx_convert_gemma r4dx_convert_lfm2 r4dx_convert_llama r4dx_convert_qwen4exp r4dx_convert_qwen35moe)
+  target_link_libraries(r4dx-convert PRIVATE r4dx_convert r4dx_convert_gemma r4dx_convert_lfm2 r4dx_convert_llama r4dx_convert_qwen4exp r4dx_convert_qwen35moe r4dx_convert_inkling2)
 endif()

@@ -570,6 +570,189 @@ void TestMoePrefill(std::mt19937& rng, bool quick) {
   }
 }
 
+void TestNvfp4Moe(std::mt19937& rng, bool quick) {
+  static constexpr float kFp4Lut[16] = {
+      0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f, -0.0f, -0.5f, -1.0f, -1.5f, -2.0f, -3.0f, -4.0f, -6.0f};
+  auto pack_nvfp4 = [](const std::vector<uint8_t>& w_raw, const std::vector<uint8_t>& s_raw, int N, int K,
+                       std::vector<uint8_t>& wq_out, std::vector<uint8_t>& ws_out) {
+    wq_out.assign(static_cast<size_t>(N) * (K / 2), 0);
+    ws_out.assign(static_cast<size_t>(N) * (K / 16), 0);
+    const int ntiles = N / 16, kblocks = K / 32, gpr16 = K / 16;
+    for (int t = 0; t < ntiles; ++t) {
+      for (int r = 0; r < 16; ++r) {
+        const uint8_t* srow = s_raw.data() + static_cast<size_t>(t * 16 + r) * gpr16;
+        for (int g16 = 0; g16 < gpr16; ++g16) ws_out[(static_cast<size_t>(t) * gpr16 + g16) * 16 + r] = srow[g16];
+      }
+      for (int kb = 0; kb < kblocks; ++kb) {
+        for (int lane = 0; lane < 32; ++lane) {
+          const int sr = t * 16 + (lane & 15);
+          const int half = lane >> 4;
+          const uint8_t* wrow = w_raw.data() + static_cast<size_t>(sr) * (K / 2);
+          uint8_t* out8 = wq_out.data() + ((static_cast<size_t>(t) * kblocks + kb) * 32 + lane) * 8;
+          const int k0 = 32 * kb + 4 * half;
+          std::memcpy(out8 + 0, wrow + (k0 >> 1), 2);
+          std::memcpy(out8 + 2, wrow + ((k0 + 8) >> 1), 2);
+          std::memcpy(out8 + 4, wrow + ((k0 + 16) >> 1), 2);
+          std::memcpy(out8 + 6, wrow + ((k0 + 24) >> 1), 2);
+        }
+      }
+    }
+  };
+  auto cpu_dot = [&](const uint16_t* a_row, const std::vector<uint8_t>& w_raw, const std::vector<uint8_t>& s_raw,
+                     float factor, int N, int K, std::vector<float>& out_row) {
+    out_row.resize(static_cast<size_t>(N));
+    for (int n = 0; n < N; ++n) {
+      double acc = 0.0;
+      const uint8_t* wr = w_raw.data() + static_cast<size_t>(n) * (K / 2);
+      const uint8_t* sr = s_raw.data() + static_cast<size_t>(n) * (K / 16);
+      for (int k = 0; k < K; ++k) {
+        const uint8_t byte = wr[k >> 1];
+        const uint8_t nib = (k & 1) ? ((byte >> 4) & 0xF) : (byte & 0xF);
+        const float sc = r4dx_convert::mxfp8::DecodeE4m3(sr[k >> 4]);
+        acc += static_cast<double>(Bf16ToFloat(a_row[k])) * static_cast<double>(kFp4Lut[nib] * sc);
+      }
+      out_row[static_cast<size_t>(n)] = static_cast<float>(acc) * factor;
+    }
+  };
+
+  struct Shape {
+    const char* name;
+    int N, K, a_row_group, n_pairs;
+  };
+  const Shape shapes[] = {
+      {"tiny.gu", 64, 64, 4, 8},
+      {"tiny.dn", 64, 32, 1, 8},
+      {"tp2.gu", 1152, 2304, 8, 8},
+      {"tp2.dn", 2304, 576, 1, 8},
+  };
+  const int n_experts = 6;
+  std::uniform_int_distribution<int> byte_dist(0, 255);
+  // Finite positive E4M3 scales in [0.125, 4.0] (codes 0x20..0x48, no NaN/zero/inf).
+  std::uniform_int_distribution<int> sc_dist(0x20, 0x48);
+  std::uniform_real_distribution<float> fac_dist(0.02f, 0.25f);
+  std::normal_distribution<float> nd(0.0f, 1.0f);
+
+  for (const auto& s : shapes) {
+    if (quick && std::string(s.name).find("tp2") != std::string::npos) continue;
+    std::vector<std::vector<uint8_t>> w_raws(static_cast<size_t>(n_experts)), s_raws(static_cast<size_t>(n_experts));
+    std::vector<DeviceBuffer<uint8_t>> wq_ds, ws_ds;
+    std::vector<uint64_t> wq_h(static_cast<size_t>(n_experts)), ws_h(static_cast<size_t>(n_experts));
+    std::vector<float> fac_h(static_cast<size_t>(n_experts));
+    for (int e = 0; e < n_experts; ++e) {
+      w_raws[static_cast<size_t>(e)].resize(static_cast<size_t>(s.N) * (s.K / 2));
+      s_raws[static_cast<size_t>(e)].resize(static_cast<size_t>(s.N) * (s.K / 16));
+      for (auto& b : w_raws[static_cast<size_t>(e)]) b = static_cast<uint8_t>(byte_dist(rng));
+      for (auto& b : s_raws[static_cast<size_t>(e)]) b = static_cast<uint8_t>(sc_dist(rng));
+      fac_h[static_cast<size_t>(e)] = fac_dist(rng);
+      std::vector<uint8_t> wq_pack, ws_pack;
+      pack_nvfp4(w_raws[static_cast<size_t>(e)], s_raws[static_cast<size_t>(e)], s.N, s.K, wq_pack, ws_pack);
+      wq_ds.emplace_back(wq_pack.size());
+      ws_ds.emplace_back(ws_pack.size());
+      wq_ds.back().CopyFromHost(wq_pack);
+      ws_ds.back().CopyFromHost(ws_pack);
+      wq_h[static_cast<size_t>(e)] = static_cast<uint64_t>(P(wq_ds.back().data()));
+      ws_h[static_cast<size_t>(e)] = static_cast<uint64_t>(P(ws_ds.back().data()));
+    }
+    DeviceBuffer<uint64_t> wq_ptrs(wq_h.size()), ws_ptrs(ws_h.size());
+    wq_ptrs.CopyFromHost(wq_h);
+    ws_ptrs.CopyFromHost(ws_h);
+    DeviceBuffer<float> fac_d(fac_h.size());
+    fac_d.CopyFromHost(fac_h);
+
+    // 1. Decode test (including out-of-range sentinel ids).
+    {
+      const int n_a_rows = s.n_pairs / s.a_row_group;
+      std::vector<uint16_t> a_h(static_cast<size_t>(n_a_rows) * s.K);
+      for (auto& v : a_h) v = FloatToBf16Rne(std::clamp(nd(rng), -3.0f, 3.0f));
+      DeviceBuffer<uint16_t> a_d(a_h.size());
+      a_d.CopyFromHost(a_h);
+      std::vector<int32_t> ids_h(static_cast<size_t>(s.n_pairs));
+      for (int p = 0; p < s.n_pairs; ++p) ids_h[static_cast<size_t>(p)] = p % n_experts;
+      ids_h[2] = -1;
+      ids_h[3] = n_experts;
+      DeviceBuffer<int32_t> ids_d(ids_h.size());
+      ids_d.CopyFromHost(ids_h);
+      const uint16_t kSentinel = 0x5A5Au;
+      std::vector<uint16_t> init_c(static_cast<size_t>(s.n_pairs) * s.N, kSentinel);
+      DeviceBuffer<uint16_t> c_d(init_c.size());
+      c_d.CopyFromHost(init_c);
+      const int sk = ((s.K / 32) % 2 == 0) ? 2 : 1;
+      const int npw = (s.N >= 64) ? 4 : 1;
+      r4dx_gemm_nvfp4_moe_decode(P(a_d.data()), P(wq_ptrs.data()), P(ws_ptrs.data()), P(fac_d.data()), P(ids_d.data()),
+                                 P(c_d.data()), s.n_pairs, s.a_row_group, n_experts, s.K, s.N, 1, sk, npw, 1, 0);
+      R4DX_HIP_CHECK(hipDeviceSynchronize());
+      const auto got = c_d.CopyToHost();
+      bool ok = true;
+      double max_rel = 0.0;
+      for (int p = 0; p < s.n_pairs; ++p) {
+        const int e = ids_h[static_cast<size_t>(p)];
+        if (e < 0 || e >= n_experts) {
+          for (int n = 0; n < s.N; ++n) {
+            if (got[static_cast<size_t>(p) * s.N + n] != kSentinel) ok = false;
+          }
+          continue;
+        }
+        std::vector<float> ref;
+        cpu_dot(a_h.data() + static_cast<size_t>(p / s.a_row_group) * s.K, w_raws[static_cast<size_t>(e)],
+                s_raws[static_cast<size_t>(e)], fac_h[static_cast<size_t>(e)], s.N, s.K, ref);
+        double num = 0.0, den = 0.0;
+        for (int n = 0; n < s.N; ++n) {
+          const double d = static_cast<double>(Bf16ToFloat(got[static_cast<size_t>(p) * s.N + n])) - ref[static_cast<size_t>(n)];
+          num += d * d;
+          den += static_cast<double>(ref[static_cast<size_t>(n)]) * ref[static_cast<size_t>(n)];
+        }
+        const double rel = std::sqrt(num / std::max(den, 1e-12));
+        if (rel > max_rel) max_rel = rel;
+        if (rel > 1e-2) ok = false;
+      }
+      Check(ok, std::string("nvfp4_moe_decode ") + s.name + " [" + std::to_string(s.N) + "x" + std::to_string(s.K) +
+                    "] max_rel=" + std::to_string(max_rel));
+    }
+
+    // 2. Prefill test (empty, 1, 7, 16, 19, 0 rows across experts).
+    {
+      const std::vector<int> counts = {0, 1, 7, 16, 19, 0};
+      std::vector<int32_t> off_h(static_cast<size_t>(n_experts + 1), 0);
+      for (int e = 0; e < n_experts; ++e) off_h[static_cast<size_t>(e + 1)] = off_h[static_cast<size_t>(e)] + counts[static_cast<size_t>(e)];
+      const int n_pairs = off_h[static_cast<size_t>(n_experts)];
+      DeviceBuffer<int32_t> off_d(off_h.size());
+      off_d.CopyFromHost(off_h);
+      std::vector<uint16_t> a_h(static_cast<size_t>(n_pairs) * s.K);
+      for (auto& v : a_h) v = FloatToBf16Rne(std::clamp(nd(rng), -3.0f, 3.0f));
+      DeviceBuffer<uint16_t> a_d(a_h.size());
+      a_d.CopyFromHost(a_h);
+      DeviceBuffer<uint16_t> c_d(static_cast<size_t>(n_pairs) * s.N);
+      R4DX_HIP_CHECK(hipMemset(c_d.data(), 0x5A, c_d.bytes()));
+      const int sk = ((s.K / 32) % 2 == 0) ? 2 : 1;
+      const int npw = (s.N >= 64) ? 4 : 1;
+      r4dx_gemm_nvfp4_moe_prefill(P(a_d.data()), P(wq_ptrs.data()), P(ws_ptrs.data()), P(fac_d.data()), P(off_d.data()),
+                                  P(c_d.data()), n_pairs, n_experts, s.K, s.N, 1, sk, npw, 0, 0);
+      R4DX_HIP_CHECK(hipDeviceSynchronize());
+      const auto got = c_d.CopyToHost();
+      bool ok = true;
+      double max_rel = 0.0;
+      for (int e = 0; e < n_experts; ++e) {
+        for (int r = off_h[static_cast<size_t>(e)]; r < off_h[static_cast<size_t>(e + 1)]; ++r) {
+          std::vector<float> ref;
+          cpu_dot(a_h.data() + static_cast<size_t>(r) * s.K, w_raws[static_cast<size_t>(e)],
+                  s_raws[static_cast<size_t>(e)], fac_h[static_cast<size_t>(e)], s.N, s.K, ref);
+          double num = 0.0, den = 0.0;
+          for (int n = 0; n < s.N; ++n) {
+            const double d = static_cast<double>(Bf16ToFloat(got[static_cast<size_t>(r) * s.N + n])) - ref[static_cast<size_t>(n)];
+            num += d * d;
+            den += static_cast<double>(ref[static_cast<size_t>(n)]) * ref[static_cast<size_t>(n)];
+          }
+          const double rel = std::sqrt(num / std::max(den, 1e-12));
+          if (rel > max_rel) max_rel = rel;
+          if (rel > 1e-2) ok = false;
+        }
+      }
+      Check(ok, std::string("nvfp4_moe_prefill ") + s.name + " [" + std::to_string(s.N) + "x" + std::to_string(s.K) +
+                    "] max_rel=" + std::to_string(max_rel));
+    }
+  }
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -595,6 +778,7 @@ int main(int argc, char** argv) {
     if (!quick) TestProblem(rng, "lm_head (200058 rounded to 200064)", 200064, 2304, {1}, false);
     TestMoeDecode(rng, quick);
     TestMoePrefill(rng, quick);
+    TestNvfp4Moe(rng, quick);
   } catch (const std::exception& e) {
     std::printf("EXCEPTION: %s\n", e.what());
     return 1;

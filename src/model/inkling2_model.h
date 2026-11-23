@@ -184,9 +184,10 @@ class Inkling2Model {
   core::DeviceBuffer<float> verify_summary_vals_dev_;        // [8 * R4DX_TOPK_LSE_K]
   core::DeviceBuffer<float> verify_summary_lse_dev_;         // [8]
 
-  // The fp32 state pool (h, blocks, h_pre, the previous pass's states) and the message buffer.
+  // The fp32 state pool (h, blocks, h_pre, the previous pass's states), their cached per-row inverse RMS, and the message buffer.
   std::vector<core::DeviceBuffer<float>> pool_;
-  core::DeviceBuffer<float> msg_;  // [4, max_chunk, H]
+  std::vector<core::DeviceBuffer<float>> pool_inv_rms_;  // [pool_slot][max_chunk] fp32
+  core::DeviceBuffer<float> msg_;                        // [4, max_chunk, H]
 
   // MoE host readbacks.
   core::PinnedBuffer<int32_t> moe_ids_host_, moe_off_host_;

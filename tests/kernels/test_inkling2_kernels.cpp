@@ -124,6 +124,34 @@ void TestAttnRes() {
       // fp32 rounding over the 2304-wide dots and norms lands around 1e-6.
       const double e = RelErr(Host(od, want.size()), want, 1.0);
       Check(e < 1e-5, "attnres n_states " + std::to_string(n_states) + " nq " + std::to_string(nq) + " (rel " + std::to_string(e) + ")");
+
+      // Verify pre-computed inv_rms path is bit-exact with on-the-fly path
+      std::vector<DeviceBuffer<float>> inv_d;
+      std::vector<int64_t> inv_ptrs;
+      for (int i = 0; i < n_states; ++i) {
+        inv_d.emplace_back(static_cast<size_t>(T));
+        r4dx_inkling2_row_inv_rms_f32(ptrs[static_cast<size_t>(i)], P(inv_d.back().data()), T, H, 1e-6f, 0);
+      }
+      for (int i = 0; i < n_states; ++i) inv_ptrs.push_back(P(inv_d[static_cast<size_t>(i)].data()));
+      DeviceBuffer<float> od_pre(static_cast<size_t>(nq * T * H));
+      r4dx_inkling2_attnres_prenorm_f32(ptrs.data(), inv_ptrs.data(), n_states, P(qd.data()), nq, P(od_pre.data()), 0, 0,
+                                        T, H, 1e-6f, 0);
+      Check(Host(od_pre, want.size()) == Host(od, want.size()),
+            "attnres_prenorm bit-exact n_states " + std::to_string(n_states) + " nq " + std::to_string(nq));
+
+      if (nq == 1) {
+        const std::vector<float> nw = RoundBf16(Rand(static_cast<size_t>(H), 1.0f));
+        DeviceBuffer<uint16_t> nwd = Dev(ToBf16(nw)), obf(static_cast<size_t>(T * H));
+        r4dx_inkling2_attnres_prenorm_f32(ptrs.data(), inv_ptrs.data(), n_states, P(qd.data()), 1, 0, P(nwd.data()),
+                                          P(obf.data()), T, H, 1e-6f, 0);
+        std::vector<float> want_bf(static_cast<size_t>(T * H));
+        for (int t = 0; t < T; ++t) {
+          ref::RmsWeighted(want.data() + static_cast<size_t>(t) * H, nw.data(), H,
+                           want_bf.data() + static_cast<size_t>(t) * H);
+        }
+        Check(Bf16Close(HostBf16(obf, want_bf.size()), want_bf, 2),
+              "attnres_prenorm + fused rmsnorm_bf16 n_states " + std::to_string(n_states));
+      }
     }
   }
 }

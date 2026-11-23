@@ -96,12 +96,15 @@ constexpr int kMaxStates = 6;
 constexpr int kMaxQueries = 4;
 struct AttnResPtrs {
   const float* s[kMaxStates];
+  const float* inv[kMaxStates];
 };
 
-// 2-pass vectorized AttnRes: computes ss[i] and dot(q[qi], S_i) in ONE pass (since dot(q, S_i * inv_i)
-// == dot(q, S_i) * inv_i), saving 1/3 of global memory reads and 1 workgroup barrier. Uses float4 when H % 4 == 0.
-__global__ __launch_bounds__(kThreads) void AttnResKernel(AttnResPtrs st, int n_states, const float* __restrict__ q,
-                                                          int nq, float* __restrict__ out, int T, int H, float eps) {
+// Fast pre-normalized AttnRes (+ optional fused RMSNorm -> bf16 when nq == 1 and norm_w != nullptr):
+// When `st.inv[i] != nullptr`, `inv[i] = st.inv[i][t]` is already pre-computed once when state S_i was produced,
+// eliminating the sum-of-squares reduction across all states and the barrier before softmax.
+__global__ __launch_bounds__(kThreads) void AttnResPrenormKernel(
+    AttnResPtrs st, int n_states, int all_prenorm, const float* __restrict__ q, int nq, float* __restrict__ out,
+    const uint16_t* __restrict__ norm_w, uint16_t* __restrict__ out_bf16, int T, int H, float eps) {
   __shared__ float red[kWaves * (kMaxStates + kMaxStates * kMaxQueries)];
   __shared__ float inv[kMaxStates];
   __shared__ float p[kMaxQueries][kMaxStates];
@@ -120,21 +123,43 @@ __global__ __launch_bounds__(kThreads) void AttnResKernel(AttnResPtrs st, int n_
   if (vec4) {
     const int H4 = H >> 2;
     const int64_t row4 = row_off >> 2;
-    for (int h4 = threadIdx.x; h4 < H4; h4 += kThreads) {
-      float4 qv[kMaxQueries];
+    if (all_prenorm) {
+      for (int h4 = threadIdx.x; h4 < H4; h4 += kThreads) {
+        float4 qv[kMaxQueries];
 #pragma unroll
-      for (int qi = 0; qi < kMaxQueries; ++qi) {
-        if (qi < nq) qv[qi] = reinterpret_cast<const float4*>(q)[static_cast<int64_t>(qi) * H4 + h4];
+        for (int qi = 0; qi < kMaxQueries; ++qi) {
+          if (qi < nq) qv[qi] = reinterpret_cast<const float4*>(q)[static_cast<int64_t>(qi) * H4 + h4];
+        }
+#pragma unroll
+        for (int i = 0; i < kMaxStates; ++i) {
+          if (i < n_states) {
+            const float4 x = reinterpret_cast<const float4*>(st.s[i])[row4 + h4];
+#pragma unroll
+            for (int qi = 0; qi < kMaxQueries; ++qi) {
+              if (qi < nq) {
+                d[qi][i] += (qv[qi].x * x.x + qv[qi].y * x.y) + (qv[qi].z * x.z + qv[qi].w * x.w);
+              }
+            }
+          }
+        }
       }
+    } else {
+      for (int h4 = threadIdx.x; h4 < H4; h4 += kThreads) {
+        float4 qv[kMaxQueries];
 #pragma unroll
-      for (int i = 0; i < kMaxStates; ++i) {
-        if (i < n_states) {
-          const float4 x = reinterpret_cast<const float4*>(st.s[i])[row4 + h4];
-          ss[i] += (x.x * x.x + x.y * x.y) + (x.z * x.z + x.w * x.w);
+        for (int qi = 0; qi < kMaxQueries; ++qi) {
+          if (qi < nq) qv[qi] = reinterpret_cast<const float4*>(q)[static_cast<int64_t>(qi) * H4 + h4];
+        }
 #pragma unroll
-          for (int qi = 0; qi < kMaxQueries; ++qi) {
-            if (qi < nq) {
-              d[qi][i] += (qv[qi].x * x.x + qv[qi].y * x.y) + (qv[qi].z * x.z + qv[qi].w * x.w);
+        for (int i = 0; i < kMaxStates; ++i) {
+          if (i < n_states) {
+            const float4 x = reinterpret_cast<const float4*>(st.s[i])[row4 + h4];
+            if (st.inv[i] == nullptr) ss[i] += (x.x * x.x + x.y * x.y) + (x.z * x.z + x.w * x.w);
+#pragma unroll
+            for (int qi = 0; qi < kMaxQueries; ++qi) {
+              if (qi < nq) {
+                d[qi][i] += (qv[qi].x * x.x + qv[qi].y * x.y) + (qv[qi].z * x.z + qv[qi].w * x.w);
+              }
             }
           }
         }
@@ -151,7 +176,7 @@ __global__ __launch_bounds__(kThreads) void AttnResKernel(AttnResPtrs st, int n_
       for (int i = 0; i < kMaxStates; ++i) {
         if (i < n_states) {
           const float x = st.s[i][row_off + h];
-          ss[i] += x * x;
+          if (st.inv[i] == nullptr) ss[i] += x * x;
 #pragma unroll
           for (int qi = 0; qi < kMaxQueries; ++qi) {
             if (qi < nq) d[qi][i] += qv[qi] * x;
@@ -160,11 +185,13 @@ __global__ __launch_bounds__(kThreads) void AttnResKernel(AttnResPtrs st, int n_
       }
     }
   }
+  if (!all_prenorm) {
 #pragma unroll
-  for (int i = 0; i < kMaxStates; ++i) {
-    if (i < n_states) {
-      const float v = WaveSum(ss[i]);
-      if ((threadIdx.x & 31) == 0) red[i * kWaves + (threadIdx.x >> 5)] = v;
+    for (int i = 0; i < kMaxStates; ++i) {
+      if (i < n_states && st.inv[i] == nullptr) {
+        const float v = WaveSum(ss[i]);
+        if ((threadIdx.x & 31) == 0) red[i * kWaves + (threadIdx.x >> 5)] = v;
+      }
     }
   }
   float* red2 = red + kWaves * kMaxStates;
@@ -180,14 +207,23 @@ __global__ __launch_bounds__(kThreads) void AttnResKernel(AttnResPtrs st, int n_
       }
     }
   }
-  __syncthreads();
-  if (threadIdx.x < n_states) {
-    float a = 0.0f;
-#pragma unroll
-    for (int w = 0; w < kWaves; ++w) a += red[threadIdx.x * kWaves + w];
-    inv[threadIdx.x] = rsqrtf(a / static_cast<float>(H) + eps);
+  if (all_prenorm && threadIdx.x < n_states) {
+    inv[threadIdx.x] = st.inv[threadIdx.x][t];
   }
   __syncthreads();
+  if (!all_prenorm) {
+    if (threadIdx.x < n_states) {
+      if (st.inv[threadIdx.x] != nullptr) {
+        inv[threadIdx.x] = st.inv[threadIdx.x][t];
+      } else {
+        float a = 0.0f;
+#pragma unroll
+        for (int w = 0; w < kWaves; ++w) a += red[threadIdx.x * kWaves + w];
+        inv[threadIdx.x] = rsqrtf(a / static_cast<float>(H) + eps);
+      }
+    }
+    __syncthreads();
+  }
   if (threadIdx.x < nq) {
     const int qi = threadIdx.x;
     const float scale = rsqrtf(static_cast<float>(H));
@@ -210,7 +246,90 @@ __global__ __launch_bounds__(kThreads) void AttnResKernel(AttnResPtrs st, int n_
     for (int i = 0; i < n_states; ++i) p[qi][i] = (lg_s[qi][i] * inv_l) * inv[i];
   }
   __syncthreads();
-  // Pass 2: mix of states (p[qi][i] already folded inv[i]).
+  // Pass 2: mix of states (p[qi][i] already folded inv[i]), optionally fused with plain RMSNorm -> bf16 (when nq == 1).
+  if (norm_w != nullptr && out_bf16 != nullptr && nq == 1) {
+    float ss_out = 0.0f;
+    if (vec4) {
+      const int H4 = H >> 2;
+      const int64_t row4 = row_off >> 2;
+      for (int h4 = threadIdx.x; h4 < H4; h4 += kThreads) {
+        float4 a = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+#pragma unroll
+        for (int i = 0; i < kMaxStates; ++i) {
+          if (i < n_states) {
+            const float4 sv = reinterpret_cast<const float4*>(st.s[i])[row4 + h4];
+            const float w = p[0][i];
+            a.x += w * sv.x;
+            a.y += w * sv.y;
+            a.z += w * sv.z;
+            a.w += w * sv.w;
+          }
+        }
+        if (out != nullptr) reinterpret_cast<float4*>(out)[row4 + h4] = a;
+        ss_out += (a.x * a.x + a.y * a.y) + (a.z * a.z + a.w * a.w);
+      }
+      ss_out = BlockSum(ss_out, red);
+      const float rstd = rsqrtf(ss_out / static_cast<float>(H) + eps);
+      uint16_t* dst = out_bf16 + row_off;
+      for (int h4 = threadIdx.x; h4 < H4; h4 += kThreads) {
+        float4 a;
+        if (out != nullptr) {
+          a = reinterpret_cast<const float4*>(out)[row4 + h4];
+        } else {
+          a = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+#pragma unroll
+          for (int i = 0; i < kMaxStates; ++i) {
+            if (i < n_states) {
+              const float4 sv = reinterpret_cast<const float4*>(st.s[i])[row4 + h4];
+              const float w = p[0][i];
+              a.x += w * sv.x;
+              a.y += w * sv.y;
+              a.z += w * sv.z;
+              a.w += w * sv.w;
+            }
+          }
+        }
+        const int h = h4 << 2;
+        const uint2 w01 = *reinterpret_cast<const uint2*>(norm_w + h);
+        const float w0 = r4dx::core::Bf16ToFloat(static_cast<uint16_t>(w01.x & 0xFFFFu));
+        const float w1 = r4dx::core::Bf16ToFloat(static_cast<uint16_t>(w01.x >> 16));
+        const float w2 = r4dx::core::Bf16ToFloat(static_cast<uint16_t>(w01.y & 0xFFFFu));
+        const float w3 = r4dx::core::Bf16ToFloat(static_cast<uint16_t>(w01.y >> 16));
+        const uint32_t o01 = static_cast<uint32_t>(r4dx::core::FloatToBf16(a.x * rstd * w0)) |
+                             (static_cast<uint32_t>(r4dx::core::FloatToBf16(a.y * rstd * w1)) << 16);
+        const uint32_t o23 = static_cast<uint32_t>(r4dx::core::FloatToBf16(a.z * rstd * w2)) |
+                             (static_cast<uint32_t>(r4dx::core::FloatToBf16(a.w * rstd * w3)) << 16);
+        *reinterpret_cast<uint2*>(dst + h) = make_uint2(o01, o23);
+      }
+    } else {
+      for (int h = threadIdx.x; h < H; h += kThreads) {
+        float a = 0.0f;
+#pragma unroll
+        for (int i = 0; i < kMaxStates; ++i) {
+          if (i < n_states) a += p[0][i] * st.s[i][row_off + h];
+        }
+        if (out != nullptr) out[row_off + h] = a;
+        ss_out += a * a;
+      }
+      ss_out = BlockSum(ss_out, red);
+      const float rstd = rsqrtf(ss_out / static_cast<float>(H) + eps);
+      uint16_t* dst = out_bf16 + row_off;
+      for (int h = threadIdx.x; h < H; h += kThreads) {
+        float a = 0.0f;
+        if (out != nullptr) {
+          a = out[row_off + h];
+        } else {
+#pragma unroll
+          for (int i = 0; i < kMaxStates; ++i) {
+            if (i < n_states) a += p[0][i] * st.s[i][row_off + h];
+          }
+        }
+        dst[h] = r4dx::core::FloatToBf16(a * rstd * r4dx::core::Bf16ToFloat(norm_w[h]));
+      }
+    }
+    return;
+  }
+
   if (vec4) {
     const int H4 = H >> 2;
     const int64_t row4 = row_off >> 2;
@@ -249,6 +368,68 @@ __global__ __launch_bounds__(kThreads) void AttnResKernel(AttnResPtrs st, int n_
         out[(static_cast<int64_t>(qi) * T + t) * H + h] = a;
       }
     }
+  }
+}
+
+__global__ __launch_bounds__(kThreads) void RowInvRmsKernel(const float* __restrict__ x, float* __restrict__ inv_out,
+                                                            int H, float eps) {
+  __shared__ float red[kWaves];
+  const int t = blockIdx.x;
+  const float* xr = x + static_cast<int64_t>(t) * H;
+  float ss = 0.0f;
+  if ((H & 3) == 0) {
+    const int H4 = H >> 2;
+    const float4* xr4 = reinterpret_cast<const float4*>(xr);
+    for (int h4 = threadIdx.x; h4 < H4; h4 += kThreads) {
+      const float4 v = xr4[h4];
+      ss += (v.x * v.x + v.y * v.y) + (v.z * v.z + v.w * v.w);
+    }
+  } else {
+    for (int h = threadIdx.x; h < H; h += kThreads) {
+      const float v = xr[h];
+      ss += v * v;
+    }
+  }
+  ss = WaveSum(ss);
+  if ((threadIdx.x & 31) == 0) red[threadIdx.x >> 5] = ss;
+  __syncthreads();
+  if (threadIdx.x == 0) {
+    float total = red[0];
+#pragma unroll
+    for (int i = 1; i < kWaves; ++i) total += red[i];
+    inv_out[t] = rsqrtf(total / static_cast<float>(H) + eps);
+  }
+}
+
+// Fused decode (T == 1) static short convolution + residual add + row inverse RMS in a single 256-thread block.
+__global__ __launch_bounds__(kThreads) void SconvStaticDecodeNormKernel(
+    const void* __restrict__ x, int x_bf16, const float* __restrict__ w, float* __restrict__ state,
+    const float* residual, float* out, float* hist, float* __restrict__ inv_out, int C, float eps) {
+  __shared__ float red[kWaves];
+  const float inv5 = sqrtf(5.0f);
+  float ss = 0.0f;
+  for (int c = threadIdx.x; c < C; c += kThreads) {
+    const float h0 = state[c], h1 = state[C + c], h2 = state[2 * C + c];
+    const float4 wv = reinterpret_cast<const float4*>(w)[c];
+    const float xt = LoadF(x, c, x_bf16);
+    if (hist != nullptr) hist[c] = xt;
+    const float conv = wv.x * h0 + wv.y * h1 + wv.z * h2 + wv.w * xt;
+    float y = (conv + xt) / inv5;
+    if (residual != nullptr) y = residual[c] + y;
+    out[c] = y;
+    state[c] = h1;
+    state[C + c] = h2;
+    state[2 * C + c] = xt;
+    ss += y * y;
+  }
+  ss = WaveSum(ss);
+  if ((threadIdx.x & 31) == 0) red[threadIdx.x >> 5] = ss;
+  __syncthreads();
+  if (threadIdx.x == 0) {
+    float total = red[0];
+#pragma unroll
+    for (int i = 1; i < kWaves; ++i) total += red[i];
+    inv_out[0] = rsqrtf(total / static_cast<float>(C) + eps);
   }
 }
 
@@ -1600,23 +1781,65 @@ void RunHead(const char* fn, HeadArgs a, int64_t stream) {
 
 extern "C" {
 
-void r4dx_inkling2_attnres_f32(const int64_t* states, int n_states, int64_t queries, int nq, int64_t out, int T,
-                               int H, float eps, int64_t stream) {
+void r4dx_inkling2_attnres_prenorm_f32(const int64_t* states, const int64_t* inv_rms, int n_states, int64_t queries,
+                                       int nq, int64_t out, int64_t norm_weight, int64_t out_bf16, int T, int H,
+                                       float eps, int64_t stream) {
   const char* fn = "r4dx_inkling2_attnres_f32";
   if (T <= 0) return;
   if (states == nullptr || n_states < 1 || n_states > kMaxStates) Fail(fn, "n_states must be 1..6 with a pointer array");
   if (nq < 1 || nq > kMaxQueries) Fail(fn, "nq must be 1..4");
   if (H < 1 || H > 8192) Fail(fn, "H must be 1..8192");
-  if (queries == 0 || out == 0) Fail(fn, "null queries / out");
+  const bool fuse_norm = (norm_weight != 0 && out_bf16 != 0 && nq == 1);
+  if (queries == 0 || (out == 0 && !fuse_norm)) Fail(fn, "null queries / out");
   AttnResPtrs p{};
+  int all_prenorm = 1;
   for (int i = 0; i < n_states; ++i) {
     if (states[i] == 0) Fail(fn, "null state pointer");
     p.s[i] = reinterpret_cast<const float*>(states[i]);
+    p.inv[i] = (inv_rms != nullptr && inv_rms[i] != 0) ? reinterpret_cast<const float*>(inv_rms[i]) : nullptr;
+    if (p.inv[i] == nullptr) all_prenorm = 0;
   }
-  hipLaunchKernelGGL(AttnResKernel, dim3(static_cast<unsigned>(T)), dim3(kThreads), 0,
-                     reinterpret_cast<hipStream_t>(stream), p, n_states, reinterpret_cast<const float*>(queries), nq,
-                     reinterpret_cast<float*>(out), T, H, eps);
+  hipLaunchKernelGGL(AttnResPrenormKernel, dim3(static_cast<unsigned>(T)), dim3(kThreads), 0,
+                     reinterpret_cast<hipStream_t>(stream), p, n_states, all_prenorm,
+                     reinterpret_cast<const float*>(queries), nq, reinterpret_cast<float*>(out),
+                     fuse_norm ? reinterpret_cast<const uint16_t*>(norm_weight) : nullptr,
+                     fuse_norm ? reinterpret_cast<uint16_t*>(out_bf16) : nullptr, T, H, eps);
   CheckLaunch(fn);
+}
+
+void r4dx_inkling2_attnres_f32(const int64_t* states, int n_states, int64_t queries, int nq, int64_t out, int T,
+                               int H, float eps, int64_t stream) {
+  r4dx_inkling2_attnres_prenorm_f32(states, nullptr, n_states, queries, nq, out, 0, 0, T, H, eps, stream);
+}
+
+void r4dx_inkling2_row_inv_rms_f32(int64_t x, int64_t inv_out, int T, int H, float eps, int64_t stream) {
+  const char* fn = "r4dx_inkling2_row_inv_rms_f32";
+  if (T <= 0) return;
+  if (x == 0 || inv_out == 0 || H < 1) Fail(fn, "null pointer or H < 1");
+  hipLaunchKernelGGL(RowInvRmsKernel, dim3(static_cast<unsigned>(T)), dim3(kThreads), 0,
+                     reinterpret_cast<hipStream_t>(stream), reinterpret_cast<const float*>(x),
+                     reinterpret_cast<float*>(inv_out), H, eps);
+  CheckLaunch(fn);
+}
+
+void r4dx_inkling2_sconv_static_hist_norm_f32(int64_t x, int x_bf16, int64_t weight, int64_t state, int64_t residual,
+                                              int64_t out, int64_t hist, int64_t inv_out, int T, int C, float eps,
+                                              int64_t stream) {
+  const char* fn = "r4dx_inkling2_sconv_static_hist_norm_f32";
+  if (T <= 0 || C <= 0) return;
+  if (x == 0 || weight == 0 || state == 0 || out == 0) Fail(fn, "null pointer");
+  if (x == out) Fail(fn, "out must not alias x");
+  if (T == 1 && inv_out != 0) {
+    hipLaunchKernelGGL(SconvStaticDecodeNormKernel, dim3(1), dim3(kThreads), 0, reinterpret_cast<hipStream_t>(stream),
+                       reinterpret_cast<const void*>(x), x_bf16, reinterpret_cast<const float*>(weight),
+                       reinterpret_cast<float*>(state), reinterpret_cast<const float*>(residual),
+                       reinterpret_cast<float*>(out), reinterpret_cast<float*>(hist),
+                       reinterpret_cast<float*>(inv_out), C, eps);
+    CheckLaunch(fn);
+    return;
+  }
+  r4dx_inkling2_sconv_static_hist_f32(x, x_bf16, weight, state, residual, out, hist, T, C, stream);
+  if (inv_out != 0) r4dx_inkling2_row_inv_rms_f32(out, inv_out, T, C, eps, stream);
 }
 
 void r4dx_inkling2_sconv_static_hist_f32(int64_t x, int x_bf16, int64_t weight, int64_t state, int64_t residual,

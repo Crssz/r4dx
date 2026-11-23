@@ -188,7 +188,11 @@ Inkling2Model Inkling2Model::Load(const Inkling2ModelOptions& opts) {
   const int64_t rows = m.max_chunk_;
 
   m.pool_.reserve(kPoolBuffers);
-  for (int i = 0; i < kPoolBuffers; ++i) m.pool_.emplace_back(static_cast<size_t>(rows * H));
+  m.pool_inv_rms_.reserve(kPoolBuffers);
+  for (int i = 0; i < kPoolBuffers; ++i) {
+    m.pool_.emplace_back(static_cast<size_t>(rows * H));
+    m.pool_inv_rms_.emplace_back(static_cast<size_t>(rows));
+  }
   m.msg_ = core::DeviceBuffer<float>(static_cast<size_t>(4 * rows * H));
 
   // KV caches + block tables.
@@ -866,24 +870,28 @@ void Inkling2Model::RunVisit(const Inkling2Visit& v, Chunk& c, int64_t T, SpanAc
   const float eps = static_cast<float>(cfg.rms_norm_eps);
   const size_t mark = arena_.Mark();
   const size_t n = static_cast<size_t>(T * H);
-  const auto stack = [&]() {
-    std::vector<int64_t> st;
-    for (int b : c.B) st.push_back(P(pool_[static_cast<size_t>(b)].data()));
-    st.push_back(P(pool_[static_cast<size_t>(c.h)].data()));
-    return st;
+  int64_t st_ptrs[6]{}, st_inv[6]{};
+  const auto fill_stack = [&](const std::vector<int>& blks, int h_idx) -> int {
+    int k = 0;
+    for (int b : blks) {
+      st_ptrs[k] = P(pool_[static_cast<size_t>(b)].data());
+      st_inv[k] = P(pool_inv_rms_[static_cast<size_t>(b)].data());
+      ++k;
+    }
+    st_ptrs[k] = P(pool_[static_cast<size_t>(h_idx)].data());
+    st_inv[k] = P(pool_inv_rms_[static_cast<size_t>(h_idx)].data());
+    return k + 1;
   };
   float* h = pool_[static_cast<size_t>(c.h)].data();
 
   // messages (passes >= 2): [q, k, v, mlp] = AttnRes(msg_query[j], [prev blocks..., prev h])
   const bool msgs = v.HasMessages();
   if (msgs) {
-    std::vector<int64_t> prev;
-    for (int b : c.prev_B) prev.push_back(P(pool_[static_cast<size_t>(b)].data()));
-    prev.push_back(P(pool_[static_cast<size_t>(c.prev_h)].data()));
+    const int n_prev = fill_stack(c.prev_B, c.prev_h);
     ProfiledCall(prof, sr, "attnres.msg", [&] {
-      r4dx_inkling2_attnres_f32(prev.data(), static_cast<int>(prev.size()),
-                                P(container_.MsgQueries().data() + static_cast<int64_t>(v.loop_j) * 4 * H), 4,
-                                P(msg_.data()), static_cast<int>(T), static_cast<int>(H), eps, s);
+      r4dx_inkling2_attnres_prenorm_f32(st_ptrs, st_inv, n_prev,
+                                        P(container_.MsgQueries().data() + static_cast<int64_t>(v.loop_j) * 4 * H), 4,
+                                        P(msg_.data()), 0, 0, static_cast<int>(T), static_cast<int>(H), eps, s);
     });
   }
   const auto msg = [&](int m) { return msg_.data() + static_cast<int64_t>(m) * T * H; };
@@ -893,12 +901,21 @@ void Inkling2Model::RunVisit(const Inkling2Visit& v, Chunk& c, int64_t T, SpanAc
   uint16_t* xk = arena_.Alloc<uint16_t>(n, 16);
   uint16_t* xv = arena_.Alloc<uint16_t>(n, 16);
   ProfiledCall(prof, sr, "attnres.attn", [&] {
+    if (!msgs && !w.full && w.n_attn_queries == 1) {
+      // Sliding layer without messages (nq == 1): fuse AttnRes + attn_norm -> xq in a single launch!
+      const int n_st = fill_stack(c.B, c.h);
+      r4dx_inkling2_attnres_prenorm_f32(st_ptrs, st_inv, n_st, P(w.attn_query.data()), 1, 0, P(w.attn_norm.data()),
+                                        P(xq), static_cast<int>(T), static_cast<int>(H), eps, s);
+      xk = xq;
+      xv = xq;
+      return;
+    }
     float* a = nullptr;
     if (w.n_attn_queries > 0) {
       a = arena_.Alloc<float>(static_cast<size_t>(w.n_attn_queries) * n, 16);
-      const std::vector<int64_t> st = stack();
-      r4dx_inkling2_attnres_f32(st.data(), static_cast<int>(st.size()), P(w.attn_query.data()), w.n_attn_queries, P(a),
-                                static_cast<int>(T), static_cast<int>(H), eps, s);
+      const int n_st = fill_stack(c.B, c.h);
+      r4dx_inkling2_attnres_prenorm_f32(st_ptrs, st_inv, n_st, P(w.attn_query.data()), w.n_attn_queries, P(a), 0, 0,
+                                        static_cast<int>(T), static_cast<int>(H), eps, s);
     }
     const auto src = [&](int m) -> const float* {
       if (a == nullptr) return h;  // layer 0: no attention residual
@@ -932,13 +949,15 @@ void Inkling2Model::RunVisit(const Inkling2Visit& v, Chunk& c, int64_t T, SpanAc
     if (cfg.IsBoundary(v.layer)) {
       c.B.push_back(c.h);
       const int hn = c.Acquire();
-      r4dx_inkling2_sconv_static_hist_f32(P(o), 1, P(w.attn_conv.data()), P(ConvState(v.cache_slot, 2)), 0,
-                                          P(pool_[static_cast<size_t>(hn)].data()), hist2, static_cast<int>(T),
-                                          static_cast<int>(H), s);
+      r4dx_inkling2_sconv_static_hist_norm_f32(P(o), 1, P(w.attn_conv.data()), P(ConvState(v.cache_slot, 2)), 0,
+                                               P(pool_[static_cast<size_t>(hn)].data()), hist2,
+                                               P(pool_inv_rms_[static_cast<size_t>(hn)].data()), static_cast<int>(T),
+                                               static_cast<int>(H), eps, s);
       c.h = hn;
     } else {
-      r4dx_inkling2_sconv_static_hist_f32(P(o), 1, P(w.attn_conv.data()), P(ConvState(v.cache_slot, 2)), P(h), P(h),
-                                          hist2, static_cast<int>(T), static_cast<int>(H), s);
+      r4dx_inkling2_sconv_static_hist_norm_f32(P(o), 1, P(w.attn_conv.data()), P(ConvState(v.cache_slot, 2)), P(h),
+                                               P(h), hist2, P(pool_inv_rms_[static_cast<size_t>(c.h)].data()),
+                                               static_cast<int>(T), static_cast<int>(H), eps, s);
     }
   });
   h = pool_[static_cast<size_t>(c.h)].data();
@@ -946,23 +965,27 @@ void Inkling2Model::RunVisit(const Inkling2Visit& v, Chunk& c, int64_t T, SpanAc
   // MLP input
   uint16_t* xm = arena_.Alloc<uint16_t>(n, 16);
   ProfiledCall(prof, sr, "attnres.mlp", [&] {
-    float* y = arena_.Alloc<float>(n, 16);
-    const std::vector<int64_t> st = stack();
-    r4dx_inkling2_attnres_f32(st.data(), static_cast<int>(st.size()), P(w.mlp_query.data()), 1, P(y), static_cast<int>(T),
-                              static_cast<int>(H), eps, s);
-    if (msgs) {
-      float* y2 = arena_.Alloc<float>(n, 16);
-      MsgGate(w.msg[3], y, msg(3), y2, T);
-      y = y2;
+    const int n_st = fill_stack(c.B, c.h);
+    if (!msgs) {
+      // No message gate: fuse AttnRes + mlp_norm -> xm in a single launch!
+      r4dx_inkling2_attnres_prenorm_f32(st_ptrs, st_inv, n_st, P(w.mlp_query.data()), 1, 0, P(w.mlp_norm.data()),
+                                        P(xm), static_cast<int>(T), static_cast<int>(H), eps, s);
+      return;
     }
-    r4dx_rmsnorm_plain_f32in_bf16(P(y), P(w.mlp_norm.data()), P(xm), T, H, eps, s);
+    float* y = arena_.Alloc<float>(n, 16);
+    r4dx_inkling2_attnres_prenorm_f32(st_ptrs, st_inv, n_st, P(w.mlp_query.data()), 1, P(y), 0, 0, static_cast<int>(T),
+                                      static_cast<int>(H), eps, s);
+    float* y2 = arena_.Alloc<float>(n, 16);
+    MsgGate(w.msg[3], y, msg(3), y2, T);
+    r4dx_rmsnorm_plain_f32in_bf16(P(y2), P(w.mlp_norm.data()), P(xm), T, H, eps, s);
   });
   uint16_t* f = arena_.Alloc<uint16_t>(n, 16);
   Moe(v.layer, xm, f, T, v.index, prof);
   ProfiledCall(prof, sr, "conv.post_mlp", [&] {
     const int64_t hist3 = capture_conv_hist ? P(ConvHist(v.cache_slot, 3)) : 0;
-    r4dx_inkling2_sconv_static_hist_f32(P(f), 1, P(w.mlp_conv.data()), P(ConvState(v.cache_slot, 3)), P(h), P(h),
-                                        hist3, static_cast<int>(T), static_cast<int>(H), s);
+    r4dx_inkling2_sconv_static_hist_norm_f32(P(f), 1, P(w.mlp_conv.data()), P(ConvState(v.cache_slot, 3)), P(h), P(h),
+                                             hist3, P(pool_inv_rms_[static_cast<size_t>(c.h)].data()),
+                                             static_cast<int>(T), static_cast<int>(H), eps, s);
   });
   arena_.Rewind(mark);
 }
@@ -974,17 +997,16 @@ void Inkling2Model::Head(const float* h_row, const std::vector<const float*>& bl
   const hipStream_t sr = stream_.get();
   const int64_t s = P(sr);
   const int64_t H = cfg.hidden_size, vl = cfg.HeadRowsLocal();
-  float* fr = arena_.Alloc<float>(static_cast<size_t>(H), 16);
   uint16_t* xn = arena_.Alloc<uint16_t>(static_cast<size_t>(H), 16);
   uint16_t* lg = arena_.Alloc<uint16_t>(static_cast<size_t>(vl), 16);
   ProfiledCall(prof, sr, "final", [&] {
-    std::vector<int64_t> st;
-    for (const float* b : blocks) st.push_back(P(b));
-    st.push_back(P(h_row));
-    r4dx_inkling2_attnres_f32(st.data(), static_cast<int>(st.size()), P(container_.FinalQuery().data()), 1, P(fr), 1,
-                              static_cast<int>(H), static_cast<float>(cfg.rms_norm_eps), s);
-    r4dx_rmsnorm_plain_f32in_bf16(P(fr), P(container_.FinalNorm().data()), P(xn), 1, H,
-                                  static_cast<float>(cfg.rms_norm_eps), s);
+    int64_t st[6]{};
+    int k = 0;
+    for (const float* b : blocks) st[k++] = P(b);
+    st[k++] = P(h_row);
+    r4dx_inkling2_attnres_prenorm_f32(st, nullptr, k, P(container_.FinalQuery().data()), 1, 0,
+                                      P(container_.FinalNorm().data()), P(xn), 1, static_cast<int>(H),
+                                      static_cast<float>(cfg.rms_norm_eps), s);
   });
   ProfiledCall(prof, sr, "gemm:lm_head", [&] { Lin(container_.LmHead(), xn, lg, 1); });
   ProfiledCall(prof, sr, "lm_head.softcap", [&] {
@@ -1058,6 +1080,8 @@ std::vector<float> Inkling2Model::RunChunk(const std::vector<int32_t>& token_ids
           r4dx_inkling2_add_f32_bf16(P(dst), P(src_dev), P(dst), sp.tokens * H, s);
         }
       }
+      r4dx_inkling2_row_inv_rms_f32(P(h0), P(pool_inv_rms_[static_cast<size_t>(c.h)].data()), static_cast<int>(T),
+                                    static_cast<int>(H), static_cast<float>(cfg.rms_norm_eps), s);
     });
     const size_t base_mark = arena_.Mark();
 
@@ -1098,14 +1122,20 @@ std::vector<float> Inkling2Model::RunChunk(const std::vector<int32_t>& token_ids
     arena_.Rewind(base_mark);
 
     if (capture_taps) {
-      float* fr_all = arena_.Alloc<float>(static_cast<size_t>(T * H), 16);
-      std::vector<int64_t> st;
-      for (int b : c.B) st.push_back(P(pool_[static_cast<size_t>(b)].data()));
-      st.push_back(P(pool_[static_cast<size_t>(c.h)].data()));
-      r4dx_inkling2_attnres_f32(st.data(), static_cast<int>(st.size()), P(container_.FinalQuery().data()), 1, P(fr_all),
-                                static_cast<int>(T), static_cast<int>(H), static_cast<float>(cfg.rms_norm_eps), s);
-      r4dx_rmsnorm_plain_f32in_bf16(P(fr_all), P(container_.FinalNorm().data()), P(dspark_taps_[3].data()), T, H,
-                                    static_cast<float>(cfg.rms_norm_eps), s);
+      int64_t st[6]{}, inv[6]{};
+      int k = 0;
+      for (int b : c.B) {
+        st[k] = P(pool_[static_cast<size_t>(b)].data());
+        inv[k] = P(pool_inv_rms_[static_cast<size_t>(b)].data());
+        ++k;
+      }
+      st[k] = P(pool_[static_cast<size_t>(c.h)].data());
+      inv[k] = P(pool_inv_rms_[static_cast<size_t>(c.h)].data());
+      ++k;
+      r4dx_inkling2_attnres_prenorm_f32(st, inv, k, P(container_.FinalQuery().data()), 1, 0,
+                                        P(container_.FinalNorm().data()), P(dspark_taps_[3].data()),
+                                        static_cast<int>(T), static_cast<int>(H),
+                                        static_cast<float>(cfg.rms_norm_eps), s);
     }
 
     const bool is_verify = (verify_greedy_out != nullptr || verify_summaries_out != nullptr);

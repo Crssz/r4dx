@@ -30,6 +30,22 @@ extern "C" {
 void r4dx_inkling2_attnres_f32(const int64_t* states, int n_states, int64_t queries, int nq, int64_t out, int T,
                                int H, float eps, int64_t stream);
 
+// Same as r4dx_inkling2_attnres_f32, but takes pre-computed per-token inverse RMS pointers `inv_rms[i]` (each fp32 [T]
+// holding rsqrt(mean(S_i[t]^2) + eps), or 0 to compute on the fly). When `norm_weight != 0` and `out_bf16 != 0`
+// (for nq == 1), also fuses the downstream RMSNorm `out_bf16[t, :] = bf16(rms(out[t, :]) * norm_weight[:])` into the
+// same kernel launch (if `out == 0`, skips writing the fp32 intermediate altogether).
+void r4dx_inkling2_attnres_prenorm_f32(const int64_t* states, const int64_t* inv_rms, int n_states, int64_t queries,
+                                       int nq, int64_t out, int64_t norm_weight, int64_t out_bf16, int T, int H,
+                                       float eps, int64_t stream);
+
+// Compute per-row inverse RMS `inv_out[t] = rsqrt(mean(x[t, :]^2) + eps)` over x fp32 [T, H].
+void r4dx_inkling2_row_inv_rms_f32(int64_t x, int64_t inv_out, int T, int H, float eps, int64_t stream);
+
+// Fused decode (T == 1) static short convolution + residual add + inverse RMS `inv_out[0] = rsqrt(mean(out^2) + eps)`.
+void r4dx_inkling2_sconv_static_hist_norm_f32(int64_t x, int x_bf16, int64_t weight, int64_t state, int64_t residual,
+                                              int64_t out, int64_t hist, int64_t inv_out, int T, int C, float eps,
+                                              int64_t stream);
+
 // ---- static short convolution (inkling2_ref::SconvStatic) ---------------------------------------------------------
 // out_t = [residual_t +] (w0 x_{t-3} + w1 x_{t-2} + w2 x_{t-1} + w3 x_t + x_t) / sqrt(5), per channel, fp32.
 // x: [T, C] bf16 (x_bf16 != 0) or fp32, row stride C. weight: fp32 [C, 4] (tap 3 = current). state: fp32 [3, C]

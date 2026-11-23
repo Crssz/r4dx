@@ -68,4 +68,13 @@ void r4dx_gemm_mxfp8_moe_prefill(int64_t a_bf16, int64_t wq_ptrs, int64_t ws_ptr
                                  int64_t c, int n_pairs, int n_experts, int K, int N, int WV, int SK,
                                  int NPW, int NT, int64_t stream);
 
+// Native NVFP4 (FP4 E2M1 packed + F8_E4M3 per-16 scales + per-expert fp32 factor) grouped MoE decode/prefill GEMMs.
+// Half the weight bandwidth of MXFP8; exact match to Inkling-2-Mini's native NVFP4 checkpoint experts.
+void r4dx_gemm_nvfp4_moe_decode(int64_t a_bf16, int64_t wq_ptrs, int64_t ws_ptrs, int64_t factors_f32, int64_t ids,
+                                int64_t c, int n_pairs, int a_row_group, int n_experts, int K, int N, int WV, int SK,
+                                int NPW, int NT, int64_t stream);
+void r4dx_gemm_nvfp4_moe_prefill(int64_t a_bf16, int64_t wq_ptrs, int64_t ws_ptrs, int64_t factors_f32,
+                                 int64_t expert_offsets, int64_t c, int n_pairs, int n_experts, int K, int N, int WV,
+                                 int SK, int NPW, int NT, int64_t stream);
+
 }  // extern "C"

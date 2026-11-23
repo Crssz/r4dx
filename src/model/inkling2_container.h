@@ -69,8 +69,12 @@ struct Inkling2LayerWeights {
   core::DeviceBuffer<float> bias;             // fp32 [E]
   std::vector<QuantLinear> gate_up, down;     // [E]
   // uint64 [E] device tables of the experts' weight bases (the grouped MoE kernels of a later stage index them):
-  // mxfp8: wq / ws, bf16: w. Empty when the experts' layouts are mixed.
+  // mxfp8/nvfp4: wq / ws, bf16: w. Empty when the experts' layouts are mixed.
   core::DeviceBuffer<uint64_t> gate_up_ptrs0, gate_up_ptrs1, down_ptrs0, down_ptrs1;
+  // Native NVFP4 MoE experts (when loaded via R4DX_INK_NVFP4_EXPERTS): half the VRAM and bandwidth of MXFP8.
+  bool nvfp4_experts = false;
+  core::DeviceBuffer<uint8_t> nvfp4_gu_wq, nvfp4_gu_ws, nvfp4_dn_wq, nvfp4_dn_ws;
+  core::DeviceBuffer<float> gate_up_factors, down_factors;  // [E]
 };
 
 struct Inkling2LoadOptions {

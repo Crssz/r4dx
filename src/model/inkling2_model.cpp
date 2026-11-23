@@ -234,9 +234,10 @@ Inkling2Model Inkling2Model::Load(const Inkling2ModelOptions& opts) {
                           (gqa == 1 || gqa == 2 || gqa == 3 || gqa == 4 || gqa == 6 || gqa == 8);
     for (int64_t l = 0; all_grouped_mx && l < cfg.num_hidden_layers; ++l) {
       const Inkling2LayerWeights& lw = m.container_.Layer(l);
+      const bool mx_ok = !lw.gate_up.empty() && !lw.down.empty() && lw.gate_up[0].layout == Layout::kMxfp8 &&
+                         lw.down[0].layout == Layout::kMxfp8;
       if (lw.gate_up_ptrs0.empty() || lw.gate_up_ptrs1.empty() || lw.down_ptrs0.empty() || lw.down_ptrs1.empty() ||
-          lw.gate_up.empty() || lw.down.empty() || lw.gate_up[0].layout != Layout::kMxfp8 ||
-          lw.down[0].layout != Layout::kMxfp8) {
+          (!lw.nvfp4_experts && !mx_ok)) {
         all_grouped_mx = false;
       }
     }
@@ -261,6 +262,10 @@ Inkling2Model Inkling2Model::Load(const Inkling2ModelOptions& opts) {
   }
   m.stream_.Synchronize();
 
+  int nvfp4_layers = 0;
+  for (int64_t l = 0; l < cfg.num_hidden_layers; ++l) {
+    if (m.container_.Layer(l).nvfp4_experts) ++nvfp4_layers;
+  }
   const double gib = 1024.0 * 1024.0 * 1024.0;
   std::cerr << "[r4dx::model::Inkling2Model] " << cfg.num_hidden_layers << " stored layers, " << m.visits_.size()
             << " visits, max_ctx " << m.max_ctx_ << ", KV bf16 = " << static_cast<double>(m.kv_bytes_) / gib
@@ -268,7 +273,9 @@ Inkling2Model Inkling2Model::Load(const Inkling2ModelOptions& opts) {
             << static_cast<double>(m.conv_.bytes()) / (1024.0 * 1024.0) << " MiB, layout " << LayoutName(opts.layout)
             << ", residual fp32, attention "
             << (AttnFusedEnabled() ? "fused h128 (on-the-fly bias + sink)" : "reference (bias + sink)") << ", MoE "
-            << (MoeGroupedDecodeEnabled() ? "grouped decode (mxfp8)" : "staged (host sync per visit)")
+            << (nvfp4_layers > 0 ? ("grouped decode (nvfp4 " + std::to_string(nvfp4_layers) + "/" +
+                                    std::to_string(cfg.num_hidden_layers) + ")")
+                                 : (MoeGroupedDecodeEnabled() ? "grouped decode (mxfp8)" : "staged (host sync per visit)"))
             << (m.decode_graph_eligible_ ? ", decode graph on" : "");
   if (is_tp) std::cerr << ", TP rank " << opts.tp_rank << "/" << opts.tp_world << " (head rows " << vl << ")";
   std::cerr << "\n";
@@ -631,10 +638,31 @@ void Inkling2Model::Moe(int64_t layer, const uint16_t* x, uint16_t* out, int64_t
     dst.insert(dst.end(), h.begin(), h.end());
   }
   if (T == 1) {
-    const bool grouped_mx = MoeGroupedDecodeEnabled() && !w.gate_up_ptrs0.empty() && !w.gate_up_ptrs1.empty() &&
-                            !w.down_ptrs0.empty() && !w.down_ptrs1.empty() && !w.gate_up.empty() &&
-                            w.gate_up[0].layout == Layout::kMxfp8 && w.down[0].layout == Layout::kMxfp8;
-    if (grouped_mx) {
+    const bool grouped_nv4 = w.nvfp4_experts && !w.gate_up_ptrs0.empty() && !w.down_ptrs0.empty();
+    const bool grouped_mx = !grouped_nv4 && MoeGroupedDecodeEnabled() && !w.gate_up_ptrs0.empty() &&
+                            !w.gate_up_ptrs1.empty() && !w.down_ptrs0.empty() && !w.down_ptrs1.empty() &&
+                            !w.gate_up.empty() && w.gate_up[0].layout == Layout::kMxfp8 &&
+                            w.down[0].layout == Layout::kMxfp8;
+    if (grouped_nv4) {
+      uint16_t* gu = arena_.Alloc<uint16_t>(static_cast<size_t>(K * 2 * I), 16);
+      uint16_t* act = arena_.Alloc<uint16_t>(static_cast<size_t>(K * I), 16);
+      const LinearTuning t_gu = PickTuning(Layout::kMxfp8, 2 * I, H, 1);
+      const LinearTuning t_dn = PickTuning(Layout::kMxfp8, H, I, 1);
+      ProfiledCall(prof, sr, "gemm:moe.gate_up", [&] {
+        r4dx_gemm_nvfp4_moe_decode(P(x), P(w.gate_up_ptrs0.data()), P(w.gate_up_ptrs1.data()),
+                                   P(w.gate_up_factors.data()), P(ids), P(gu), static_cast<int>(K), static_cast<int>(K),
+                                   static_cast<int>(E), static_cast<int>(H), static_cast<int>(2 * I), t_gu.WV, t_gu.SK,
+                                   t_gu.NPW, t_gu.NT, s);
+      });
+      ProfiledCall(prof, sr, "moe.act", [&] {
+        r4dx_inkling2_swiglu_softcap_bf16(P(gu), P(act), K, I, 2 * I, s);
+      });
+      ProfiledCall(prof, sr, "gemm:moe.down", [&] {
+        r4dx_gemm_nvfp4_moe_decode(P(act), P(w.down_ptrs0.data()), P(w.down_ptrs1.data()), P(w.down_factors.data()),
+                                   P(ids), P(ys), static_cast<int>(K), 1, static_cast<int>(E), static_cast<int>(I),
+                                   static_cast<int>(H), t_dn.WV, t_dn.SK, t_dn.NPW, t_dn.NT, s);
+      });
+    } else if (grouped_mx) {
       uint16_t* gu = arena_.Alloc<uint16_t>(static_cast<size_t>(K * 2 * I), 16);
       uint16_t* act = arena_.Alloc<uint16_t>(static_cast<size_t>(K * I), 16);
       const LinearTuning t_gu = PickTuning(Layout::kMxfp8, w.gate_up[0].N, w.gate_up[0].K, 1);
@@ -686,10 +714,32 @@ void Inkling2Model::Moe(int64_t layer, const uint16_t* x, uint16_t* out, int64_t
       r4dx_lfm2_moe_gather_bf16(P(x), P(sorted), P(xs), static_cast<int>(Pn), static_cast<int>(K), static_cast<int>(H), H,
                                 P(offsets + E), s);
     });
-    const bool grouped_mx_pf = MoeGroupedPrefillEnabled() && !w.gate_up_ptrs0.empty() && !w.gate_up_ptrs1.empty() &&
-                               !w.down_ptrs0.empty() && !w.down_ptrs1.empty() && !w.gate_up.empty() &&
-                               w.gate_up[0].layout == Layout::kMxfp8 && w.down[0].layout == Layout::kMxfp8;
-    if (grouped_mx_pf) {
+    const bool grouped_nv4_pf = w.nvfp4_experts && !w.gate_up_ptrs0.empty() && !w.down_ptrs0.empty();
+    const bool grouped_mx_pf = !grouped_nv4_pf && MoeGroupedPrefillEnabled() && !w.gate_up_ptrs0.empty() &&
+                               !w.gate_up_ptrs1.empty() && !w.down_ptrs0.empty() && !w.down_ptrs1.empty() &&
+                               !w.gate_up.empty() && w.gate_up[0].layout == Layout::kMxfp8 &&
+                               w.down[0].layout == Layout::kMxfp8;
+    if (grouped_nv4_pf) {
+      uint16_t* gu = arena_.Alloc<uint16_t>(static_cast<size_t>(Pn * 2 * I), 16);
+      uint16_t* act = arena_.Alloc<uint16_t>(static_cast<size_t>(Pn * I), 16);
+      const int64_t m_tune = std::min<int64_t>(T, 64);
+      const LinearTuning t_gu = PickTuning(Layout::kMxfp8, 2 * I, H, m_tune);
+      const LinearTuning t_dn = PickTuning(Layout::kMxfp8, H, I, m_tune);
+      ProfiledCall(prof, sr, "gemm:moe.gate_up", [&] {
+        r4dx_gemm_nvfp4_moe_prefill(P(xs), P(w.gate_up_ptrs0.data()), P(w.gate_up_ptrs1.data()),
+                                    P(w.gate_up_factors.data()), P(offsets), P(gu), static_cast<int>(Pn),
+                                    static_cast<int>(E), static_cast<int>(H), static_cast<int>(2 * I), t_gu.WV, t_gu.SK,
+                                    t_gu.NPW, t_gu.NT, s);
+      });
+      ProfiledCall(prof, sr, "moe.act", [&] {
+        r4dx_inkling2_swiglu_softcap_bf16(P(gu), P(act), Pn, I, 2 * I, s);
+      });
+      ProfiledCall(prof, sr, "gemm:moe.down", [&] {
+        r4dx_gemm_nvfp4_moe_prefill(P(act), P(w.down_ptrs0.data()), P(w.down_ptrs1.data()), P(w.down_factors.data()),
+                                    P(offsets), P(ys), static_cast<int>(Pn), static_cast<int>(E), static_cast<int>(I),
+                                    static_cast<int>(H), t_dn.WV, t_dn.SK, t_dn.NPW, t_dn.NT, s);
+      });
+    } else if (grouped_mx_pf) {
       if (MoeCheckOffsetsEnabled()) {
         R4DX_HIP_CHECK(hipMemcpyAsync(moe_off_host_.data(), offsets, static_cast<size_t>(E + 1) * sizeof(int32_t),
                                       hipMemcpyDeviceToHost, sr));

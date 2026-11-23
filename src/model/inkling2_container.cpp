@@ -2,8 +2,11 @@
 
 #include <algorithm>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
+#include <filesystem>
 #include <stdexcept>
+#include <thread>
 
 #include "arch.h"
 #include "container_load_util.h"
@@ -200,6 +203,17 @@ Inkling2Container Inkling2Container::Load(const std::string& path, const Inkling
   meta.mxfp8 = CheckMxfp8Choice(metadata, path, o.layout, o.layout);
   SafetensorsReader r(Utf8ToWide(path));
 
+  // Optional native NVFP4 MoE experts loaded directly from the HF checkpoint safetensors (half VRAM + bandwidth).
+  std::unique_ptr<SafetensorsReader> nvfp4_st;
+  if (const char* nv_env = std::getenv("R4DX_INK_NVFP4_EXPERTS"); nv_env != nullptr && nv_env[0] != '\0') {
+    std::filesystem::path p(nv_env);
+    if (std::filesystem::is_directory(p)) p /= "model-00001-of-00001.safetensors";
+    nvfp4_st = std::make_unique<SafetensorsReader>(Utf8ToWide(p.string()));
+    if (o.tp_rank == 0) {
+      std::fprintf(stderr, "r4dx: Inkling2Container loading native NVFP4 MoE experts from %s\n", p.string().c_str());
+    }
+  }
+
   const int64_t H = g.hidden_size, hd = g.head_dim, I = g.moe_intermediate_size;
   const int64_t hl = l.num_attention_heads, kvl = l.num_key_value_heads;
   const int64_t h0 = R * hl, kv0 = R * kvl;  // the rank's first q head / kv head
@@ -293,36 +307,161 @@ Inkling2Container Inkling2Container::Load(const std::string& path, const Inkling
     }
     w.router = Upload(HostBf16(r, b + "moe.router", g.num_experts * H));
     w.bias = Upload(HostF32(r, b + "moe.bias", g.num_experts));
-    w.gate_up.reserve(static_cast<size_t>(g.num_experts));
-    w.down.reserve(static_cast<size_t>(g.num_experts));
-    for (int64_t e = 0; e < g.num_experts; ++e) {
-      const std::string eb = b + "moe.experts." + std::to_string(e) + ".";
-      w.gate_up.push_back(lin(eb + "gate_up", 2 * I, H, RowRule({I, I})));
-      w.down.push_back(lin(eb + "down", H, I, ColRule(I)));
-    }
-    // Device pointer tables when every expert of the layer has one layout.
-    bool all_mx = true, all_bf = true;
-    for (size_t e = 0; e < w.gate_up.size(); ++e) {
-      all_mx = all_mx && w.gate_up[e].layout == Layout::kMxfp8 && w.down[e].layout == Layout::kMxfp8;
-      all_bf = all_bf && w.gate_up[e].layout == Layout::kBf16 && w.down[e].layout == Layout::kBf16;
-    }
-    if (all_mx || all_bf) {
-      std::vector<uint64_t> gu0, gu1, dn0, dn1;
-      for (size_t e = 0; e < w.gate_up.size(); ++e) {
-        gu0.push_back(reinterpret_cast<uint64_t>(all_mx ? static_cast<const void*>(w.gate_up[e].mx_wq.data())
-                                                        : static_cast<const void*>(w.gate_up[e].bf16_w.data())));
-        dn0.push_back(reinterpret_cast<uint64_t>(all_mx ? static_cast<const void*>(w.down[e].mx_wq.data())
-                                                        : static_cast<const void*>(w.down[e].bf16_w.data())));
-        if (all_mx) {
-          gu1.push_back(reinterpret_cast<uint64_t>(w.gate_up[e].mx_ws.data()));
-          dn1.push_back(reinterpret_cast<uint64_t>(w.down[e].mx_ws.data()));
-        }
+    const std::string hf = "model.llm.layers." + std::to_string(i) + ".mlp.experts.";
+    if (nvfp4_st != nullptr && nvfp4_st->Has(hf + "w13_weight_outer_scale_denominator")) {
+      const int64_t E = g.num_experts;
+      const int64_t Il = I / o.tp_world;
+      const int64_t i0 = o.tp_rank * Il;
+      const uint8_t* w13_w = nvfp4_st->Data(hf + "w13_weight");
+      const uint8_t* w13_s = nvfp4_st->Data(hf + "w13_weight_scale");
+      const float* w13_amax = reinterpret_cast<const float*>(nvfp4_st->Data(hf + "w13_weight_amax"));
+      const float w13_den = *reinterpret_cast<const float*>(nvfp4_st->Data(hf + "w13_weight_outer_scale_denominator"));
+      const uint8_t* w2_w = nvfp4_st->Data(hf + "w2_weight");
+      const uint8_t* w2_s = nvfp4_st->Data(hf + "w2_weight_scale");
+      const float* w2_amax = reinterpret_cast<const float*>(nvfp4_st->Data(hf + "w2_weight_amax"));
+      const float w2_den = *reinterpret_cast<const float*>(nvfp4_st->Data(hf + "w2_weight_outer_scale_denominator"));
+
+      const int64_t gu_N = 2 * Il, gu_K = H;
+      const int64_t dn_N = H, dn_K = Il;
+      const size_t gu_wq_per = static_cast<size_t>(gu_N * (gu_K / 2));
+      const size_t gu_ws_per = static_cast<size_t>(gu_N * (gu_K / 16));
+      const size_t dn_wq_per = static_cast<size_t>(dn_N * (dn_K / 2));
+      const size_t dn_ws_per = static_cast<size_t>(dn_N * (dn_K / 16));
+
+      std::vector<uint8_t> gu_wq_h(static_cast<size_t>(E) * gu_wq_per);
+      std::vector<uint8_t> gu_ws_h(static_cast<size_t>(E) * gu_ws_per);
+      std::vector<uint8_t> dn_wq_h(static_cast<size_t>(E) * dn_wq_per);
+      std::vector<uint8_t> dn_ws_h(static_cast<size_t>(E) * dn_ws_per);
+      std::vector<float> gu_fac_h(static_cast<size_t>(E)), dn_fac_h(static_cast<size_t>(E));
+      for (int64_t e = 0; e < E; ++e) {
+        gu_fac_h[static_cast<size_t>(e)] = w13_amax[e] / w13_den;
+        dn_fac_h[static_cast<size_t>(e)] = w2_amax[e] / w2_den;
+      }
+
+      const int nthreads = 8;
+      std::vector<std::thread> threads;
+      threads.reserve(static_cast<size_t>(nthreads));
+      for (int tid = 0; tid < nthreads; ++tid) {
+        threads.emplace_back([&, tid]() {
+          const int64_t e0 = (E * tid) / nthreads, e1 = (E * (tid + 1)) / nthreads;
+          for (int64_t e = e0; e < e1; ++e) {
+            // Pack gate_up (de-interleaved + row-sharded [2*Il, H])
+            {
+              const uint8_t* ew = w13_w + e * (2 * I) * (H / 2);
+              const uint8_t* es = w13_s + e * (2 * I) * (H / 16);
+              uint8_t* dst_q = gu_wq_h.data() + static_cast<size_t>(e) * gu_wq_per;
+              uint8_t* dst_s = gu_ws_h.data() + static_cast<size_t>(e) * gu_ws_per;
+              const int ntiles = static_cast<int>(gu_N / 16), kblocks = static_cast<int>(gu_K / 32);
+              const int gpr16 = static_cast<int>(gu_K / 16);
+              for (int t = 0; t < ntiles; ++t) {
+                for (int r = 0; r < 16; ++r) {
+                  const int64_t lr = t * 16 + r;
+                  const int64_t sr = (lr < Il) ? (2 * (i0 + lr)) : (2 * (i0 + lr - Il) + 1);
+                  const uint8_t* srow = es + sr * gpr16;
+                  for (int g16 = 0; g16 < gpr16; ++g16) dst_s[(t * gpr16 + g16) * 16 + r] = srow[g16];
+                }
+                for (int kb = 0; kb < kblocks; ++kb) {
+                  for (int lane = 0; lane < 32; ++lane) {
+                    const int64_t lr = t * 16 + (lane & 15);
+                    const int64_t sr = (lr < Il) ? (2 * (i0 + lr)) : (2 * (i0 + lr - Il) + 1);
+                    const int half = lane >> 4;
+                    const uint8_t* wrow = ew + sr * (H / 2);
+                    uint8_t* out8 = dst_q + ((static_cast<size_t>(t) * kblocks + kb) * 32 + lane) * 8;
+                    const int k0 = 32 * kb + 4 * half;
+                    std::memcpy(out8 + 0, wrow + (k0 >> 1), 2);
+                    std::memcpy(out8 + 2, wrow + ((k0 + 8) >> 1), 2);
+                    std::memcpy(out8 + 4, wrow + ((k0 + 16) >> 1), 2);
+                    std::memcpy(out8 + 6, wrow + ((k0 + 24) >> 1), 2);
+                  }
+                }
+              }
+            }
+            // Pack down (col-sharded [H, Il])
+            {
+              const uint8_t* ew = w2_w + e * H * (I / 2);
+              const uint8_t* es = w2_s + e * H * (I / 16);
+              uint8_t* dst_q = dn_wq_h.data() + static_cast<size_t>(e) * dn_wq_per;
+              uint8_t* dst_s = dn_ws_h.data() + static_cast<size_t>(e) * dn_ws_per;
+              const int ntiles = static_cast<int>(dn_N / 16), kblocks = static_cast<int>(dn_K / 32);
+              const int gpr16 = static_cast<int>(dn_K / 16);
+              const int64_t w_col0 = i0 / 2, s_col0 = i0 / 16;
+              for (int t = 0; t < ntiles; ++t) {
+                for (int r = 0; r < 16; ++r) {
+                  const int64_t sr = t * 16 + r;
+                  const uint8_t* srow = es + sr * (I / 16) + s_col0;
+                  for (int g16 = 0; g16 < gpr16; ++g16) dst_s[(t * gpr16 + g16) * 16 + r] = srow[g16];
+                }
+                for (int kb = 0; kb < kblocks; ++kb) {
+                  for (int lane = 0; lane < 32; ++lane) {
+                    const int64_t sr = t * 16 + (lane & 15);
+                    const int half = lane >> 4;
+                    const uint8_t* wrow = ew + sr * (I / 2) + w_col0;
+                    uint8_t* out8 = dst_q + ((static_cast<size_t>(t) * kblocks + kb) * 32 + lane) * 8;
+                    const int k0 = 32 * kb + 4 * half;
+                    std::memcpy(out8 + 0, wrow + (k0 >> 1), 2);
+                    std::memcpy(out8 + 2, wrow + ((k0 + 8) >> 1), 2);
+                    std::memcpy(out8 + 4, wrow + ((k0 + 16) >> 1), 2);
+                    std::memcpy(out8 + 6, wrow + ((k0 + 24) >> 1), 2);
+                  }
+                }
+              }
+            }
+          }
+        });
+      }
+      for (auto& th : threads) th.join();
+
+      w.nvfp4_experts = true;
+      w.nvfp4_gu_wq = Upload(gu_wq_h);
+      w.nvfp4_gu_ws = Upload(gu_ws_h);
+      w.nvfp4_dn_wq = Upload(dn_wq_h);
+      w.nvfp4_dn_ws = Upload(dn_ws_h);
+      w.gate_up_factors = Upload(gu_fac_h);
+      w.down_factors = Upload(dn_fac_h);
+      std::vector<uint64_t> gu0(static_cast<size_t>(E)), gu1(static_cast<size_t>(E));
+      std::vector<uint64_t> dn0(static_cast<size_t>(E)), dn1(static_cast<size_t>(E));
+      for (int64_t e = 0; e < E; ++e) {
+        gu0[static_cast<size_t>(e)] = reinterpret_cast<uint64_t>(w.nvfp4_gu_wq.data() + static_cast<size_t>(e) * gu_wq_per);
+        gu1[static_cast<size_t>(e)] = reinterpret_cast<uint64_t>(w.nvfp4_gu_ws.data() + static_cast<size_t>(e) * gu_ws_per);
+        dn0[static_cast<size_t>(e)] = reinterpret_cast<uint64_t>(w.nvfp4_dn_wq.data() + static_cast<size_t>(e) * dn_wq_per);
+        dn1[static_cast<size_t>(e)] = reinterpret_cast<uint64_t>(w.nvfp4_dn_ws.data() + static_cast<size_t>(e) * dn_ws_per);
       }
       w.gate_up_ptrs0 = Upload(gu0);
+      w.gate_up_ptrs1 = Upload(gu1);
       w.down_ptrs0 = Upload(dn0);
-      if (all_mx) {
-        w.gate_up_ptrs1 = Upload(gu1);
-        w.down_ptrs1 = Upload(dn1);
+      w.down_ptrs1 = Upload(dn1);
+    } else {
+      w.gate_up.reserve(static_cast<size_t>(g.num_experts));
+      w.down.reserve(static_cast<size_t>(g.num_experts));
+      for (int64_t e = 0; e < g.num_experts; ++e) {
+        const std::string eb = b + "moe.experts." + std::to_string(e) + ".";
+        w.gate_up.push_back(lin(eb + "gate_up", 2 * I, H, RowRule({I, I})));
+        w.down.push_back(lin(eb + "down", H, I, ColRule(I)));
+      }
+      // Device pointer tables when every expert of the layer has one layout.
+      bool all_mx = true, all_bf = true;
+      for (size_t e = 0; e < w.gate_up.size(); ++e) {
+        all_mx = all_mx && w.gate_up[e].layout == Layout::kMxfp8 && w.down[e].layout == Layout::kMxfp8;
+        all_bf = all_bf && w.gate_up[e].layout == Layout::kBf16 && w.down[e].layout == Layout::kBf16;
+      }
+      if (all_mx || all_bf) {
+        std::vector<uint64_t> gu0, gu1, dn0, dn1;
+        for (size_t e = 0; e < w.gate_up.size(); ++e) {
+          gu0.push_back(reinterpret_cast<uint64_t>(all_mx ? static_cast<const void*>(w.gate_up[e].mx_wq.data())
+                                                          : static_cast<const void*>(w.gate_up[e].bf16_w.data())));
+          dn0.push_back(reinterpret_cast<uint64_t>(all_mx ? static_cast<const void*>(w.down[e].mx_wq.data())
+                                                          : static_cast<const void*>(w.down[e].bf16_w.data())));
+          if (all_mx) {
+            gu1.push_back(reinterpret_cast<uint64_t>(w.gate_up[e].mx_ws.data()));
+            dn1.push_back(reinterpret_cast<uint64_t>(w.down[e].mx_ws.data()));
+          }
+        }
+        w.gate_up_ptrs0 = Upload(gu0);
+        w.down_ptrs0 = Upload(dn0);
+        if (all_mx) {
+          w.gate_up_ptrs1 = Upload(gu1);
+          w.down_ptrs1 = Upload(dn1);
+        }
       }
     }
     c.layers_.push_back(std::move(w));

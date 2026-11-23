@@ -39,8 +39,10 @@ constexpr int kMaxMoeExperts = 256;
 
 typedef _Float16 v8h __attribute__((ext_vector_type(8)));
 typedef unsigned uint4v __attribute__((ext_vector_type(4)));
+typedef unsigned uint2v __attribute__((ext_vector_type(2)));
 
 typedef __attribute__((address_space(1))) const uint4v* gw4;
+typedef __attribute__((address_space(1))) const uint2v* gw2;
 typedef __attribute__((address_space(1))) const unsigned long long* gu2;
 typedef __attribute__((address_space(1))) const unsigned char* gub;
 
@@ -590,6 +592,271 @@ void r4dx_gemm_mxfp8_moe_prefill(int64_t a_bf16, int64_t wq_ptrs, int64_t ws_ptr
   if ((size_t)WV * NPW * SK * 256 * sizeof(float) > 64 * 1024) FailMoePrefill("LDS WV*NPW*SK KiB > 64");
   if (!a_bf16 || !wq_ptrs || !ws_ptrs || !expert_offsets || !c) FailMoePrefill("null pointer");
   LaunchMoePrefill(a_bf16, wq_ptrs, ws_ptrs, expert_offsets, c, n_pairs, n_experts, K, N, WV, SK, NPW, NT, stream);
+  r4dx_kernel_launch_counter_add(1);
+}
+
+}  // extern "C"
+
+namespace {
+
+// ---- Native NVFP4 (FP4 E2M1 + F8_E4M3 per-16 scales + per-expert fp32 factor) grouped MoE GEMMs -------------------
+__device__ __forceinline__ v8h dequant8_fp4(unsigned d) {
+  static constexpr unsigned short kLut[16] = {
+      0x0000, 0x3800, 0x3C00, 0x3E00, 0x4000, 0x4200, 0x4400, 0x4600,
+      0x8000, 0xB800, 0xBC00, 0xBE00, 0xC000, 0xC200, 0xC400, 0xC600};
+  union { unsigned short h[8]; v8h f; } x;
+  x.h[0] = kLut[(d >>  0) & 0xFu];
+  x.h[1] = kLut[(d >>  4) & 0xFu];
+  x.h[2] = kLut[(d >>  8) & 0xFu];
+  x.h[3] = kLut[(d >> 12) & 0xFu];
+  x.h[4] = kLut[(d >> 16) & 0xFu];
+  x.h[5] = kLut[(d >> 20) & 0xFu];
+  x.h[6] = kLut[(d >> 24) & 0xFu];
+  x.h[7] = kLut[(d >> 28) & 0xFu];
+  return x.f;
+}
+
+__device__ __forceinline__ float e4m3_to_f32(unsigned b) {
+  const unsigned u = e4m3x2_scaled(b, 0x0C0C000Cu);
+  return __half2float(__ushort_as_half(static_cast<unsigned short>(u & 0xFFFFu))) * 256.0f;
+}
+
+template <int NPW>
+__device__ __forceinline__ void group_step_nvfp4(v8f (&acc)[NPW], const uint2v (&wv)[NPW], const float (&sc0)[NPW],
+                                                 const float (&sc1)[NPW], gu2 pa, int u0) {
+  const v8h a0 = fragA_bf16(pa, u0);
+  const v8h a1 = fragA_bf16(pa, u0 + 1);
+#pragma unroll
+  for (int j = 0; j < NPW; j++) {
+    const v8f g0 = mmah(a0, dequant8_fp4(wv[j][0]), (v8f)(0.f));
+    const v8f g1 = mmah(a1, dequant8_fp4(wv[j][1]), (v8f)(0.f));
+#pragma unroll
+    for (int e = 0; e < 8; e++) acc[j][e] = fmaf(g1[e], sc1[j], fmaf(g0[e], sc0[j], acc[j][e]));
+  }
+}
+
+template <int NPW, bool NT>
+__global__ __launch_bounds__(1024) void nvfp4_gemm_moe_decode_kernel(
+    const unsigned short* __restrict__ A, const uint64_t* __restrict__ wq_ptrs, const uint64_t* __restrict__ ws_ptrs,
+    const float* __restrict__ factors, const int32_t* __restrict__ ids, __hip_bfloat16* __restrict__ C, int n_pairs,
+    int a_row_group, int n_experts, int K, int N, int WV, int SK) {
+  extern __shared__ float red[];
+  const int p = static_cast<int>(blockIdx.z);
+  if (p >= n_pairs) return;
+  const int e = ids[p];
+  if (e < 0 || e >= n_experts) return;
+  const unsigned char* Wq = reinterpret_cast<const unsigned char*>(wq_ptrs[e]);
+  const unsigned char* Ws = reinterpret_cast<const unsigned char*>(ws_ptrs[e]);
+  if (!Wq || !Ws) return;
+  const float factor = factors[e];
+  const unsigned short* Ap = A + static_cast<size_t>(p / a_row_group) * static_cast<size_t>(K);
+  __hip_bfloat16* Cp = C + static_cast<size_t>(p) * static_cast<size_t>(N);
+
+  const int tid = threadIdx.x, wave = tid / kWave, lane = tid % kWave;
+  const int col_local = wave / SK, ksplit = wave % SK;
+  const int nt0 = (blockIdx.x * WV + col_local) * NPW;
+  const int n0 = nt0 * 16;
+  const int Ks = K / SK;
+  const int groups = Ks / kGroup;
+  const int kbase = ksplit * Ks;
+
+  v8f acc[NPW];
+#pragma unroll
+  for (int j = 0; j < NPW; j++) acc[j] = (v8f)(0.f);
+
+  if (n0 < N) {
+    const unsigned off = rowGo((unsigned)K, 0, 0, lane) + (unsigned)kbase;
+    const gu2 pa = (gu2)(const unsigned long long*)(Ap + off);
+    const int kpb = K / kGroup;
+    const int gpr16 = K / 16;
+    gw2 pw[NPW];
+    gub ps[NPW];
+    const int ntlast = N / 16 - 1;
+#pragma unroll
+    for (int j = 0; j < NPW; j++) {
+      const int t = (nt0 + j) < ntlast ? (nt0 + j) : ntlast;
+      pw[j] = (gw2)(const uint2v*)(Wq) + (size_t)(t * (size_t)kpb + kbase / kGroup) * kWave + lane;
+      ps[j] = (gub)(Ws) + (size_t)(t * (size_t)gpr16 + kbase / 16) * 16 + (lane & 15);
+    }
+    for (int g = 0; g < groups; ++g) {
+      uint2v wv[NPW];
+      float sc0[NPW], sc1[NPW];
+#pragma unroll
+      for (int j = 0; j < NPW; j++) {
+        const size_t o = (size_t)g * kWave;
+        wv[j] = NT ? __builtin_nontemporal_load(&pw[j][o]) : pw[j][o];
+        sc0[j] = e4m3_to_f32(ps[j][(size_t)(2 * g + 0) * 16]);
+        sc1[j] = e4m3_to_f32(ps[j][(size_t)(2 * g + 1) * 16]);
+      }
+      group_step_nvfp4<NPW>(acc, wv, sc0, sc1, pa, 2 * g);
+    }
+  }
+
+  const int ncols = WV * NPW;
+  const int nthreads = WV * SK * kWave;
+  __syncthreads();
+#pragma unroll
+  for (int j = 0; j < NPW; j++) {
+    const int slot = ((col_local * NPW + j) * SK + ksplit) * 256;
+#pragma unroll
+    for (int e_idx = 0; e_idx < 8; e_idx++) red[slot + e_idx * kWave + lane] = acc[j][e_idx];
+  }
+  __syncthreads();
+  for (int idx = tid; idx < ncols * 16; idx += nthreads) {
+    const int col = idx >> 4, r = idx & 15;
+    float v = 0.f;
+    for (int s = 0; s < SK; s++) v += red[(col * SK + s) * 256 + r];
+    const int n = (blockIdx.x * ncols + col) * 16 + r;
+    if (n < N) Cp[n] = __float2bfloat16(v * factor);
+  }
+}
+
+template <int NPW, bool NT>
+__global__ __launch_bounds__(1024) void nvfp4_gemm_moe_prefill_kernel(
+    const unsigned short* __restrict__ A, const uint64_t* __restrict__ wq_ptrs, const uint64_t* __restrict__ ws_ptrs,
+    const float* __restrict__ factors, const int32_t* __restrict__ offsets, __hip_bfloat16* __restrict__ C, int n_pairs,
+    int n_experts, int K, int N, int WV, int SK) {
+  extern __shared__ float red[];
+  int e = 0, row_start = 0, m_rows = 0;
+  if (!ResolveMxfp8MoePrefillTile(offsets, n_experts, n_pairs, static_cast<int>(blockIdx.y), e, row_start, m_rows)) {
+    return;
+  }
+  const unsigned char* Wq = reinterpret_cast<const unsigned char*>(wq_ptrs[e]);
+  const unsigned char* Ws = reinterpret_cast<const unsigned char*>(ws_ptrs[e]);
+  if (!Wq || !Ws) return;
+  const float factor = factors[e];
+  const unsigned short* Ap = A + (size_t)row_start * (size_t)K;
+  __hip_bfloat16* Cp = C + (size_t)row_start * (size_t)N;
+
+  const int tid = threadIdx.x, wave = tid / kWave, lane = tid % kWave;
+  const int col_local = wave / SK, ksplit = wave % SK;
+  const int nt0 = (blockIdx.x * WV + col_local) * NPW;
+  const int n0 = nt0 * 16;
+  const int Ks = K / SK;
+  const int groups = Ks / kGroup;
+  const int kbase = ksplit * Ks;
+
+  v8f acc[NPW];
+#pragma unroll
+  for (int j = 0; j < NPW; j++) acc[j] = (v8f)(0.f);
+
+  if (n0 < N) {
+    const unsigned off = rowGo((unsigned)K, 0, m_rows - 1, lane) + (unsigned)kbase;
+    const gu2 pa = (gu2)(const unsigned long long*)(Ap + off);
+    const int kpb = K / kGroup;
+    const int gpr16 = K / 16;
+    gw2 pw[NPW];
+    gub ps[NPW];
+    const int ntlast = N / 16 - 1;
+#pragma unroll
+    for (int j = 0; j < NPW; j++) {
+      const int t = (nt0 + j) < ntlast ? (nt0 + j) : ntlast;
+      pw[j] = (gw2)(const uint2v*)(Wq) + (size_t)(t * (size_t)kpb + kbase / kGroup) * kWave + lane;
+      ps[j] = (gub)(Ws) + (size_t)(t * (size_t)gpr16 + kbase / 16) * 16 + (lane & 15);
+    }
+    for (int g = 0; g < groups; ++g) {
+      uint2v wv[NPW];
+      float sc0[NPW], sc1[NPW];
+#pragma unroll
+      for (int j = 0; j < NPW; j++) {
+        const size_t o = (size_t)g * kWave;
+        wv[j] = NT ? __builtin_nontemporal_load(&pw[j][o]) : pw[j][o];
+        sc0[j] = e4m3_to_f32(ps[j][(size_t)(2 * g + 0) * 16]);
+        sc1[j] = e4m3_to_f32(ps[j][(size_t)(2 * g + 1) * 16]);
+      }
+      group_step_nvfp4<NPW>(acc, wv, sc0, sc1, pa, 2 * g);
+    }
+  }
+
+  const int ncols = WV * NPW;
+  const int nthreads = WV * SK * kWave;
+  __syncthreads();
+#pragma unroll
+  for (int j = 0; j < NPW; j++) {
+    const int slot = ((col_local * NPW + j) * SK + ksplit) * 256;
+#pragma unroll
+    for (int e_idx = 0; e_idx < 8; e_idx++) red[slot + e_idx * kWave + lane] = acc[j][e_idx];
+  }
+  __syncthreads();
+  for (int idx = tid; idx < ncols * 256; idx += nthreads) {
+    const int col = idx >> 8, off = idx & 255;
+    float v = 0.f;
+    for (int s = 0; s < SK; s++) v += red[(col * SK + s) * 256 + off];
+    const int l = off & 31;
+    const int n = (blockIdx.x * ncols + col) * 16 + (l & 15);
+    const int m = 8 * (l >> 4) + (off >> 5);
+    if (n < N && m < m_rows) Cp[(size_t)m * N + n] = __float2bfloat16(v * factor);
+  }
+}
+
+}  // namespace
+
+extern "C" {
+
+void r4dx_gemm_nvfp4_moe_decode(int64_t a_bf16, int64_t wq_ptrs, int64_t ws_ptrs, int64_t factors_f32, int64_t ids,
+                                int64_t c, int n_pairs, int a_row_group, int n_experts, int K, int N, int WV, int SK,
+                                int NPW, int NT, int64_t stream) {
+  if (n_pairs < 1 || n_pairs > kMaxMoePairs || n_experts < 1 || n_experts > kMaxMoeExperts || N < 16 || N % 16 ||
+      WV < 1 || SK < 1 || K < 1 || K % (SK * kGroup) || WV * SK * kWave > 1024 || (NPW != 1 && NPW != 4) ||
+      (size_t)WV * NPW * SK * 256 * sizeof(float) > 64 * 1024 || !a_bf16 || !wq_ptrs || !ws_ptrs || !factors_f32 ||
+      !ids || !c) {
+    throw std::runtime_error("r4dx_gemm_nvfp4_moe_decode: invalid args");
+  }
+  const int ntiles = N / 16, ncols = WV * NPW;
+  dim3 grid((ntiles + ncols - 1) / ncols, 1, n_pairs), block(WV * SK * kWave);
+  const size_t smem = (size_t)ncols * SK * 256 * sizeof(float);
+  auto Ap = (const unsigned short*)a_bf16;
+  auto Wqp = (const uint64_t*)wq_ptrs;
+  auto Wsp = (const uint64_t*)ws_ptrs;
+  auto Fp = (const float*)factors_f32;
+  auto Idp = (const int32_t*)ids;
+  auto Cp = (__hip_bfloat16*)c;
+  hipStream_t st = (hipStream_t)stream;
+#define NV4_DEC_LAUNCH(NP, TT)                                                                              \
+  hipLaunchKernelGGL((nvfp4_gemm_moe_decode_kernel<NP, TT>), grid, block, smem, st, Ap, Wqp, Wsp, Fp, Idp, \
+                     Cp, n_pairs, a_row_group, n_experts, K, N, WV, SK)
+  if (NPW == 1) {
+    if (NT) { NV4_DEC_LAUNCH(1, true); } else { NV4_DEC_LAUNCH(1, false); }
+  } else {
+    if (NT) { NV4_DEC_LAUNCH(4, true); } else { NV4_DEC_LAUNCH(4, false); }
+  }
+#undef NV4_DEC_LAUNCH
+  const hipError_t err = hipGetLastError();
+  if (err != hipSuccess) throw std::runtime_error(std::string("r4dx_gemm_nvfp4_moe_decode: launch failed: ") + hipGetErrorString(err));
+  r4dx_kernel_launch_counter_add(1);
+}
+
+void r4dx_gemm_nvfp4_moe_prefill(int64_t a_bf16, int64_t wq_ptrs, int64_t ws_ptrs, int64_t factors_f32,
+                                 int64_t expert_offsets, int64_t c, int n_pairs, int n_experts, int K, int N, int WV,
+                                 int SK, int NPW, int NT, int64_t stream) {
+  if (n_pairs < 1 || n_pairs > kMaxMoePairs || n_experts < 1 || n_experts > kMaxMoeExperts || N < 16 || N % 16 ||
+      WV < 1 || SK < 1 || K < 1 || K % (SK * kGroup) || WV * SK * kWave > 1024 || (NPW != 1 && NPW != 4) ||
+      (size_t)WV * NPW * SK * 256 * sizeof(float) > 64 * 1024 || !a_bf16 || !wq_ptrs || !ws_ptrs || !factors_f32 ||
+      !expert_offsets || !c) {
+    FailMoePrefill("r4dx_gemm_nvfp4_moe_prefill: invalid args");
+  }
+  const int ntiles = N / 16, ncols = WV * NPW;
+  const int max_tiles = n_pairs < ((n_pairs + 15) / 16 + n_experts) ? n_pairs : ((n_pairs + 15) / 16 + n_experts);
+  dim3 grid((ntiles + ncols - 1) / ncols, max_tiles), block(WV * SK * kWave);
+  const size_t smem = (size_t)ncols * SK * 256 * sizeof(float);
+  auto Ap = (const unsigned short*)a_bf16;
+  auto Wqp = (const uint64_t*)wq_ptrs;
+  auto Wsp = (const uint64_t*)ws_ptrs;
+  auto Fp = (const float*)factors_f32;
+  auto Ofp = (const int32_t*)expert_offsets;
+  auto Cp = (__hip_bfloat16*)c;
+  hipStream_t st = (hipStream_t)stream;
+#define NV4_PF_LAUNCH(NP, TT)                                                                               \
+  hipLaunchKernelGGL((nvfp4_gemm_moe_prefill_kernel<NP, TT>), grid, block, smem, st, Ap, Wqp, Wsp, Fp, Ofp, \
+                     Cp, n_pairs, n_experts, K, N, WV, SK)
+  if (NPW == 1) {
+    if (NT) { NV4_PF_LAUNCH(1, true); } else { NV4_PF_LAUNCH(1, false); }
+  } else {
+    if (NT) { NV4_PF_LAUNCH(4, true); } else { NV4_PF_LAUNCH(4, false); }
+  }
+#undef NV4_PF_LAUNCH
+  const hipError_t err = hipGetLastError();
+  if (err != hipSuccess) FailMoePrefill(std::string("nvfp4 launch failed: ") + hipGetErrorString(err));
   r4dx_kernel_launch_counter_add(1);
 }
 

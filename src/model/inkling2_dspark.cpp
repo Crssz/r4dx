@@ -17,6 +17,7 @@
 #include "r4dx/core/error.hpp"
 #include "r4dx/kernels/inkling2_kernels.h"
 #include "r4dx/kernels/kernels.h"
+#include "r4dx_convert/quant_mxfp8.hpp"
 
 namespace r4dx::model {
 
@@ -88,6 +89,30 @@ class SafetensorsReader {
     return q;
   }
 
+  static QuantLinear MakeMxfp8LinearFromBf16(const std::vector<uint16_t>& bf16, int64_t N, int64_t K, const char* hint) {
+    std::vector<float> f(bf16.size());
+    for (size_t i = 0; i < bf16.size(); ++i) f[i] = core::Bf16ToFloat(bf16[i]);
+    std::vector<uint8_t> codes, scales;
+    r4dx_convert::QuantizeMxfp8(f.data(), static_cast<int>(N), static_cast<int>(K), 8, codes, scales, hint);
+    const std::vector<uint8_t> wq = r4dx_convert::PackMxfp8Codes(codes, static_cast<int>(N), static_cast<int>(K), 8);
+    const std::vector<uint8_t> ws = r4dx_convert::PackMxfp8Scales(scales, static_cast<int>(N), static_cast<int>(K));
+    QuantLinear q;
+    q.layout = Layout::kMxfp8;
+    q.N = N;
+    q.K = K;
+    q.mx_wq = core::DeviceBuffer<uint8_t>(wq.size());
+    q.mx_wq.CopyFromHost(wq);
+    q.mx_ws = core::DeviceBuffer<uint8_t>(ws.size());
+    q.mx_ws.CopyFromHost(ws);
+    return q;
+  }
+
+  QuantLinear ReadDraftLinear(const std::string& name, int64_t N, int64_t K, bool use_mxfp8) {
+    if (!use_mxfp8) return ReadBf16Linear(name, N, K);
+    const std::vector<uint16_t> h = ReadBf16(name, {N, K});
+    return MakeMxfp8LinearFromBf16(h, N, K, name.c_str());
+  }
+
  private:
   std::ifstream f_;
   uint64_t data_base_ = 0;
@@ -124,6 +149,9 @@ Inkling2DsparkDraft Inkling2DsparkDraft::Load(const std::string& safetensors_pat
   d.mask_embed_ = r.ReadDevBf16("mask_embed", {H});
   d.norm_ = r.ReadDevBf16("norm.weight", {H});
 
+  const char* bf16_env = std::getenv("R4DX_INK_DSPARK_BF16");
+  const bool use_mxfp8 = !(bf16_env != nullptr && std::strcmp(bf16_env, "1") == 0);
+
   d.layers_.resize(static_cast<size_t>(c.num_layers));
   for (int64_t l = 0; l < c.num_layers; ++l) {
     Layer& L = d.layers_[static_cast<size_t>(l)];
@@ -134,12 +162,12 @@ Inkling2DsparkDraft Inkling2DsparkDraft::Load(const std::string& safetensors_pat
     L.q_norm = r.ReadDevBf16(p + "self_attn.q_norm.weight", {c.head_dim});
     L.k_norm = r.ReadDevBf16(p + "self_attn.k_norm.weight", {c.head_dim});
     L.k_norm_ctx = r.ReadDevBf16(p + "self_attn.k_norm_ctx.weight", {c.head_dim});
-    L.q_proj = r.ReadBf16Linear(p + "self_attn.q_proj.weight", Q, H);
-    L.k_proj = r.ReadBf16Linear(p + "self_attn.k_proj.weight", KV, H);
-    L.v_proj = r.ReadBf16Linear(p + "self_attn.v_proj.weight", KV, H);
-    L.o_proj = r.ReadBf16Linear(p + "self_attn.o_proj.weight", H, Q);
-    L.k_proj_ctx = r.ReadBf16Linear(p + "self_attn.k_proj_ctx.weight", KV, H);
-    L.v_proj_ctx = r.ReadBf16Linear(p + "self_attn.v_proj_ctx.weight", KV, H);
+    L.q_proj = r.ReadDraftLinear(p + "self_attn.q_proj.weight", Q, H, use_mxfp8);
+    L.k_proj = r.ReadDraftLinear(p + "self_attn.k_proj.weight", KV, H, use_mxfp8);
+    L.v_proj = r.ReadDraftLinear(p + "self_attn.v_proj.weight", KV, H, use_mxfp8);
+    L.o_proj = r.ReadDraftLinear(p + "self_attn.o_proj.weight", H, Q, use_mxfp8);
+    L.k_proj_ctx = r.ReadDraftLinear(p + "self_attn.k_proj_ctx.weight", KV, H, use_mxfp8);
+    L.v_proj_ctx = r.ReadDraftLinear(p + "self_attn.v_proj_ctx.weight", KV, H, use_mxfp8);
     // Stack gate_proj + up_proj into gate_up_proj [2*I, H]
     {
       const std::vector<uint16_t> gp = r.ReadBf16(p + "mlp.gate_proj.weight", {I, H});
@@ -148,13 +176,17 @@ Inkling2DsparkDraft Inkling2DsparkDraft::Load(const std::string& safetensors_pat
       gu.reserve(gp.size() + up.size());
       gu.insert(gu.end(), gp.begin(), gp.end());
       gu.insert(gu.end(), up.begin(), up.end());
-      L.gate_up_proj.layout = Layout::kBf16;
-      L.gate_up_proj.N = 2 * I;
-      L.gate_up_proj.K = H;
-      L.gate_up_proj.bf16_w = core::DeviceBuffer<uint16_t>(gu.size());
-      L.gate_up_proj.bf16_w.CopyFromHost(gu);
+      if (use_mxfp8) {
+        L.gate_up_proj = SafetensorsReader::MakeMxfp8LinearFromBf16(gu, 2 * I, H, (p + "mlp.gate_up_proj").c_str());
+      } else {
+        L.gate_up_proj.layout = Layout::kBf16;
+        L.gate_up_proj.N = 2 * I;
+        L.gate_up_proj.K = H;
+        L.gate_up_proj.bf16_w = core::DeviceBuffer<uint16_t>(gu.size());
+        L.gate_up_proj.bf16_w.CopyFromHost(gu);
+      }
     }
-    L.down_proj = r.ReadBf16Linear(p + "mlp.down_proj.weight", H, I);
+    L.down_proj = r.ReadDraftLinear(p + "mlp.down_proj.weight", H, I, use_mxfp8);
 
     const bool local = c.is_local[static_cast<size_t>(l)];
     L.window = local ? static_cast<int>(c.sliding_window) : 0;
@@ -186,7 +218,8 @@ Inkling2DsparkDraft Inkling2DsparkDraft::Load(const std::string& safetensors_pat
   d.f_rnn_.Zero();
   d.prev_emb_host_ = core::PinnedBuffer<uint16_t>(static_cast<size_t>(R));
 
-  std::cerr << "[r4dx::model::Inkling2DsparkDraft] loaded " << safetensors_path << " (3 layers, block " << c.block_size
+  std::cerr << "[r4dx::model::Inkling2DsparkDraft] loaded " << safetensors_path << " (3 layers "
+            << (use_mxfp8 ? "mxfp8" : "bf16") << ", block " << c.block_size
             << ", markov_rank " << R << ", markov_w1 host-resident 103 MB, KV slots " << d.layers_[0].slots << "/"
             << d.layers_[1].slots << "/" << d.layers_[2].slots << ")\n";
   return d;

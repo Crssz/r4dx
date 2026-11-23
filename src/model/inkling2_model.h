@@ -114,7 +114,9 @@ class Inkling2Model {
 
   std::vector<float> RunChunk(const std::vector<int32_t>& ids, bool want_logits, int32_t* greedy_out,
                               const SummaryRequest* summary, SpanAccumulator* prof,
-                              bool verify_conv_hist = false, std::vector<int32_t>* verify_greedy_out = nullptr);
+                              bool verify_conv_hist = false, std::vector<int32_t>* verify_greedy_out = nullptr,
+                              float verify_inv_temp = 0.0f,
+                              std::vector<kernels::RowSummary>* verify_summaries_out = nullptr);
   void RunVisit(const Inkling2Visit& v, Chunk& c, int64_t T, SpanAccumulator* prof, bool use_pos_dev = false,
                 bool graph_long_ctx = true, bool capture_conv_hist = false);
   void Attention(const Inkling2Visit& v, const uint16_t* xq, const uint16_t* xk, const uint16_t* xv, uint16_t* out,
@@ -132,6 +134,7 @@ class Inkling2Model {
   int32_t MergeGreedyPairAt(const int32_t* dev_pair);
   void MergeSummary(kernels::RowSummary* out);
   void GatherVocabRow(std::vector<float>* full);
+  void GatherVerifyVocabRow(int64_t row, std::vector<float>* full);
   void FetchRowSummary(float inv_temperature, kernels::RowSummary* out);
   void RequireNotTp(const char* what) const;
 
@@ -166,6 +169,9 @@ class Inkling2Model {
   std::array<core::DeviceBuffer<uint16_t>, 4> dspark_taps_;  // [4][max_chunk, H] bf16
   core::DeviceBuffer<float> verify_logits_dev_;              // [8, HeadRowsLocal]
   core::DeviceBuffer<int32_t> verify_argmax_dev_, verify_argmax_pair_dev_;
+  core::DeviceBuffer<int32_t> verify_summary_ids_dev_;       // [8 * R4DX_TOPK_LSE_K]
+  core::DeviceBuffer<float> verify_summary_vals_dev_;        // [8 * R4DX_TOPK_LSE_K]
+  core::DeviceBuffer<float> verify_summary_lse_dev_;         // [8]
 
   // The fp32 state pool (h, blocks, h_pre, the previous pass's states) and the message buffer.
   std::vector<core::DeviceBuffer<float>> pool_;

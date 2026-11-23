@@ -214,6 +214,9 @@ Inkling2Model Inkling2Model::Load(const Inkling2ModelOptions& opts) {
     m.verify_logits_dev_ = core::DeviceBuffer<float>(static_cast<size_t>(kVerifyMaxT * cfg.HeadRowsLocal()));
     m.verify_argmax_dev_ = core::DeviceBuffer<int32_t>(static_cast<size_t>(kVerifyMaxT));
     m.verify_argmax_pair_dev_ = core::DeviceBuffer<int32_t>(static_cast<size_t>(kVerifyMaxT * 2));
+    m.verify_summary_ids_dev_ = core::DeviceBuffer<int32_t>(static_cast<size_t>(kVerifyMaxT * R4DX_TOPK_LSE_K));
+    m.verify_summary_vals_dev_ = core::DeviceBuffer<float>(static_cast<size_t>(kVerifyMaxT * R4DX_TOPK_LSE_K));
+    m.verify_summary_lse_dev_ = core::DeviceBuffer<float>(static_cast<size_t>(kVerifyMaxT));
   }
 
   m.moe_ids_host_ = core::PinnedBuffer<int32_t>(static_cast<size_t>(rows * cfg.num_experts_per_tok));
@@ -225,7 +228,8 @@ Inkling2Model Inkling2Model::Load(const Inkling2ModelOptions& opts) {
   {
     const int64_t hl = cfg.num_attention_heads;
     const int64_t gqa = (kvl > 0) ? (hl / kvl) : 0;
-    bool all_grouped_mx = !is_tp && DecodeGraphEnabled() && MoeGroupedDecodeEnabled() && AttnFusedEnabled() &&
+    const bool tp_graph_ok = !is_tp || (opts.tp_comm != nullptr && opts.tp_comm->IsGraphCapturable());
+    bool all_grouped_mx = tp_graph_ok && DecodeGraphEnabled() && MoeGroupedDecodeEnabled() && AttnFusedEnabled() &&
                           hd == 128 && cfg.d_rel <= 32 && kvl > 0 && hl % kvl == 0 &&
                           (gqa == 1 || gqa == 2 || gqa == 3 || gqa == 4 || gqa == 6 || gqa == 8);
     for (int64_t l = 0; all_grouped_mx && l < cfg.num_hidden_layers; ++l) {
@@ -889,7 +893,9 @@ void Inkling2Model::Head(const float* h_row, const std::vector<const float*>& bl
 
 std::vector<float> Inkling2Model::RunChunk(const std::vector<int32_t>& token_ids, bool want_logits, int32_t* greedy_out,
                                            const SummaryRequest* summary, SpanAccumulator* prof,
-                                           bool verify_conv_hist, std::vector<int32_t>* verify_greedy_out) {
+                                           bool verify_conv_hist, std::vector<int32_t>* verify_greedy_out,
+                                           float verify_inv_temp,
+                                           std::vector<kernels::RowSummary>* verify_summaries_out) {
   const int64_t T = static_cast<int64_t>(token_ids.size());
   if (T < 1 || T > max_chunk_)
     throw std::runtime_error("Inkling2Model::RunChunk: token_ids.size() must be in [1, " + std::to_string(max_chunk_) + "]");
@@ -970,7 +976,8 @@ std::vector<float> Inkling2Model::RunChunk(const std::vector<int32_t>& token_ids
                                     static_cast<float>(cfg.rms_norm_eps), s);
     }
 
-    if (verify_greedy_out != nullptr) {
+    const bool is_verify = (verify_greedy_out != nullptr || verify_summaries_out != nullptr);
+    if (is_verify) {
       const int64_t vl = cfg.HeadRowsLocal();
       uint16_t* lg = arena_.Alloc<uint16_t>(static_cast<size_t>(T * vl), 16);
       Lin(container_.LmHead(), dspark_taps_[3].data(), lg, T);
@@ -991,12 +998,14 @@ std::vector<float> Inkling2Model::RunChunk(const std::vector<int32_t>& token_ids
     arena_.Reset();
   };
 
+  const bool is_verify = (verify_greedy_out != nullptr || verify_summaries_out != nullptr);
   const bool try_graph = T == 1 && want_logits && prof == nullptr && !trace_.enabled && decode_graph_eligible_ &&
-                         !decode_graph_disabled_ && verify_greedy_out == nullptr && !dspark_;
-  const bool try_verify_graph = T > 1 && T <= 8 && verify_greedy_out != nullptr && prof == nullptr && !trace_.enabled &&
+                         !decode_graph_disabled_ && !is_verify && !dspark_;
+  const bool try_verify_graph = T > 1 && T <= 8 && is_verify && prof == nullptr && !trace_.enabled &&
                                 decode_graph_eligible_ && !decode_graph_disabled_ && MoeGroupedPrefillEnabled() &&
                                 !MoeCheckOffsetsEnabled();
   bool launched_graph = false;
+  bool just_captured = false;
   if (try_graph) {
     if (decode_steps_seen_ >= 1) {
       pos_host_.data()[0] = static_cast<int32_t>(pos_);
@@ -1009,6 +1018,7 @@ std::vector<float> Inkling2Model::RunChunk(const std::vector<int32_t>& token_ids
               run_body(/*use_pos_dev=*/true, /*graph_long_ctx=*/long_ctx);
             })) {
           slot.reset(exec);
+          just_captured = true;
         } else {
           decode_graph_disabled_ = true;
           std::cerr << "[r4dx::model::Inkling2Model] HIP graph capture failed; falling back to eager decode\n";
@@ -1031,6 +1041,7 @@ std::vector<float> Inkling2Model::RunChunk(const std::vector<int32_t>& token_ids
           })) {
         verify_graph_.reset(exec);
         verify_graph_T_ = T;
+        just_captured = true;
       } else {
         decode_graph_disabled_ = true;
         std::cerr << "[r4dx::model::Inkling2Model] HIP verify graph capture failed; falling back to eager verify\n";
@@ -1040,6 +1051,9 @@ std::vector<float> Inkling2Model::RunChunk(const std::vector<int32_t>& token_ids
       R4DX_HIP_CHECK(hipGraphLaunch(static_cast<hipGraphExec_t>(verify_graph_.get()), sr));
       launched_graph = true;
     }
+  }
+  if (launched_graph && !just_captured && comm_ != nullptr) {
+    comm_->NoteGraphReplay(static_cast<size_t>(T * H * 2), static_cast<int64_t>(2 * visits_.size()));
   }
   if (!launched_graph) {
     run_body(/*use_pos_dev=*/false, /*graph_long_ctx=*/true);
@@ -1053,8 +1067,14 @@ std::vector<float> Inkling2Model::RunChunk(const std::vector<int32_t>& token_ids
       r4dx_argmax_rows_f32(P(verify_logits_dev_.data()), vl, P(verify_argmax_dev_.data()), 0, 1, T,
                            vocab_local_valid_, s);
     }
+  } else if (verify_summaries_out != nullptr) {
+    const int64_t vl = cfg.HeadRowsLocal();
+    r4dx_topk_lse_f32_ws(P(verify_logits_dev_.data()), P(verify_summary_ids_dev_.data()),
+                         P(verify_summary_vals_dev_.data()), P(verify_summary_lse_dev_.data()), static_cast<int>(T),
+                         comm_ != nullptr ? vl : vocab_local_valid_, verify_inv_temp, s,
+                         comm_ != nullptr ? P(topk_lse_ws_.data()) : 0);
   }
-  if (want_logits && verify_greedy_out == nullptr) {
+  if (want_logits && !is_verify) {
     const int64_t vl = cfg.HeadRowsLocal();
     if (greedy_out != nullptr && comm_ != nullptr) {
       r4dx_argmax_val_f32(P(logits_dev_.data()), P(argmax_pair_dev_.data()), P(argmax_pair_dev_.data() + 1), vl, s);
@@ -1066,7 +1086,7 @@ std::vector<float> Inkling2Model::RunChunk(const std::vector<int32_t>& token_ids
                            summary->inv_temperature, s, comm_ != nullptr ? P(topk_lse_ws_.data()) : 0);
     }
   }
-  if (capture_taps && verify_greedy_out == nullptr) {
+  if (capture_taps && !is_verify) {
     dspark_->InjectTaps(dspark_taps_[0].data(), dspark_taps_[1].data(), dspark_taps_[2].data(), dspark_taps_[3].data(),
                         T, pos_, stream_, arena_);
   }
@@ -1080,6 +1100,27 @@ std::vector<float> Inkling2Model::RunChunk(const std::vector<int32_t>& token_ids
       }
     } else {
       verify_argmax_dev_.CopyToHost(verify_greedy_out->data(), static_cast<size_t>(T));
+    }
+  } else if (verify_summaries_out != nullptr) {
+    std::vector<int32_t> ids(static_cast<size_t>(T * R4DX_TOPK_LSE_K));
+    std::vector<float> vals(static_cast<size_t>(T * R4DX_TOPK_LSE_K));
+    std::vector<float> lses(static_cast<size_t>(T));
+    verify_summary_ids_dev_.CopyToHost(ids.data(), ids.size());
+    verify_summary_vals_dev_.CopyToHost(vals.data(), vals.size());
+    verify_summary_lse_dev_.CopyToHost(lses.data(), lses.size());
+    verify_summaries_out->resize(static_cast<size_t>(T));
+    const int64_t row_vocab = comm_ != nullptr ? cfg.HeadRowsLocal() : vocab_local_valid_;
+    for (int64_t r = 0; r < T; ++r) {
+      kernels::RowSummary& rs = (*verify_summaries_out)[static_cast<size_t>(r)];
+      rs.k = R4DX_TOPK_LSE_K;
+      rs.vocab = row_vocab;
+      rs.inv_temperature = verify_inv_temp;
+      rs.lse = lses[static_cast<size_t>(r)];
+      for (int j = 0; j < R4DX_TOPK_LSE_K; ++j) {
+        rs.ids[j] = ids[static_cast<size_t>(r * R4DX_TOPK_LSE_K + j)];
+        rs.vals[j] = vals[static_cast<size_t>(r * R4DX_TOPK_LSE_K + j)];
+      }
+      if (comm_ != nullptr) MergeSummary(&rs);
     }
   }
 
@@ -1327,8 +1368,95 @@ std::vector<int32_t> Inkling2Model::DecodeStepDflashSampled(int32_t token_id, in
                                                             const kernels::SampleParams& params, std::mt19937_64& rng,
                                                             int64_t* walk_len_out) {
   if (params.temperature <= 0.0f) return DecodeStepDflashGreedy(token_id, draft_k, walk_len_out);
-  if (walk_len_out != nullptr) *walk_len_out = 0;
-  return {DecodeStepSampled(token_id, params, rng)};
+  if (!dspark_) throw std::runtime_error("Inkling2Model::DecodeStepDflashSampled: no DSpark drafter loaded");
+  const float inv_t = SummaryInvTemperature(params);
+  if (inv_t == 0.0f || vocab_local_valid_ <= R4DX_TOPK_LSE_K) {
+    if (walk_len_out != nullptr) *walk_len_out = 0;
+    return {DecodeStepSampled(token_id, params, rng)};
+  }
+  const Inkling2Config& cfg = container_.Config();
+  const hipStream_t sr = stream_.get();
+  const int64_t s = P(sr);
+  const int64_t H = cfg.hidden_size;
+  int64_t k = (draft_k > 0) ? std::min<int64_t>(draft_k, dspark_->NumSpecTokens()) : dspark_->NumSpecTokens();
+  k = std::min<int64_t>(k, max_ctx_ - pos_ - 1);
+  if (k <= 0) {
+    if (walk_len_out != nullptr) *walk_len_out = 0;
+    return {DecodeStepSampled(token_id, params, rng)};
+  }
+
+  // 1. Draft k speculative tokens greedily with DSpark.
+  const auto embed_anchor = [&](int32_t id, uint16_t* out_bf16) {
+    ids_host_.data()[0] = id;
+    ids_dev_.CopyFromHostAsync(ids_host_.data(), 1, stream_);
+    const size_t emark = arena_.Mark();
+    uint16_t* e = arena_.Alloc<uint16_t>(static_cast<size_t>(H), 16);
+    r4dx_embedding_gather_bf16(P(container_.EmbedTokens().data()), P(ids_dev_.data()), P(e), 1, H, cfg.vocab_size, s);
+    r4dx_rmsnorm_plain_bf16(P(e), P(container_.EmbedNorm().data()), P(out_bf16), 1, H,
+                            static_cast<float>(cfg.rms_norm_eps), /*out_fp32=*/0, s);
+    arena_.Rewind(emark);
+  };
+  const auto lm_argmax = [&](const uint16_t* h_bf16) { return LmHeadArgmaxFromBf16(h_bf16); };
+  const auto lm_batch = [&](const uint16_t* h_bf16, int64_t M, uint16_t* out_bf16) {
+    Lin(container_.LmHead(), h_bf16, out_bf16, M);
+  };
+  const auto lg_argmax = [&](const uint16_t* base_bf16, const uint16_t* delta_bf16, const uint16_t* bias_bf16) {
+    return DsparkLogitsArgmax(base_bf16, delta_bf16, bias_bf16);
+  };
+  std::vector<int32_t> drafted =
+      dspark_->DraftGreedy(token_id, pos_, k, stream_, arena_, embed_anchor, lm_argmax, lm_batch, lg_argmax);
+
+  // 2. Snapshot short-conv states and verify [token_id, d_0..d_{k-1}] -> per-row top-K + LSE summaries.
+  R4DX_HIP_CHECK(hipMemcpyAsync(conv_verify_bak_.data(), conv_.data(), conv_.bytes(), hipMemcpyDeviceToDevice, sr));
+  std::vector<int32_t> window;
+  window.reserve(static_cast<size_t>(1 + k));
+  window.push_back(token_id);
+  window.insert(window.end(), drafted.begin(), drafted.end());
+
+  const int64_t pos_before = pos_;
+  std::vector<kernels::RowSummary> summaries;
+  (void)RunChunk(window, /*want_logits=*/false, nullptr, nullptr, nullptr, /*verify_conv_hist=*/true, nullptr, inv_t,
+                 &summaries);
+
+  // 3. Exact canonical sample-and-match (bit-exact to DecodeStepSampled for the same RNG seed).
+  const int64_t vocab = Vocab();
+  std::vector<int32_t> out;
+  out.reserve(static_cast<size_t>(1 + k));
+  int64_t n_keep = 0;
+  for (int64_t i = 0; i <= k; ++i) {
+    const double u = kernels::DrawUniform01(rng);
+    const kernels::SummarySampleResult r = kernels::SampleFromSummary(summaries[static_cast<size_t>(i)], params, u);
+    int32_t tok = r.token;
+    if (!r.resolved) {
+      ++sampled_fallback_rows_;
+      GatherVerifyVocabRow(i, &sampled_row_scratch_);
+      tok = kernels::SampleCanonical(sampled_row_scratch_.data(), vocab, params, u);
+    }
+    out.push_back(tok);
+    ++n_keep;
+    if (i < k && tok == drafted[static_cast<size_t>(i)]) continue;
+    break;
+  }
+
+  // 4. Exact short-conv rollback if fewer than all 1 + k tokens were kept.
+  if (n_keep < 1 + k) {
+    const int64_t n_convs = static_cast<int64_t>(conv_off_.size());
+    for (int64_t ci = 0; ci < n_convs; ++ci) {
+      const int64_t off = conv_off_[static_cast<size_t>(ci)];
+      const int64_t hoff = conv_hist_off_[static_cast<size_t>(ci)];
+      const int64_t C = conv_ch_[static_cast<size_t>(ci)];
+      r4dx_inkling2_sconv_rollback_f32(P(conv_verify_bak_.data() + off), P(conv_verify_hist_.data() + hoff),
+                                       P(conv_.data() + off), static_cast<int>(n_keep), static_cast<int>(C), s);
+    }
+    pos_ = pos_before + n_keep;
+  }
+
+  // 5. Inject the n_keep committed taps into the DSpark context KV cache.
+  dspark_->InjectTaps(dspark_taps_[0].data(), dspark_taps_[1].data(), dspark_taps_[2].data(), dspark_taps_[3].data(),
+                      n_keep, pos_before, stream_, arena_);
+  stream_.Synchronize();
+  if (walk_len_out != nullptr) *walk_len_out = k;
+  return out;
 }
 
 void Inkling2Model::MergeSummary(kernels::RowSummary* out) {
@@ -1344,6 +1472,21 @@ void Inkling2Model::GatherVocabRow(std::vector<float>* full) {
   gather_host_.resize(static_cast<size_t>(vl));
   R4DX_HIP_CHECK(hipMemcpy(gather_host_.data(), logits_dev_.data(), static_cast<size_t>(vl) * sizeof(float),
                            hipMemcpyDeviceToHost));
+  full->resize(static_cast<size_t>(vl * comm_->World()));
+  comm_->HostAllGather(gather_host_.data(), static_cast<size_t>(vl) * sizeof(float), full->data());
+  full->resize(static_cast<size_t>(Vocab()));
+}
+
+void Inkling2Model::GatherVerifyVocabRow(int64_t row, std::vector<float>* full) {
+  const int64_t vl = container_.Config().HeadRowsLocal();
+  const float* src = verify_logits_dev_.data() + row * vl;
+  if (comm_ == nullptr) {
+    full->resize(static_cast<size_t>(Vocab()));
+    R4DX_HIP_CHECK(hipMemcpy(full->data(), src, static_cast<size_t>(Vocab()) * sizeof(float), hipMemcpyDeviceToHost));
+    return;
+  }
+  gather_host_.resize(static_cast<size_t>(vl));
+  R4DX_HIP_CHECK(hipMemcpy(gather_host_.data(), src, static_cast<size_t>(vl) * sizeof(float), hipMemcpyDeviceToHost));
   full->resize(static_cast<size_t>(vl * comm_->World()));
   comm_->HostAllGather(gather_host_.data(), static_cast<size_t>(vl) * sizeof(float), full->data());
   full->resize(static_cast<size_t>(Vocab()));

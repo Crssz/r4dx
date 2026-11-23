@@ -295,6 +295,15 @@ class HostMailboxComm final : public TpEndpoint {
     stats_ = core::TpCommStats{};
   }
   std::array<uint64_t, 2> CallCounts() const override { return calls_; }
+  bool IsGraphCapturable() const override { return fault_at_ <= 0; }
+  void NoteGraphReplay(size_t bytes, int64_t count) override {
+    if (count <= 0) return;
+    const int ch = MailboxLayout::ChannelFor(bytes);
+    stats_.ar_calls[ch] += static_cast<uint64_t>(count);
+    stats_.ar_bytes[ch] += static_cast<uint64_t>(bytes) * static_cast<uint64_t>(count);
+    calls_[static_cast<size_t>(ch)] += static_cast<uint64_t>(count);
+    if (hb_ != nullptr) hb_->fetch_add(static_cast<uint64_t>(count), std::memory_order_relaxed);
+  }
 
   // ---- TpEndpoint -------------------------------------------------------------------------------
   void SyncStreams() override {

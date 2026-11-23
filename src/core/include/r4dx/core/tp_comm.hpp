@@ -103,6 +103,10 @@ class TpComm {
   // Calls per channel since the last ResetCounters(); both ranks must agree (docs/tp.md 2.5
   // step 7).
   virtual std::array<uint64_t, 2> CallCounts() const = 0;
+  // True when AllReduceSumBf16 only enqueues pure device work with fixed pointers (safe inside hipStreamBeginCapture).
+  virtual bool IsGraphCapturable() const { return false; }
+  // Record `count` all-reduce calls of `bytes` each executed by a replayed HIP graph (keeps stats and heartbeat current).
+  virtual void NoteGraphReplay(size_t /*bytes*/, int64_t /*count*/) {}
 };
 
 }  // namespace r4dx::core

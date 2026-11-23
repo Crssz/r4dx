@@ -120,6 +120,7 @@ struct Kit {
                      int64_t elem_bytes)>
       add_raw;
   bool keep_nvfp4_experts = false;
+  bool include_vision = false;
 };
 
 // f32 q, kv: [2 * loop_layers, H] each -> out [loop_layers, 4, H] = per loop layer j: q[2j], kv[2j], kv[2j + 1], q[2j + 1]

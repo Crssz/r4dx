@@ -68,6 +68,7 @@ struct ImageProcessorConfig {
   // (the Gemma TextModel reports VisionMergeSize() == 1). Default false: the Qwen path is untouched.
   bool gemma = false;
   int gemma_soft_tokens = 280;  // 70 | 140 | 280 | 560 | 1120
+  bool inkling2 = false;        // Inkling-2-Mini 20x20 native patch, 2x2 merge (40px factor)
 
   int Factor() const { return patch_size * merge_size; }
   int64_t PatchDim() const {

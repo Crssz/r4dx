@@ -61,9 +61,9 @@ class Inkling2TpModel final : public TextModel, public TpDiagnostics {
   // ---- identity / capabilities: cached at load, legal in every state ------------------------------
   const ModelConfig& Config() const override { return global_config_; }
   const std::string& ModelId() const override { return model_id_; }
-  int64_t ImageTokenId() const override { return -1; }
+  int64_t ImageTokenId() const override { return has_vision_ ? 200054 : -1; }
   int64_t VisionMergeSize() const override { return 2; }
-  bool HasVision() const override { return false; }
+  bool HasVision() const override { return has_vision_; }
   bool MtpEnabled() const override { return false; }
   bool MtpUsingReducedVocabDraft() const override { return false; }
   bool DflashEnabled() const override { return !lopts_.dspark_path.empty(); }
@@ -236,6 +236,7 @@ class Inkling2TpModel final : public TextModel, public TpDiagnostics {
 
   std::string model_id_;
   int64_t num_loaded_layers_ = 0;
+  bool has_vision_ = false;
   int64_t cached_position_ = 0;
   int64_t cached_fallback_rows_ = 0;
   mutable std::vector<VramReport> cached_vram_;

@@ -2644,6 +2644,8 @@ int RunConvert(const AppArgs& args) {
       const char* nv4_env = std::getenv("R4DX_CONVERT_NVFP4_EXPERTS");
       kit.keep_nvfp4_experts =
           (nv4_env != nullptr && (std::strcmp(nv4_env, "1") == 0 || std::strcmp(nv4_env, "on") == 0));
+      const char* vis_env = std::getenv("R4DX_CONVERT_VISION");
+      kit.include_vision = (vis_env != nullptr && (std::strcmp(vis_env, "1") == 0 || std::strcmp(vis_env, "on") == 0));
     }
     kit.add_raw = [&](const std::string& hf_name, const std::string& container_name,
                       const std::vector<int64_t>& shape, int64_t elem_bytes) {
@@ -2734,9 +2736,45 @@ int RunConvert(const AppArgs& args) {
       if (unconsumed.size() > 20) msg += "\n  ... and " + std::to_string(unconsumed.size() - 20) + " more";
       throw std::runtime_error(msg);
     }
-    for (const std::string& n : all) inkling_visual_skipped += ik::IsAllowListed(n) ? 1 : 0;
+    for (const std::string& n : all) {
+      if (consumed.count(n) == 0 && ik::IsAllowListed(n)) ++inkling_visual_skipped;
+    }
     std::cout << "[r4dx-convert] inkling2_loop: " << consumed.size() << " checkpoint tensor(s) consumed, "
-              << inkling_visual_skipped << " allow-listed and skipped (model.visual.*: the ViT is a later milestone)\n";
+              << inkling_visual_skipped << " allow-listed and skipped\n";
+
+    // Optional: bundle mtp.safetensors (DSpark drafter, 636 MB) under `dspark.*` inside the .r4dx container.
+    const char* dsp_env = std::getenv("R4DX_CONVERT_DSPARK");
+    const bool bundle_dspark = (dsp_env != nullptr && (std::strcmp(dsp_env, "1") == 0 || std::strcmp(dsp_env, "on") == 0));
+    std::shared_ptr<r4dx_convert::SafetensorsReader> mtp_reader;
+    if (bundle_dspark) {
+      const std::filesystem::path mtp_path = std::filesystem::path(args.input) / "mtp.safetensors";
+      if (std::filesystem::exists(mtp_path)) {
+        mtp_reader = std::make_shared<r4dx_convert::SafetensorsReader>(mtp_path.wstring());
+        std::vector<std::string> mtp_names;
+        {
+          const auto mj = nlohmann::json::parse(mtp_reader->HeaderJson());
+          for (auto it = mj.begin(); it != mj.end(); ++it) {
+            if (it.key() != "__metadata__") mtp_names.push_back(it.key());
+          }
+          std::sort(mtp_names.begin(), mtp_names.end());
+        }
+        for (const std::string& tn : mtp_names) {
+          const std::string cname = "dspark." + tn;
+          const auto meta = mtp_reader->Meta(tn);
+          const uint64_t nbytes = static_cast<uint64_t>(meta.ElemCount()) * 2;
+          plan_jobs.push_back([&writer, cname, meta, nbytes]() {
+            std::vector<int64_t> sh = meta.shape;
+            sh.push_back(2);
+            writer.Plan(cname, sh, nbytes);
+          });
+          emit_jobs.push_back([&writer, mtp_reader, tn, cname, nbytes]() {
+            writer.WriteTensor(cname, mtp_reader->Data(tn), static_cast<size_t>(nbytes));
+          });
+        }
+        std::cout << "[r4dx-convert] inkling2_loop: bundled " << mtp_names.size()
+                  << " DSpark tensor(s) from mtp.safetensors under dspark.*\n";
+      }
+    }
   }
 
   // ---- qwen4_exp branch (qwen4exp_layout.cpp): the whole text stack, through the closures above ---------

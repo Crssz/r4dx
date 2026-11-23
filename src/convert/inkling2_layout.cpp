@@ -357,6 +357,16 @@ std::set<std::string> AddInkling2TextStack(Kit& kit, const TextShape& s) {
     };
     kit.add_source_linear("lm_head", /*head=*/true, std::move(src));
   }
+
+  // Optional Vision encoder (model.visual.* -> vision.* BF16 passthrough, 422 tensors ~600 MB).
+  if (kit.include_vision && kit.add_raw) {
+    for (const std::string& name : kit.all_names()) {
+      if (name.compare(0, 13, "model.visual.") != 0) continue;
+      if (kit.dtype(name) != "BF16") Fail("vision tensor '" + name + "' has dtype " + kit.dtype(name) + ", want BF16");
+      consumed.insert(name);
+      kit.add_raw(name, "vision." + name.substr(13), kit.shape(name), 2);
+    }
+  }
   return consumed;
 }
 

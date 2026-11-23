@@ -245,6 +245,8 @@ void Engine::LoadAndStart() {
     }
     image_preproc_.gemma = true;
     image_preproc_.gemma_soft_tokens = opts_.image_soft_tokens;
+  } else if (model_->ImageTokenId() == 200054) {
+    image_preproc_.inkling2 = true;
   }
   if (model_->HasVision()) {
     if (image_preproc_.gemma) {
@@ -252,6 +254,11 @@ void Engine::LoadAndStart() {
                    "[r4dx-server] vision embedder ready (Gemma 4, %d soft tokens per image at most; an image is "
                    "resized to the largest 48-multiple size inside that budget)\n",
                    opts_.image_soft_tokens);
+    } else if (image_preproc_.inkling2) {
+      std::fprintf(stderr,
+                   "[r4dx-server] vision tower ready (Inkling-2-Mini 23-layer ViT, 20px patch, 2x2 merge, "
+                   "image_max_pixels=%lld)\n",
+                   static_cast<long long>(image_preproc_.max_pixels));
     } else {
       std::fprintf(stderr,
                    "[r4dx-server] vision tower ready (image_max_pixels=%lld, an image above that is "

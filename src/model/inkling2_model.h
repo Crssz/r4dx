@@ -34,6 +34,8 @@
 
 #include "inkling2_container.h"
 #include "inkling2_dspark.h"
+#include "inkling2_vision_tower.h"
+#include "model_types.h"
 #include "model_types.h"
 #include "r4dx/core/arena.hpp"
 #include "r4dx/core/device_buffer.hpp"
@@ -53,7 +55,8 @@ struct Inkling2ModelOptions {
   int64_t max_ctx = 0;        // <= 0: Inkling2Config::ResolveMaxCtx default (131072)
   int prefill_chunk = 256;    // [1, 256]
   bool prompt_checkpoint = false;
-  std::string dspark_path;    // optional path to mtp.safetensors (Inkling2 DSpark drafter)
+  bool enable_vision = true;
+  std::string dspark_path;    // optional path to mtp.safetensors (or "auto" for bundled dspark.*)
   // Tensor parallel (Inkling2TpModel fills these per rank).
   int tp_world = 1;
   int tp_rank = 0;
@@ -82,12 +85,16 @@ class Inkling2Model {
   int64_t Vocab() const { return container_.GlobalConfig().unpadded_vocab_size; }  // the logits width
   int TpWorld() const { return opts_.tp_world; }
   bool DsparkEnabled() const { return dspark_ != nullptr; }
+  bool HasVision() const { return vision_.HasWeights(); }
 
   void Reset();
   void SaveCheckpoint();
   void RestoreCheckpoint();
 
+  void EncodeImages(const float* pixel_values, int64_t total_patches, const std::vector<vision::GridThw>& grids,
+                    core::DeviceBuffer<uint16_t>* out_bf16);
   std::vector<float> Prefill(const std::vector<int32_t>& token_ids);
+  std::vector<float> PrefillMultimodal(const std::vector<int32_t>& token_ids, const std::vector<ImageSpan>& images);
   std::vector<float> DecodeStep(int32_t token_id);
   int32_t DecodeStepGreedy(int32_t token_id);
   int32_t DecodeStepSampled(int32_t token_id, const kernels::SampleParams& params, std::mt19937_64& rng);
@@ -116,7 +123,8 @@ class Inkling2Model {
                               const SummaryRequest* summary, SpanAccumulator* prof,
                               bool verify_conv_hist = false, std::vector<int32_t>* verify_greedy_out = nullptr,
                               float verify_inv_temp = 0.0f,
-                              std::vector<kernels::RowSummary>* verify_summaries_out = nullptr);
+                              std::vector<kernels::RowSummary>* verify_summaries_out = nullptr,
+                              const std::vector<ImageSpan>* chunk_images = nullptr);
   void RunVisit(const Inkling2Visit& v, Chunk& c, int64_t T, SpanAccumulator* prof, bool use_pos_dev = false,
                 bool graph_long_ctx = true, bool capture_conv_hist = false);
   void Attention(const Inkling2Visit& v, const uint16_t* xq, const uint16_t* xk, const uint16_t* xv, uint16_t* out,
@@ -166,8 +174,9 @@ class Inkling2Model {
   std::vector<int64_t> conv_ch_;
   core::DeviceBuffer<float> conv_, conv_ckpt_, conv_verify_bak_, conv_verify_hist_;
 
-  // Optional Inkling2 DSpark / MTP drafter (mtp.safetensors).
+  // Optional Inkling2 DSpark / MTP drafter (mtp.safetensors) and Vision Tower (vision.*).
   std::unique_ptr<Inkling2DsparkDraft> dspark_;
+  Inkling2VisionTower vision_;
   std::array<core::DeviceBuffer<uint16_t>, 4> dspark_taps_;  // [4][max_chunk, H] bf16
   core::DeviceBuffer<float> verify_logits_dev_;              // [8, HeadRowsLocal]
   core::DeviceBuffer<int32_t> verify_argmax_dev_, verify_argmax_pair_dev_;

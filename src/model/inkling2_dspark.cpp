@@ -54,22 +54,27 @@ class SafetensorsReader {
       e.end = offs.at(1).get<uint64_t>();
       entries_.emplace(it.key(), std::move(e));
     }
+    if (entries_.count("dspark.fuse_weight") > 0 && entries_.count("fuse_weight") == 0) {
+      prefix_ = "dspark.";
+    }
   }
 
   std::vector<uint16_t> ReadBf16(const std::string& name, const std::vector<int64_t>& expect_shape) {
-    auto it = entries_.find(name);
-    if (it == entries_.end()) throw std::runtime_error("Inkling2DsparkDraft: missing tensor " + name);
+    const std::string key = prefix_ + name;
+    auto it = entries_.find(key);
+    if (it == entries_.end()) throw std::runtime_error("Inkling2DsparkDraft: missing tensor " + key);
     const StEntry& e = it->second;
-    if (e.dtype != "BF16") throw std::runtime_error("Inkling2DsparkDraft: " + name + " expected BF16, got " + e.dtype);
-    if (e.shape != expect_shape) throw std::runtime_error("Inkling2DsparkDraft: unexpected shape for " + name);
     int64_t elems = 1;
-    for (int64_t d : e.shape) elems *= d;
+    for (int64_t d : expect_shape) elems *= d;
+    const bool shape_ok = (e.dtype == "BF16" && e.shape == expect_shape) ||
+                          (e.dtype == "U8" && e.end - e.begin == static_cast<uint64_t>(elems) * 2);
+    if (!shape_ok) throw std::runtime_error("Inkling2DsparkDraft: unexpected dtype/shape for " + key);
     if (e.end - e.begin != static_cast<uint64_t>(elems) * 2)
-      throw std::runtime_error("Inkling2DsparkDraft: byte length mismatch for " + name);
+      throw std::runtime_error("Inkling2DsparkDraft: byte length mismatch for " + key);
     std::vector<uint16_t> buf(static_cast<size_t>(elems));
     f_.seekg(static_cast<std::streamoff>(data_base_ + e.begin), std::ios::beg);
     f_.read(reinterpret_cast<char*>(buf.data()), static_cast<std::streamsize>(buf.size() * 2));
-    if (!f_) throw std::runtime_error("Inkling2DsparkDraft: read failed for " + name);
+    if (!f_) throw std::runtime_error("Inkling2DsparkDraft: read failed for " + key);
     return buf;
   }
 
@@ -116,6 +121,7 @@ class SafetensorsReader {
  private:
   std::ifstream f_;
   uint64_t data_base_ = 0;
+  std::string prefix_;
   std::unordered_map<std::string, StEntry> entries_;
 };
 

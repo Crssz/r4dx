@@ -1,6 +1,7 @@
 #include "preprocess.h"
 
 #include "gemma_vision.h"
+#include "inkling2_vision.h"
 
 #include <algorithm>
 #include <cmath>
@@ -281,6 +282,21 @@ PreprocessedImages PreprocessImages(const std::vector<DecodedImage>& images,
                                      const ImageProcessorConfig& cfg) {
   PreprocessedImages out;
   out.grid_thw.reserve(images.size());
+  if (cfg.inkling2) {
+    Inkling2ImageConfig ic;
+    if (cfg.max_pixels > 0) ic.max_pixels = cfg.max_pixels;
+    out.patch_dim = kInkling2PatchDim;
+    for (const DecodedImage& img : images) {
+      const Inkling2Preprocessed p = PreprocessInkling2Image(img, ic);
+      out.pixel_values.insert(out.pixel_values.end(), p.pixel_values.begin(), p.pixel_values.end());
+      GridThw grid;
+      grid.t = 1;
+      grid.h = p.grid_h;
+      grid.w = p.grid_w;
+      out.grid_thw.push_back(grid);
+    }
+    return out;
+  }
   if (cfg.gemma) {
     GemmaImageConfig gc;
     gc.max_soft_tokens = cfg.gemma_soft_tokens;

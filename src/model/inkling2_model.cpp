@@ -252,8 +252,13 @@ Inkling2Model Inkling2Model::Load(const Inkling2ModelOptions& opts) {
     m.conv_ckpt_ = core::DeviceBuffer<float>(static_cast<size_t>(conv_total));
     m.conv_ckpt_.Zero();
   }
+  if (opts.enable_vision && opts.tp_rank == 0) {
+    m.vision_ = Inkling2VisionTower::TryLoad(opts.container_path);
+  }
   if (!opts.dspark_path.empty()) {
-    m.dspark_ = std::make_unique<Inkling2DsparkDraft>(Inkling2DsparkDraft::Load(opts.dspark_path, m.max_ctx_));
+    const std::string dp =
+        (opts.dspark_path == "auto" || opts.dspark_path == "self") ? opts.container_path : opts.dspark_path;
+    m.dspark_ = std::make_unique<Inkling2DsparkDraft>(Inkling2DsparkDraft::Load(dp, m.max_ctx_));
     for (int j = 0; j < 4; ++j) m.dspark_taps_[static_cast<size_t>(j)] = core::DeviceBuffer<uint16_t>(static_cast<size_t>(rows * H));
     m.conv_verify_bak_ = core::DeviceBuffer<float>(static_cast<size_t>(conv_total));
     m.conv_verify_hist_ = core::DeviceBuffer<float>(static_cast<size_t>(conv_hist_total));
@@ -997,7 +1002,8 @@ std::vector<float> Inkling2Model::RunChunk(const std::vector<int32_t>& token_ids
                                            const SummaryRequest* summary, SpanAccumulator* prof,
                                            bool verify_conv_hist, std::vector<int32_t>* verify_greedy_out,
                                            float verify_inv_temp,
-                                           std::vector<kernels::RowSummary>* verify_summaries_out) {
+                                           std::vector<kernels::RowSummary>* verify_summaries_out,
+                                           const std::vector<ImageSpan>* chunk_images) {
   const int64_t T = static_cast<int64_t>(token_ids.size());
   if (T < 1 || T > max_chunk_)
     throw std::runtime_error("Inkling2Model::RunChunk: token_ids.size() must be in [1, " + std::to_string(max_chunk_) + "]");
@@ -1024,10 +1030,35 @@ std::vector<float> Inkling2Model::RunChunk(const std::vector<int32_t>& token_ids
     c.used.assign(pool_.size(), false);
     c.h = c.Acquire();
     ProfiledCall(prof, sr, "embed", [&] {
+      const bool vis_after_norm = InkEnvFlag("R4DX_INK_VIS_AFTER_NORM", true);
       uint16_t* e = arena_.Alloc<uint16_t>(static_cast<size_t>(T * H), 16);
       r4dx_embedding_gather_bf16(P(container_.EmbedTokens().data()), P(ids_dev_.data()), P(e), T, H, cfg.vocab_size, s);
-      r4dx_rmsnorm_plain_bf16(P(e), P(container_.EmbedNorm().data()), P(pool_[static_cast<size_t>(c.h)].data()), T, H,
+      if (chunk_images != nullptr && !vis_after_norm) {
+        for (const ImageSpan& sp : *chunk_images) {
+          if (sp.tokens <= 0 || sp.embeds == nullptr) continue;
+          const hipMemcpyKind kind = sp.embeds_on_host ? hipMemcpyHostToDevice : hipMemcpyDeviceToDevice;
+          R4DX_HIP_CHECK(hipMemcpyAsync(e + static_cast<size_t>(sp.offset * H), sp.embeds,
+                                        static_cast<size_t>(sp.tokens * H) * sizeof(uint16_t), kind, sr));
+        }
+      }
+      float* h0 = pool_[static_cast<size_t>(c.h)].data();
+      r4dx_rmsnorm_plain_bf16(P(e), P(container_.EmbedNorm().data()), P(h0), T, H,
                               static_cast<float>(cfg.rms_norm_eps), /*out_fp32=*/1, s);
+      if (chunk_images != nullptr && vis_after_norm) {
+        for (const ImageSpan& sp : *chunk_images) {
+          if (sp.tokens <= 0 || sp.embeds == nullptr) continue;
+          const uint16_t* src_dev = sp.embeds;
+          if (sp.embeds_on_host) {
+            uint16_t* tmp = arena_.Alloc<uint16_t>(static_cast<size_t>(sp.tokens * H), 16);
+            R4DX_HIP_CHECK(hipMemcpyAsync(tmp, sp.embeds, static_cast<size_t>(sp.tokens * H) * sizeof(uint16_t),
+                                          hipMemcpyHostToDevice, sr));
+            src_dev = tmp;
+          }
+          float* dst = h0 + static_cast<size_t>(sp.offset * H);
+          R4DX_HIP_CHECK(hipMemsetAsync(dst, 0, static_cast<size_t>(sp.tokens * H) * sizeof(float), sr));
+          r4dx_inkling2_add_f32_bf16(P(dst), P(src_dev), P(dst), sp.tokens * H, s);
+        }
+      }
     });
     const size_t base_mark = arena_.Mark();
 
@@ -1268,6 +1299,44 @@ void Inkling2Model::FetchRowSummary(float inv_temperature, kernels::RowSummary* 
 }
 
 // ---- public forward -------------------------------------------------------------------------------------------------
+
+void Inkling2Model::EncodeImages(const float* pixel_values, int64_t total_patches,
+                                 const std::vector<vision::GridThw>& grids, core::DeviceBuffer<uint16_t>* out_bf16) {
+  vision_.Encode(pixel_values, total_patches, grids, out_bf16, stream_, arena_);
+}
+
+std::vector<float> Inkling2Model::PrefillMultimodal(const std::vector<int32_t>& token_ids,
+                                                    const std::vector<ImageSpan>& images) {
+  if (images.empty()) return Prefill(token_ids);
+  if (token_ids.empty()) throw std::runtime_error("Inkling2Model::PrefillMultimodal: token_ids is empty");
+  const int64_t H = container_.Config().hidden_size;
+  std::vector<float> logits;
+  for (size_t off = 0; off < token_ids.size();) {
+    const size_t n = std::min(static_cast<size_t>(max_chunk_), token_ids.size() - off);
+    const int64_t c0 = static_cast<int64_t>(off), c1 = static_cast<int64_t>(off + n);
+    std::vector<ImageSpan> slice;
+    for (const ImageSpan& sp : images) {
+      const int64_t s0 = std::max(c0, sp.offset);
+      const int64_t s1 = std::min(c1, sp.offset + sp.tokens);
+      if (s1 > s0) {
+        ImageSpan sub;
+        sub.offset = s0 - c0;
+        sub.tokens = s1 - s0;
+        sub.embeds = sp.embeds + static_cast<size_t>((s0 - sp.offset) * H);
+        sub.embeds_on_host = sp.embeds_on_host;
+        slice.push_back(sub);
+      }
+    }
+    const std::vector<int32_t> chunk(token_ids.begin() + static_cast<std::ptrdiff_t>(off),
+                                     token_ids.begin() + static_cast<std::ptrdiff_t>(off + n));
+    const bool last = off + n == token_ids.size();
+    off += n;
+    std::vector<float> l = RunChunk(chunk, last, nullptr, nullptr, nullptr, false, nullptr, 0.0f, nullptr,
+                                    slice.empty() ? nullptr : &slice);
+    if (last) logits = std::move(l);
+  }
+  return logits;
+}
 
 std::vector<float> Inkling2Model::Prefill(const std::vector<int32_t>& token_ids) {
   if (token_ids.empty()) throw std::runtime_error("Inkling2Model::Prefill: token_ids is empty");

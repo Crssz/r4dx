@@ -142,6 +142,7 @@ set(R4DX_MODEL_SOURCES
   # the TP=1 TextModel + the LoadInkling2TextModel dispatch, and the TP=2 facade.
   inkling2_container.cpp
   inkling2_dspark.cpp
+  inkling2_vision_tower.cpp
   inkling2_model.cpp
   inkling2_local_text_model.cpp
   inkling2_tp_model.cpp

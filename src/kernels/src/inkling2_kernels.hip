@@ -1985,3 +1985,206 @@ void r4dx_inkling2_qgrkv_split_bf16(int64_t src, int64_t total_n, int64_t q_out,
 }
 
 }  // extern "C"
+
+namespace {
+
+__global__ __launch_bounds__(kThreads) void VitPosClsKernel(
+    const uint16_t* __restrict__ patch_out, const uint16_t* __restrict__ cls_emb,
+    const uint16_t* __restrict__ cls_pos, const uint16_t* __restrict__ pos_emb, uint16_t* __restrict__ out,
+    int gh, int gw, int grid_src, int D) {
+  const int row = static_cast<int>(blockIdx.y);
+  const int col = static_cast<int>(blockIdx.x) * kThreads + threadIdx.x;
+  if (col >= D) return;
+  if (row == 0) {
+    const float v = r4dx::core::Bf16ToFloat(cls_emb[col]) + r4dx::core::Bf16ToFloat(cls_pos[col]);
+    out[col] = r4dx::core::FloatToBf16(v);
+    return;
+  }
+  const int p = row - 1;
+  const int gy = p / gw;
+  const int gx = p - gy * gw;
+  const float fy = (gh > 1) ? ((static_cast<float>(gy) + 0.5f) * static_cast<float>(grid_src) / static_cast<float>(gh) - 0.5f) : 0.0f;
+  const float fx = (gw > 1) ? ((static_cast<float>(gx) + 0.5f) * static_cast<float>(grid_src) / static_cast<float>(gw) - 0.5f) : 0.0f;
+  int y0 = static_cast<int>(floorf(fy));
+  int x0 = static_cast<int>(floorf(fx));
+  float wy = fy - static_cast<float>(y0);
+  float wx = fx - static_cast<float>(x0);
+  if (y0 < 0) { y0 = 0; wy = 0.0f; }
+  if (x0 < 0) { x0 = 0; wx = 0.0f; }
+  if (y0 >= grid_src - 1) { y0 = grid_src - 1; wy = 0.0f; }
+  if (x0 >= grid_src - 1) { x0 = grid_src - 1; wx = 0.0f; }
+  const int y1 = (y0 + 1 < grid_src) ? (y0 + 1) : y0;
+  const int x1 = (x0 + 1 < grid_src) ? (x0 + 1) : x0;
+  const float p00 = r4dx::core::Bf16ToFloat(pos_emb[static_cast<int64_t>(y0 * grid_src + x0) * D + col]);
+  const float p01 = r4dx::core::Bf16ToFloat(pos_emb[static_cast<int64_t>(y0 * grid_src + x1) * D + col]);
+  const float p10 = r4dx::core::Bf16ToFloat(pos_emb[static_cast<int64_t>(y1 * grid_src + x0) * D + col]);
+  const float p11 = r4dx::core::Bf16ToFloat(pos_emb[static_cast<int64_t>(y1 * grid_src + x1) * D + col]);
+  const float pe = (1.0f - wy) * ((1.0f - wx) * p00 + wx * p01) + wy * ((1.0f - wx) * p10 + wx * p11);
+  const float v = r4dx::core::Bf16ToFloat(patch_out[static_cast<int64_t>(p) * D + col]) + pe;
+  out[static_cast<int64_t>(row) * D + col] = r4dx::core::FloatToBf16(v);
+}
+
+__global__ __launch_bounds__(kThreads) void VitLayerNormKernel(
+    const uint16_t* __restrict__ x, const uint16_t* __restrict__ w, const uint16_t* __restrict__ b,
+    uint16_t* __restrict__ out, int D, float eps) {
+  __shared__ float red[kWaves];
+  const int64_t row = blockIdx.x;
+  const uint16_t* xr = x + row * D;
+  float sum = 0.0f;
+  for (int c = threadIdx.x; c < D; c += kThreads) sum += r4dx::core::Bf16ToFloat(xr[c]);
+  const float mean = BlockSum(sum, red) / static_cast<float>(D);
+  float var = 0.0f;
+  for (int c = threadIdx.x; c < D; c += kThreads) {
+    const float d = r4dx::core::Bf16ToFloat(xr[c]) - mean;
+    var += d * d;
+  }
+  const float inv = rsqrtf(BlockSum(var, red) / static_cast<float>(D) + eps);
+  uint16_t* orow = out + row * D;
+  for (int c = threadIdx.x; c < D; c += kThreads) {
+    float v = (r4dx::core::Bf16ToFloat(xr[c]) - mean) * inv * r4dx::core::Bf16ToFloat(w[c]);
+    if (b != nullptr) v += r4dx::core::Bf16ToFloat(b[c]);
+    orow[c] = r4dx::core::FloatToBf16(v);
+  }
+}
+
+__global__ __launch_bounds__(kThreads) void VitBiasGeluKernel(
+    const uint16_t* __restrict__ x, const uint16_t* __restrict__ b, uint16_t* __restrict__ out,
+    int64_t total, int D, int do_gelu) {
+  const int64_t i = static_cast<int64_t>(blockIdx.x) * kThreads + threadIdx.x;
+  if (i >= total) return;
+  float v = r4dx::core::Bf16ToFloat(x[i]);
+  if (b != nullptr) v += r4dx::core::Bf16ToFloat(b[i % D]);
+  if (do_gelu) v = 0.5f * v * (1.0f + erff(v * 0.7071067811865475f));
+  out[i] = r4dx::core::FloatToBf16(v);
+}
+
+__global__ __launch_bounds__(kThreads) void VitLayerScaleAddKernel(
+    uint16_t* __restrict__ resid, const uint16_t* __restrict__ x, const uint16_t* __restrict__ b,
+    const uint16_t* __restrict__ gamma, int64_t total, int D) {
+  const int64_t i = static_cast<int64_t>(blockIdx.x) * kThreads + threadIdx.x;
+  if (i >= total) return;
+  const int c = static_cast<int>(i % D);
+  float xv = r4dx::core::Bf16ToFloat(x[i]);
+  if (b != nullptr) xv += r4dx::core::Bf16ToFloat(b[c]);
+  const float rv = r4dx::core::Bf16ToFloat(resid[i]) + xv * r4dx::core::Bf16ToFloat(gamma[c]);
+  resid[i] = r4dx::core::FloatToBf16(rv);
+}
+
+__global__ __launch_bounds__(32) void VitAttnH64Kernel(
+    const uint16_t* __restrict__ q, const uint16_t* __restrict__ k, const uint16_t* __restrict__ v,
+    uint16_t* __restrict__ out, int N, int heads, float scale) {
+  const int h = static_cast<int>(blockIdx.x);
+  const int qi = static_cast<int>(blockIdx.y);
+  const int lane = threadIdx.x;
+  const int64_t stride = static_cast<int64_t>(heads) * 64;
+  const uint16_t* qr = q + static_cast<int64_t>(qi) * stride + static_cast<int64_t>(h) * 64;
+  const float q0 = r4dx::core::Bf16ToFloat(qr[lane]);
+  const float q1 = r4dx::core::Bf16ToFloat(qr[lane + 32]);
+  float mv = -INFINITY, lv = 0.0f, o0 = 0.0f, o1 = 0.0f;
+  for (int ki = 0; ki < N; ++ki) {
+    const int64_t koff = static_cast<int64_t>(ki) * stride + static_cast<int64_t>(h) * 64;
+    const float k0 = r4dx::core::Bf16ToFloat(k[koff + lane]);
+    const float k1 = r4dx::core::Bf16ToFloat(k[koff + lane + 32]);
+    float dot = WaveSum(q0 * k0 + q1 * k1) * scale;
+    const float mn = fmaxf(mv, dot);
+    const float alpha = (mv == -INFINITY) ? 0.0f : expf(mv - mn);
+    const float p = expf(dot - mn);
+    lv = lv * alpha + p;
+    o0 = o0 * alpha + p * r4dx::core::Bf16ToFloat(v[koff + lane]);
+    o1 = o1 * alpha + p * r4dx::core::Bf16ToFloat(v[koff + lane + 32]);
+    mv = mn;
+  }
+  const float inv = (lv > 0.0f) ? (1.0f / lv) : 0.0f;
+  uint16_t* orow = out + static_cast<int64_t>(qi) * stride + static_cast<int64_t>(h) * 64;
+  orow[lane] = r4dx::core::FloatToBf16(o0 * inv);
+  orow[lane + 32] = r4dx::core::FloatToBf16(o1 * inv);
+}
+
+__global__ __launch_bounds__(kThreads) void VitMerge2x2Kernel(
+    const uint16_t* __restrict__ in_with_cls, uint16_t* __restrict__ out, int gh, int gw, int D) {
+  const int mh = gh / 2, mw = gw / 2;
+  const int m_idx = static_cast<int>(blockIdx.y);
+  const int col = static_cast<int>(blockIdx.x) * kThreads + threadIdx.x;
+  if (m_idx >= mh * mw || col >= 4 * D) return;
+  const int my = m_idx / mw, mx = m_idx - my * mw;
+  const int sub = col / D;
+  const int d = col - sub * D;
+  const int dy = sub >> 1, dx = sub & 1;
+  const int src_p = (my * 2 + dy) * gw + (mx * 2 + dx);
+  out[static_cast<int64_t>(m_idx) * (4 * D) + col] = in_with_cls[static_cast<int64_t>(src_p + 1) * D + d];
+}
+
+}  // namespace
+
+extern "C" {
+
+void r4dx_inkling2_vit_pos_cls_bf16(int64_t patch_out, int64_t cls_emb, int64_t cls_pos, int64_t pos_emb, int64_t out,
+                                    int gh, int gw, int grid_src, int D, int64_t stream) {
+  const char* fn = "r4dx_inkling2_vit_pos_cls_bf16";
+  if (gh <= 0 || gw <= 0 || D <= 0) return;
+  hipLaunchKernelGGL(VitPosClsKernel, dim3(static_cast<unsigned>((D + kThreads - 1) / kThreads), static_cast<unsigned>(1 + gh * gw)),
+                     dim3(kThreads), 0, reinterpret_cast<hipStream_t>(stream),
+                     reinterpret_cast<const uint16_t*>(patch_out), reinterpret_cast<const uint16_t*>(cls_emb),
+                     reinterpret_cast<const uint16_t*>(cls_pos), reinterpret_cast<const uint16_t*>(pos_emb),
+                     reinterpret_cast<uint16_t*>(out), gh, gw, grid_src, D);
+  CheckLaunch(fn);
+}
+
+void r4dx_inkling2_vit_layernorm_bf16(int64_t x, int64_t weight, int64_t bias, int64_t out, int rows, int D, float eps,
+                                      int64_t stream) {
+  const char* fn = "r4dx_inkling2_vit_layernorm_bf16";
+  if (rows <= 0 || D <= 0) return;
+  hipLaunchKernelGGL(VitLayerNormKernel, dim3(static_cast<unsigned>(rows)), dim3(kThreads), 0,
+                     reinterpret_cast<hipStream_t>(stream), reinterpret_cast<const uint16_t*>(x),
+                     reinterpret_cast<const uint16_t*>(weight), reinterpret_cast<const uint16_t*>(bias),
+                     reinterpret_cast<uint16_t*>(out), D, eps);
+  CheckLaunch(fn);
+}
+
+void r4dx_inkling2_vit_bias_gelu_bf16(int64_t x, int64_t bias, int64_t out, int rows, int D, int do_gelu,
+                                      int64_t stream) {
+  const char* fn = "r4dx_inkling2_vit_bias_gelu_bf16";
+  const int64_t total = static_cast<int64_t>(rows) * D;
+  if (total <= 0) return;
+  hipLaunchKernelGGL(VitBiasGeluKernel, dim3(static_cast<unsigned>((total + kThreads - 1) / kThreads)), dim3(kThreads),
+                     0, reinterpret_cast<hipStream_t>(stream), reinterpret_cast<const uint16_t*>(x),
+                     reinterpret_cast<const uint16_t*>(bias), reinterpret_cast<uint16_t*>(out), total, D, do_gelu);
+  CheckLaunch(fn);
+}
+
+void r4dx_inkling2_vit_layerscale_add_bf16(int64_t resid, int64_t x, int64_t bias, int64_t gamma, int rows, int D,
+                                           int64_t stream) {
+  const char* fn = "r4dx_inkling2_vit_layerscale_add_bf16";
+  const int64_t total = static_cast<int64_t>(rows) * D;
+  if (total <= 0) return;
+  hipLaunchKernelGGL(VitLayerScaleAddKernel, dim3(static_cast<unsigned>((total + kThreads - 1) / kThreads)),
+                     dim3(kThreads), 0, reinterpret_cast<hipStream_t>(stream), reinterpret_cast<uint16_t*>(resid),
+                     reinterpret_cast<const uint16_t*>(x), reinterpret_cast<const uint16_t*>(bias),
+                     reinterpret_cast<const uint16_t*>(gamma), total, D);
+  CheckLaunch(fn);
+}
+
+void r4dx_inkling2_vit_attn_bf16(int64_t q, int64_t k, int64_t v, int64_t out, int N, int heads, int head_dim,
+                                 float scale, int64_t stream) {
+  const char* fn = "r4dx_inkling2_vit_attn_bf16";
+  if (N <= 0 || heads <= 0) return;
+  if (head_dim != 64) Fail(fn, "head_dim must be 64");
+  hipLaunchKernelGGL(VitAttnH64Kernel, dim3(static_cast<unsigned>(heads), static_cast<unsigned>(N)), dim3(32), 0,
+                     reinterpret_cast<hipStream_t>(stream), reinterpret_cast<const uint16_t*>(q),
+                     reinterpret_cast<const uint16_t*>(k), reinterpret_cast<const uint16_t*>(v),
+                     reinterpret_cast<uint16_t*>(out), N, heads, scale);
+  CheckLaunch(fn);
+}
+
+void r4dx_inkling2_vit_merge2x2_bf16(int64_t in_with_cls, int64_t out, int gh, int gw, int D, int64_t stream) {
+  const char* fn = "r4dx_inkling2_vit_merge2x2_bf16";
+  if (gh <= 0 || gw <= 0 || (gh % 2) != 0 || (gw % 2) != 0 || D <= 0) return;
+  const int m_rows = (gh / 2) * (gw / 2);
+  hipLaunchKernelGGL(VitMerge2x2Kernel,
+                     dim3(static_cast<unsigned>((4 * D + kThreads - 1) / kThreads), static_cast<unsigned>(m_rows)),
+                     dim3(kThreads), 0, reinterpret_cast<hipStream_t>(stream),
+                     reinterpret_cast<const uint16_t*>(in_with_cls), reinterpret_cast<uint16_t*>(out), gh, gw, D);
+  CheckLaunch(fn);
+}
+
+}  // extern "C"

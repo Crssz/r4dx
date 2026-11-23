@@ -249,4 +249,25 @@ void r4dx_inkling2_add_bf16(int64_t a, int64_t b, int64_t out, int64_t n, int64_
 // out[i] = a[i] + f32(b[i]) (a fp32, b bf16, out fp32), n elements.
 void r4dx_inkling2_add_f32_bf16(int64_t a, int64_t b, int64_t out, int64_t n, int64_t stream);
 
+// ---- Inkling-2-Mini Vision Transformer (ViT, hidden=1024, heads=16, hd=64) kernels ---------------------------------
+// Prepend class_embedding + cls_position_embedding at row 0 and add 2D bilinear-interpolated position_embedding
+// [grid_src, grid_src, D] to patch_out [gh*gw, D] -> out [1 + gh*gw, D] bf16.
+void r4dx_inkling2_vit_pos_cls_bf16(int64_t patch_out, int64_t cls_emb, int64_t cls_pos, int64_t pos_emb, int64_t out,
+                                    int gh, int gw, int grid_src, int D, int64_t stream);
+// Standard LayerNorm over [rows, D] bf16: out = (x - mean) / sqrt(var + eps) * weight + bias.
+void r4dx_inkling2_vit_layernorm_bf16(int64_t x, int64_t weight, int64_t bias, int64_t out, int rows, int D, float eps,
+                                      int64_t stream);
+// Add optional bias [D] bf16 to x [rows, D] bf16 and optionally apply exact GELU (do_gelu != 0).
+void r4dx_inkling2_vit_bias_gelu_bf16(int64_t x, int64_t bias, int64_t out, int rows, int D, int do_gelu,
+                                      int64_t stream);
+// Fused bias + LayerScale gamma + residual add: resid[r, c] += (x[r, c] + bias[c]) * gamma[c].
+void r4dx_inkling2_vit_layerscale_add_bf16(int64_t resid, int64_t x, int64_t bias, int64_t gamma, int rows, int D,
+                                           int64_t stream);
+// Full bidirectional multi-head self-attention for ViT (heads=16, head_dim=64, N tokens):
+// q, k, v [N, heads*64] bf16 -> out [N, heads*64] bf16.
+void r4dx_inkling2_vit_attn_bf16(int64_t q, int64_t k, int64_t v, int64_t out, int N, int heads, int head_dim,
+                                 float scale, int64_t stream);
+// Drop CLS row 0 and 2x2 spatial merge [1 + gh*gw, D] -> [(gh/2)*(gw/2), 4*D] bf16 (dy in {0,1}, dx in {0,1}).
+void r4dx_inkling2_vit_merge2x2_bf16(int64_t in_with_cls, int64_t out, int gh, int gw, int D, int64_t stream);
+
 }  // extern "C"

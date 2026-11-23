@@ -394,7 +394,10 @@ std::unique_ptr<Inkling2TpModel> Inkling2TpModel::Load(const ModelOptions& opts,
            c.layers = mm.GetContainer().NumLoadedLayers();
            c.vocab = mm.Vocab();
            c.hidden = mm.Config().hidden_size;
-           if (s.index == 0) rank0_global_config = mm.GetContainer().GenericConfig();
+           if (s.index == 0) {
+             rank0_global_config = mm.GetContainer().GenericConfig();
+             m->has_vision_ = mm.HasVision();
+           }
          },
          CmdKind::kPlain, kNoStall);
   m->global_config_ = rank0_global_config;
@@ -726,18 +729,41 @@ void Inkling2TpModel::RunCollectiveForTest(const std::function<void(Inkling2Mode
 
 // ---- unsupported features / profiling -----------------------------------------------------------
 
-void Inkling2TpModel::EncodeImages(const float*, int64_t, const std::vector<vision::GridThw>&, ImageRows*,
-                               vision::VisionEncodeStats*) {
-  throw std::runtime_error("Inkling2TpModel: Inkling-2-Mini runs text only in r4dx (milestone 1: no vision tower)");
+void Inkling2TpModel::EncodeImages(const float* pixel_values, int64_t total_patches,
+                                   const std::vector<vision::GridThw>& grids, ImageRows* out,
+                                   vision::VisionEncodeStats*) {
+  RequireReady();
+  if (!has_vision_) throw std::runtime_error("Inkling2TpModel: no vision tower loaded");
+  if (out == nullptr) throw std::invalid_argument("Inkling2TpModel::EncodeImages: out is null");
+  auto host_rows = std::make_shared<std::vector<uint16_t>>();
+  Run({0},
+      [pixel_values, total_patches, grids, host_rows](RankSlot& s) {
+        core::DeviceBuffer<uint16_t> dev;
+        s.model->EncodeImages(pixel_values, total_patches, grids, &dev);
+        *host_rows = dev.CopyToHost();
+      },
+      CmdKind::kPlain);
+  out->dev = {};
+  out->host = std::move(*host_rows);
+  int64_t merged = 0;
+  for (const auto& g : grids) merged += g.MergedTokenCount(2);
+  out->SetFilled(true, merged);
 }
 
 std::vector<float> Inkling2TpModel::PrefillMultimodal(const std::vector<int32_t>& token_ids,
-                                                  const std::vector<ImageSpan>& images) {
-  // Refused on the facade (a client error must not put the group into kNeedsRecovery).
-  if (!images.empty()) {
-    throw std::runtime_error("Inkling2TpModel::PrefillMultimodal: Inkling-2-Mini runs text only in r4dx (image spans given)");
+                                                      const std::vector<ImageSpan>& images) {
+  if (images.empty()) return Prefill(token_ids);
+  if (!has_vision_) throw std::runtime_error("Inkling2TpModel::PrefillMultimodal: no vision tower loaded");
+  for (const ImageSpan& sp : images) {
+    if (!sp.embeds_on_host) {
+      throw std::invalid_argument("Inkling2TpModel::PrefillMultimodal: TP expects host ImageSpan rows (from EncodeImages)");
+    }
   }
-  return Prefill(token_ids);
+  const std::vector<std::vector<float>> r = RunCollective(
+      [&token_ids, &images](Inkling2Model& m, int) { return m.PrefillMultimodal(token_ids, images); });
+  RequireAllEqual(r, "PrefillMultimodal logits");
+  cached_position_ += static_cast<int64_t>(token_ids.size());
+  return r[0];
 }
 
 std::vector<int32_t> Inkling2TpModel::DecodeStepMtpGreedy(int32_t, int64_t) {

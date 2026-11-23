@@ -27,9 +27,9 @@ class Inkling2LocalTextModel final : public TextModel {
 
   const ModelConfig& Config() const override { return m_.GetContainer().GenericConfig(); }
   const std::string& ModelId() const override { return m_.GetContainer().ModelId(); }
-  int64_t ImageTokenId() const override { return -1; }
+  int64_t ImageTokenId() const override { return m_.HasVision() ? 200054 : -1; }
   int64_t VisionMergeSize() const override { return 2; }
-  bool HasVision() const override { return false; }
+  bool HasVision() const override { return m_.HasVision(); }
   bool MtpEnabled() const override { return false; }
   bool MtpUsingReducedVocabDraft() const override { return false; }
   bool DflashEnabled() const override { return m_.DsparkEnabled(); }

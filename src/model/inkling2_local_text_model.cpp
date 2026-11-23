@@ -35,15 +35,22 @@ std::vector<VramReport> Inkling2LocalTextModel::Vram() const {
   return {r};
 }
 
-void Inkling2LocalTextModel::EncodeImages(const float*, int64_t, const std::vector<vision::GridThw>&, ImageRows*,
+void Inkling2LocalTextModel::EncodeImages(const float* pixel_values, int64_t total_patches,
+                                          const std::vector<vision::GridThw>& grids, ImageRows* out,
                                           vision::VisionEncodeStats*) {
-  throw std::runtime_error(std::string("Inkling2LocalTextModel: ") + kTextOnly);
+  if (!m_.HasVision()) throw std::runtime_error(std::string("Inkling2LocalTextModel: ") + kTextOnly);
+  out->host.clear();
+  m_.EncodeImages(pixel_values, total_patches, grids, &out->dev);
+  int64_t merged = 0;
+  for (const auto& g : grids) merged += g.MergedTokenCount(2);
+  out->SetFilled(false, merged);
 }
 
 std::vector<float> Inkling2LocalTextModel::PrefillMultimodal(const std::vector<int32_t>& token_ids,
                                                              const std::vector<ImageSpan>& images) {
-  if (!images.empty()) throw std::runtime_error(std::string("Inkling2LocalTextModel::PrefillMultimodal: ") + kTextOnly);
-  return m_.Prefill(token_ids);
+  if (!images.empty() && !m_.HasVision())
+    throw std::runtime_error(std::string("Inkling2LocalTextModel::PrefillMultimodal: ") + kTextOnly);
+  return m_.PrefillMultimodal(token_ids, images);
 }
 
 std::vector<int32_t> Inkling2LocalTextModel::DecodeStepMtpGreedy(int32_t, int64_t) {
@@ -77,8 +84,7 @@ Inkling2ModelOptions MakeInkling2ModelOptions(const ModelOptions& opts) {
     throw std::invalid_argument("LoadTextModel: --layers is not supported for inkling2_loop (the looped stack runs whole)");
   if (opts.mtp_draft_k > 0) throw std::invalid_argument(std::string("LoadTextModel: ") + kNoMtp);
   if (!opts.dflash_container.empty()) o.dspark_path = opts.dflash_container;
-  if (opts.vision == ModelOptions::VisionMode::kOn)
-    throw std::invalid_argument(std::string("LoadTextModel: --vision on, but ") + kTextOnly);
+  o.enable_vision = (opts.vision != ModelOptions::VisionMode::kOff);
   if (opts.batch_slots > 0)
     throw std::invalid_argument("LoadTextModel: --batch " + std::to_string(opts.batch_slots) +
                                 " does not support inkling2_loop (no batched decode path; drop --batch)");

@@ -2808,6 +2808,93 @@ __global__ __launch_bounds__(kThreads) void DsparkAddSoftcapKernel(
   out[i] = softcap * tanhf(x / softcap);
 }
 
+constexpr int kDsparkArgmaxBlocks = 256;
+
+__global__ __launch_bounds__(kThreads) void DsparkAddArgmaxPartKernel(
+    const uint16_t* __restrict__ base, const uint16_t* __restrict__ delta, const uint16_t* __restrict__ bias,
+    float* __restrict__ part_val, int32_t* __restrict__ part_idx, int64_t n) {
+  float best_v = -INFINITY;
+  int32_t best_i = 0x7fffffff;
+  const int64_t stride = static_cast<int64_t>(gridDim.x) * kThreads;
+  for (int64_t i = static_cast<int64_t>(blockIdx.x) * kThreads + threadIdx.x; i < n; i += stride) {
+    float x = r4dx::core::Bf16ToFloat(base[i]);
+    if (delta != nullptr) x += r4dx::core::Bf16ToFloat(delta[i]);
+    if (bias != nullptr) x += r4dx::core::Bf16ToFloat(bias[i]);
+    const int32_t idx = static_cast<int32_t>(i);
+    if (x > best_v || (x == best_v && idx < best_i)) {
+      best_v = x;
+      best_i = idx;
+    }
+  }
+  __shared__ float s_val[kThreads];
+  __shared__ int32_t s_idx[kThreads];
+  s_val[threadIdx.x] = best_v;
+  s_idx[threadIdx.x] = best_i;
+  __syncthreads();
+  for (int off = kThreads / 2; off > 0; off >>= 1) {
+    if (threadIdx.x < off) {
+      const float ov = s_val[threadIdx.x + off];
+      const int32_t oi = s_idx[threadIdx.x + off];
+      const float mv = s_val[threadIdx.x];
+      const int32_t mi = s_idx[threadIdx.x];
+      if (ov > mv || (ov == mv && oi < mi)) {
+        s_val[threadIdx.x] = ov;
+        s_idx[threadIdx.x] = oi;
+      }
+    }
+    __syncthreads();
+  }
+  if (threadIdx.x == 0) {
+    part_val[blockIdx.x] = s_val[0];
+    part_idx[blockIdx.x] = s_idx[0];
+  }
+}
+
+__global__ __launch_bounds__(kThreads) void DsparkAddArgmaxFinalKernel(
+    const float* __restrict__ part_val, const int32_t* __restrict__ part_idx, int32_t* __restrict__ out_idx,
+    float* __restrict__ out_val, int nblocks) {
+  __shared__ float s_val[kThreads];
+  __shared__ int32_t s_idx[kThreads];
+  const int tid = threadIdx.x;
+  s_val[tid] = (tid < nblocks) ? part_val[tid] : -INFINITY;
+  s_idx[tid] = (tid < nblocks) ? part_idx[tid] : 0x7fffffff;
+  __syncthreads();
+  for (int off = kThreads / 2; off > 0; off >>= 1) {
+    if (tid < off) {
+      const float ov = s_val[tid + off];
+      const int32_t oi = s_idx[tid + off];
+      const float mv = s_val[tid];
+      const int32_t mi = s_idx[tid];
+      if (ov > mv || (ov == mv && oi < mi)) {
+        s_val[tid] = ov;
+        s_idx[tid] = oi;
+      }
+    }
+    __syncthreads();
+  }
+  if (tid == 0) {
+    out_idx[0] = s_idx[0];
+    if (out_val != nullptr) out_val[0] = s_val[0];
+  }
+}
+
+__global__ __launch_bounds__(kThreads) void DsparkMarkovPrepKernel(
+    uint16_t* __restrict__ rnn_in, const uint16_t* __restrict__ prev_emb, const uint16_t* __restrict__ head_h,
+    const uint16_t* __restrict__ f_rnn, int zero_state, int R, int H) {
+  const int i = blockIdx.x * kThreads + threadIdx.x;
+  const int total = 2 * R + 2 * H;
+  if (i >= total) return;
+  if (i < R) {
+    if (zero_state != 0) rnn_in[i] = 0;
+  } else if (i < 2 * R) {
+    if (prev_emb != nullptr) rnn_in[i] = prev_emb[i - R];
+  } else if (i < 2 * R + H) {
+    if (head_h != nullptr) rnn_in[i] = head_h[i - 2 * R];
+  } else {
+    if (f_rnn != nullptr) rnn_in[i] = f_rnn[i - 2 * R - H];
+  }
+}
+
 __global__ __launch_bounds__(kThreads) void DsparkTransposeBf16Kernel(
     const uint16_t* __restrict__ in, uint16_t* __restrict__ out, int64_t rows, int64_t cols) {
   const int64_t idx = static_cast<int64_t>(blockIdx.x) * kThreads + threadIdx.x;
@@ -3006,6 +3093,37 @@ void r4dx_inkling2_dspark_add_softcap_f32(int64_t base, int64_t delta, int64_t b
   CheckLaunch(fn);
 }
 
+void r4dx_inkling2_dspark_add_argmax_bf16(int64_t base, int64_t delta, int64_t bias, int64_t ws, int64_t out_idx,
+                                          int64_t out_val, int64_t n, int64_t stream) {
+  const char* fn = "r4dx_inkling2_dspark_add_argmax_bf16";
+  if (n <= 0) return;
+  if (base == 0 || ws == 0 || out_idx == 0) Fail(fn, "null pointer");
+  const int nblocks =
+      static_cast<int>(std::min<int64_t>(kDsparkArgmaxBlocks, (n + kThreads - 1) / kThreads));
+  float* part_val = reinterpret_cast<float*>(ws);
+  int32_t* part_idx = reinterpret_cast<int32_t*>(ws + kDsparkArgmaxBlocks * static_cast<int64_t>(sizeof(float)));
+  hipStream_t sr = reinterpret_cast<hipStream_t>(stream);
+  hipLaunchKernelGGL(DsparkAddArgmaxPartKernel, dim3(static_cast<unsigned>(nblocks)), dim3(kThreads), 0, sr,
+                     reinterpret_cast<const uint16_t*>(base), reinterpret_cast<const uint16_t*>(delta),
+                     reinterpret_cast<const uint16_t*>(bias), part_val, part_idx, n);
+  CheckLaunch(fn);
+  hipLaunchKernelGGL(DsparkAddArgmaxFinalKernel, dim3(1), dim3(kThreads), 0, sr, part_val, part_idx,
+                     reinterpret_cast<int32_t*>(out_idx), reinterpret_cast<float*>(out_val), nblocks);
+  CheckLaunch(fn);
+}
+
+void r4dx_inkling2_dspark_markov_prep_bf16(int64_t rnn_in, int64_t prev_emb, int64_t head_h, int64_t f_rnn,
+                                           int zero_state, int R, int H, int64_t stream) {
+  const char* fn = "r4dx_inkling2_dspark_markov_prep_bf16";
+  if (rnn_in == 0 || R < 1 || H < 1) Fail(fn, "invalid args");
+  const int total = 2 * R + 2 * H;
+  hipLaunchKernelGGL(DsparkMarkovPrepKernel, dim3(static_cast<unsigned>((total + kThreads - 1) / kThreads)),
+                     dim3(kThreads), 0, reinterpret_cast<hipStream_t>(stream), reinterpret_cast<uint16_t*>(rnn_in),
+                     reinterpret_cast<const uint16_t*>(prev_emb), reinterpret_cast<const uint16_t*>(head_h),
+                     reinterpret_cast<const uint16_t*>(f_rnn), zero_state, R, H);
+  CheckLaunch(fn);
+}
+
 void r4dx_inkling2_dspark_transpose_bf16(int64_t in, int64_t out, int64_t rows, int64_t cols, int64_t stream) {
   const char* fn = "r4dx_inkling2_dspark_transpose_bf16";
   if (rows <= 0 || cols <= 0) return;
@@ -3122,6 +3240,27 @@ __global__ __launch_bounds__(kThreads) void SconvRollbackKernel(const float* __r
   }
 }
 
+__global__ __launch_bounds__(kThreads) void SconvRollbackBatchKernel(
+    const float* __restrict__ state_bak, const float* __restrict__ hist, float* __restrict__ state_out,
+    const int64_t* __restrict__ conv_off, const int64_t* __restrict__ conv_hist_off,
+    const int32_t* __restrict__ conv_ch, int n_keep) {
+  const int ci = blockIdx.y;
+  const int C = conv_ch[ci];
+  const int c = blockIdx.x * kThreads + threadIdx.x;
+  if (c >= C) return;
+  const int64_t off = conv_off[ci];
+  const int64_t hoff = conv_hist_off[ci];
+  const float* bak = state_bak + off;
+  const float* h = hist + hoff;
+  float* out = state_out + off;
+#pragma unroll
+  for (int k = 0; k < 3; ++k) {
+    const int idx = n_keep + k;
+    out[static_cast<int64_t>(k) * C + c] =
+        (idx < 3) ? bak[static_cast<int64_t>(idx) * C + c] : h[static_cast<int64_t>(idx - 3) * C + c];
+  }
+}
+
 __global__ __launch_bounds__(kThreads) void AddBf16Kernel(const uint16_t* __restrict__ a,
                                                           const uint16_t* __restrict__ b, uint16_t* __restrict__ out,
                                                           int64_t n) {
@@ -3177,6 +3316,23 @@ void r4dx_inkling2_sconv_rollback_f32(int64_t state_bak, int64_t hist, int64_t s
   hipLaunchKernelGGL(SconvRollbackKernel, dim3(static_cast<unsigned>((C + kThreads - 1) / kThreads)), dim3(kThreads),
                      0, reinterpret_cast<hipStream_t>(stream), reinterpret_cast<const float*>(state_bak),
                      reinterpret_cast<const float*>(hist), reinterpret_cast<float*>(state_out), n_keep, C);
+  CheckLaunch(fn);
+}
+
+void r4dx_inkling2_sconv_rollback_batch_f32(int64_t state_bak, int64_t hist, int64_t state_out, int64_t conv_off,
+                                            int64_t conv_hist_off, int64_t conv_ch, int n_convs, int max_C, int n_keep,
+                                            int64_t stream) {
+  const char* fn = "r4dx_inkling2_sconv_rollback_batch_f32";
+  if (n_convs <= 0 || max_C <= 0) return;
+  if (state_bak == 0 || state_out == 0 || (n_keep > 0 && hist == 0) || conv_off == 0 || conv_hist_off == 0 ||
+      conv_ch == 0)
+    Fail(fn, "null pointer");
+  hipLaunchKernelGGL(SconvRollbackBatchKernel,
+                     dim3(static_cast<unsigned>((max_C + kThreads - 1) / kThreads), static_cast<unsigned>(n_convs)),
+                     dim3(kThreads), 0, reinterpret_cast<hipStream_t>(stream),
+                     reinterpret_cast<const float*>(state_bak), reinterpret_cast<const float*>(hist),
+                     reinterpret_cast<float*>(state_out), reinterpret_cast<const int64_t*>(conv_off),
+                     reinterpret_cast<const int64_t*>(conv_hist_off), reinterpret_cast<const int32_t*>(conv_ch), n_keep);
   CheckLaunch(fn);
 }
 

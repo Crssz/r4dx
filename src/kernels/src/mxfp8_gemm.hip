@@ -72,23 +72,22 @@ __device__ __forceinline__ unsigned e4m3x2_scaled(unsigned d, unsigned sel) {
   return ((x >> 1) & 0x3F803F80u) | (x & 0x80008000u);
 }
 
-// Two dwords of four e4m3 codes (elements e0..e3, e4..e7) -> one f16 B fragment of the exact values.
+// Two dwords of four e4m3 codes (elements e0..e3, e4..e7) -> one f16 B fragment scaled by 2^-8.
+// The 2^8 factor is folded into the group's E8M0 power-of-two scale (e8m0_value_p8), saving 4 v_pk_mul_f16 per 8 weights.
 __device__ __forceinline__ v8h dequant8(unsigned d0, unsigned d1) {
-  const __half2 k256 = __halves2half2(__ushort_as_half((unsigned short)0x5C00u),   // 2^8
-                                      __ushort_as_half((unsigned short)0x5C00u));
-  union { unsigned u[4]; __half2 h2[4]; v8h f; } x;
+  union { unsigned u[4]; v8h f; } x;
   x.u[0] = e4m3x2_scaled(d0, 0x010C000Cu);  // bytes 0, 1 -> e0, e1
   x.u[1] = e4m3x2_scaled(d0, 0x030C020Cu);  // bytes 2, 3 -> e2, e3
   x.u[2] = e4m3x2_scaled(d1, 0x010C000Cu);  // e4, e5
   x.u[3] = e4m3x2_scaled(d1, 0x030C020Cu);  // e6, e7
-#pragma unroll
-  for (int i = 0; i < 4; i++) x.h2[i] = __hmul2(x.h2[i], k256);
   return x.f;
 }
 
-// E8M0 byte -> 2^(b - 127) as f32 (b == 0: the subnormal 2^-127 = 0x00400000).
+// E8M0 byte -> 2^(b - 127 + 8) as f32 when b <= 246 (exact, including b == 0 -> 2^-119).
+// For the rare extreme b in [247, 254] (where 2^(b - 119) overflows f32), encode -2^(b - 127)
+// in the sign bit so group_step multiplies g_acc by 256.f before applying 2^(b - 127).
 __device__ __forceinline__ float e8m0_value(unsigned b) {
-  return __uint_as_float(b != 0u ? (b << 23) : 0x00400000u);
+  return __uint_as_float(b <= 246u ? ((b + 8u) << 23) : ((b << 23) | 0x80000000u));
 }
 
 __device__ __forceinline__ v8f mmah(v8h a, v8h b, v8f c) {
@@ -116,11 +115,20 @@ __device__ __forceinline__ void group_step(v8f (&acc)[NPW][MT], const uint4v (&w
     }
   }
 #pragma unroll
-  for (int j = 0; j < NPW; j++)
+  for (int j = 0; j < NPW; j++) {
+    if (__builtin_expect(sc[j] < 0.0f, 0)) {
+      const float s_pos = -sc[j];
 #pragma unroll
-    for (int i = 0; i < MT; i++)
+      for (int i = 0; i < MT; i++)
 #pragma unroll
-      for (int e = 0; e < 8; e++) acc[j][i][e] = fmaf(g_acc[j][i][e], sc[j], acc[j][i][e]);
+        for (int e = 0; e < 8; e++) acc[j][i][e] = fmaf(g_acc[j][i][e] * 256.0f, s_pos, acc[j][i][e]);
+    } else {
+#pragma unroll
+      for (int i = 0; i < MT; i++)
+#pragma unroll
+        for (int e = 0; e < 8; e++) acc[j][i][e] = fmaf(g_acc[j][i][e], sc[j], acc[j][i][e]);
+    }
+  }
 }
 
 template <int MT, int NPW, bool NT>

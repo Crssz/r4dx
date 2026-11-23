@@ -237,6 +237,20 @@ void r4dx_inkling2_dspark_markov_gate_bf16(int64_t raw, int64_t bias, int64_t st
 void r4dx_inkling2_dspark_add_softcap_f32(int64_t base, int64_t delta, int64_t bias, int64_t out, int64_t n,
                                           float softcap, int64_t stream);
 
+// Fused DSpark greedy argmax over base[i] + delta[i] + bias[i] (all bf16, i < n), skipping monotonic tanh softcap and
+// avoiding materializing fp32 logits. ws_bytes = 256 * (sizeof(float) + sizeof(int32_t)) = 2048 bytes (per-device scratch).
+// Writes winning index to out_idx (int32*) and, if out_val != 0, winning raw fp32 value to out_val (float*).
+void r4dx_inkling2_dspark_add_argmax_bf16(int64_t base, int64_t delta, int64_t bias, int64_t ws, int64_t out_idx,
+                                          int64_t out_val, int64_t n, int64_t stream);
+
+// Single-launch Markov RNN input prep: fills rnn_in [2*R + 2*H] bf16:
+//   [0..R)       zeroed if zero_state != 0 (otherwise untouched)
+//   [R..2R)      copied from prev_emb (if prev_emb != 0)
+//   [2R..2R+H)   copied from head_h (if head_h != 0)
+//   [2R+H..2R+2H) copied from f_rnn (if f_rnn != 0)
+void r4dx_inkling2_dspark_markov_prep_bf16(int64_t rnn_in, int64_t prev_emb, int64_t head_h, int64_t f_rnn,
+                                           int zero_state, int R, int H, int64_t stream);
+
 // Transpose [rows, cols] bf16 -> [cols, rows] bf16.
 void r4dx_inkling2_dspark_transpose_bf16(int64_t in, int64_t out, int64_t rows, int64_t cols, int64_t stream);
 
@@ -279,6 +293,11 @@ void r4dx_inkling2_sconv_dynamic_hist_f32(int64_t x, int x_bf16, int64_t dyn, in
 void r4dx_inkling2_sconv_capture_x_f32(int64_t x, int x_bf16, int64_t hist, int T, int C, int64_t stream);
 void r4dx_inkling2_sconv_rollback_f32(int64_t state_bak, int64_t hist, int64_t state_out, int n_keep, int C,
                                       int64_t stream);
+// Batched rollback of all n_convs short-conv states in one launch using device tables conv_off/conv_hist_off (int64_t[n_convs])
+// and conv_ch (int32_t[n_convs]); max_C >= max(conv_ch).
+void r4dx_inkling2_sconv_rollback_batch_f32(int64_t state_bak, int64_t hist, int64_t state_out, int64_t conv_off,
+                                            int64_t conv_hist_off, int64_t conv_ch, int n_convs, int max_C, int n_keep,
+                                            int64_t stream);
 
 // Split concatenated [T, total_n] bf16 Q/gate/rel/(optional K/V) rows into contiguous [T, slice_n] outputs.
 void r4dx_inkling2_qgrkv_split_bf16(int64_t src, int64_t total_n, int64_t q_out, int64_t q_off, int64_t q_n,

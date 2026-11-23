@@ -590,12 +590,8 @@ std::vector<int32_t> Inkling2DsparkDraft::DraftGreedy(int32_t anchor_token, int6
   // rnn_in = [state (R), prev_emb (R), head_h[1+i] (H), f_rnn (H)] -> [2*R + 2*H] bf16.
   const int64_t rnn_in_dim = 2 * R + 2 * H;
   uint16_t* rnn_in = arena.Alloc<uint16_t>(static_cast<size_t>(rnn_in_dim), 16);
-  uint16_t* state_next = arena.Alloc<uint16_t>(static_cast<size_t>(R), 16);
   uint16_t* latent = arena.Alloc<uint16_t>(static_cast<size_t>(R), 16);
   uint16_t* raw_bf16 = arena.Alloc<uint16_t>(static_cast<size_t>(3 * R), 16);
-  R4DX_HIP_CHECK(hipMemsetAsync(rnn_in, 0, static_cast<size_t>(R) * 2, sr));
-  R4DX_HIP_CHECK(hipMemcpyAsync(rnn_in + 2 * R + H, f_rnn_.data(), static_cast<size_t>(H) * 2,
-                                hipMemcpyDeviceToDevice, sr));
 
   const bool use_folded = has_folded_lm_head_ && static_cast<bool>(lm_head_batch) && static_cast<bool>(logits_argmax);
   uint16_t* base_lg = nullptr;
@@ -617,20 +613,20 @@ std::vector<int32_t> Inkling2DsparkDraft::DraftGreedy(int32_t anchor_token, int6
 
   for (int64_t i = 0; i < n_steps; ++i) {
     const int64_t clamped = (prev >= 0 && prev < cfg_.vocab_size) ? prev : 0;
+    int64_t prev_emb_dev = 0;
     if (!markov_w1_dev_.empty()) {
-      R4DX_HIP_CHECK(hipMemcpyAsync(rnn_in + R, markov_w1_dev_.data() + clamped * R, static_cast<size_t>(R) * 2,
-                                    hipMemcpyDeviceToDevice, sr));
+      prev_emb_dev = P(markov_w1_dev_.data() + clamped * R);
     } else {
       std::memcpy(prev_emb_host_.data(), markov_w1_host_.data() + clamped * R, static_cast<size_t>(R) * 2);
       R4DX_HIP_CHECK(hipMemcpyAsync(rnn_in + R, prev_emb_host_.data(), static_cast<size_t>(R) * 2,
                                     hipMemcpyHostToDevice, sr));
     }
-    R4DX_HIP_CHECK(hipMemcpyAsync(rnn_in + 2 * R, head_h + (i + 1) * H, static_cast<size_t>(H) * 2,
-                                  hipMemcpyDeviceToDevice, sr));
+    r4dx_inkling2_dspark_markov_prep_bf16(P(rnn_in), prev_emb_dev, P(head_h + (i + 1) * H),
+                                          i == 0 ? P(f_rnn_.data()) : 0, i == 0 ? 1 : 0, static_cast<int>(R),
+                                          static_cast<int>(H), s);
     ApplyLinear(sr, arena, rnn_proj_, rnn_in, raw_bf16, 1);
-    r4dx_inkling2_dspark_markov_gate_bf16(P(raw_bf16), P(rnn_bias_bf16_.data()), P(rnn_in), P(state_next), P(latent),
+    r4dx_inkling2_dspark_markov_gate_bf16(P(raw_bf16), P(rnn_bias_bf16_.data()), P(rnn_in), P(rnn_in), P(latent),
                                           static_cast<int>(R), s);
-    R4DX_HIP_CHECK(hipMemcpyAsync(rnn_in, state_next, static_cast<size_t>(R) * 2, hipMemcpyDeviceToDevice, sr));
     if (use_folded) {
       ApplyLinear(sr, arena, fold_w_, latent, delta_lg, 1);
       prev = logits_argmax(base_lg + i * fold_vl_, delta_lg, fold_b_.data());

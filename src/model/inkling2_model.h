@@ -174,7 +174,11 @@ class Inkling2Model {
   std::vector<int64_t> conv_off_;  // [slot * 4 + which]
   std::vector<int64_t> conv_hist_off_;
   std::vector<int64_t> conv_ch_;
+  core::DeviceBuffer<int64_t> conv_off_dev_, conv_hist_off_dev_;
+  core::DeviceBuffer<int32_t> conv_ch_dev_;
+  int32_t conv_max_ch_ = 0;
   core::DeviceBuffer<float> conv_, conv_ckpt_, conv_verify_bak_, conv_verify_hist_;
+  core::DeviceBuffer<uint8_t> dspark_argmax_ws_;
 
   // Optional Inkling2 DSpark / MTP drafter (mtp.safetensors) and Vision Tower (vision.*).
   std::unique_ptr<Inkling2DsparkDraft> dspark_;

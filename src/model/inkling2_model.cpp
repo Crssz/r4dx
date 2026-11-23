@@ -266,6 +266,19 @@ Inkling2Model Inkling2Model::Load(const Inkling2ModelOptions& opts) {
     for (int j = 0; j < 4; ++j) m.dspark_taps_[static_cast<size_t>(j)] = core::DeviceBuffer<uint16_t>(static_cast<size_t>(rows * H));
     m.conv_verify_bak_ = core::DeviceBuffer<float>(static_cast<size_t>(conv_total));
     m.conv_verify_hist_ = core::DeviceBuffer<float>(static_cast<size_t>(conv_hist_total));
+    m.conv_off_dev_ = core::DeviceBuffer<int64_t>(m.conv_off_.size());
+    m.conv_off_dev_.CopyFromHost(m.conv_off_);
+    m.conv_hist_off_dev_ = core::DeviceBuffer<int64_t>(m.conv_hist_off_.size());
+    m.conv_hist_off_dev_.CopyFromHost(m.conv_hist_off_);
+    std::vector<int32_t> conv_ch32(m.conv_ch_.size());
+    m.conv_max_ch_ = 0;
+    for (size_t i = 0; i < m.conv_ch_.size(); ++i) {
+      conv_ch32[i] = static_cast<int32_t>(m.conv_ch_[i]);
+      if (conv_ch32[i] > m.conv_max_ch_) m.conv_max_ch_ = conv_ch32[i];
+    }
+    m.conv_ch_dev_ = core::DeviceBuffer<int32_t>(conv_ch32.size());
+    m.conv_ch_dev_.CopyFromHost(conv_ch32);
+    m.dspark_argmax_ws_ = core::DeviceBuffer<uint8_t>(256 * (sizeof(float) + sizeof(int32_t)));
     m.verify_logits_dev_ = core::DeviceBuffer<float>(static_cast<size_t>(kVerifyMaxT * cfg.HeadRowsLocal()));
     m.verify_argmax_dev_ = core::DeviceBuffer<int32_t>(static_cast<size_t>(kVerifyMaxT));
     m.verify_argmax_pair_dev_ = core::DeviceBuffer<int32_t>(static_cast<size_t>(kVerifyMaxT * 2));
@@ -1486,20 +1499,15 @@ int32_t Inkling2Model::LmHeadArgmaxFromBf16(const uint16_t* h_bf16) {
 
 int32_t Inkling2Model::DsparkLogitsArgmax(const uint16_t* base_bf16, const uint16_t* delta_bf16,
                                           const uint16_t* bias_bf16) {
-  const Inkling2Config& cfg = container_.Config();
   const hipStream_t sr = stream_.get();
   const int64_t s = P(sr);
-  const int64_t vl = cfg.HeadRowsLocal();
-  r4dx_inkling2_dspark_add_softcap_f32(P(base_bf16), P(delta_bf16), P(bias_bf16), P(logits_dev_.data()), vl,
-                                       static_cast<float>(cfg.final_logit_softcap), s);
-  if (vocab_local_valid_ < vl) {
-    R4DX_HIP_CHECK(hipMemsetD32Async(reinterpret_cast<hipDeviceptr_t>(logits_dev_.data() + vocab_local_valid_),
-                                     static_cast<int>(kNegInfBits), static_cast<size_t>(vl - vocab_local_valid_), sr));
-  }
   if (comm_ != nullptr) {
-    r4dx_argmax_val_f32(P(logits_dev_.data()), P(argmax_pair_dev_.data()), P(argmax_pair_dev_.data() + 1), vl, s);
+    r4dx_inkling2_dspark_add_argmax_bf16(P(base_bf16), P(delta_bf16), P(bias_bf16), P(dspark_argmax_ws_.data()),
+                                         P(argmax_pair_dev_.data()), P(argmax_pair_dev_.data() + 1), vocab_local_valid_,
+                                         s);
   } else {
-    r4dx_argmax_f32(P(logits_dev_.data()), P(argmax_dev_.data()), vocab_local_valid_, s);
+    r4dx_inkling2_dspark_add_argmax_bf16(P(base_bf16), P(delta_bf16), P(bias_bf16), P(dspark_argmax_ws_.data()),
+                                         P(argmax_dev_.data()), 0, vocab_local_valid_, s);
   }
   stream_.Synchronize();
   if (comm_ != nullptr) return MergeGreedyPair();
@@ -1571,14 +1579,10 @@ std::vector<int32_t> Inkling2Model::DecodeStepDflashGreedy(int32_t token_id, int
 
   // 4. Exact short-conv rollback if fewer than all 1 + k tokens were kept.
   if (n_keep < 1 + k) {
-    const int64_t n_convs = static_cast<int64_t>(conv_off_.size());
-    for (int64_t ci = 0; ci < n_convs; ++ci) {
-      const int64_t off = conv_off_[static_cast<size_t>(ci)];
-      const int64_t hoff = conv_hist_off_[static_cast<size_t>(ci)];
-      const int64_t C = conv_ch_[static_cast<size_t>(ci)];
-      r4dx_inkling2_sconv_rollback_f32(P(conv_verify_bak_.data() + off), P(conv_verify_hist_.data() + hoff),
-                                       P(conv_.data() + off), static_cast<int>(n_keep), static_cast<int>(C), s);
-    }
+    r4dx_inkling2_sconv_rollback_batch_f32(P(conv_verify_bak_.data()), P(conv_verify_hist_.data()), P(conv_.data()),
+                                           P(conv_off_dev_.data()), P(conv_hist_off_dev_.data()), P(conv_ch_dev_.data()),
+                                           static_cast<int>(conv_off_.size()), conv_max_ch_, static_cast<int>(n_keep),
+                                           s);
     pos_ = pos_before + n_keep;
   }
 
@@ -1672,14 +1676,10 @@ std::vector<int32_t> Inkling2Model::DecodeStepDflashSampled(int32_t token_id, in
 
   // 4. Exact short-conv rollback if fewer than all 1 + k tokens were kept.
   if (n_keep < 1 + k) {
-    const int64_t n_convs = static_cast<int64_t>(conv_off_.size());
-    for (int64_t ci = 0; ci < n_convs; ++ci) {
-      const int64_t off = conv_off_[static_cast<size_t>(ci)];
-      const int64_t hoff = conv_hist_off_[static_cast<size_t>(ci)];
-      const int64_t C = conv_ch_[static_cast<size_t>(ci)];
-      r4dx_inkling2_sconv_rollback_f32(P(conv_verify_bak_.data() + off), P(conv_verify_hist_.data() + hoff),
-                                       P(conv_.data() + off), static_cast<int>(n_keep), static_cast<int>(C), s);
-    }
+    r4dx_inkling2_sconv_rollback_batch_f32(P(conv_verify_bak_.data()), P(conv_verify_hist_.data()), P(conv_.data()),
+                                           P(conv_off_dev_.data()), P(conv_hist_off_dev_.data()), P(conv_ch_dev_.data()),
+                                           static_cast<int>(conv_off_.size()), conv_max_ch_, static_cast<int>(n_keep),
+                                           s);
     pos_ = pos_before + n_keep;
   }
 

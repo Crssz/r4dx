@@ -565,22 +565,64 @@ void Inkling2Model::Attention(const Inkling2Visit& v, const uint16_t* xq, const 
   }
 
   const int64_t pos_dev_ptr = use_pos_dev ? P(pos_dev_.data()) : 0;
-  // q clip
+  const int64_t gqa = hl / kvl;
+  const bool use_fused_attn = AttnFusedEnabled() && hd == 128 && drel <= 32 && hl % kvl == 0 &&
+                              (gqa == 1 || gqa == 2 || gqa == 3 || gqa == 4 || gqa == 6 || gqa == 8);
   uint16_t* q = arena_.Alloc<uint16_t>(static_cast<size_t>(T * hl * hd), 16);
-  R4dxInkling2HeadOut dense_q{};
-  dense_q.kind = 0;
-  dense_q.out_bf16 = 1;
-  dense_q.out = P(q);
-  dense_q.out_row_stride = hl * hd;
-  dense_q.pos_dev = pos_dev_ptr;
-  r4dx_inkling2_head_clip(P(qlin), 1, hl * hd, P(a.q_scale.data()), static_cast<float>(cfg.qk_clip), pos0, log_alpha,
-                          log_floor, &dense_q, static_cast<int>(T), static_cast<int>(hl), static_cast<int>(hd), s);
+  float* r = arena_.Alloc<float>(static_cast<size_t>(T * hl * drel), 16);
+  float* rel = use_fused_attn ? nullptr : arena_.Alloc<float>(static_cast<size_t>(T * hl * ext), 16);
+  float* sink = arena_.Alloc<float>(static_cast<size_t>(T * hl), 16);
+  // q + r head_clip (fused into 1 launch when hd <= 128 && drel <= 128)
+  ProfiledCall(prof, sr, "attn.rel_sink", [&] {
+    if (!concat_all5 && !concat_qgr) {
+      if (has_concat) lin_slice(a.rel_row0, rel_all, xq, rlin);
+      else Lin(a.rel, xq, rlin, T);
+    }
+    if (hd <= 128 && drel <= 128) {
+      r4dx_inkling2_head_clip_qr(P(qlin), hl * hd, P(a.q_scale.data()), static_cast<float>(cfg.qk_clip), P(q),
+                                 static_cast<int>(hd), P(rlin + cfg.tp_rank * hl * drel), rel_all,
+                                 P(a.rel_scale.data()), static_cast<float>(cfg.rel_clip), P(r), static_cast<int>(drel),
+                                 pos0, pos_dev_ptr, log_alpha, log_floor, static_cast<int>(T), static_cast<int>(hl), s);
+    } else {
+      R4dxInkling2HeadOut dense_q{};
+      dense_q.kind = 0;
+      dense_q.out_bf16 = 1;
+      dense_q.out = P(q);
+      dense_q.out_row_stride = hl * hd;
+      dense_q.pos_dev = pos_dev_ptr;
+      r4dx_inkling2_head_clip(P(qlin), 1, hl * hd, P(a.q_scale.data()), static_cast<float>(cfg.qk_clip), pos0, log_alpha,
+                              log_floor, &dense_q, static_cast<int>(T), static_cast<int>(hl), static_cast<int>(hd), s);
+      R4dxInkling2HeadOut dense_r{};
+      dense_r.kind = 0;
+      dense_r.out_bf16 = 0;
+      dense_r.out = P(r);
+      dense_r.out_row_stride = hl * drel;
+      dense_r.pos_dev = pos_dev_ptr;
+      r4dx_inkling2_head_clip(P(rlin + cfg.tp_rank * hl * drel), 1, rel_all, P(a.rel_scale.data()),
+                              static_cast<float>(cfg.rel_clip), pos0, log_alpha, log_floor, &dense_r,
+                              static_cast<int>(T), static_cast<int>(hl), static_cast<int>(drel), s);
+    }
+    if (!use_fused_attn) {
+      r4dx_inkling2_rel_logits_f32(P(r), P(a.rel_proj.data()), P(rel), static_cast<int>(T * hl), static_cast<int>(drel),
+                                   static_cast<int>(ext), s);
+    }
+    r4dx_inkling2_dense_bf16(P(xq), H, P(a.sink.data()), P(sink), 0, hl, static_cast<int>(T), static_cast<int>(hl),
+                             static_cast<int>(H), s);
+  });
   // k, v: short conv -> clip / rms -> the paged cache
-  float* kc = arena_.Alloc<float>(static_cast<size_t>(T * C), 16);
-  float* vc = arena_.Alloc<float>(static_cast<size_t>(T * C), 16);
   ProfiledCall(prof, sr, "attn.kv_conv", [&] {
     const int64_t khist = capture_conv_hist ? P(ConvHist(slot, 0)) : 0;
     const int64_t vhist = capture_conv_hist ? P(ConvHist(slot, 1)) : 0;
+    if (!full && !slot_fp8 && hd == 128 && T <= 16) {
+      r4dx_inkling2_sconv_kv_paged_bf16(P(klin), P(vlin), P(a.k_conv.data()), P(a.v_conv.data()), P(ConvState(slot, 0)),
+                                        P(ConvState(slot, 1)), khist, vhist, static_cast<float>(cfg.qk_clip),
+                                        static_cast<float>(cfg.rms_norm_eps), pos0, pos_dev_ptr, kv_ptr, P(table), bs,
+                                        kvl * bs * 2 * hd, static_cast<int64_t>(bs) * 2 * hd, static_cast<int>(T),
+                                        static_cast<int>(kvl), s);
+      return;
+    }
+    float* kc = arena_.Alloc<float>(static_cast<size_t>(T * C), 16);
+    float* vc = arena_.Alloc<float>(static_cast<size_t>(T * C), 16);
     if (full) {
       float* dk = arena_.Alloc<float>(static_cast<size_t>(T * kvl * 4), 16);
       float* dv = arena_.Alloc<float>(static_cast<size_t>(T * kvl * 4), 16);
@@ -615,35 +657,8 @@ void Inkling2Model::Attention(const Inkling2Visit& v, const uint16_t* xq, const 
     r4dx_inkling2_head_rms(P(vc), 0, C, static_cast<float>(cfg.rms_norm_eps), pos0, &paged, static_cast<int>(T),
                            static_cast<int>(kvl), static_cast<int>(hd), s);
   });
-  // relative bias (every rank computes all heads' relative states; this rank's heads are read at h0 * d_rel)
-  const int64_t gqa = hl / kvl;
-  const bool use_fused_attn = AttnFusedEnabled() && hd == 128 && drel <= 32 && hl % kvl == 0 &&
-                              (gqa == 1 || gqa == 2 || gqa == 3 || gqa == 4 || gqa == 6 || gqa == 8);
-  float* r = arena_.Alloc<float>(static_cast<size_t>(T * hl * drel), 16);
-  float* rel = use_fused_attn ? nullptr : arena_.Alloc<float>(static_cast<size_t>(T * hl * ext), 16);
-  float* sink = arena_.Alloc<float>(static_cast<size_t>(T * hl), 16);
-  ProfiledCall(prof, sr, "attn.rel_sink", [&] {
-    if (!concat_all5 && !concat_qgr) {
-      if (has_concat) lin_slice(a.rel_row0, rel_all, xq, rlin);
-      else Lin(a.rel, xq, rlin, T);
-    }
-    R4dxInkling2HeadOut dense_r{};
-    dense_r.kind = 0;
-    dense_r.out_bf16 = 0;
-    dense_r.out = P(r);
-    dense_r.out_row_stride = hl * drel;
-    dense_r.pos_dev = pos_dev_ptr;
-    r4dx_inkling2_head_clip(P(rlin + cfg.tp_rank * hl * drel), 1, rel_all, P(a.rel_scale.data()),
-                            static_cast<float>(cfg.rel_clip), pos0, log_alpha, log_floor, &dense_r, static_cast<int>(T),
-                            static_cast<int>(hl), static_cast<int>(drel), s);
-    if (!use_fused_attn) {
-      r4dx_inkling2_rel_logits_f32(P(r), P(a.rel_proj.data()), P(rel), static_cast<int>(T * hl), static_cast<int>(drel),
-                                   static_cast<int>(ext), s);
-    }
-    r4dx_inkling2_dense_bf16(P(xq), H, P(a.sink.data()), P(sink), 0, hl, static_cast<int>(T), static_cast<int>(hl),
-                             static_cast<int>(H), s);
-  });
   // attention, gate, o
+  const bool fused_gate = use_fused_attn && (concat_all5 || concat_qgr);
   uint16_t* ao = arena_.Alloc<uint16_t>(static_cast<size_t>(T * hl * hd), 16);
   ProfiledCall(prof, sr, "attn.core", [&] {
     if (use_fused_attn) {
@@ -674,6 +689,7 @@ void Inkling2Model::Attention(const Inkling2Visit& v, const uint16_t* xq, const 
       af.kv_head_stride = static_cast<int64_t>(bs) * 2 * hd;
       af.pos_dev = pos_dev_ptr;
       af.kv_fp8 = slot_fp8 ? 1 : 0;
+      af.gate = fused_gate ? P(gt) : 0;
       const int rc = r4dx_inkling2_attn_fused_bf16kv(&af, s);
       if (rc != 0) throw std::runtime_error("Inkling2Model: r4dx_inkling2_attn_fused_bf16kv refused the launch (" + std::to_string(rc) + ")");
     } else {
@@ -704,7 +720,9 @@ void Inkling2Model::Attention(const Inkling2Visit& v, const uint16_t* xq, const 
       if (has_concat) lin_slice(a.gate_row0, hl * hd, xq, gt);
       else Lin(a.gate, xq, gt, T);
     }
-    r4dx_inkling2_sigmoid_gate_mul_bf16(P(ao), P(gt), P(ao), T * hl * hd, s);
+    if (!fused_gate) {
+      r4dx_inkling2_sigmoid_gate_mul_bf16(P(ao), P(gt), P(ao), T * hl * hd, s);
+    }
     Lin(a.o, ao, out, T);
   });
   if (comm_ != nullptr) ProfiledCall(prof, sr, "tp.allreduce", [&] { comm_->AllReduceSumBf16Rows(out, T, H, sr); });

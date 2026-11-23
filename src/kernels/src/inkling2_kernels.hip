@@ -511,6 +511,129 @@ __global__ __launch_bounds__(kThreads) void SconvStaticPairKernel(
   state[2 * C + c] = h2;
 }
 
+// Fused sliding KV static short-conv + K head_clip + V head_rms + paged bf16 KV cache write.
+// Grid: (kv_heads, 2) where blockIdx.y == 0 is K (clip, col_offset 0) and blockIdx.y == 1 is V (rms, col_offset 128).
+// Block: 32 threads (1 wave per head, 4 channels/lane: i = lane + 32*j), exact same WaveSum reduction order as HeadKernel.
+__global__ __launch_bounds__(32) void SconvKvPagedBf16Kernel(
+    const uint16_t* __restrict__ xk, const uint16_t* __restrict__ xv, const float* __restrict__ wk,
+    const float* __restrict__ wv, float* __restrict__ state_k, float* __restrict__ state_v,
+    float* __restrict__ hist_k, float* __restrict__ hist_v, float qk_clip, float eps, int64_t pos0_host,
+    const int32_t* __restrict__ pos_dev, uint16_t* __restrict__ kv_out, const int32_t* __restrict__ block_table,
+    int block_size, int64_t kv_block_stride, int64_t kv_head_stride, int T, int kv_heads) {
+  constexpr int kHd = 128;
+  const int h = static_cast<int>(blockIdx.x);
+  const bool is_v = (blockIdx.y != 0);
+  const int lane = threadIdx.x;
+  const int C = kv_heads * kHd;
+  const uint16_t* x = is_v ? xv : xk;
+  const float4* w4 = reinterpret_cast<const float4*>(is_v ? wv : wk);
+  float* state = is_v ? state_v : state_k;
+  float* hist = is_v ? hist_v : hist_k;
+  const int64_t pos0 = (pos_dev != nullptr) ? static_cast<int64_t>(*pos_dev) : pos0_host;
+  const int col_offset = is_v ? kHd : 0;
+  const float inv_s5 = sqrtf(5.0f);
+
+  float h0[4], h1[4], h2[4];
+  float4 wc[4];
+#pragma unroll
+  for (int j = 0; j < 4; ++j) {
+    const int c = h * kHd + lane + 32 * j;
+    h0[j] = state[c];
+    h1[j] = state[C + c];
+    h2[j] = state[2 * C + c];
+    wc[j] = w4[c];
+  }
+  for (int t = 0; t < T; ++t) {
+    float v[4];
+    float ss = 0.0f;
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+      const int c = h * kHd + lane + 32 * j;
+      const int64_t idx = static_cast<int64_t>(t) * C + c;
+      const float xt = r4dx::core::Bf16ToFloat(x[idx]);
+      if (hist != nullptr) hist[idx] = xt;
+      const float conv = wc[j].x * h0[j] + wc[j].y * h1[j] + wc[j].z * h2[j] + wc[j].w * xt;
+      const float y = (conv + xt) / inv_s5;
+      v[j] = y;
+      ss += y * y;
+      h0[j] = h1[j];
+      h1[j] = h2[j];
+      h2[j] = xt;
+    }
+    ss = WaveSum(ss);
+    const float f = is_v ? (1.0f / sqrtf(ss / static_cast<float>(kHd) + eps))
+                         : fminf(1.0f, qk_clip / (sqrtf(ss) + 1e-6f));
+    const int64_t p = pos0 + t;
+    const int64_t base = static_cast<int64_t>(block_table[p / block_size]) * kv_block_stride +
+                         static_cast<int64_t>(h) * kv_head_stride + (p % block_size) * (2 * kHd) + col_offset;
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+      kv_out[base + lane + 32 * j] = r4dx::core::FloatToBf16(v[j] * f);
+    }
+  }
+#pragma unroll
+  for (int j = 0; j < 4; ++j) {
+    const int c = h * kHd + lane + 32 * j;
+    state[c] = h0[j];
+    state[C + c] = h1[j];
+    state[2 * C + c] = h2[j];
+  }
+}
+
+// Fused Q (bf16 out) + R (fp32 out) HeadClip: blockIdx.y == 0 -> Q, blockIdx.y == 1 -> R.
+__global__ __launch_bounds__(kThreads) void HeadClipQRKernel(
+    const uint16_t* __restrict__ q_in, int64_t q_in_stride, const float* __restrict__ q_scale, float q_thresh,
+    uint16_t* __restrict__ q_out, int q_d, const uint16_t* __restrict__ r_in, int64_t r_in_stride,
+    const float* __restrict__ r_scale, float r_thresh, float* __restrict__ r_out, int r_d, int64_t pos0_host,
+    const int32_t* __restrict__ pos_dev, float log_alpha, float log_floor, int T, int heads) {
+  const int wave = (blockIdx.x * kThreads + threadIdx.x) >> 5;
+  const int lane = threadIdx.x & 31;
+  if (wave >= T * heads) return;
+  const int t = wave / heads;
+  const int h = wave % heads;
+  const bool is_r = (blockIdx.y != 0);
+  const uint16_t* xin = is_r ? r_in : q_in;
+  const int64_t stride = is_r ? r_in_stride : q_in_stride;
+  const float* sc = is_r ? r_scale : q_scale;
+  const float thresh = is_r ? r_thresh : q_thresh;
+  const int d = is_r ? r_d : q_d;
+
+  float v[4];
+  float ss = 0.0f;
+#pragma unroll
+  for (int j = 0; j < 4; ++j) {
+    const int i = lane + 32 * j;
+    v[j] = 0.0f;
+    if (i < d) {
+      float xv = r4dx::core::Bf16ToFloat(xin[static_cast<int64_t>(t) * stride + static_cast<int64_t>(h) * d + i]);
+      if (sc != nullptr) xv = xv * sc[static_cast<int64_t>(h) * d + i];
+      v[j] = xv;
+      ss += xv * xv;
+    }
+  }
+  const int64_t pos0 = (pos_dev != nullptr) ? static_cast<int64_t>(*pos_dev) : pos0_host;
+  ss = WaveSum(ss);
+  const float f = fminf(1.0f, thresh / (sqrtf(ss) + 1e-6f));
+  float tau = 1.0f;
+  if (log_alpha != 0.0f) {
+    const float r = static_cast<float>(pos0 + t + 1) / log_floor;
+    tau = 1.0f + log_alpha * logf(fmaxf(r, 1.0f));
+  }
+  const int64_t out_base = (static_cast<int64_t>(t) * heads + h) * d;
+#pragma unroll
+  for (int j = 0; j < 4; ++j) {
+    const int i = lane + 32 * j;
+    if (i >= d) continue;
+    float y = v[j] * f;
+    if (log_alpha != 0.0f) y = y * tau;
+    if (is_r) {
+      r_out[out_base + i] = y;
+    } else {
+      q_out[out_base + i] = r4dx::core::FloatToBf16(y);
+    }
+  }
+}
+
 // ---- short convolutions -----------------------------------------------------------------------------------------
 __global__ __launch_bounds__(kThreads) void SconvStaticKernel(const void* __restrict__ x, int x_bf16,
                                                               const float* __restrict__ w, float* __restrict__ state,
@@ -1651,8 +1774,18 @@ __global__ __launch_bounds__(kFusedWaves * 32) void Inkling2AttnDecodeSplitKerne
           r3 *= alpha;
         }
         const float inv = (l_all > 0.0f) ? (1.0f / l_all) : 0.0f;
-        *reinterpret_cast<uint2*>(out_ptr + th * kFusedHd + lane * 4) =
-            Pack4Bf16(r0 * inv, r1 * inv, r2 * inv, r3 * inv);
+        float y0 = r0 * inv, y1 = r1 * inv, y2 = r2 * inv, y3 = r3 * inv;
+        if (a.gate != 0) {
+          const uint2 gv =
+              *reinterpret_cast<const uint2*>(reinterpret_cast<const uint16_t*>(a.gate) + th * kFusedHd + lane * 4);
+          float g0, g1, g2, g3;
+          Unpack4Bf16(gv, g0, g1, g2, g3);
+          y0 = r4dx::core::Bf16ToFloat(r4dx::core::FloatToBf16(y0)) * SigmoidF(g0);
+          y1 = r4dx::core::Bf16ToFloat(r4dx::core::FloatToBf16(y1)) * SigmoidF(g1);
+          y2 = r4dx::core::Bf16ToFloat(r4dx::core::FloatToBf16(y2)) * SigmoidF(g2);
+          y3 = r4dx::core::Bf16ToFloat(r4dx::core::FloatToBf16(y3)) * SigmoidF(g3);
+        }
+        *reinterpret_cast<uint2*>(out_ptr + th * kFusedHd + lane * 4) = Pack4Bf16(y0, y1, y2, y3);
       } else {
         // Workspace layout per (t, h, split): [m, l, o[0..127]] (130 floats).
         float* dst = ws_ptr + (th * n_splits + split) * (kFusedHd + 2);
@@ -1672,8 +1805,8 @@ __global__ __launch_bounds__(kFusedWaves * 32) void Inkling2AttnDecodeSplitKerne
 
 // Combine kernel for split-K decode: grid = (q_heads, q_len), block = (32).
 __global__ __launch_bounds__(32) void Inkling2AttnDecodeCombineKernel(
-    const float* __restrict__ ws, const float* __restrict__ sink, uint16_t* __restrict__ out, int q_heads,
-    int n_splits) {
+    const float* __restrict__ ws, const float* __restrict__ sink, const uint16_t* __restrict__ gate,
+    uint16_t* __restrict__ out, int q_heads, int n_splits) {
   const int h = static_cast<int>(blockIdx.x);
   const int t = static_cast<int>(blockIdx.y);
   const int64_t th = static_cast<int64_t>(t) * q_heads + h;
@@ -1699,7 +1832,17 @@ __global__ __launch_bounds__(32) void Inkling2AttnDecodeCombineKernel(
     }
   }
   const float inv = (l_all > 0.0f) ? (1.0f / l_all) : 0.0f;
-  *reinterpret_cast<uint2*>(out + th * kFusedHd + lane * 4) = Pack4Bf16(r0 * inv, r1 * inv, r2 * inv, r3 * inv);
+  float y0 = r0 * inv, y1 = r1 * inv, y2 = r2 * inv, y3 = r3 * inv;
+  if (gate != nullptr) {
+    const uint2 gv = *reinterpret_cast<const uint2*>(gate + th * kFusedHd + lane * 4);
+    float g0, g1, g2, g3;
+    Unpack4Bf16(gv, g0, g1, g2, g3);
+    y0 = r4dx::core::Bf16ToFloat(r4dx::core::FloatToBf16(y0)) * SigmoidF(g0);
+    y1 = r4dx::core::Bf16ToFloat(r4dx::core::FloatToBf16(y1)) * SigmoidF(g1);
+    y2 = r4dx::core::Bf16ToFloat(r4dx::core::FloatToBf16(y2)) * SigmoidF(g2);
+    y3 = r4dx::core::Bf16ToFloat(r4dx::core::FloatToBf16(y3)) * SigmoidF(g3);
+  }
+  *reinterpret_cast<uint2*>(out + th * kFusedHd + lane * 4) = Pack4Bf16(y0, y1, y2, y3);
 }
 
 // Prefill kernel (q_len > 1): grid = (kv_heads, ceil(q_len / 4)), block = (128) = 4 waves.
@@ -2266,6 +2409,45 @@ void r4dx_inkling2_sconv_static_pair_hist_f32(int64_t x_k, int64_t x_v, int x_bf
   CheckLaunch(fn);
 }
 
+void r4dx_inkling2_sconv_kv_paged_bf16(int64_t x_k, int64_t x_v, int64_t w_k, int64_t w_v, int64_t state_k,
+                                       int64_t state_v, int64_t hist_k, int64_t hist_v, float qk_clip, float eps,
+                                       int64_t pos0, int64_t pos_dev, int64_t kv_out, int64_t block_table,
+                                       int block_size, int64_t kv_block_stride, int64_t kv_head_stride, int T,
+                                       int kv_heads, int64_t stream) {
+  const char* fn = "r4dx_inkling2_sconv_kv_paged_bf16";
+  if (T <= 0 || kv_heads <= 0) return;
+  if (x_k == 0 || x_v == 0 || w_k == 0 || w_v == 0 || state_k == 0 || state_v == 0 || kv_out == 0 || block_table == 0 ||
+      block_size <= 0)
+    Fail(fn, "null pointer or invalid block_size");
+  hipLaunchKernelGGL(SconvKvPagedBf16Kernel, dim3(static_cast<unsigned>(kv_heads), 2u), dim3(32), 0,
+                     reinterpret_cast<hipStream_t>(stream), reinterpret_cast<const uint16_t*>(x_k),
+                     reinterpret_cast<const uint16_t*>(x_v), reinterpret_cast<const float*>(w_k),
+                     reinterpret_cast<const float*>(w_v), reinterpret_cast<float*>(state_k),
+                     reinterpret_cast<float*>(state_v), reinterpret_cast<float*>(hist_k),
+                     reinterpret_cast<float*>(hist_v), qk_clip, eps, pos0, reinterpret_cast<const int32_t*>(pos_dev),
+                     reinterpret_cast<uint16_t*>(kv_out), reinterpret_cast<const int32_t*>(block_table), block_size,
+                     kv_block_stride, kv_head_stride, T, kv_heads);
+  CheckLaunch(fn);
+}
+
+void r4dx_inkling2_head_clip_qr(int64_t q_in, int64_t q_in_stride, int64_t q_scale, float q_thresh, int64_t q_out,
+                                int q_d, int64_t r_in, int64_t r_in_stride, int64_t r_scale, float r_thresh,
+                                int64_t r_out, int r_d, int64_t pos0, int64_t pos_dev, float log_alpha, float log_floor,
+                                int T, int heads, int64_t stream) {
+  const char* fn = "r4dx_inkling2_head_clip_qr";
+  if (T <= 0 || heads <= 0) return;
+  if (q_in == 0 || q_out == 0 || r_in == 0 || r_out == 0 || q_d < 1 || q_d > 128 || r_d < 1 || r_d > 128)
+    Fail(fn, "null pointer or d > 128");
+  const int64_t waves = static_cast<int64_t>(T) * heads;
+  const unsigned bx = static_cast<unsigned>((waves + kWaves - 1) / kWaves);
+  hipLaunchKernelGGL(HeadClipQRKernel, dim3(bx, 2u), dim3(kThreads), 0, reinterpret_cast<hipStream_t>(stream),
+                     reinterpret_cast<const uint16_t*>(q_in), q_in_stride, reinterpret_cast<const float*>(q_scale),
+                     q_thresh, reinterpret_cast<uint16_t*>(q_out), q_d, reinterpret_cast<const uint16_t*>(r_in),
+                     r_in_stride, reinterpret_cast<const float*>(r_scale), r_thresh, reinterpret_cast<float*>(r_out), r_d,
+                     pos0, reinterpret_cast<const int32_t*>(pos_dev), log_alpha, log_floor, T, heads);
+  CheckLaunch(fn);
+}
+
 void r4dx_inkling2_msg_gate_prep3_bf16(int64_t x, int64_t x_gate_stride, int64_t m_all, int64_t out_cat, int T, int H,
                                        float eps, int64_t stream) {
   const char* fn = "r4dx_inkling2_msg_gate_prep3_bf16";
@@ -2678,7 +2860,8 @@ int r4dx_inkling2_attn_fused_bf16kv(const R4dxInkling2AttnFusedArgs* a, int64_t 
       hipLaunchKernelGGL(Inkling2AttnDecodeCombineKernel,
                          dim3(static_cast<unsigned>(a->q_heads), static_cast<unsigned>(a->q_len)), dim3(32), 0, st,
                          reinterpret_cast<const float*>(a->workspace), reinterpret_cast<const float*>(a->sink),
-                         reinterpret_cast<uint16_t*>(a->out), a->q_heads, n_splits);
+                         reinterpret_cast<const uint16_t*>(a->gate), reinterpret_cast<uint16_t*>(a->out), a->q_heads,
+                         n_splits);
       e = hipGetLastError();
       if (e != hipSuccess) return -100 - static_cast<int>(e);
       r4dx_kernel_launch_counter_add(1);

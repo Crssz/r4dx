@@ -51,6 +51,20 @@ void r4dx_inkling2_sconv_static_pair_hist_f32(int64_t x_k, int64_t x_v, int x_bf
                                               int64_t state_k, int64_t state_v, int64_t out_k, int64_t out_v,
                                               int64_t hist_k, int64_t hist_v, int T, int C, int64_t stream);
 
+// Fused sliding-layer K/V static short convolution + K head_clip + V head_rms + paged bf16 KV write in one launch.
+// Eliminates intermediate fp32 kc/vc buffers and 2 kernel launches per sliding visit (hd == 128, C == kv_heads * 128).
+void r4dx_inkling2_sconv_kv_paged_bf16(int64_t x_k, int64_t x_v, int64_t w_k, int64_t w_v, int64_t state_k,
+                                       int64_t state_v, int64_t hist_k, int64_t hist_v, float qk_clip, float eps,
+                                       int64_t pos0, int64_t pos_dev, int64_t kv_out, int64_t block_table,
+                                       int block_size, int64_t kv_block_stride, int64_t kv_head_stride, int T,
+                                       int kv_heads, int64_t stream);
+
+// Fused Q (bf16 out) + R (fp32 out) head_clip in a single launch (both read bf16 inputs and share pos0/log_scaling).
+void r4dx_inkling2_head_clip_qr(int64_t q_in, int64_t q_in_stride, int64_t q_scale, float q_thresh, int64_t q_out,
+                                int q_d, int64_t r_in, int64_t r_in_stride, int64_t r_scale, float r_thresh,
+                                int64_t r_out, int r_d, int64_t pos0, int64_t pos_dev, float log_alpha, float log_floor,
+                                int T, int heads, int64_t stream);
+
 // Batched 3-gate (Q, K, V) MsgGate prep, down GEMM, apply, and RMSNorm -> bf16 in 4 launches instead of 12.
 // If x_stride == 0 (sliding layers), all 3 gates share the single [T, H] input `x`; if x_stride == T * H (full layers),
 // gate g reads `x + g * T * H`. `m_all` is `[3, T, H]` fp32 contiguous (`msg(0..2)`).
@@ -215,6 +229,7 @@ struct R4dxInkling2AttnFusedArgs {
   int64_t kv_head_stride;
   int64_t pos_dev;      // optional device int32* holding pos0 (0 = use host ctx - q_len)
   int kv_fp8;           // 1 = kv cache stores fp8 e4m3fn (uint8), 0 = bf16 (uint16)
+  int64_t gate;         // optional [q_len, q_heads, 128] bf16 output gate (0 = none; fuses out *= sigmoid(gate))
 };
 int r4dx_inkling2_attn_fused_bf16kv(const R4dxInkling2AttnFusedArgs* a, int64_t stream);
 

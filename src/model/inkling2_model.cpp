@@ -72,6 +72,11 @@ LinearTuning PickNvfp4MoeTuning(int64_t N, int64_t K, int64_t M, bool is_down) {
   return t;
 }
 
+bool DsparkAdaptEnabled() {
+  static const bool v = InkEnvFlag("R4DX_INK_DSPARK_ADAPT", true);
+  return v;
+}
+
 bool MoeGroupedDecodeEnabled() {
   static const bool kEnabled = InkEnvFlag("R4DX_INK_MOE_DECODE", true);
   return kEnabled;
@@ -321,6 +326,7 @@ void Inkling2Model::Reset() {
   conv_.ZeroAsync(stream_);
   stream_.Synchronize();
   pos_ = 0;
+  dspark_adapt_k_ = 3;
   started_ = false;
   arena_.Reset();
   ckpt_pos_ = -1;
@@ -1116,22 +1122,21 @@ std::vector<float> Inkling2Model::RunChunk(const std::vector<int32_t>& token_ids
   } else if (try_verify_graph) {
     pos_host_.data()[0] = static_cast<int32_t>(pos_);
     pos_dev_.CopyFromHostAsync(pos_host_.data(), 1, stream_);
-    if (!verify_graph_ || verify_graph_T_ != T) {
-      verify_graph_.reset();
+    GraphExecPtr& vg = verify_graphs_[static_cast<size_t>(T)];
+    if (!vg) {
       hipGraphExec_t exec = nullptr;
       if (CaptureDecodeGraph(sr, &exec, [&] {
             run_body(/*use_pos_dev=*/true, /*graph_long_ctx=*/true);
           })) {
-        verify_graph_.reset(exec);
-        verify_graph_T_ = T;
+        vg.reset(exec);
         just_captured = true;
       } else {
         decode_graph_disabled_ = true;
         std::cerr << "[r4dx::model::Inkling2Model] HIP verify graph capture failed; falling back to eager verify\n";
       }
     }
-    if (verify_graph_) {
-      R4DX_HIP_CHECK(hipGraphLaunch(static_cast<hipGraphExec_t>(verify_graph_.get()), sr));
+    if (vg) {
+      R4DX_HIP_CHECK(hipGraphLaunch(static_cast<hipGraphExec_t>(vg.get()), sr));
       launched_graph = true;
     }
   }
@@ -1373,7 +1378,9 @@ std::vector<int32_t> Inkling2Model::DecodeStepDflashGreedy(int32_t token_id, int
   const hipStream_t sr = stream_.get();
   const int64_t s = P(sr);
   const int64_t H = cfg.hidden_size;
-  int64_t k = (draft_k > 0) ? std::min<int64_t>(draft_k, dspark_->NumSpecTokens()) : dspark_->NumSpecTokens();
+  const int64_t k_max = (draft_k > 0) ? std::min<int64_t>(draft_k, dspark_->NumSpecTokens()) : dspark_->NumSpecTokens();
+  const bool adapt = DsparkAdaptEnabled() && k_max >= 3;
+  int64_t k = adapt ? std::clamp<int64_t>(dspark_adapt_k_, 2, k_max) : k_max;
   k = std::min<int64_t>(k, max_ctx_ - pos_ - 1);
   if (k <= 0) {
     if (walk_len_out != nullptr) *walk_len_out = 0;
@@ -1443,6 +1450,10 @@ std::vector<int32_t> Inkling2Model::DecodeStepDflashGreedy(int32_t token_id, int
   dspark_->InjectTaps(dspark_taps_[0].data(), dspark_taps_[1].data(), dspark_taps_[2].data(), dspark_taps_[3].data(),
                       n_keep, pos_before, stream_, arena_);
   stream_.Synchronize();
+  if (adapt) {
+    if (n_keep == 1 + k) dspark_adapt_k_ = std::min<int64_t>(k + 1, k_max);
+    else if (n_keep == 1) dspark_adapt_k_ = std::max<int64_t>(2, k - 1);
+  }
   if (walk_len_out != nullptr) *walk_len_out = k;
   return out;
 }
@@ -1461,7 +1472,9 @@ std::vector<int32_t> Inkling2Model::DecodeStepDflashSampled(int32_t token_id, in
   const hipStream_t sr = stream_.get();
   const int64_t s = P(sr);
   const int64_t H = cfg.hidden_size;
-  int64_t k = (draft_k > 0) ? std::min<int64_t>(draft_k, dspark_->NumSpecTokens()) : dspark_->NumSpecTokens();
+  const int64_t k_max = (draft_k > 0) ? std::min<int64_t>(draft_k, dspark_->NumSpecTokens()) : dspark_->NumSpecTokens();
+  const bool adapt = DsparkAdaptEnabled() && k_max >= 3;
+  int64_t k = adapt ? std::clamp<int64_t>(dspark_adapt_k_, 2, k_max) : k_max;
   k = std::min<int64_t>(k, max_ctx_ - pos_ - 1);
   if (k <= 0) {
     if (walk_len_out != nullptr) *walk_len_out = 0;
@@ -1538,6 +1551,10 @@ std::vector<int32_t> Inkling2Model::DecodeStepDflashSampled(int32_t token_id, in
   dspark_->InjectTaps(dspark_taps_[0].data(), dspark_taps_[1].data(), dspark_taps_[2].data(), dspark_taps_[3].data(),
                       n_keep, pos_before, stream_, arena_);
   stream_.Synchronize();
+  if (adapt) {
+    if (n_keep == 1 + k) dspark_adapt_k_ = std::min<int64_t>(k + 1, k_max);
+    else if (n_keep == 1) dspark_adapt_k_ = std::max<int64_t>(2, k - 1);
+  }
   if (walk_len_out != nullptr) *walk_len_out = k;
   return out;
 }

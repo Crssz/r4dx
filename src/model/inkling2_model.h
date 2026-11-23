@@ -188,8 +188,9 @@ class Inkling2Model {
 
   core::PinnedBuffer<int32_t> ids_host_, pos_host_;
   core::DeviceBuffer<int32_t> ids_dev_, pos_dev_;
-  GraphExecPtr decode_graph_short_, decode_graph_long_, verify_graph_;
-  int64_t verify_graph_T_ = 0;
+  GraphExecPtr decode_graph_short_, decode_graph_long_;
+  std::array<GraphExecPtr, 9> verify_graphs_;  // indexed by verify window T in [2..8]
+  int64_t dspark_adapt_k_ = 3;
   bool decode_graph_eligible_ = false;
   bool decode_graph_disabled_ = false;
   int64_t decode_steps_seen_ = 0;

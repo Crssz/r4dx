@@ -90,6 +90,22 @@ __device__ __forceinline__ void st_rlx_sys(u32* p, u32 v) {
 }
 __device__ __forceinline__ u64 now_ticks() { return (u64)wall_clock64(); }
 
+// Non-temporal 16-B loads/stores for single-pass host-mailbox traffic (RCCL op128.h /
+// CollCommon_ll128.h): emits `th:TH_LOAD_NT` / `th:TH_STORE_NT` on gfx12 so small 10 KiB decode
+// traffic does not pollute L0/L2 or bloat the L2-wide `global_wb scope:SCOPE_SYS` flush.
+typedef __attribute__((__vector_size__(4 * sizeof(unsigned int)))) unsigned int v4u;
+typedef __attribute__((address_space(1))) v4u* v4u_gptr;
+typedef __attribute__((address_space(1))) const v4u* const_v4u_gptr;
+
+__device__ __forceinline__ uint4 ld_nt_128(const uint4* p) {
+  const v4u v = __builtin_nontemporal_load((const_v4u_gptr)p);
+  return make_uint4(v[0], v[1], v[2], v[3]);
+}
+__device__ __forceinline__ void st_nt_128(uint4* p, const uint4& x) {
+  const v4u v = {x.x, x.y, x.z, x.w};
+  __builtin_nontemporal_store(v, (v4u_gptr)p);
+}
+
 // ar_bench.hip 599-611; shared by the all-reduce and r4dx_tp_add_bf16 (emulation), so an emulated
 // run adds with exactly the arithmetic of a real one.
 __device__ __forceinline__ u32 add_bf16x2(u32 a, u32 b) {
@@ -140,21 +156,29 @@ __device__ void note_abort_exit(Status* st, u32 seq) {
 }
 
 // Spin until (int)(*f - want) >= 0. (ar_bench.hip 651-676)
-//   spin_acq = 0 (production): system-scope RELAXED polls, then one system-scope acquire fence after
+//   kSpinAcq = 0 (production): system-scope RELAXED polls, then one system-scope acquire fence after
 //                              success (synchronizes-with the writer's release, same guarantee).
-//   spin_acq = 1:              a system-scope ACQUIRE load on every poll.
+//   kSpinAcq = 1:              a system-scope ACQUIRE load on every poll.
+//   kSpinAcq < 0:              runtime selection from `spin_acq`.
 // Every 16th poll also loads both abort words, issued right after the flag load so one wait covers
 // all three. Returns 0 = reached, 1 = timed out, 2 = an abort word is set. *seen = last flag value.
+template <int kSpinAcq>
 __device__ __forceinline__ int spin_flag_ge(const u32* f, u32 want, const u32* ab_mine, const u32* ab_peer,
                                             u64 timeout, int spin_acq, u32* seen) {
   const u64 t0 = now_ticks();
   for (u32 it = 1;; ++it) {
     const bool slow = (it & 15u) == 0u;
-    const u32 v = spin_acq ? ld_acq_sys(f) : ld_rlx_sys(f);  // flag first: issued before the abort loads
+    u32 v;
+    if constexpr (kSpinAcq == 0) v = ld_rlx_sys(f);
+    else if constexpr (kSpinAcq == 1) v = ld_acq_sys(f);
+    else v = spin_acq ? ld_acq_sys(f) : ld_rlx_sys(f);  // flag first: issued before the abort loads
     u32 ab = 0;
     if (slow) ab = ld_rlx_sys(ab_mine) | ld_rlx_sys(ab_peer);
     if ((int)(v - want) >= 0) {
-      if (!spin_acq) __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "");  // "" = system scope
+      if constexpr (kSpinAcq == 0) __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "");  // "" = system scope
+      else if constexpr (kSpinAcq < 0) {
+        if (!spin_acq) __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "");
+      }
       *seen = v;
       return 0;
     }
@@ -170,6 +194,19 @@ __device__ __forceinline__ int spin_flag_ge(const u32* f, u32 want, const u32* a
     }
     __builtin_amdgcn_s_sleep(1);
   }
+}
+
+// LDS-only workgroup barrier (from RCCL CollCommon.h ddaLdsBarrier): synchronizes LDS without the
+// global store wait + `global_inv scope:SCOPE_SE` that __syncthreads() emits on gfx12. Used only
+// for the entry s_seq/s_fail broadcast (before any global push stores).
+__device__ __forceinline__ void lds_barrier() {
+#if defined(__gfx1200__) || defined(__gfx1201__) || defined(__gfx1250__)
+  __builtin_amdgcn_fence(__ATOMIC_RELEASE, "workgroup", "local");
+  __builtin_amdgcn_s_barrier();
+  __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "workgroup", "local");
+#else
+  __syncthreads();
+#endif
 }
 
 // The kernel's parameter: R4dxTpArArgs with typed pointers (tp_bench's ArArgs), built by the host
@@ -232,7 +269,9 @@ __device__ __forceinline__ bool ar_entry(const ArArgs& a, int b, u32* s_out) {
 }
 
 // ar_bench.hip 804-893 (ar_flag_kernel), in place, trace removed, the channel recorded on failure.
-__global__ void __launch_bounds__(1024) r4dx_tp_ar_flag_bf16_kernel(ArArgs a) {
+// kDrain / kAcq / kSpinAcq >= 0 specialize at compile time (production: 3, 0, 0); < 0 reads ArArgs.
+template <int kDrain, int kAcq, int kSpinAcq>
+__device__ __forceinline__ void ar_flag_bf16_impl(ArArgs a) {
   const int b = blockIdx.x, tid = threadIdx.x, nt = blockDim.x;
   __shared__ u32 s_seq;
   __shared__ int s_fail;  // 0 ok, 1 timeout, 2 abort exit, 3 protocol violation, 4 skipped (sticky)
@@ -241,7 +280,7 @@ __global__ void __launch_bounds__(1024) r4dx_tp_ar_flag_bf16_kernel(ArArgs a) {
     s_fail = ar_entry(a, b, &s0) ? 4 : 0;
     s_seq = s0;
   }
-  __syncthreads();
+  lds_barrier();
   if (s_fail != 0) return;  // block-uniform: an aborted rank pushes nothing more (sticky abort)
   const u32 s = s_seq;
   const u32 slot = s & 1u;
@@ -253,27 +292,49 @@ __global__ void __launch_bounds__(1024) r4dx_tp_ar_flag_bf16_kernel(ArArgs a) {
   uint4* dst = (uint4*)(a.peer_mbox + (size_t)slot * a.slot_stride + (size_t)b * a.blk_stride);
   const uint4* src = (const uint4*)(a.my_mbox + (size_t)slot * a.slot_stride + (size_t)b * a.blk_stride);
 
-  // PUSH my chunk into the peer's slot: up to 4 words per thread. The VRAM loads are unconditional
-  // (index clamped into the chunk, so they stay in flight together); only the stores are predicated.
-  for (int k0 = tid; k0 < cnt; k0 += 4 * nt) {
-    uint4 x[4];
-#pragma unroll
-    for (int j = 0; j < 4; ++j) x[j] = in[min(k0 + j * nt, cnt - 1)];
-#pragma unroll
-    for (int j = 0; j < 4; ++j)
-      if (k0 + j * nt < cnt) dst[k0 + j * nt] = x[j];
+  // PUSH my chunk into the peer's slot. When cnt <= nt (all T=1 decode calls: 10 KiB -> cnt = 160),
+  // each thread owns at most one 16-B word, so keep x0 in registers across the flag wait and avoid
+  // reloading `in` from VRAM during REDUCE.
+  uint4 x0{};
+  const bool single_pass = (cnt <= nt);
+  if (single_pass) {
+    if (tid < cnt) {
+      x0 = in[tid];
+      st_nt_128(dst + tid, x0);
+    }
+  } else {
+    // Up to 4 words per thread. The VRAM loads are unconditional (index clamped into the chunk, so
+    // they stay in flight together); only the stores are predicated. Explicit variables (not a
+    // local uint4[4] array) keep LLVM from lowering the buffer to 80 B of private scratch. Plain
+    // cacheable stores preserve L2 write-combining across iterations (measured faster than NT at
+    // 80 KiB / 640 KiB, whereas NT wins on single-pass 10 KiB above).
+    for (int k0 = tid; k0 < cnt; k0 += 4 * nt) {
+      const int k1 = k0 + nt, k2 = k0 + 2 * nt, k3 = k0 + 3 * nt;
+      const uint4 v0 = in[min(k0, cnt - 1)];
+      const uint4 v1 = in[min(k1, cnt - 1)];
+      const uint4 v2 = in[min(k2, cnt - 1)];
+      const uint4 v3 = in[min(k3, cnt - 1)];
+      dst[k0] = v0;
+      if (k1 < cnt) dst[k1] = v1;
+      if (k2 < cnt) dst[k2] = v2;
+      if (k3 < cnt) dst[k3] = v3;
+    }
   }
   // DRAIN (every thread): make the pushes visible at system scope before the flag. (drain=3 is
   // ISA-identical to no drain in WGP mode -- see the header; tid0's release writes everything back.)
-  if (a.drain == 1) __threadfence_system();
-  else asm volatile("s_wait_storecnt 0x0" ::: "memory");
+  if constexpr (kDrain == 1) __threadfence_system();
+  else if constexpr (kDrain == 3) asm volatile("s_wait_storecnt 0x0" ::: "memory");
+  else {
+    if (a.drain == 1) __threadfence_system();
+    else asm volatile("s_wait_storecnt 0x0" ::: "memory");
+  }
   __syncthreads();
 
   if (tid == 0) {
     st_rel_sys(&a.peer_flags[(size_t)b * kFlagStride], s);  // RELEASE: data before flag
     u32 seen = 0;
-    int rc = spin_flag_ge(&a.my_flags[(size_t)b * kFlagStride], s, a.my_abort, a.peer_abort, a.timeout,
-                          a.spin_acq, &seen);
+    int rc = spin_flag_ge<kSpinAcq>(&a.my_flags[(size_t)b * kFlagStride], s, a.my_abort, a.peer_abort, a.timeout,
+                                    a.spin_acq, &seen);
     if (rc == 0 && (int)(seen - s) >= 2) {  // legal: s or s+1 only
       if ((ld_rlx_sys(a.my_abort) | ld_rlx_sys(a.peer_abort)) != 0u) rc = 2;  // peer pushed after an abort
       else {
@@ -288,24 +349,43 @@ __global__ void __launch_bounds__(1024) r4dx_tp_ar_flag_bf16_kernel(ArArgs a) {
   __syncthreads();
 
   if (s_fail == 0) {
-    if (a.acq) __threadfence_system();
-    // REDUCE: up to 4 words per thread, all host-memory (and VRAM) loads issued before any store, so a
-    // thread has up to 4 PCIe reads in flight instead of one per word. In place: word k0 + j*nt is
-    // the one this same thread pushed above, and every push read finished before the barriers.
-    for (int k0 = tid; k0 < cnt; k0 += 4 * nt) {
-      uint4 p[4], x[4];
+    if constexpr (kAcq == 1) __threadfence_system();
+    else if constexpr (kAcq < 0) {
+      if (a.acq) __threadfence_system();
+    }
+    if (single_pass) {
+      if (tid < cnt) out[tid] = add_bf16x8(x0, ld_nt_128(src + tid));
+    } else {
+      // REDUCE: up to 4 words per thread, all host-memory (and VRAM) loads issued before any store,
+      // so a thread has up to 4 PCIe reads in flight instead of one per word. In place: word
+      // k0 + j*nt is the one this same thread pushed above, and every push read finished before the
+      // barriers.
+      for (int k0 = tid; k0 < cnt; k0 += 4 * nt) {
+        uint4 p[4], x[4];
 #pragma unroll
-      for (int j = 0; j < 4; ++j)
-        if (k0 + j * nt < cnt) {
-          p[j] = src[k0 + j * nt];
-          x[j] = in[k0 + j * nt];
-        }
+        for (int j = 0; j < 4; ++j)
+          if (k0 + j * nt < cnt) {
+            p[j] = src[k0 + j * nt];
+            x[j] = in[k0 + j * nt];
+          }
 #pragma unroll
-      for (int j = 0; j < 4; ++j)
-        if (k0 + j * nt < cnt) out[k0 + j * nt] = add_bf16x8(x[j], p[j]);
+        for (int j = 0; j < 4; ++j)
+          if (k0 + j * nt < cnt) out[k0 + j * nt] = add_bf16x8(x[j], p[j]);
+      }
     }
   }
   // (a failed block does NOT reduce: buf keeps this rank's partial, and the host reports the abort)
+}
+
+// Production fast path: nt <= 256, drain = 3, acq = 0, spin_acq = 0. Checked by
+// src/kernels/check_tp_isa.cmake.
+__global__ void __launch_bounds__(256) r4dx_tp_ar_flag_bf16_kernel(ArArgs a) {
+  ar_flag_bf16_impl<3, 0, 0>(a);
+}
+
+// Generic fallback for non-production (drain, acq, spin_acq) or nt > 256.
+__global__ void __launch_bounds__(1024) r4dx_tp_ar_flag_bf16_generic_kernel(ArArgs a) {
+  ar_flag_bf16_impl<-1, -1, -1>(a);
 }
 
 // EmulatedComm's add (docs/tp.md 6.5): same add_bf16x8, operand order (mine, peer).
@@ -449,8 +529,13 @@ void r4dx_tp_ar_flag_bf16(const R4dxTpArArgs* a, int nt, int64_t stream) {
     Bad(std::string(kWho) + ": drain must be 1|3, acq and spin_acq 0|1");
   if (a->timeout_ticks == 0) Bad(std::string(kWho) + ": timeout_ticks is 0");
   CheckNt(kWho, nt);
-  hipLaunchKernelGGL(r4dx_tp_ar_flag_bf16_kernel, dim3(static_cast<unsigned>(a->nb)), dim3(static_cast<unsigned>(nt)),
-                     0, (hipStream_t)stream, typed_args(*a));
+  if (nt <= 256 && a->drain == 3 && a->acq == 0 && a->spin_acq == 0) {
+    hipLaunchKernelGGL(r4dx_tp_ar_flag_bf16_kernel, dim3(static_cast<unsigned>(a->nb)), dim3(static_cast<unsigned>(nt)),
+                       0, (hipStream_t)stream, typed_args(*a));
+  } else {
+    hipLaunchKernelGGL(r4dx_tp_ar_flag_bf16_generic_kernel, dim3(static_cast<unsigned>(a->nb)),
+                       dim3(static_cast<unsigned>(nt)), 0, (hipStream_t)stream, typed_args(*a));
+  }
   R4DX_HIP_CHECK(hipGetLastError());
 }
 

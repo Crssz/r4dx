@@ -679,8 +679,7 @@ void Inkling2Model::Moe(int64_t layer, const uint16_t* x, uint16_t* out, int64_t
   int32_t* ids = arena_.Alloc<int32_t>(static_cast<size_t>(Pn), 16);
   float* wts = arena_.Alloc<float>(static_cast<size_t>(Pn), 16);
   uint16_t* ys = arena_.Alloc<uint16_t>(static_cast<size_t>(Pn * H), 16);
-  float* router_logits =
-      (T < 16 && MoeGroupedDecodeEnabled()) ? arena_.Alloc<float>(static_cast<size_t>(T * E), 16) : nullptr;
+  float* router_logits = MoeGroupedDecodeEnabled() ? arena_.Alloc<float>(static_cast<size_t>(T * E), 16) : nullptr;
   ProfiledCall(prof, sr, "moe.router", [&] {
     r4dx_inkling2_router_f32(P(x), P(w.router.data()), P(w.bias.data()), P(ids), P(wts), static_cast<int>(T),
                              static_cast<int>(H), static_cast<int>(E), static_cast<int>(K),

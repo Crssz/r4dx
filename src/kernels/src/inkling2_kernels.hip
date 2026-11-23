@@ -11,6 +11,7 @@
 #include <string>
 
 #include "r4d_attn_window.h"
+#include "r4d_gdn_wmma.h"
 #include "r4dx/core/dtype.hpp"
 #include "r4dx/kernels/inkling2_kernels.h"
 #include "r4dx/kernels/kernels.h"  // r4dx_kernel_launch_counter_add
@@ -97,6 +98,8 @@ struct AttnResPtrs {
   const float* s[kMaxStates];
 };
 
+// 2-pass vectorized AttnRes: computes ss[i] and dot(q[qi], S_i) in ONE pass (since dot(q, S_i * inv_i)
+// == dot(q, S_i) * inv_i), saving 1/3 of global memory reads and 1 workgroup barrier. Uses float4 when H % 4 == 0.
 __global__ __launch_bounds__(kThreads) void AttnResKernel(AttnResPtrs st, int n_states, const float* __restrict__ q,
                                                           int nq, float* __restrict__ out, int T, int H, float eps) {
   __shared__ float red[kWaves * (kMaxStates + kMaxStates * kMaxQueries)];
@@ -104,16 +107,56 @@ __global__ __launch_bounds__(kThreads) void AttnResKernel(AttnResPtrs st, int n_
   __shared__ float p[kMaxQueries][kMaxStates];
   __shared__ float lg_s[kMaxQueries][kMaxStates];
   const int t = blockIdx.x;
-  // 1. per state: the sum of squares -> inv
+  const int64_t row_off = static_cast<int64_t>(t) * H;
   float ss[kMaxStates];
+  float d[kMaxQueries][kMaxStates];
 #pragma unroll
-  for (int i = 0; i < kMaxStates; ++i) ss[i] = 0.0f;
-  for (int h = threadIdx.x; h < H; h += kThreads) {
+  for (int i = 0; i < kMaxStates; ++i) {
+    ss[i] = 0.0f;
 #pragma unroll
-    for (int i = 0; i < kMaxStates; ++i) {
-      if (i < n_states) {
-        const float x = st.s[i][static_cast<int64_t>(t) * H + h];
-        ss[i] += x * x;
+    for (int qi = 0; qi < kMaxQueries; ++qi) d[qi][i] = 0.0f;
+  }
+  const bool vec4 = (H & 3) == 0;
+  if (vec4) {
+    const int H4 = H >> 2;
+    const int64_t row4 = row_off >> 2;
+    for (int h4 = threadIdx.x; h4 < H4; h4 += kThreads) {
+      float4 qv[kMaxQueries];
+#pragma unroll
+      for (int qi = 0; qi < kMaxQueries; ++qi) {
+        if (qi < nq) qv[qi] = reinterpret_cast<const float4*>(q)[static_cast<int64_t>(qi) * H4 + h4];
+      }
+#pragma unroll
+      for (int i = 0; i < kMaxStates; ++i) {
+        if (i < n_states) {
+          const float4 x = reinterpret_cast<const float4*>(st.s[i])[row4 + h4];
+          ss[i] += (x.x * x.x + x.y * x.y) + (x.z * x.z + x.w * x.w);
+#pragma unroll
+          for (int qi = 0; qi < kMaxQueries; ++qi) {
+            if (qi < nq) {
+              d[qi][i] += (qv[qi].x * x.x + qv[qi].y * x.y) + (qv[qi].z * x.z + qv[qi].w * x.w);
+            }
+          }
+        }
+      }
+    }
+  } else {
+    for (int h = threadIdx.x; h < H; h += kThreads) {
+      float qv[kMaxQueries];
+#pragma unroll
+      for (int qi = 0; qi < kMaxQueries; ++qi) {
+        if (qi < nq) qv[qi] = q[static_cast<int64_t>(qi) * H + h];
+      }
+#pragma unroll
+      for (int i = 0; i < kMaxStates; ++i) {
+        if (i < n_states) {
+          const float x = st.s[i][row_off + h];
+          ss[i] += x * x;
+#pragma unroll
+          for (int qi = 0; qi < kMaxQueries; ++qi) {
+            if (qi < nq) d[qi][i] += qv[qi] * x;
+          }
+        }
       }
     }
   }
@@ -122,31 +165,6 @@ __global__ __launch_bounds__(kThreads) void AttnResKernel(AttnResPtrs st, int n_
     if (i < n_states) {
       const float v = WaveSum(ss[i]);
       if ((threadIdx.x & 31) == 0) red[i * kWaves + (threadIdx.x >> 5)] = v;
-    }
-  }
-  __syncthreads();
-  if (threadIdx.x < n_states) {
-    float a = 0.0f;
-#pragma unroll
-    for (int w = 0; w < kWaves; ++w) a += red[threadIdx.x * kWaves + w];
-    inv[threadIdx.x] = 1.0f / sqrtf(a / static_cast<float>(H) + eps);
-  }
-  __syncthreads();
-  // 2. per (query, state): q . rms(S_i)
-  float d[kMaxQueries][kMaxStates];
-#pragma unroll
-  for (int qi = 0; qi < kMaxQueries; ++qi)
-#pragma unroll
-    for (int i = 0; i < kMaxStates; ++i) d[qi][i] = 0.0f;
-  for (int h = threadIdx.x; h < H; h += kThreads) {
-#pragma unroll
-    for (int i = 0; i < kMaxStates; ++i) {
-      if (i >= n_states) continue;
-      const float r = st.s[i][static_cast<int64_t>(t) * H + h] * inv[i];
-#pragma unroll
-      for (int qi = 0; qi < kMaxQueries; ++qi) {
-        if (qi < nq) d[qi][i] += q[static_cast<int64_t>(qi) * H + h] * r;
-      }
     }
   }
   float* red2 = red + kWaves * kMaxStates;
@@ -163,15 +181,22 @@ __global__ __launch_bounds__(kThreads) void AttnResKernel(AttnResPtrs st, int n_
     }
   }
   __syncthreads();
+  if (threadIdx.x < n_states) {
+    float a = 0.0f;
+#pragma unroll
+    for (int w = 0; w < kWaves; ++w) a += red[threadIdx.x * kWaves + w];
+    inv[threadIdx.x] = rsqrtf(a / static_cast<float>(H) + eps);
+  }
+  __syncthreads();
   if (threadIdx.x < nq) {
     const int qi = threadIdx.x;
-    const float scale = 1.0f / sqrtf(static_cast<float>(H));
+    const float scale = rsqrtf(static_cast<float>(H));
     float m = -INFINITY;
     for (int i = 0; i < n_states; ++i) {
       float a = 0.0f;
 #pragma unroll
       for (int w = 0; w < kWaves; ++w) a += red2[(qi * kMaxStates + i) * kWaves + w];
-      const float v = a * scale;
+      const float v = (a * inv[i]) * scale;
       lg_s[qi][i] = v;
       m = fmaxf(m, v);
     }
@@ -181,21 +206,48 @@ __global__ __launch_bounds__(kThreads) void AttnResKernel(AttnResPtrs st, int n_
       lg_s[qi][i] = e;
       l += e;
     }
-    for (int i = 0; i < n_states; ++i) p[qi][i] = lg_s[qi][i] / l;
+    const float inv_l = 1.0f / l;
+    for (int i = 0; i < n_states; ++i) p[qi][i] = (lg_s[qi][i] * inv_l) * inv[i];
   }
   __syncthreads();
-  // 3. the mix of the normalized states (statically unrolled over kMaxStates -> zero scratch spill)
-  for (int h = threadIdx.x; h < H; h += kThreads) {
-    float r[kMaxStates];
-#pragma unroll
-    for (int i = 0; i < kMaxStates; ++i) r[i] = i < n_states ? st.s[i][static_cast<int64_t>(t) * H + h] * inv[i] : 0.0f;
-    for (int qi = 0; qi < nq; ++qi) {
-      float a = 0.0f;
+  // Pass 2: mix of states (p[qi][i] already folded inv[i]).
+  if (vec4) {
+    const int H4 = H >> 2;
+    const int64_t row4 = row_off >> 2;
+    for (int h4 = threadIdx.x; h4 < H4; h4 += kThreads) {
+      float4 s_v[kMaxStates];
 #pragma unroll
       for (int i = 0; i < kMaxStates; ++i) {
-        if (i < n_states) a += p[qi][i] * r[i];
+        if (i < n_states) s_v[i] = reinterpret_cast<const float4*>(st.s[i])[row4 + h4];
       }
-      out[(static_cast<int64_t>(qi) * T + t) * H + h] = a;
+      for (int qi = 0; qi < nq; ++qi) {
+        float4 a = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+#pragma unroll
+        for (int i = 0; i < kMaxStates; ++i) {
+          if (i < n_states) {
+            const float w = p[qi][i];
+            a.x += w * s_v[i].x;
+            a.y += w * s_v[i].y;
+            a.z += w * s_v[i].z;
+            a.w += w * s_v[i].w;
+          }
+        }
+        reinterpret_cast<float4*>(out)[(static_cast<int64_t>(qi) * T + t) * H4 + h4] = a;
+      }
+    }
+  } else {
+    for (int h = threadIdx.x; h < H; h += kThreads) {
+      float s_v[kMaxStates];
+#pragma unroll
+      for (int i = 0; i < kMaxStates; ++i) s_v[i] = i < n_states ? st.s[i][row_off + h] : 0.0f;
+      for (int qi = 0; qi < nq; ++qi) {
+        float a = 0.0f;
+#pragma unroll
+        for (int i = 0; i < kMaxStates; ++i) {
+          if (i < n_states) a += p[qi][i] * s_v[i];
+        }
+        out[(static_cast<int64_t>(qi) * T + t) * H + h] = a;
+      }
     }
   }
 }
@@ -380,6 +432,114 @@ __global__ __launch_bounds__(kThreads) void MsgPrepKernel(const float* __restric
 constexpr int kMaxRank = 256;
 // Coalesced, bit-exact MsgApply: each block handles 32 output channels h0..h0+31 across 4 waves (128 threads),
 // loading [32][32] tiles of forget/gain coalesced along R into LDS and summing r = 0..R-1 in exact order.
+// Fast zero-LDS-tile float4 MsgApply (R % 4 == 0): 16 lanes per output channel h (8 channels per
+// 128-thread block), 100% of waves active, coalesced float4 loads along R.
+__device__ __forceinline__ float HalfWaveSum(float v) {
+  v += __shfl_xor(v, 8, 32);
+  v += __shfl_xor(v, 4, 32);
+  v += __shfl_xor(v, 2, 32);
+  v += __shfl_xor(v, 1, 32);
+  return v;
+}
+
+__device__ __forceinline__ float HalfWaveMax(float v) {
+  v = fmaxf(v, __shfl_xor(v, 8, 32));
+  v = fmaxf(v, __shfl_xor(v, 4, 32));
+  v = fmaxf(v, __shfl_xor(v, 2, 32));
+  v = fmaxf(v, __shfl_xor(v, 1, 32));
+  return v;
+}
+
+__global__ __launch_bounds__(128) void MsgApplyVec4Kernel(
+    const float* __restrict__ x, const float* __restrict__ m, const void* __restrict__ g, int g_bf16,
+    const float* __restrict__ forget, const float* __restrict__ gain, float* __restrict__ out, int H, int R) {
+  __shared__ float gs[kMaxRank];
+  const int64_t t = blockIdx.y;
+  const int tid = threadIdx.x;
+  for (int r = tid; r < R; r += 128) gs[r] = LoadF(g, t * R + r, g_bf16);
+  __syncthreads();
+  const int sub = tid >> 4;   // 0..7
+  const int lane16 = tid & 15;
+  const int h = static_cast<int>(blockIdx.x) * 8 + sub;
+  if (h >= H) return;
+  const int R4 = R >> 2;
+  const float4* fr = reinterpret_cast<const float4*>(forget + static_cast<int64_t>(h) * R);
+  const float4* gr = reinterpret_cast<const float4*>(gain + static_cast<int64_t>(h) * R);
+  const float4* g4 = reinterpret_cast<const float4*>(gs);
+  float f = 0.0f, a = 0.0f;
+  for (int r4 = lane16; r4 < R4; r4 += 16) {
+    const float4 gv = g4[r4];
+    const float4 fv = fr[r4];
+    const float4 av = gr[r4];
+    f += gv.x * fv.x; f += gv.y * fv.y; f += gv.z * fv.z; f += gv.w * fv.w;
+    a += gv.x * av.x; a += gv.y * av.y; a += gv.z * av.z; a += gv.w * av.w;
+  }
+  f = HalfWaveSum(f);
+  a = HalfWaveSum(a);
+  if (lane16 == 0) {
+    const int64_t i = t * H + h;
+    out[i] = (1.0f - tanhf(f)) * x[i] + tanhf(a) * m[i];
+  }
+}
+
+// 4-token-tiled float4 MsgApply for prefill (T >= 4, R % 4 == 0): reads forget/gain ONCE per 4 tokens.
+__global__ __launch_bounds__(128) void MsgApplyTiled4Kernel(
+    const float* __restrict__ x, const float* __restrict__ m, const void* __restrict__ g, int g_bf16,
+    const float* __restrict__ forget, const float* __restrict__ gain, float* __restrict__ out, int T, int H, int R) {
+  __shared__ float gs[4][kMaxRank];
+  const int t0 = static_cast<int>(blockIdx.y) * 4;
+  const int tid = threadIdx.x;
+  const int nt = (T - t0 < 4) ? (T - t0) : 4;
+  for (int idx = tid; idx < nt * R; idx += 128) {
+    const int dt = idx / R;
+    const int r = idx - dt * R;
+    gs[dt][r] = LoadF(g, static_cast<int64_t>(t0 + dt) * R + r, g_bf16);
+  }
+  __syncthreads();
+  const int sub = tid >> 4;
+  const int lane16 = tid & 15;
+  const int h = static_cast<int>(blockIdx.x) * 8 + sub;
+  if (h >= H) return;
+  const int R4 = R >> 2;
+  const float4* fr = reinterpret_cast<const float4*>(forget + static_cast<int64_t>(h) * R);
+  const float4* gr = reinterpret_cast<const float4*>(gain + static_cast<int64_t>(h) * R);
+  float f0 = 0.0f, f1 = 0.0f, f2 = 0.0f, f3 = 0.0f;
+  float a0 = 0.0f, a1 = 0.0f, a2 = 0.0f, a3 = 0.0f;
+  for (int r4 = lane16; r4 < R4; r4 += 16) {
+    const float4 fv = fr[r4];
+    const float4 av = gr[r4];
+    const float4 g0 = reinterpret_cast<const float4*>(gs[0])[r4];
+    f0 += g0.x * fv.x; f0 += g0.y * fv.y; f0 += g0.z * fv.z; f0 += g0.w * fv.w;
+    a0 += g0.x * av.x; a0 += g0.y * av.y; a0 += g0.z * av.z; a0 += g0.w * av.w;
+    if (nt > 1) {
+      const float4 g1 = reinterpret_cast<const float4*>(gs[1])[r4];
+      f1 += g1.x * fv.x; f1 += g1.y * fv.y; f1 += g1.z * fv.z; f1 += g1.w * fv.w;
+      a1 += g1.x * av.x; a1 += g1.y * av.y; a1 += g1.z * av.z; a1 += g1.w * av.w;
+    }
+    if (nt > 2) {
+      const float4 g2 = reinterpret_cast<const float4*>(gs[2])[r4];
+      f2 += g2.x * fv.x; f2 += g2.y * fv.y; f2 += g2.z * fv.z; f2 += g2.w * fv.w;
+      a2 += g2.x * av.x; a2 += g2.y * av.y; a2 += g2.z * av.z; a2 += g2.w * av.w;
+    }
+    if (nt > 3) {
+      const float4 g3 = reinterpret_cast<const float4*>(gs[3])[r4];
+      f3 += g3.x * fv.x; f3 += g3.y * fv.y; f3 += g3.z * fv.z; f3 += g3.w * fv.w;
+      a3 += g3.x * av.x; a3 += g3.y * av.y; a3 += g3.z * av.z; a3 += g3.w * av.w;
+    }
+  }
+  f0 = HalfWaveSum(f0); a0 = HalfWaveSum(a0);
+  if (nt > 1) { f1 = HalfWaveSum(f1); a1 = HalfWaveSum(a1); }
+  if (nt > 2) { f2 = HalfWaveSum(f2); a2 = HalfWaveSum(a2); }
+  if (nt > 3) { f3 = HalfWaveSum(f3); a3 = HalfWaveSum(a3); }
+  if (lane16 == 0) {
+    const int64_t i0 = static_cast<int64_t>(t0) * H + h;
+    out[i0] = (1.0f - tanhf(f0)) * x[i0] + tanhf(a0) * m[i0];
+    if (nt > 1) { const int64_t i1 = i0 + H; out[i1] = (1.0f - tanhf(f1)) * x[i1] + tanhf(a1) * m[i1]; }
+    if (nt > 2) { const int64_t i2 = i0 + 2 * H; out[i2] = (1.0f - tanhf(f2)) * x[i2] + tanhf(a2) * m[i2]; }
+    if (nt > 3) { const int64_t i3 = i0 + 3 * H; out[i3] = (1.0f - tanhf(f3)) * x[i3] + tanhf(a3) * m[i3]; }
+  }
+}
+
 constexpr int kMsgTile = 32;
 constexpr int kMsgWaves = 4;
 __global__ __launch_bounds__(kMsgWaves * 32) void MsgApplyKernel(
@@ -470,8 +630,21 @@ __global__ __launch_bounds__(kThreads) void RouterKernel(const uint16_t* __restr
   }
 }
 
-// Multi-block decode router (bit-identical to RouterKernel): 4 waves (128 threads) per block, 1 wave per expert ->
-// E/4 blocks spread across CUs instead of 1 CU doing all E experts serially.
+// Dot product of 8 packed bf16s (uint4) in fp32.
+__device__ __forceinline__ float Dot8Bf16(const uint4& a, const uint4& b) {
+  float s = 0.0f;
+  s += r4dx::core::Bf16ToFloat(static_cast<uint16_t>(a.x & 0xFFFFu)) * r4dx::core::Bf16ToFloat(static_cast<uint16_t>(b.x & 0xFFFFu));
+  s += r4dx::core::Bf16ToFloat(static_cast<uint16_t>(a.x >> 16)) * r4dx::core::Bf16ToFloat(static_cast<uint16_t>(b.x >> 16));
+  s += r4dx::core::Bf16ToFloat(static_cast<uint16_t>(a.y & 0xFFFFu)) * r4dx::core::Bf16ToFloat(static_cast<uint16_t>(b.y & 0xFFFFu));
+  s += r4dx::core::Bf16ToFloat(static_cast<uint16_t>(a.y >> 16)) * r4dx::core::Bf16ToFloat(static_cast<uint16_t>(b.y >> 16));
+  s += r4dx::core::Bf16ToFloat(static_cast<uint16_t>(a.z & 0xFFFFu)) * r4dx::core::Bf16ToFloat(static_cast<uint16_t>(b.z & 0xFFFFu));
+  s += r4dx::core::Bf16ToFloat(static_cast<uint16_t>(a.z >> 16)) * r4dx::core::Bf16ToFloat(static_cast<uint16_t>(b.z >> 16));
+  s += r4dx::core::Bf16ToFloat(static_cast<uint16_t>(a.w & 0xFFFFu)) * r4dx::core::Bf16ToFloat(static_cast<uint16_t>(b.w & 0xFFFFu));
+  s += r4dx::core::Bf16ToFloat(static_cast<uint16_t>(a.w >> 16)) * r4dx::core::Bf16ToFloat(static_cast<uint16_t>(b.w >> 16));
+  return s;
+}
+
+// Multi-block decode router (uint4 vectorized when H % 8 == 0): 4 waves/block, 1 wave per expert.
 constexpr int kRouterWavesPerBlock = 4;
 __global__ __launch_bounds__(kRouterWavesPerBlock * 32) void RouterDotsKernel(
     const uint16_t* __restrict__ x, const uint16_t* __restrict__ gw, float* __restrict__ logits_out,
@@ -483,9 +656,46 @@ __global__ __launch_bounds__(kRouterWavesPerBlock * 32) void RouterDotsKernel(
   const uint16_t* xr = x + t * x_row_stride;
   const uint16_t* wr = gw + static_cast<int64_t>(e) * H;
   float a = 0.0f;
-  for (int h = lane; h < H; h += 32) a += r4dx::core::Bf16ToFloat(xr[h]) * r4dx::core::Bf16ToFloat(wr[h]);
+  if ((H & 7) == 0 && (x_row_stride & 7) == 0) {
+    const int H8 = H >> 3;
+    const uint4* x8 = reinterpret_cast<const uint4*>(xr);
+    const uint4* w8 = reinterpret_cast<const uint4*>(wr);
+    for (int h = lane; h < H8; h += 32) a += Dot8Bf16(x8[h], w8[h]);
+  } else {
+    for (int h = lane; h < H; h += 32) a += r4dx::core::Bf16ToFloat(xr[h]) * r4dx::core::Bf16ToFloat(wr[h]);
+  }
   a = WaveSum(a);
   if (lane == 0) logits_out[t * E + e] = a;
+}
+
+// 8-token-tiled prefill router (H % 8 == 0): reads gw[e] ONCE per 8 tokens (8x less weight traffic).
+__global__ __launch_bounds__(kRouterWavesPerBlock * 32) void RouterDotsTiled8Kernel(
+    const uint16_t* __restrict__ x, const uint16_t* __restrict__ gw, float* __restrict__ logits_out,
+    int T, int H, int E, int64_t x_row_stride) {
+  const int t0 = static_cast<int>(blockIdx.y) * 8;
+  const int wave = threadIdx.x >> 5, lane = threadIdx.x & 31;
+  const int e = static_cast<int>(blockIdx.x) * kRouterWavesPerBlock + wave;
+  if (e >= E) return;
+  const int nt = (T - t0 < 8) ? (T - t0) : 8;
+  const int H8 = H >> 3;
+  const int64_t s8 = x_row_stride >> 3;
+  const uint4* x8 = reinterpret_cast<const uint4*>(x + static_cast<int64_t>(t0) * x_row_stride);
+  const uint4* w8 = reinterpret_cast<const uint4*>(gw + static_cast<int64_t>(e) * H);
+  float a[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+  for (int h = lane; h < H8; h += 32) {
+    const uint4 wv = w8[h];
+#pragma unroll
+    for (int dt = 0; dt < 8; ++dt) {
+      if (dt < nt) a[dt] += Dot8Bf16(x8[dt * s8 + h], wv);
+    }
+  }
+#pragma unroll
+  for (int dt = 0; dt < 8; ++dt) {
+    if (dt < nt) {
+      const float v = WaveSum(a[dt]);
+      if (lane == 0) logits_out[static_cast<int64_t>(t0 + dt) * E + e] = v;
+    }
+  }
 }
 
 // Parallel wave32 top-k (bit-identical to RouterKernel: strict >, ties keep lower index; zero local array / scratch spill).
@@ -1084,7 +1294,204 @@ __global__ __launch_bounds__(kFusedWaves * 32) void Inkling2AttnPrefillKernel(co
   }
 }
 
-// ---- small dense GEMM: one wave per output element (1 wave/block at small M for CU spread, bit-identical) ----------
+// WMMA BF16 FlashAttention prefill kernel (gfx1201, head_dim == 128, d_rel <= 16):
+// Grid = (q_heads, ceil(q_len / 64)), Block = (128) = 4 waves (16 query rows per wave).
+// Uses 16x16x16 bf16 WMMA for both Q*K^T (8 ops) and P*V (8 ops) per 16-key tile.
+__global__ __launch_bounds__(128) void Inkling2AttnPrefillWmmaKernel(const R4dxInkling2AttnFusedArgs a) {
+  __shared__ unsigned short sk[16][128];       // 4 KiB: K[16][128]
+  __shared__ unsigned short sv_t[128][16];     // 4 KiB: V^T[128][16]
+  __shared__ unsigned short sp_hi[4][16][16];  // 2 KiB: P_hi[wave][16][16] (bf16)
+  __shared__ unsigned short sp_lo[4][16][16];  // 2 KiB: P_lo[wave][16][16] (bf16 residual -> 14-bit P)
+  __shared__ float sr[4][16][16];              // 4 KiB: r[wave][16][d_rel]
+
+  const int h = static_cast<int>(blockIdx.x);
+  const int gqa = a.q_heads / a.kv_heads;
+  const int kvh = h / gqa;
+  const int t0 = static_cast<int>(blockIdx.y) * 64;
+  const int wave = threadIdx.x >> 5;
+  const int lane = threadIdx.x & 31;
+  const int tw = t0 + wave * 16;
+  const int n = lane & 15;
+  const int m_hi = (lane >> 4) * 8;
+
+  const int ctx = (a.pos_dev != 0) ? (*reinterpret_cast<const int32_t*>(a.pos_dev) + a.q_len) : a.ctx;
+  const int t_last = (t0 + 63 < a.q_len) ? (t0 + 63) : (a.q_len - 1);
+  const int k_tile_begin = r4d_win_klow(ctx - a.q_len + t0, a.window);
+  const int k_tile_end_raw = ctx - a.q_len + t_last;
+  const int k_tile_end = (k_tile_end_raw < ctx - 1 ? k_tile_end_raw : ctx - 1) + 1;
+
+  const unsigned short* q_ptr = reinterpret_cast<const unsigned short*>(a.q);
+  const uint16_t* kv_ptr = reinterpret_cast<const uint16_t*>(a.kv);
+  const uint8_t* kv8_ptr = reinterpret_cast<const uint8_t*>(a.kv);
+  const int* bt = reinterpret_cast<const int*>(a.block_table);
+  const float* r_ptr = a.r ? reinterpret_cast<const float*>(a.r) : nullptr;
+  const float* proj_ptr = a.rel_proj ? reinterpret_cast<const float*>(a.rel_proj) : nullptr;
+  const bool has_rel = (r_ptr != nullptr && proj_ptr != nullptr && a.d_rel > 0 && a.rel_extent > 0);
+
+  // Load Q[16][128] into 8 v8bf fragments (32 VGPRs).
+  v8bf q_frag[8];
+  const int qr = tw + n;
+  if (qr < a.q_len) {
+    const unsigned short* qrow = q_ptr + (static_cast<size_t>(qr) * a.q_heads + h) * 128 + 4 * (lane >> 4);
+#pragma unroll
+    for (int s = 0; s < 8; ++s) q_frag[s] = fragP(qrow + s * 16);
+  } else {
+#pragma unroll
+    for (int s = 0; s < 8; ++s) q_frag[s] = v8bf{};
+  }
+
+  // Load r[16][d_rel] into LDS once per wave.
+  if (has_rel) {
+    for (int idx = lane; idx < 16 * 16; idx += 32) {
+      const int rm = idx >> 4;
+      const int rd = idx & 15;
+      const int rt = tw + rm;
+      sr[wave][rm][rd] =
+          (rt < a.q_len && rd < a.d_rel) ? r_ptr[(static_cast<int64_t>(rt) * a.q_heads + h) * a.d_rel + rd] : 0.0f;
+    }
+  }
+
+  v8f o_frag[8];
+#pragma unroll
+  for (int d = 0; d < 8; ++d) o_frag[d] = v8f{};
+  float m_row[8], l_row[8];
+#pragma unroll
+  for (int e = 0; e < 8; ++e) {
+    m_row[e] = -INFINITY;
+    l_row[e] = 0.0f;
+  }
+
+  const int bs = a.block_size;
+  const int w_t_last = (tw + 15 < a.q_len) ? (tw + 15) : (a.q_len - 1);
+  const int w_klow = (tw < a.q_len) ? r4d_win_klow(ctx - a.q_len + tw, a.window) : ctx;
+  const int w_khigh = (tw < a.q_len) ? ((ctx - a.q_len + w_t_last < ctx - 1) ? (ctx - a.q_len + w_t_last) : (ctx - 1)) : -1;
+
+  for (int kb = k_tile_begin; kb < k_tile_end; kb += 16) {
+    const int n_tile = (k_tile_end - kb < 16) ? (k_tile_end - kb) : 16;
+    // Cooperative load of K[16][128] and V^T[128][16].
+    for (int j = wave; j < 16; j += 4) {
+      if (j < n_tile) {
+        const int k = kb + j;
+        const int64_t base = static_cast<int64_t>(bt[k / bs]) * a.kv_block_stride +
+                             static_cast<int64_t>(kvh) * a.kv_head_stride +
+                             static_cast<int64_t>(k % bs) * (2 * kFusedHd);
+        uint2 kv_k, kv_v;
+        if (a.kv_fp8) {
+          float f0, f1, f2, f3;
+          Unpack4Fp8(*reinterpret_cast<const uint32_t*>(kv8_ptr + base + lane * 4), f0, f1, f2, f3);
+          kv_k = Pack4Bf16(f0, f1, f2, f3);
+          Unpack4Fp8(*reinterpret_cast<const uint32_t*>(kv8_ptr + base + kFusedHd + lane * 4), f0, f1, f2, f3);
+          kv_v = Pack4Bf16(f0, f1, f2, f3);
+        } else {
+          kv_k = *reinterpret_cast<const uint2*>(kv_ptr + base + lane * 4);
+          kv_v = *reinterpret_cast<const uint2*>(kv_ptr + base + kFusedHd + lane * 4);
+        }
+        *reinterpret_cast<uint2*>(&sk[j][lane * 4]) = kv_k;
+        sv_t[lane * 4 + 0][j] = static_cast<unsigned short>(kv_v.x & 0xFFFFu);
+        sv_t[lane * 4 + 1][j] = static_cast<unsigned short>(kv_v.x >> 16);
+        sv_t[lane * 4 + 2][j] = static_cast<unsigned short>(kv_v.y & 0xFFFFu);
+        sv_t[lane * 4 + 3][j] = static_cast<unsigned short>(kv_v.y >> 16);
+      } else {
+        *reinterpret_cast<uint2*>(&sk[j][lane * 4]) = make_uint2(0u, 0u);
+        sv_t[lane * 4 + 0][j] = 0;
+        sv_t[lane * 4 + 1][j] = 0;
+        sv_t[lane * 4 + 2][j] = 0;
+        sv_t[lane * 4 + 3][j] = 0;
+      }
+    }
+    __syncthreads();
+
+    if (tw < a.q_len && w_khigh >= kb && w_klow < kb + n_tile) {
+      // 1. Q * K^T (8 WMMA ops)
+      v8f sc = {};
+#pragma unroll
+      for (int s = 0; s < 8; ++s) {
+        sc = mma(q_frag[s], frag(&sk[0][0], 128, 0, s * 16, lane), sc);
+      }
+      // 2. Scale, rel bias, causal/window mask, online softmax -> sp_bf[wave][16][16]
+      const int k = kb + n;
+      const bool valid_k = (n < n_tile) && (k < ctx);
+#pragma unroll
+      for (int e = 0; e < 8; ++e) {
+        const int m = m_hi + e;
+        const int t = tw + m;
+        const int qpos = ctx - a.q_len + t;
+        const bool valid = valid_k && (t < a.q_len) && (k >= r4d_win_klow(qpos, a.window)) && (k <= qpos);
+        float val = -INFINITY;
+        if (valid) {
+          val = sc[e] * a.scale;
+          if (has_rel) {
+            const int dist = qpos - k;
+            if (dist < a.rel_extent) {
+              float rb = 0.0f;
+              for (int rd = 0; rd < a.d_rel; ++rd) {
+                rb += sr[wave][m][rd] * proj_ptr[static_cast<int64_t>(rd) * a.rel_extent + dist];
+              }
+              val += rb;
+            }
+          }
+        }
+        const float tm = HalfWaveMax(val);
+        if (tm != -INFINITY) {
+          const float mn = fmaxf(m_row[e], tm);
+          const float alpha = (m_row[e] == -INFINITY) ? 0.0f : expf(m_row[e] - mn);
+          const float pv = (val == -INFINITY) ? 0.0f : expf(val - mn);
+          l_row[e] = l_row[e] * alpha + HalfWaveSum(pv);
+          m_row[e] = mn;
+          const uint16_t p_hi_u = r4dx::core::FloatToBf16(pv);
+          const uint16_t p_lo_u = r4dx::core::FloatToBf16(pv - r4dx::core::Bf16ToFloat(p_hi_u));
+          sp_hi[wave][m][n] = p_hi_u;
+          sp_lo[wave][m][n] = p_lo_u;
+          if (alpha != 1.0f) {
+#pragma unroll
+            for (int d = 0; d < 8; ++d) o_frag[d][e] *= alpha;
+          }
+        } else {
+          sp_hi[wave][m][n] = 0;
+          sp_lo[wave][m][n] = 0;
+        }
+      }
+      asm volatile("s_wait_dscnt 0x0" ::: "memory");
+      // 3. P * V (2-term bf16 split for 14-bit P precision -> <= 1-2 bf16 ULP, zero extra V loads)
+      const v8bf p_hi_f = frag(&sp_hi[wave][0][0], 16, 0, 0, lane);
+      const v8bf p_lo_f = frag(&sp_lo[wave][0][0], 16, 0, 0, lane);
+#pragma unroll
+      for (int d = 0; d < 8; ++d) {
+        const v8bf vf = frag(&sv_t[0][0], 16, d * 16, 0, lane);
+        o_frag[d] = mma(p_hi_f, vf, o_frag[d]);
+        o_frag[d] = mma(p_lo_f, vf, o_frag[d]);
+      }
+    }
+    __syncthreads();
+  }
+
+  // Epilogue: sink + normalize + store bf16.
+  const float* sink_ptr = a.sink ? reinterpret_cast<const float*>(a.sink) : nullptr;
+  uint16_t* out_ptr = reinterpret_cast<uint16_t*>(a.out);
+#pragma unroll
+  for (int e = 0; e < 8; ++e) {
+    const int m = m_hi + e;
+    const int t = tw + m;
+    if (t >= a.q_len) continue;
+    float scale_o;
+    if (sink_ptr != nullptr) {
+      const float sv_s = sink_ptr[static_cast<int64_t>(t) * a.q_heads + h];
+      const float mn = fmaxf(m_row[e], sv_s);
+      const float alpha = (m_row[e] == -INFINITY) ? 0.0f : expf(m_row[e] - mn);
+      const float l_tot = l_row[e] * alpha + expf(sv_s - mn);
+      scale_o = (l_tot > 0.0f) ? (alpha / l_tot) : 0.0f;
+    } else {
+      scale_o = (l_row[e] > 0.0f) ? (1.0f / l_row[e]) : 0.0f;
+    }
+    uint16_t* orow = out_ptr + (static_cast<int64_t>(t) * a.q_heads + h) * 128;
+#pragma unroll
+    for (int d = 0; d < 8; ++d) {
+      orow[d * 16 + n] = r4dx::core::FloatToBf16(o_frag[d][e] * scale_o);
+    }
+  }
+}
+
+// ---- small dense GEMM: uint4 vectorized (8x bf16/load) + 4-row prefill tiling ----------
 __global__ __launch_bounds__(32) void DenseBf16DecodeKernel(const uint16_t* __restrict__ x, int64_t xs,
                                                             const uint16_t* __restrict__ w, void* __restrict__ out,
                                                             int out_bf16, int64_t os, int N, int K) {
@@ -1095,7 +1502,14 @@ __global__ __launch_bounds__(32) void DenseBf16DecodeKernel(const uint16_t* __re
   const uint16_t* xr = x + m * xs;
   const uint16_t* wr = w + static_cast<int64_t>(n) * K;
   float a = 0.0f;
-  for (int k = lane; k < K; k += 32) a += r4dx::core::Bf16ToFloat(xr[k]) * r4dx::core::Bf16ToFloat(wr[k]);
+  if ((K & 7) == 0 && (xs & 7) == 0) {
+    const int K8 = K >> 3;
+    const uint4* x8 = reinterpret_cast<const uint4*>(xr);
+    const uint4* w8 = reinterpret_cast<const uint4*>(wr);
+    for (int k = lane; k < K8; k += 32) a += Dot8Bf16(x8[k], w8[k]);
+  } else {
+    for (int k = lane; k < K; k += 32) a += r4dx::core::Bf16ToFloat(xr[k]) * r4dx::core::Bf16ToFloat(wr[k]);
+  }
   a = WaveSum(a);
   if (lane != 0) return;
   if (out_bf16) {
@@ -1103,6 +1517,42 @@ __global__ __launch_bounds__(32) void DenseBf16DecodeKernel(const uint16_t* __re
   } else {
     static_cast<float*>(out)[m * os + n] = a;
   }
+}
+
+__global__ __launch_bounds__(128) void DenseBf16Tiled4Kernel(const uint16_t* __restrict__ x, int64_t xs,
+                                                             const uint16_t* __restrict__ w, void* __restrict__ out,
+                                                             int out_bf16, int64_t os, int M, int N, int K) {
+  const int m0 = static_cast<int>(blockIdx.y) * 4;
+  const int wave = threadIdx.x >> 5, lane = threadIdx.x & 31;
+  const int n = static_cast<int>(blockIdx.x) * 4 + wave;
+  if (n >= N) return;
+  const int nm = (M - m0 < 4) ? (M - m0) : 4;
+  const int K8 = K >> 3;
+  const int64_t xs8 = xs >> 3;
+  const uint4* x8 = reinterpret_cast<const uint4*>(x + static_cast<int64_t>(m0) * xs);
+  const uint4* w8 = reinterpret_cast<const uint4*>(w + static_cast<int64_t>(n) * K);
+  float a0 = 0.0f, a1 = 0.0f, a2 = 0.0f, a3 = 0.0f;
+  for (int k = lane; k < K8; k += 32) {
+    const uint4 wv = w8[k];
+    a0 += Dot8Bf16(x8[k], wv);
+    if (nm > 1) a1 += Dot8Bf16(x8[xs8 + k], wv);
+    if (nm > 2) a2 += Dot8Bf16(x8[2 * xs8 + k], wv);
+    if (nm > 3) a3 += Dot8Bf16(x8[3 * xs8 + k], wv);
+  }
+  a0 = WaveSum(a0);
+  if (nm > 1) a1 = WaveSum(a1);
+  if (nm > 2) a2 = WaveSum(a2);
+  if (nm > 3) a3 = WaveSum(a3);
+  if (lane != 0) return;
+  auto store = [&](int dm, float v) {
+    const int64_t idx = static_cast<int64_t>(m0 + dm) * os + n;
+    if (out_bf16) static_cast<uint16_t*>(out)[idx] = r4dx::core::FloatToBf16(v);
+    else static_cast<float*>(out)[idx] = v;
+  };
+  store(0, a0);
+  if (nm > 1) store(1, a1);
+  if (nm > 2) store(2, a2);
+  if (nm > 3) store(3, a3);
 }
 
 __global__ __launch_bounds__(kThreads) void DenseBf16Kernel(const uint16_t* __restrict__ x, int64_t xs,
@@ -1288,6 +1738,24 @@ void r4dx_inkling2_msg_gate_apply_f32(int64_t x, int64_t m, int64_t g, int g_bf1
   if (T <= 0) return;
   if (x == 0 || m == 0 || g == 0 || forget == 0 || gain == 0 || out == 0) Fail(fn, "null pointer");
   if (H < 1 || R < 1 || R > kMaxRank) Fail(fn, "H >= 1 and R in 1..256");
+  if ((R & 3) == 0 && (forget & 15) == 0 && (gain & 15) == 0) {
+    const unsigned bx = static_cast<unsigned>((H + 7) / 8);
+    if (T >= 4) {
+      hipLaunchKernelGGL(MsgApplyTiled4Kernel, dim3(bx, static_cast<unsigned>((T + 3) / 4)), dim3(128), 0,
+                         reinterpret_cast<hipStream_t>(stream), reinterpret_cast<const float*>(x),
+                         reinterpret_cast<const float*>(m), reinterpret_cast<const void*>(g), g_bf16,
+                         reinterpret_cast<const float*>(forget), reinterpret_cast<const float*>(gain),
+                         reinterpret_cast<float*>(out), T, H, R);
+    } else {
+      hipLaunchKernelGGL(MsgApplyVec4Kernel, dim3(bx, static_cast<unsigned>(T)), dim3(128), 0,
+                         reinterpret_cast<hipStream_t>(stream), reinterpret_cast<const float*>(x),
+                         reinterpret_cast<const float*>(m), reinterpret_cast<const void*>(g), g_bf16,
+                         reinterpret_cast<const float*>(forget), reinterpret_cast<const float*>(gain),
+                         reinterpret_cast<float*>(out), H, R);
+    }
+    CheckLaunch(fn);
+    return;
+  }
   hipLaunchKernelGGL(MsgApplyKernel, dim3(static_cast<unsigned>((H + kMsgTile - 1) / kMsgTile), static_cast<unsigned>(T)),
                      dim3(kMsgWaves * 32), 0, reinterpret_cast<hipStream_t>(stream), reinterpret_cast<const float*>(x),
                      reinterpret_cast<const float*>(m), reinterpret_cast<const void*>(g), g_bf16,
@@ -1304,12 +1772,19 @@ void r4dx_inkling2_router_f32(int64_t x, int64_t gate_w, int64_t bias, int64_t i
   if (E < 1 || E > kMaxExperts) Fail(fn, "E must be 1..256");
   if (top_k < 1 || top_k > kMaxTopK || top_k > E) Fail(fn, "top_k must be 1..min(16, E)");
   if (H < 1 || H > 8192 || x_row_stride < H) Fail(fn, "H must be 1..8192 and x_row_stride >= H");
-  if (T < 16 && logits_out != 0 && E >= 16) {
+  if (logits_out != 0 && E >= 16) {
     const unsigned blocks_e = static_cast<unsigned>((E + kRouterWavesPerBlock - 1) / kRouterWavesPerBlock);
-    hipLaunchKernelGGL(RouterDotsKernel, dim3(blocks_e, static_cast<unsigned>(T)), dim3(kRouterWavesPerBlock * 32), 0,
-                       reinterpret_cast<hipStream_t>(stream), reinterpret_cast<const uint16_t*>(x),
-                       reinterpret_cast<const uint16_t*>(gate_w), reinterpret_cast<float*>(logits_out), H, E,
-                       x_row_stride);
+    if (T >= 8 && (H & 7) == 0 && (x_row_stride & 7) == 0 && (x & 15) == 0 && (gate_w & 15) == 0) {
+      hipLaunchKernelGGL(RouterDotsTiled8Kernel, dim3(blocks_e, static_cast<unsigned>((T + 7) / 8)),
+                         dim3(kRouterWavesPerBlock * 32), 0, reinterpret_cast<hipStream_t>(stream),
+                         reinterpret_cast<const uint16_t*>(x), reinterpret_cast<const uint16_t*>(gate_w),
+                         reinterpret_cast<float*>(logits_out), T, H, E, x_row_stride);
+    } else {
+      hipLaunchKernelGGL(RouterDotsKernel, dim3(blocks_e, static_cast<unsigned>(T)), dim3(kRouterWavesPerBlock * 32), 0,
+                         reinterpret_cast<hipStream_t>(stream), reinterpret_cast<const uint16_t*>(x),
+                         reinterpret_cast<const uint16_t*>(gate_w), reinterpret_cast<float*>(logits_out), H, E,
+                         x_row_stride);
+    }
     CheckLaunch(fn);
     hipLaunchKernelGGL(RouterTopkKernel, dim3(static_cast<unsigned>(T)), dim3(32), 0,
                        reinterpret_cast<hipStream_t>(stream), reinterpret_cast<const float*>(logits_out),
@@ -1364,6 +1839,15 @@ void r4dx_inkling2_dense_bf16(int64_t x, int64_t x_row_stride, int64_t w, int64_
     hipLaunchKernelGGL(DenseBf16DecodeKernel, dim3(static_cast<unsigned>(N), static_cast<unsigned>(M)), dim3(32), 0,
                        reinterpret_cast<hipStream_t>(stream), reinterpret_cast<const uint16_t*>(x), x_row_stride,
                        reinterpret_cast<const uint16_t*>(w), reinterpret_cast<void*>(out), out_bf16, out_row_stride, N, K);
+    CheckLaunch(fn);
+    return;
+  }
+  if (M > 4 && (K & 7) == 0 && (x_row_stride & 7) == 0 && (x & 15) == 0 && (w & 15) == 0) {
+    hipLaunchKernelGGL(DenseBf16Tiled4Kernel,
+                       dim3(static_cast<unsigned>((N + 3) / 4), static_cast<unsigned>((M + 3) / 4)), dim3(128), 0,
+                       reinterpret_cast<hipStream_t>(stream), reinterpret_cast<const uint16_t*>(x), x_row_stride,
+                       reinterpret_cast<const uint16_t*>(w), reinterpret_cast<void*>(out), out_bf16, out_row_stride, M,
+                       N, K);
     CheckLaunch(fn);
     return;
   }
@@ -1454,6 +1938,14 @@ int r4dx_inkling2_attn_fused_bf16kv(const R4dxInkling2AttnFusedArgs* a, int64_t 
       if (e != hipSuccess) return -100 - static_cast<int>(e);
       r4dx_kernel_launch_counter_add(1);
     }
+    return 0;
+  }
+  if (a->q_len >= 16 && (a->r == 0 || a->d_rel <= 16)) {
+    const dim3 wgrid(static_cast<unsigned>(a->q_heads), static_cast<unsigned>((a->q_len + 63) / 64));
+    hipLaunchKernelGGL(Inkling2AttnPrefillWmmaKernel, wgrid, dim3(128), 0, st, *a);
+    const hipError_t e = hipGetLastError();
+    if (e != hipSuccess) return -100 - static_cast<int>(e);
+    r4dx_kernel_launch_counter_add(1);
     return 0;
   }
   const dim3 grid(static_cast<unsigned>(a->kv_heads), static_cast<unsigned>((a->q_len + kFusedWaves - 1) / kFusedWaves));

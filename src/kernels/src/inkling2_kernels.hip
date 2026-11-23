@@ -48,6 +48,46 @@ __device__ __forceinline__ float BlockSum(float v, float* red) {
   return out;
 }
 
+__device__ __forceinline__ uint8_t FloatToFp8E4m3Fn(float x) {
+  const uint32_t bits = __float_as_uint(x);
+  const uint32_t sign = (bits >> 24) & 0x80u;
+  const float ax = fabsf(x);
+  if (!(ax > 0.0f)) return static_cast<uint8_t>(sign);
+  if (ax >= 448.0f) return static_cast<uint8_t>(sign | 0x7Eu);
+  const uint32_t abits = __float_as_uint(ax);
+  const int exp = static_cast<int>((abits >> 23) & 0xFFu) - 127;
+  const uint32_t mant = abits & 0x7FFFFFu;
+  if (exp < -6) {
+    const int m = __float2int_rn(ax * 512.0f);
+    if (m <= 0) return static_cast<uint8_t>(sign);
+    if (m >= 8) return static_cast<uint8_t>(sign | 0x08u);
+    return static_cast<uint8_t>(sign | static_cast<uint32_t>(m));
+  }
+  const int e4 = exp + 7;
+  const uint32_t m3 = (mant + 0x7FFFFu + ((mant >> 20) & 1u)) >> 20;
+  const uint32_t code = (static_cast<uint32_t>(e4) << 3) + m3;
+  return static_cast<uint8_t>(sign | (code > 0x7Eu ? 0x7Eu : code));
+}
+
+__device__ __forceinline__ float Fp8E4m3FnToFloat(uint8_t c) {
+  const uint32_t sign = (static_cast<uint32_t>(c) & 0x80u) << 24;
+  const uint32_t e = (c >> 3) & 0xFu;
+  const uint32_t m = c & 0x7u;
+  if (e == 0u) {
+    const float v = static_cast<float>(m) * (1.0f / 512.0f);
+    return sign ? -v : v;
+  }
+  if (e == 15u && m == 7u) return 0.0f;
+  return __uint_as_float(sign | ((e + 120u) << 23) | (m << 20));
+}
+
+__device__ __forceinline__ void Unpack4Fp8(uint32_t p, float& f0, float& f1, float& f2, float& f3) {
+  f0 = Fp8E4m3FnToFloat(static_cast<uint8_t>(p & 0xFFu));
+  f1 = Fp8E4m3FnToFloat(static_cast<uint8_t>((p >> 8) & 0xFFu));
+  f2 = Fp8E4m3FnToFloat(static_cast<uint8_t>((p >> 16) & 0xFFu));
+  f3 = Fp8E4m3FnToFloat(static_cast<uint8_t>((p >> 24) & 0xFFu));
+}
+
 __device__ __forceinline__ float SigmoidF(float x) { return 1.0f / (1.0f + expf(-x)); }
 
 // ---- attnres ---------------------------------------------------------------------------------------------------
@@ -269,7 +309,11 @@ __global__ __launch_bounds__(kThreads) void HeadKernel(HeadArgs a) {
     if (a.o.kind == 0) {
       const int64_t idx = static_cast<int64_t>(t) * a.o.out_row_stride + static_cast<int64_t>(h) * a.d + i;
       if (a.o.out_bf16)
+        if (a.o.out_fp8) {
+        reinterpret_cast<uint8_t*>(a.o.out)[idx] = FloatToFp8E4m3Fn(y);
+      } else {
         reinterpret_cast<uint16_t*>(a.o.out)[idx] = r4dx::core::FloatToBf16(y);
+      }
       else
         reinterpret_cast<float*>(a.o.out)[idx] = y;
     } else {
@@ -278,7 +322,11 @@ __global__ __launch_bounds__(kThreads) void HeadKernel(HeadArgs a) {
       const int64_t idx = static_cast<int64_t>(bt[p / a.o.block_size]) * a.o.kv_block_stride +
                           static_cast<int64_t>(h) * a.o.kv_head_stride + (p % a.o.block_size) * 2 * a.d +
                           a.o.col_offset + i;
-      reinterpret_cast<uint16_t*>(a.o.out)[idx] = r4dx::core::FloatToBf16(y);
+      if (a.o.out_fp8) {
+        reinterpret_cast<uint8_t*>(a.o.out)[idx] = FloatToFp8E4m3Fn(y);
+      } else {
+        reinterpret_cast<uint16_t*>(a.o.out)[idx] = r4dx::core::FloatToBf16(y);
+      }
     }
   }
 }
@@ -709,9 +757,14 @@ __global__ __launch_bounds__(kFusedWaves * 32) void Inkling2AttnDecodeSplitKerne
       const int64_t base = static_cast<int64_t>(bt[k / bs]) * a.kv_block_stride +
                            static_cast<int64_t>(kvh) * a.kv_head_stride +
                            static_cast<int64_t>(k % bs) * (2 * kFusedHd);
-      const uint2 kv_k = *reinterpret_cast<const uint2*>(kv_ptr + base + lane * 4);
       float k0, k1, k2, k3;
-      Unpack4Bf16(kv_k, k0, k1, k2, k3);
+      if (a.kv_fp8) {
+        const uint32_t p = *reinterpret_cast<const uint32_t*>(reinterpret_cast<const uint8_t*>(a.kv) + base + lane * 4);
+        Unpack4Fp8(p, k0, k1, k2, k3);
+      } else {
+        const uint2 kv_k = *reinterpret_cast<const uint2*>(kv_ptr + base + lane * 4);
+        Unpack4Bf16(kv_k, k0, k1, k2, k3);
+      }
       const int dist = qpos - k;
       const bool use_rel = has_rel && dist < a.rel_extent;
       const float pj = (use_rel && lane < a.d_rel) ? proj_ptr[static_cast<int64_t>(lane) * a.rel_extent + dist] : 0.0f;
@@ -752,9 +805,15 @@ __global__ __launch_bounds__(kFusedWaves * 32) void Inkling2AttnDecodeSplitKerne
       const int64_t base = static_cast<int64_t>(bt[k / bs]) * a.kv_block_stride +
                            static_cast<int64_t>(kvh) * a.kv_head_stride +
                            static_cast<int64_t>(k % bs) * (2 * kFusedHd);
-      const uint2 kv_v = *reinterpret_cast<const uint2*>(kv_ptr + base + kFusedHd + lane * 4);
       float v0, v1, v2, v3;
-      Unpack4Bf16(kv_v, v0, v1, v2, v3);
+      if (a.kv_fp8) {
+        const uint32_t p =
+            *reinterpret_cast<const uint32_t*>(reinterpret_cast<const uint8_t*>(a.kv) + base + kFusedHd + lane * 4);
+        Unpack4Fp8(p, v0, v1, v2, v3);
+      } else {
+        const uint2 kv_v = *reinterpret_cast<const uint2*>(kv_ptr + base + kFusedHd + lane * 4);
+        Unpack4Bf16(kv_v, v0, v1, v2, v3);
+      }
 #pragma unroll
       for (int g = 0; g < GQA; ++g) {
         const float p = expf(s_tile[g][j] - tile_m[g]);
@@ -951,8 +1010,14 @@ __global__ __launch_bounds__(kFusedWaves * 32) void Inkling2AttnPrefillKernel(co
       const int64_t base = static_cast<int64_t>(bt[k / bs]) * a.kv_block_stride +
                            static_cast<int64_t>(kvh) * a.kv_head_stride +
                            static_cast<int64_t>(k % bs) * (2 * kFusedHd);
-      sk[j][lane] = *reinterpret_cast<const uint2*>(kv_ptr + base + lane * 4);
-      sv[j][lane] = *reinterpret_cast<const uint2*>(kv_ptr + base + kFusedHd + lane * 4);
+      if (a.kv_fp8) {
+        const uint8_t* kv8 = reinterpret_cast<const uint8_t*>(a.kv);
+        sk[j][lane].x = *reinterpret_cast<const uint32_t*>(kv8 + base + lane * 4);
+        sv[j][lane].x = *reinterpret_cast<const uint32_t*>(kv8 + base + kFusedHd + lane * 4);
+      } else {
+        sk[j][lane] = *reinterpret_cast<const uint2*>(kv_ptr + base + lane * 4);
+        sv[j][lane] = *reinterpret_cast<const uint2*>(kv_ptr + base + kFusedHd + lane * 4);
+      }
     }
     __syncthreads();
 
@@ -961,8 +1026,13 @@ __global__ __launch_bounds__(kFusedWaves * 32) void Inkling2AttnPrefillKernel(co
         const int k = kb + j;
         if (k < klow || k > khigh) continue;
         float k0, k1, k2, k3, v0, v1, v2, v3;
-        Unpack4Bf16(sk[j][lane], k0, k1, k2, k3);
-        Unpack4Bf16(sv[j][lane], v0, v1, v2, v3);
+        if (a.kv_fp8) {
+          Unpack4Fp8(sk[j][lane].x, k0, k1, k2, k3);
+          Unpack4Fp8(sv[j][lane].x, v0, v1, v2, v3);
+        } else {
+          Unpack4Bf16(sk[j][lane], k0, k1, k2, k3);
+          Unpack4Bf16(sv[j][lane], v0, v1, v2, v3);
+        }
 
         const int dist = qpos - k;
         const bool use_rel = has_rel && dist < a.rel_extent;
@@ -1525,12 +1595,26 @@ __global__ __launch_bounds__(kThreads) void DsparkKvWriteKernel(
   v_store[slot * elems_per_row + rem] = v_in[idx];
 }
 
+__global__ __launch_bounds__(kThreads) void DsparkKvWriteFp8Kernel(
+    const uint16_t* __restrict__ k_in, const uint16_t* __restrict__ v_in, uint8_t* __restrict__ k_store,
+    uint8_t* __restrict__ v_store, int n, int kv_heads, int head_dim, int64_t pos0, int slots) {
+  const int64_t elems_per_row = static_cast<int64_t>(kv_heads) * head_dim;
+  const int64_t total = static_cast<int64_t>(n) * elems_per_row;
+  const int64_t idx = static_cast<int64_t>(blockIdx.x) * kThreads + threadIdx.x;
+  if (idx >= total) return;
+  const int64_t r = idx / elems_per_row;
+  const int64_t rem = idx - r * elems_per_row;
+  const int64_t slot = (pos0 + r) % slots;
+  k_store[slot * elems_per_row + rem] = FloatToFp8E4m3Fn(r4dx::core::Bf16ToFloat(k_in[idx]));
+  v_store[slot * elems_per_row + rem] = FloatToFp8E4m3Fn(r4dx::core::Bf16ToFloat(v_in[idx]));
+}
+
 // Bidirectional block attention for DSpark draft (head_dim == 128): grid = (q_heads, T), block = 128 (4 waves).
 __global__ __launch_bounds__(128) void DsparkAttnKernel(
     const uint16_t* __restrict__ q_ptr, const uint16_t* __restrict__ kb_ptr, const uint16_t* __restrict__ vb_ptr,
-    const uint16_t* __restrict__ ks_ptr, const uint16_t* __restrict__ vs_ptr, uint16_t* __restrict__ out_ptr,
+    const void* __restrict__ ks_ptr, const void* __restrict__ vs_ptr, uint16_t* __restrict__ out_ptr,
     int T, int q_heads, int kv_heads, int n_injected, const int64_t* __restrict__ pos_dev, int window, int slots,
-    float scale) {
+    float scale, int kv_fp8) {
   const int n_inj = (pos_dev != nullptr) ? static_cast<int>(*pos_dev) : n_injected;
   __shared__ float sm[4];
   __shared__ float sl[4];
@@ -1555,21 +1639,26 @@ __global__ __launch_bounds__(128) void DsparkAttnKernel(
   const int total_k = ctx_len + T;
 
   for (int idx = wave; idx < total_k; idx += 4) {
-    const uint16_t* kr;
-    const uint16_t* vr;
+    float k0, k1, k2, k3, v0, v1, v2, v3;
     if (idx < ctx_len) {
       const int64_t slot = (k_begin + idx) % slots;
       const int64_t off = slot * kv_row_stride + static_cast<int64_t>(kvh) * 128;
-      kr = ks_ptr + off;
-      vr = vs_ptr + off;
+      if (kv_fp8) {
+        Unpack4Fp8(*reinterpret_cast<const uint32_t*>(reinterpret_cast<const uint8_t*>(ks_ptr) + off + lane * 4),
+                   k0, k1, k2, k3);
+        Unpack4Fp8(*reinterpret_cast<const uint32_t*>(reinterpret_cast<const uint8_t*>(vs_ptr) + off + lane * 4),
+                   v0, v1, v2, v3);
+      } else {
+        Unpack4Bf16(*reinterpret_cast<const uint2*>(reinterpret_cast<const uint16_t*>(ks_ptr) + off + lane * 4),
+                    k0, k1, k2, k3);
+        Unpack4Bf16(*reinterpret_cast<const uint2*>(reinterpret_cast<const uint16_t*>(vs_ptr) + off + lane * 4),
+                    v0, v1, v2, v3);
+      }
     } else {
       const int64_t off = static_cast<int64_t>(idx - ctx_len) * kv_row_stride + static_cast<int64_t>(kvh) * 128;
-      kr = kb_ptr + off;
-      vr = vb_ptr + off;
+      Unpack4Bf16(*reinterpret_cast<const uint2*>(kb_ptr + off + lane * 4), k0, k1, k2, k3);
+      Unpack4Bf16(*reinterpret_cast<const uint2*>(vb_ptr + off + lane * 4), v0, v1, v2, v3);
     }
-    float k0, k1, k2, k3, v0, v1, v2, v3;
-    Unpack4Bf16(*reinterpret_cast<const uint2*>(kr + lane * 4), k0, k1, k2, k3);
-    Unpack4Bf16(*reinterpret_cast<const uint2*>(vr + lane * 4), v0, v1, v2, v3);
     float dot = (q0 * k0 + q1 * k1 + q2 * k2 + q3 * k3);
     dot = WaveSum(dot) * scale;
     const float mn = fmaxf(mv, dot);
@@ -1716,9 +1805,9 @@ void r4dx_inkling2_dspark_attn_bf16(int64_t q, int64_t k_block, int64_t v_block,
   hipLaunchKernelGGL(DsparkAttnKernel, dim3(static_cast<unsigned>(q_heads), static_cast<unsigned>(T)), dim3(128), 0,
                      reinterpret_cast<hipStream_t>(stream), reinterpret_cast<const uint16_t*>(q),
                      reinterpret_cast<const uint16_t*>(k_block), reinterpret_cast<const uint16_t*>(v_block),
-                     reinterpret_cast<const uint16_t*>(k_store), reinterpret_cast<const uint16_t*>(v_store),
+                     reinterpret_cast<const void*>(k_store), reinterpret_cast<const void*>(v_store),
                      reinterpret_cast<uint16_t*>(out), T, q_heads, kv_heads, n_injected,
-                     static_cast<const int64_t*>(nullptr), window, slots, scale);
+                     static_cast<const int64_t*>(nullptr), window, slots, scale, 0);
   CheckLaunch(fn);
 }
 
@@ -1734,9 +1823,41 @@ void r4dx_inkling2_dspark_attn_posdev_bf16(int64_t q, int64_t k_block, int64_t v
   hipLaunchKernelGGL(DsparkAttnKernel, dim3(static_cast<unsigned>(q_heads), static_cast<unsigned>(T)), dim3(128), 0,
                      reinterpret_cast<hipStream_t>(stream), reinterpret_cast<const uint16_t*>(q),
                      reinterpret_cast<const uint16_t*>(k_block), reinterpret_cast<const uint16_t*>(v_block),
-                     reinterpret_cast<const uint16_t*>(k_store), reinterpret_cast<const uint16_t*>(v_store),
+                     reinterpret_cast<const void*>(k_store), reinterpret_cast<const void*>(v_store),
                      reinterpret_cast<uint16_t*>(out), T, q_heads, kv_heads, 0,
-                     reinterpret_cast<const int64_t*>(pos_dev), window, slots, scale);
+                     reinterpret_cast<const int64_t*>(pos_dev), window, slots, scale, 0);
+  CheckLaunch(fn);
+}
+
+void r4dx_inkling2_dspark_kv_write_fp8(int64_t k_in, int64_t v_in, int64_t k_store_fp8, int64_t v_store_fp8, int n,
+                                       int kv_heads, int head_dim, int64_t pos0, int slots, int64_t stream) {
+  const char* fn = "r4dx_inkling2_dspark_kv_write_fp8";
+  if (n <= 0) return;
+  if (k_in == 0 || v_in == 0 || k_store_fp8 == 0 || v_store_fp8 == 0 || slots <= 0) Fail(fn, "null pointer or slots <= 0");
+  const int64_t total = static_cast<int64_t>(n) * kv_heads * head_dim;
+  hipLaunchKernelGGL(DsparkKvWriteFp8Kernel, dim3(static_cast<unsigned>((total + kThreads - 1) / kThreads)),
+                     dim3(kThreads), 0, reinterpret_cast<hipStream_t>(stream), reinterpret_cast<const uint16_t*>(k_in),
+                     reinterpret_cast<const uint16_t*>(v_in), reinterpret_cast<uint8_t*>(k_store_fp8),
+                     reinterpret_cast<uint8_t*>(v_store_fp8), n, kv_heads, head_dim, pos0, slots);
+  CheckLaunch(fn);
+}
+
+void r4dx_inkling2_dspark_attn_fp8kv(int64_t q, int64_t k_block, int64_t v_block, int64_t k_store_fp8,
+                                     int64_t v_store_fp8, int64_t out, int T, int q_heads, int kv_heads, int head_dim,
+                                     int n_injected, int64_t pos_dev, int window, int slots, float scale,
+                                     int64_t stream) {
+  const char* fn = "r4dx_inkling2_dspark_attn_fp8kv";
+  if (T <= 0) return;
+  if (q == 0 || k_block == 0 || v_block == 0 || out == 0 || head_dim != 128 || kv_heads <= 0 ||
+      q_heads % kv_heads != 0) {
+    Fail(fn, "invalid args");
+  }
+  hipLaunchKernelGGL(DsparkAttnKernel, dim3(static_cast<unsigned>(q_heads), static_cast<unsigned>(T)), dim3(128), 0,
+                     reinterpret_cast<hipStream_t>(stream), reinterpret_cast<const uint16_t*>(q),
+                     reinterpret_cast<const uint16_t*>(k_block), reinterpret_cast<const uint16_t*>(v_block),
+                     reinterpret_cast<const void*>(k_store_fp8), reinterpret_cast<const void*>(v_store_fp8),
+                     reinterpret_cast<uint16_t*>(out), T, q_heads, kv_heads, n_injected,
+                     reinterpret_cast<const int64_t*>(pos_dev), window, slots, scale, 1);
   CheckLaunch(fn);
 }
 

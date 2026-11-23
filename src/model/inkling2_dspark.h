@@ -97,8 +97,10 @@ class Inkling2DsparkDraft {
     QuantLinear q_proj, k_proj, v_proj, o_proj;
     QuantLinear k_proj_ctx, v_proj_ctx;
     QuantLinear gate_up_proj, down_proj;
-    core::DeviceBuffer<uint16_t> k_store, v_store;  // [slots, kv_heads, head_dim]
+    core::DeviceBuffer<uint16_t> k_store, v_store;  // [slots, kv_heads, head_dim] bf16
+    core::DeviceBuffer<uint8_t> k_store_fp8, v_store_fp8;  // [slots, kv_heads, head_dim] fp8 (full layer when R4DX_INK_KV_FP8=1)
     core::DeviceBuffer<uint16_t> k_store_ckpt, v_store_ckpt;
+    bool kv_fp8 = false;
     int slots = 0;
     int window = 0;
   };

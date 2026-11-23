@@ -193,8 +193,18 @@ Inkling2DsparkDraft Inkling2DsparkDraft::Load(const std::string& safetensors_pat
     L.window = local ? static_cast<int>(c.sliding_window) : 0;
     L.slots = local ? static_cast<int>(std::min<int64_t>(max_ctx, 2048)) : static_cast<int>(max_ctx);
     const size_t kv_elems = static_cast<size_t>(L.slots) * static_cast<size_t>(KV);
-    L.k_store = core::DeviceBuffer<uint16_t>(kv_elems);
-    L.v_store = core::DeviceBuffer<uint16_t>(kv_elems);
+    const char* kv_fp8_env = std::getenv("R4DX_INK_KV_FP8");
+    const bool use_kv_fp8 = !local && kv_fp8_env != nullptr &&
+                            (std::strcmp(kv_fp8_env, "1") == 0 || std::strcmp(kv_fp8_env, "on") == 0 ||
+                             std::strcmp(kv_fp8_env, "true") == 0);
+    L.kv_fp8 = use_kv_fp8;
+    if (use_kv_fp8) {
+      L.k_store_fp8 = core::DeviceBuffer<uint8_t>(kv_elems);
+      L.v_store_fp8 = core::DeviceBuffer<uint8_t>(kv_elems);
+    } else {
+      L.k_store = core::DeviceBuffer<uint16_t>(kv_elems);
+      L.v_store = core::DeviceBuffer<uint16_t>(kv_elems);
+    }
   }
 
   // Recurrent Markov head
@@ -421,9 +431,15 @@ void Inkling2DsparkDraft::InjectTaps(const uint16_t* tap0, const uint16_t* tap1,
     r4dx_inkling2_dspark_head_norm_rope_bf16(P(k), KV, P(L.k_norm_ctx.data()), static_cast<int>(n),
                                              static_cast<int>(cfg_.num_key_value_heads), static_cast<int>(cfg_.head_dim),
                                              pos0, cfg_.rope_theta, cfg_.rms_norm_eps, s);
-    r4dx_inkling2_dspark_kv_write_bf16(P(k), P(v), P(L.k_store.data()), P(L.v_store.data()), static_cast<int>(n),
-                                       static_cast<int>(cfg_.num_key_value_heads), static_cast<int>(cfg_.head_dim), pos0,
-                                       L.slots, s);
+    if (L.kv_fp8) {
+      r4dx_inkling2_dspark_kv_write_fp8(P(k), P(v), P(L.k_store_fp8.data()), P(L.v_store_fp8.data()),
+                                        static_cast<int>(n), static_cast<int>(cfg_.num_key_value_heads),
+                                        static_cast<int>(cfg_.head_dim), pos0, L.slots, s);
+    } else {
+      r4dx_inkling2_dspark_kv_write_bf16(P(k), P(v), P(L.k_store.data()), P(L.v_store.data()), static_cast<int>(n),
+                                         static_cast<int>(cfg_.num_key_value_heads), static_cast<int>(cfg_.head_dim),
+                                         pos0, L.slots, s);
+    }
   }
   // Update f_rnn_ from the last committed token (row n - 1).
   const auto& al3 = fuse_alpha_[3];
@@ -489,11 +505,18 @@ std::vector<int32_t> Inkling2DsparkDraft::DraftGreedy(int32_t anchor_token, int6
                                                         static_cast<int>(cfg_.num_key_value_heads),
                                                         static_cast<int>(cfg_.head_dim), P(draft_pos_dev_.data()),
                                                         cfg_.rope_theta, cfg_.rms_norm_eps, s);
-        r4dx_inkling2_dspark_attn_posdev_bf16(P(q), P(k), P(v), P(L.k_store.data()), P(L.v_store.data()), P(ao),
-                                              static_cast<int>(B), static_cast<int>(cfg_.num_attention_heads),
-                                              static_cast<int>(cfg_.num_key_value_heads),
-                                              static_cast<int>(cfg_.head_dim), P(draft_pos_dev_.data()), L.window,
-                                              L.slots, scale, s);
+        if (L.kv_fp8) {
+          r4dx_inkling2_dspark_attn_fp8kv(P(q), P(k), P(v), P(L.k_store_fp8.data()), P(L.v_store_fp8.data()), P(ao),
+                                          static_cast<int>(B), static_cast<int>(cfg_.num_attention_heads),
+                                          static_cast<int>(cfg_.num_key_value_heads), static_cast<int>(cfg_.head_dim),
+                                          0, P(draft_pos_dev_.data()), L.window, L.slots, scale, s);
+        } else {
+          r4dx_inkling2_dspark_attn_posdev_bf16(P(q), P(k), P(v), P(L.k_store.data()), P(L.v_store.data()), P(ao),
+                                                static_cast<int>(B), static_cast<int>(cfg_.num_attention_heads),
+                                                static_cast<int>(cfg_.num_key_value_heads),
+                                                static_cast<int>(cfg_.head_dim), P(draft_pos_dev_.data()), L.window,
+                                                L.slots, scale, s);
+        }
       } else {
         r4dx_inkling2_dspark_head_norm_rope_bf16(P(q), Q, P(L.q_norm.data()), static_cast<int>(B),
                                                  static_cast<int>(cfg_.num_attention_heads),
@@ -503,10 +526,17 @@ std::vector<int32_t> Inkling2DsparkDraft::DraftGreedy(int32_t anchor_token, int6
                                                  static_cast<int>(cfg_.num_key_value_heads),
                                                  static_cast<int>(cfg_.head_dim), anchor_pos, cfg_.rope_theta,
                                                  cfg_.rms_norm_eps, s);
-        r4dx_inkling2_dspark_attn_bf16(P(q), P(k), P(v), P(L.k_store.data()), P(L.v_store.data()), P(ao),
-                                       static_cast<int>(B), static_cast<int>(cfg_.num_attention_heads),
-                                       static_cast<int>(cfg_.num_key_value_heads), static_cast<int>(cfg_.head_dim),
-                                       static_cast<int>(n_injected_), L.window, L.slots, scale, s);
+        if (L.kv_fp8) {
+          r4dx_inkling2_dspark_attn_fp8kv(P(q), P(k), P(v), P(L.k_store_fp8.data()), P(L.v_store_fp8.data()), P(ao),
+                                          static_cast<int>(B), static_cast<int>(cfg_.num_attention_heads),
+                                          static_cast<int>(cfg_.num_key_value_heads), static_cast<int>(cfg_.head_dim),
+                                          static_cast<int>(n_injected_), 0, L.window, L.slots, scale, s);
+        } else {
+          r4dx_inkling2_dspark_attn_bf16(P(q), P(k), P(v), P(L.k_store.data()), P(L.v_store.data()), P(ao),
+                                         static_cast<int>(B), static_cast<int>(cfg_.num_attention_heads),
+                                         static_cast<int>(cfg_.num_key_value_heads), static_cast<int>(cfg_.head_dim),
+                                         static_cast<int>(n_injected_), L.window, L.slots, scale, s);
+        }
       }
       ApplyLinear(sr, arena, L.o_proj, ao, o, B);
       r4dx_residual_add_bf16(P(resid), P(o), P(resid), B * H, s);

@@ -152,11 +152,13 @@ class Inkling2Model {
   int64_t kv_bytes_ = 0;
   int64_t ckpt_pos_ = -1;
 
-  // KV: one paged bf16 cache per slot; the two block tables (full: identity, sliding: the ring).
+  // KV: one paged cache per slot (full: bf16 or fp8 e4m3fn when R4DX_INK_KV_FP8=1; sliding: bf16 ring).
   int kv_block_ = 256;
   int64_t full_blocks_ = 0, ring_blocks_ = 0;
-  std::vector<core::DeviceBuffer<uint16_t>> kv_;       // [slot]
+  std::vector<core::DeviceBuffer<uint16_t>> kv_;       // [slot] bf16
+  std::vector<core::DeviceBuffer<uint8_t>> kv_fp8_;    // [slot] fp8 e4m3fn (full slots when kv_fp8_enabled_)
   std::vector<core::DeviceBuffer<uint16_t>> kv_ckpt_;  // [slot] sliding slots only (prompt_checkpoint)
+  bool kv_fp8_enabled_ = false;
   core::DeviceBuffer<int32_t> table_full_, table_ring_;
   // Conv states: [slot][4][3, C] fp32 in one buffer.
   std::vector<int64_t> conv_off_;  // [slot * 4 + which]

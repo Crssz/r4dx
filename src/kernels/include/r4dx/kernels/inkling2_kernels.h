@@ -62,6 +62,7 @@ struct R4dxInkling2HeadOut {
   int col_offset;         // paged: 0 (K) or d (V)
   int64_t kv_block_stride, kv_head_stride;  // paged, elements
   int64_t pos_dev;        // optional device int32* holding pos0 (0 = use host pos0); for HIP graph capture
+  int out_fp8;            // paged only: 1 write fp8 e4m3fn (uint8), 0 write bf16 (uint16)
 };
 // v = x * scale[h] (scale fp32 [heads, d] or 0 = none); out = v * min(1, threshold / (||v|| + 1e-6)), times
 // 1 + log_alpha * ln(max((pos0 + t + 1) / log_floor, 1)) when log_alpha != 0. x: [T, heads * d] bf16 or fp32 with row
@@ -171,6 +172,7 @@ struct R4dxInkling2AttnFusedArgs {
   int64_t kv_block_stride;
   int64_t kv_head_stride;
   int64_t pos_dev;      // optional device int32* holding pos0 (0 = use host ctx - q_len)
+  int kv_fp8;           // 1 = kv cache stores fp8 e4m3fn (uint8), 0 = bf16 (uint16)
 };
 int r4dx_inkling2_attn_fused_bf16kv(const R4dxInkling2AttnFusedArgs* a, int64_t stream);
 
@@ -210,6 +212,14 @@ void r4dx_inkling2_dspark_head_norm_rope_posdev_bf16(int64_t x, int64_t x_row_st
 void r4dx_inkling2_dspark_attn_posdev_bf16(int64_t q, int64_t k_block, int64_t v_block, int64_t k_store, int64_t v_store,
                                            int64_t out, int T, int q_heads, int kv_heads, int head_dim, int64_t pos_dev,
                                            int window, int slots, float scale, int64_t stream);
+
+// FP8 E4M3FN context KV store variants for DSpark (half VRAM for layer-1 full KV).
+void r4dx_inkling2_dspark_kv_write_fp8(int64_t k_in, int64_t v_in, int64_t k_store_fp8, int64_t v_store_fp8, int n,
+                                       int kv_heads, int head_dim, int64_t pos0, int slots, int64_t stream);
+void r4dx_inkling2_dspark_attn_fp8kv(int64_t q, int64_t k_block, int64_t v_block, int64_t k_store_fp8,
+                                     int64_t v_store_fp8, int64_t out, int T, int q_heads, int kv_heads, int head_dim,
+                                     int n_injected, int64_t pos_dev, int window, int slots, float scale,
+                                     int64_t stream);
 
 // Write n rows of [n, kv_heads, head_dim] bf16 K/V into ring store [slots, kv_heads, head_dim] at positions pos0..pos0+n-1.
 void r4dx_inkling2_dspark_kv_write_bf16(int64_t k_in, int64_t v_in, int64_t k_store, int64_t v_store, int n,

@@ -211,7 +211,10 @@ Inkling2Model Inkling2Model::Load(const Inkling2ModelOptions& opts) {
   for (const Inkling2Visit& v : m.visits_) slot_layer.at(static_cast<size_t>(v.cache_slot)) = v.layer;
   const int64_t kvl = cfg.num_key_value_heads, hd = cfg.head_dim;
   const int64_t block_elems = kvl * bs * 2 * hd;
+  const bool want_kv_fp8 = InkEnvFlag("R4DX_INK_KV_FP8", false) && AttnFusedEnabled() && hd == 128;
+  m.kv_fp8_enabled_ = want_kv_fp8;
   m.kv_.resize(static_cast<size_t>(slots));
+  m.kv_fp8_.resize(static_cast<size_t>(slots));
   m.kv_ckpt_.resize(static_cast<size_t>(slots));
   int64_t conv_total = 0;
   int64_t conv_hist_total = 0;
@@ -224,8 +227,13 @@ Inkling2Model Inkling2Model::Load(const Inkling2ModelOptions& opts) {
     if (layer < 0) throw std::logic_error("Inkling2Model::Load: cache slot without a visit");
     const bool full = cfg.IsFull(layer);
     const int64_t nblk = full ? m.full_blocks_ : m.ring_blocks_;
-    m.kv_[static_cast<size_t>(s)] = core::DeviceBuffer<uint16_t>(static_cast<size_t>(nblk * block_elems));
-    m.kv_bytes_ += static_cast<int64_t>(m.kv_[static_cast<size_t>(s)].bytes());
+    if (full && want_kv_fp8) {
+      m.kv_fp8_[static_cast<size_t>(s)] = core::DeviceBuffer<uint8_t>(static_cast<size_t>(nblk * block_elems));
+      m.kv_bytes_ += static_cast<int64_t>(m.kv_fp8_[static_cast<size_t>(s)].bytes());
+    } else {
+      m.kv_[static_cast<size_t>(s)] = core::DeviceBuffer<uint16_t>(static_cast<size_t>(nblk * block_elems));
+      m.kv_bytes_ += static_cast<int64_t>(m.kv_[static_cast<size_t>(s)].bytes());
+    }
     if (opts.prompt_checkpoint && !full)
       m.kv_ckpt_[static_cast<size_t>(s)] = core::DeviceBuffer<uint16_t>(static_cast<size_t>(nblk * block_elems));
     const int64_t C[4] = {kvl * hd, kvl * hd, H, H};
@@ -306,7 +314,8 @@ Inkling2Model Inkling2Model::Load(const Inkling2ModelOptions& opts) {
   }
   const double gib = 1024.0 * 1024.0 * 1024.0;
   std::cerr << "[r4dx::model::Inkling2Model] " << cfg.num_hidden_layers << " stored layers, " << m.visits_.size()
-            << " visits, max_ctx " << m.max_ctx_ << ", KV bf16 = " << static_cast<double>(m.kv_bytes_) / gib
+            << " visits, max_ctx " << m.max_ctx_ << ", KV " << (m.kv_fp8_enabled_ ? "fp8(full)/bf16(local)" : "bf16")
+            << " = " << static_cast<double>(m.kv_bytes_) / gib
             << " GiB (sliding ring " << m.ring_blocks_ * bs << " positions), conv states "
             << static_cast<double>(m.conv_.bytes()) / (1024.0 * 1024.0) << " MiB, layout " << LayoutName(opts.layout)
             << ", residual fp32, attention "
@@ -422,7 +431,9 @@ void Inkling2Model::Attention(const Inkling2Visit& v, const uint16_t* xq, const 
   const int slot = v.cache_slot;
   const int bs = kv_block_;
   const int32_t* table = full ? table_full_.data() : table_ring_.data();
-  uint16_t* kv = kv_.at(static_cast<size_t>(slot)).data();
+  const bool slot_fp8 = full && kv_fp8_enabled_ && !kv_fp8_.at(static_cast<size_t>(slot)).empty();
+  const int64_t kv_ptr =
+      slot_fp8 ? P(kv_fp8_.at(static_cast<size_t>(slot)).data()) : P(kv_.at(static_cast<size_t>(slot)).data());
 
   // Helper to run an MXFP8 linear from a contiguous 16-row-tile slice of a.qgrkv_{wq,ws}.
   const auto lin_slice = [&](int64_t row0, int64_t N_slice, const uint16_t* x_in, uint16_t* y_out) {
@@ -544,12 +555,13 @@ void Inkling2Model::Attention(const Inkling2Visit& v, const uint16_t* xq, const 
     }
     R4dxInkling2HeadOut paged{};
     paged.kind = 1;
-    paged.out = P(kv);
+    paged.out = kv_ptr;
     paged.block_table = P(table);
     paged.block_size = bs;
     paged.kv_block_stride = kvl * bs * 2 * hd;
     paged.kv_head_stride = static_cast<int64_t>(bs) * 2 * hd;
     paged.pos_dev = pos_dev_ptr;
+    paged.out_fp8 = slot_fp8 ? 1 : 0;
     paged.col_offset = 0;
     r4dx_inkling2_head_clip(P(kc), 0, C, 0, static_cast<float>(cfg.qk_clip), pos0, 0.0f, 1.0f, &paged, static_cast<int>(T),
                             static_cast<int>(kvl), static_cast<int>(hd), s);
@@ -594,7 +606,7 @@ void Inkling2Model::Attention(const Inkling2Visit& v, const uint16_t* xq, const 
           (T <= 16) ? arena_.Alloc<float>(static_cast<size_t>(T * hl * kMaxSplits * (hd + 2)), 16) : nullptr;
       R4dxInkling2AttnFusedArgs af{};
       af.q = P(q);
-      af.kv = P(kv);
+      af.kv = kv_ptr;
       af.block_table = P(table);
       af.out = P(ao);
       af.r = P(r);
@@ -615,12 +627,13 @@ void Inkling2Model::Attention(const Inkling2Visit& v, const uint16_t* xq, const 
       af.kv_block_stride = kvl * bs * 2 * hd;
       af.kv_head_stride = static_cast<int64_t>(bs) * 2 * hd;
       af.pos_dev = pos_dev_ptr;
+      af.kv_fp8 = slot_fp8 ? 1 : 0;
       const int rc = r4dx_inkling2_attn_fused_bf16kv(&af, s);
       if (rc != 0) throw std::runtime_error("Inkling2Model: r4dx_inkling2_attn_fused_bf16kv refused the launch (" + std::to_string(rc) + ")");
     } else {
       R4dxInkling2AttnRefArgs ar{};
       ar.q = P(q);
-      ar.kv = P(kv);
+      ar.kv = kv_ptr;
       ar.block_table = P(table);
       ar.out = P(ao);
       ar.rel = P(rel);

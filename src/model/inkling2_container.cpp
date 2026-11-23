@@ -308,18 +308,23 @@ Inkling2Container Inkling2Container::Load(const std::string& path, const Inkling
     w.router = Upload(HostBf16(r, b + "moe.router", g.num_experts * H));
     w.bias = Upload(HostF32(r, b + "moe.bias", g.num_experts));
     const std::string hf = "model.llm.layers." + std::to_string(i) + ".mlp.experts.";
-    if (nvfp4_st != nullptr && nvfp4_st->Has(hf + "w13_weight_outer_scale_denominator")) {
+    const std::string nb = b + "moe.nvfp4.";
+    const bool ext_nvfp4 = nvfp4_st != nullptr && nvfp4_st->Has(hf + "w13_weight_outer_scale_denominator");
+    const bool int_nvfp4 = !ext_nvfp4 && r.Has(nb + "w13_weight_outer_scale_denominator");
+    if (ext_nvfp4 || int_nvfp4) {
+      const SafetensorsReader& src_st = ext_nvfp4 ? *nvfp4_st : r;
+      const std::string& np = ext_nvfp4 ? hf : nb;
       const int64_t E = g.num_experts;
       const int64_t Il = I / o.tp_world;
       const int64_t i0 = o.tp_rank * Il;
-      const uint8_t* w13_w = nvfp4_st->Data(hf + "w13_weight");
-      const uint8_t* w13_s = nvfp4_st->Data(hf + "w13_weight_scale");
-      const float* w13_amax = reinterpret_cast<const float*>(nvfp4_st->Data(hf + "w13_weight_amax"));
-      const float w13_den = *reinterpret_cast<const float*>(nvfp4_st->Data(hf + "w13_weight_outer_scale_denominator"));
-      const uint8_t* w2_w = nvfp4_st->Data(hf + "w2_weight");
-      const uint8_t* w2_s = nvfp4_st->Data(hf + "w2_weight_scale");
-      const float* w2_amax = reinterpret_cast<const float*>(nvfp4_st->Data(hf + "w2_weight_amax"));
-      const float w2_den = *reinterpret_cast<const float*>(nvfp4_st->Data(hf + "w2_weight_outer_scale_denominator"));
+      const uint8_t* w13_w = src_st.Data(np + "w13_weight");
+      const uint8_t* w13_s = src_st.Data(np + "w13_weight_scale");
+      const float* w13_amax = reinterpret_cast<const float*>(src_st.Data(np + "w13_weight_amax"));
+      const float w13_den = *reinterpret_cast<const float*>(src_st.Data(np + "w13_weight_outer_scale_denominator"));
+      const uint8_t* w2_w = src_st.Data(np + "w2_weight");
+      const uint8_t* w2_s = src_st.Data(np + "w2_weight_scale");
+      const float* w2_amax = reinterpret_cast<const float*>(src_st.Data(np + "w2_weight_amax"));
+      const float w2_den = *reinterpret_cast<const float*>(src_st.Data(np + "w2_weight_outer_scale_denominator"));
 
       const int64_t gu_N = 2 * Il, gu_K = H;
       const int64_t dn_N = H, dn_K = Il;

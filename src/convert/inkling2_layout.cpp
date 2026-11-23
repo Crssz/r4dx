@@ -308,10 +308,23 @@ std::set<std::string> AddInkling2TextStack(Kit& kit, const TextShape& s) {
     fp32(hf + "mlp.gate.bias", base + "moe.bias", {s.experts});
     const ExpertGroup w13 = CheckExpertGroup(kit, consumed, hf, "w13", s.experts, 2 * I, H);
     const ExpertGroup w2 = CheckExpertGroup(kit, consumed, hf, "w2", s.experts, H, I);
-    for (int64_t e = 0; e < s.experts; ++e) {
-      const std::string eb = base + "moe.experts." + std::to_string(e) + ".";
-      kit.add_source_linear(eb + "gate_up", false, ExpertSource(kit.data, w13, s.experts, e, /*interleaved=*/true));
-      kit.add_source_linear(eb + "down", false, ExpertSource(kit.data, w2, s.experts, e, /*interleaved=*/false));
+    if (kit.keep_nvfp4_experts && kit.add_raw && w13.format == ExpertFormat::kNvfp4 &&
+        w2.format == ExpertFormat::kNvfp4) {
+      const std::string nb = base + "moe.nvfp4.";
+      kit.add_raw(w13.weight, nb + "w13_weight", {s.experts, 2 * I, H / 2}, 1);
+      kit.add_raw(w13.scale, nb + "w13_weight_scale", {s.experts, 2 * I, H / kNvfp4Group}, 1);
+      kit.add_raw(w13.amax, nb + "w13_weight_amax", {s.experts}, 4);
+      kit.add_raw(w13.denom, nb + "w13_weight_outer_scale_denominator", {1}, 4);
+      kit.add_raw(w2.weight, nb + "w2_weight", {s.experts, H, I / 2}, 1);
+      kit.add_raw(w2.scale, nb + "w2_weight_scale", {s.experts, H, I / kNvfp4Group}, 1);
+      kit.add_raw(w2.amax, nb + "w2_weight_amax", {s.experts}, 4);
+      kit.add_raw(w2.denom, nb + "w2_weight_outer_scale_denominator", {1}, 4);
+    } else {
+      for (int64_t e = 0; e < s.experts; ++e) {
+        const std::string eb = base + "moe.experts." + std::to_string(e) + ".";
+        kit.add_source_linear(eb + "gate_up", false, ExpertSource(kit.data, w13, s.experts, e, /*interleaved=*/true));
+        kit.add_source_linear(eb + "down", false, ExpertSource(kit.data, w2, s.experts, e, /*interleaved=*/false));
+      }
     }
   }
 

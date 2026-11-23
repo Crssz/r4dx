@@ -2640,6 +2640,26 @@ int RunConvert(const AppArgs& args) {
     kit.data = [&model](const std::string& n) { return model.Data(n); };
     kit.add_bf16 = add_bf16;
     kit.add_fp32_widen = add_fp32_widen;
+    {
+      const char* nv4_env = std::getenv("R4DX_CONVERT_NVFP4_EXPERTS");
+      kit.keep_nvfp4_experts =
+          (nv4_env != nullptr && (std::strcmp(nv4_env, "1") == 0 || std::strcmp(nv4_env, "on") == 0));
+    }
+    kit.add_raw = [&](const std::string& hf_name, const std::string& container_name,
+                      const std::vector<int64_t>& shape, int64_t elem_bytes) {
+      plan_jobs.push_back([&writer, container_name, shape, elem_bytes]() {
+        uint64_t n = static_cast<uint64_t>(elem_bytes);
+        for (int64_t d : shape) n *= static_cast<uint64_t>(d);
+        std::vector<int64_t> sh = shape;
+        if (elem_bytes > 1) sh.push_back(elem_bytes);
+        writer.Plan(container_name, sh, n);
+      });
+      emit_jobs.push_back([&writer, &model, hf_name, container_name, elem_bytes]() {
+        const auto& meta = model.Meta(hf_name);
+        const uint64_t nbytes = static_cast<uint64_t>(meta.ElemCount()) * static_cast<uint64_t>(elem_bytes);
+        writer.WriteTensor(container_name, model.Data(hf_name), static_cast<size_t>(nbytes));
+      });
+    };
     // A relabelled bf16 passthrough (the conv taps [C,1,4] -> [C,4]): the bytes are copied unchanged.
     kit.add_bf16_shaped = [&](const std::string& hf_name, const std::string& container_name,
                               const std::vector<int64_t>& shape_no_width) {

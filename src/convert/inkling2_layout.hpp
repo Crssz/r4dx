@@ -114,6 +114,12 @@ struct Kit {
   std::function<void(const std::vector<std::string>& hf, const std::string& base, bool head)> add_linear;
   // A linear computed from checkpoint bytes (an expert slice, the padded head), same layout rules as add_linear.
   std::function<void(const std::string& base, bool head, LinearSource source)> add_source_linear;
+  // Optional raw passthrough (bytes copied verbatim with explicit container shape): used when keep_nvfp4_experts is
+  // true to store layers 0..20 native NVFP4 experts directly in the .r4dx container (~15.8 GB vs 27.4 GB).
+  std::function<void(const std::string& hf, const std::string& name, const std::vector<int64_t>& shape,
+                     int64_t elem_bytes)>
+      add_raw;
+  bool keep_nvfp4_experts = false;
 };
 
 // f32 q, kv: [2 * loop_layers, H] each -> out [loop_layers, 4, H] = per loop layer j: q[2j], kv[2j], kv[2j + 1], q[2j + 1]

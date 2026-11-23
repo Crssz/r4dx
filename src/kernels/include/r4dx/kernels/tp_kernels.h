@@ -91,6 +91,14 @@ extern "C" {
 // timeout_ticks > 0.
 void r4dx_tp_ar_flag_bf16(const R4dxTpArArgs* a, int nt, int64_t stream);
 
+// Same two-rank flag(drain 3, acq 0) all-reduce over fp32 elements (n16 * 4 floats, in place).
+void r4dx_tp_ar_flag_f32(const R4dxTpArArgs* a, int nt, int64_t stream);
+
+// Device-side two-rank argmax-pair exchange over channel 0 (1 block, 32 threads, zero host sync):
+// reads {local_idx, val_bits} from a->buf (int32[2]), adds row_offset to local_idx, exchanges with peer,
+// and writes the winning global int32 token id to out_tok.
+void r4dx_tp_ar_argmax_pair(const R4dxTpArArgs* a, int32_t row_offset, int64_t out_tok, int64_t stream);
+
 // EmulatedComm's add (docs/tp.md 6.5): inout[i] = bf16_rne(f32(inout[i]) + f32(peer[i])), the SAME
 // add_bf16x8 as the all-reduce, operand order (mine, peer). n bf16 elements, n % 8 == 0.
 void r4dx_tp_add_bf16(int64_t inout, int64_t peer, int64_t n, int64_t stream);

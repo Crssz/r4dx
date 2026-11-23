@@ -107,6 +107,13 @@ class TpComm {
   virtual bool IsGraphCapturable() const { return false; }
   // Record `count` all-reduce calls of `bytes` each executed by a replayed HIP graph (keeps stats and heartbeat current).
   virtual void NoteGraphReplay(size_t /*bytes*/, int64_t /*count*/) {}
+  // Optional device-side fp32 all-reduce (returns false if unsupported, e.g. EmulatedComm/NoopComm).
+  virtual bool AllReduceSumF32(float* /*buf*/, int64_t /*n*/, hipStream_t /*stream*/) { return false; }
+  // Optional device-side argmax-pair merge across ranks (zero host sync; returns false if unsupported).
+  virtual bool AllReduceArgmaxPair(int32_t* /*pair_dev*/, int32_t /*row_offset*/, int32_t* /*out_tok_dev*/,
+                                   hipStream_t /*stream*/) {
+    return false;
+  }
 };
 
 }  // namespace r4dx::core

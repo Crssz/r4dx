@@ -59,6 +59,20 @@ void r4dx_inkling2_sconv_kv_paged_bf16(int64_t x_k, int64_t x_v, int64_t w_k, in
                                        int block_size, int64_t kv_block_stride, int64_t kv_head_stride, int T,
                                        int kv_heads, int64_t stream);
 
+// Batched 2-way small dense GEMM for full-layer K/V dynamic conv projections (M <= 16).
+void r4dx_inkling2_dense2_bf16(int64_t x0, int64_t x1, int64_t w0, int64_t w1, int64_t out0, int64_t out1, int M, int N,
+                               int K, int64_t stream);
+
+// Fused full-layer K/V dynamic short convolution + K head_clip + V head_rms + paged KV write (bf16 or fp8) in 1 launch.
+void r4dx_inkling2_sconv_dyn_kv_paged(int64_t x_k, int64_t x_v, int64_t dyn_k, int64_t dyn_v, int64_t sw_k,
+                                      int64_t sw_v, int64_t state_k, int64_t state_v, int64_t hist_k, int64_t hist_v,
+                                      float qk_clip, float eps, int64_t pos0, int64_t pos_dev, int64_t kv_out,
+                                      int out_fp8, int64_t block_table, int block_size, int64_t kv_block_stride,
+                                      int64_t kv_head_stride, int T, int kv_heads, int64_t stream);
+
+// Fill rows 1..B-1 of resid [B, H] bf16 with mask_embed [H] bf16 in a single launch.
+void r4dx_inkling2_dspark_fill_mask_bf16(int64_t resid, int64_t mask_embed, int B, int H, int64_t stream);
+
 // Fused Q (bf16 out) + R (fp32 out) head_clip in a single launch (both read bf16 inputs and share pos0/log_scaling).
 void r4dx_inkling2_head_clip_qr(int64_t q_in, int64_t q_in_stride, int64_t q_scale, float q_thresh, int64_t q_out,
                                 int q_d, int64_t r_in, int64_t r_in_stride, int64_t r_scale, float r_thresh,
@@ -265,6 +279,12 @@ void r4dx_inkling2_dspark_add_argmax_bf16(int64_t base, int64_t delta, int64_t b
 //   [2R+H..2R+2H) copied from f_rnn (if f_rnn != 0)
 void r4dx_inkling2_dspark_markov_prep_bf16(int64_t rnn_in, int64_t prev_emb, int64_t head_h, int64_t f_rnn,
                                            int zero_state, int R, int H, int64_t stream);
+
+// Device-indexed variant for zero-sync Markov loop: reads token id from device int32* prev_tok_dev,
+// clamps to [0, vocab_size), and gathers markov_w1[tok * R .. (tok+1)*R] into rnn_in[R..2R).
+void r4dx_inkling2_dspark_markov_prep_dev_bf16(int64_t rnn_in, int64_t markov_w1_dev, int64_t prev_tok_dev,
+                                               int64_t vocab_size, int64_t head_h, int64_t f_rnn, int zero_state, int R,
+                                               int H, int64_t stream);
 
 // Transpose [rows, cols] bf16 -> [cols, rows] bf16.
 void r4dx_inkling2_dspark_transpose_bf16(int64_t in, int64_t out, int64_t rows, int64_t cols, int64_t stream);

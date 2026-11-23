@@ -168,6 +168,44 @@ class HostMailboxComm final : public TpEndpoint {
     if (hb_ != nullptr) hb_->fetch_add(1, std::memory_order_relaxed);
   }
 
+  bool AllReduceSumF32(float* buf, int64_t n, hipStream_t stream) override {
+    const int64_t bytes = n * 4;
+    if (buf == nullptr || n <= 0 || bytes % 16 != 0 || static_cast<size_t>(bytes) > kMaxAllReduceBytes) {
+      throw std::invalid_argument("tp::HostMailboxComm::AllReduceSumF32: invalid n=" + std::to_string(n));
+    }
+    const int ch = MailboxLayout::ChannelFor(static_cast<size_t>(bytes));
+    const CallChunks g = ChunkCall(static_cast<size_t>(bytes), L_.ch[ch].nb);
+    R4dxTpArArgs a = args_[ch];
+    a.buf = reinterpret_cast<int64_t>(buf);
+    a.n16 = g.n16;
+    a.nb = g.nb;
+    a.w = g.w;
+    if (stream != last_stream_) TrackStream(stream);
+    r4dx_tp_ar_flag_f32(&a, kArThreads, reinterpret_cast<int64_t>(stream));
+    ++stats_.ar_calls[ch];
+    stats_.ar_bytes[ch] += static_cast<uint64_t>(bytes);
+    ++calls_[static_cast<size_t>(ch)];
+    if (hb_ != nullptr) hb_->fetch_add(1, std::memory_order_relaxed);
+    return true;
+  }
+
+  bool AllReduceArgmaxPair(int32_t* pair_dev, int32_t row_offset, int32_t* out_tok_dev, hipStream_t stream) override {
+    if (pair_dev == nullptr || out_tok_dev == nullptr)
+      throw std::invalid_argument("tp::HostMailboxComm::AllReduceArgmaxPair: null pointer");
+    R4dxTpArArgs a = args_[0];
+    a.buf = reinterpret_cast<int64_t>(pair_dev);
+    a.n16 = 1;
+    a.nb = 1;
+    a.w = 1;
+    if (stream != last_stream_) TrackStream(stream);
+    r4dx_tp_ar_argmax_pair(&a, row_offset, reinterpret_cast<int64_t>(out_tok_dev), reinterpret_cast<int64_t>(stream));
+    ++stats_.ar_calls[0];
+    stats_.ar_bytes[0] += 16;
+    ++calls_[0];
+    if (hb_ != nullptr) hb_->fetch_add(1, std::memory_order_relaxed);
+    return true;
+  }
+
   void HostAllGather(const void* mine, size_t bytes, void* out) override {
     const auto t0 = std::chrono::steady_clock::now();
     g_->Exchange().AllGather(rank_, mine, bytes, out);

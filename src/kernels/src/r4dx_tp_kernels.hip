@@ -122,6 +122,15 @@ __device__ __forceinline__ uint4 add_bf16x8(const uint4& a, const uint4& b) {
   return r;
 }
 
+__device__ __forceinline__ uint4 add_f32x4(const uint4& a, const uint4& b) {
+  uint4 r;
+  r.x = fbits(__uint_as_float(a.x) + __uint_as_float(b.x));
+  r.y = fbits(__uint_as_float(a.y) + __uint_as_float(b.y));
+  r.z = fbits(__uint_as_float(a.z) + __uint_as_float(b.z));
+  r.w = fbits(__uint_as_float(a.w) + __uint_as_float(b.w));
+  return r;
+}
+
 // The rank's sticky local abort (VRAM): once set, every later AR kernel of this rank skips the call.
 // (ar_bench.hip 614-620)
 __device__ __forceinline__ u32 ld_sticky(const Status* st) {
@@ -388,6 +397,123 @@ __global__ void __launch_bounds__(1024) r4dx_tp_ar_flag_bf16_generic_kernel(ArAr
   ar_flag_bf16_impl<-1, -1, -1>(a);
 }
 
+// Production fp32 all-reduce (drain 3, acq 0, spin_acq 0): same protocol as ar_flag_bf16_impl, fp32 add.
+__global__ void __launch_bounds__(256) r4dx_tp_ar_flag_f32_kernel(ArArgs a) {
+  const int b = blockIdx.x, tid = threadIdx.x, nt = blockDim.x;
+  __shared__ u32 s_seq;
+  __shared__ int s_fail;
+  if (tid == 0) {
+    u32 s0 = 0;
+    s_fail = ar_entry(a, b, &s0) ? 4 : 0;
+    s_seq = s0;
+  }
+  lds_barrier();
+  if (s_fail != 0) return;
+  const u32 s = s_seq;
+  const u32 slot = s & 1u;
+  const int start = b * a.w;
+  const int end = (start + a.w < a.n16) ? start + a.w : a.n16;
+  const int cnt = end - start;
+  const uint4* in = a.buf + start;
+  uint4* out = a.buf + start;
+  uint4* dst = (uint4*)(a.peer_mbox + (size_t)slot * a.slot_stride + (size_t)b * a.blk_stride);
+  const uint4* src = (const uint4*)(a.my_mbox + (size_t)slot * a.slot_stride + (size_t)b * a.blk_stride);
+
+  uint4 x0{};
+  const bool single_pass = (cnt <= nt);
+  if (single_pass) {
+    if (tid < cnt) {
+      x0 = in[tid];
+      st_nt_128(dst + tid, x0);
+    }
+  } else {
+    for (int k0 = tid; k0 < cnt; k0 += 4 * nt) {
+      const int k1 = k0 + nt, k2 = k0 + 2 * nt, k3 = k0 + 3 * nt;
+      const uint4 v0 = in[min(k0, cnt - 1)];
+      const uint4 v1 = in[min(k1, cnt - 1)];
+      const uint4 v2 = in[min(k2, cnt - 1)];
+      const uint4 v3 = in[min(k3, cnt - 1)];
+      dst[k0] = v0;
+      if (k1 < cnt) dst[k1] = v1;
+      if (k2 < cnt) dst[k2] = v2;
+      if (k3 < cnt) dst[k3] = v3;
+    }
+  }
+  asm volatile("s_wait_storecnt 0x0" ::: "memory");
+  __syncthreads();
+
+  if (tid == 0) {
+    st_rel_sys(&a.peer_flags[(size_t)b * kFlagStride], s);
+    u32 seen = 0;
+    int rc = spin_flag_ge<0>(&a.my_flags[(size_t)b * kFlagStride], s, a.my_abort, a.peer_abort, a.timeout, 0, &seen);
+    if (rc == 0 && (int)(seen - s) >= 2) {
+      if ((ld_rlx_sys(a.my_abort) | ld_rlx_sys(a.peer_abort)) != 0u) rc = 2;
+      else {
+        note_failure(a.my_abort, a.st, ABORT_PROTOCOL, (u32)b, s, PH_FLAG_WAIT, a.channel, seen);
+        rc = 3;
+      }
+    }
+    if (rc == 1) note_failure(a.my_abort, a.st, ABORT_TIMEOUT, (u32)b, s, PH_FLAG_WAIT, a.channel, seen);
+    else if (rc == 2) note_abort_exit(a.st, s);
+    s_fail = rc;
+  }
+  __syncthreads();
+
+  if (s_fail == 0) {
+    if (single_pass) {
+      if (tid < cnt) out[tid] = add_f32x4(x0, ld_nt_128(src + tid));
+    } else {
+      for (int k0 = tid; k0 < cnt; k0 += 4 * nt) {
+        uint4 p[4], x[4];
+#pragma unroll
+        for (int j = 0; j < 4; ++j)
+          if (k0 + j * nt < cnt) {
+            p[j] = src[k0 + j * nt];
+            x[j] = in[k0 + j * nt];
+          }
+#pragma unroll
+        for (int j = 0; j < 4; ++j)
+          if (k0 + j * nt < cnt) out[k0 + j * nt] = add_f32x4(x[j], p[j]);
+      }
+    }
+  }
+}
+
+// Single-block (32 threads) device-side argmax-pair exchange on block 0 of channel 0 (zero host sync).
+__global__ void __launch_bounds__(32) r4dx_tp_ar_argmax_pair_kernel(ArArgs a, int32_t row_offset,
+                                                                     int32_t* __restrict__ out_tok) {
+  if (threadIdx.x != 0) return;
+  u32 s = 0;
+  if (ar_entry(a, 0, &s)) return;
+  const u32 slot = s & 1u;
+  const int32_t* pair = (const int32_t*)a.buf;
+  const int32_t my_idx = pair[0] + row_offset;
+  const u32 my_val_bits = (u32)pair[1];
+  uint4* dst = (uint4*)(a.peer_mbox + (size_t)slot * a.slot_stride);
+  const uint4* src = (const uint4*)(a.my_mbox + (size_t)slot * a.slot_stride);
+  st_nt_128(dst, make_uint4((u32)my_idx, my_val_bits, 0u, 0u));
+  asm volatile("s_wait_storecnt 0x0" ::: "memory");
+  st_rel_sys(&a.peer_flags[0], s);
+  u32 seen = 0;
+  int rc = spin_flag_ge<0>(&a.my_flags[0], s, a.my_abort, a.peer_abort, a.timeout, 0, &seen);
+  if (rc == 0 && (int)(seen - s) >= 2) {
+    if ((ld_rlx_sys(a.my_abort) | ld_rlx_sys(a.peer_abort)) != 0u) rc = 2;
+    else {
+      note_failure(a.my_abort, a.st, ABORT_PROTOCOL, 0u, s, PH_FLAG_WAIT, a.channel, seen);
+      rc = 3;
+    }
+  }
+  if (rc == 1) note_failure(a.my_abort, a.st, ABORT_TIMEOUT, 0u, s, PH_FLAG_WAIT, a.channel, seen);
+  else if (rc == 2) note_abort_exit(a.st, s);
+  if (rc == 0) {
+    const uint4 peer = ld_nt_128(src);
+    const int32_t peer_idx = (int32_t)peer.x;
+    const float peer_val = __uint_as_float(peer.y);
+    const float my_val = __uint_as_float(my_val_bits);
+    out_tok[0] = (peer_val > my_val || (peer_val == my_val && peer_idx < my_idx)) ? peer_idx : my_idx;
+  }
+}
+
 // EmulatedComm's add (docs/tp.md 6.5): same add_bf16x8, operand order (mine, peer).
 __global__ void __launch_bounds__(256) r4dx_tp_add_bf16_kernel(uint4* __restrict__ inout,
                                                                const uint4* __restrict__ peer, u64 n16) {
@@ -536,6 +662,34 @@ void r4dx_tp_ar_flag_bf16(const R4dxTpArArgs* a, int nt, int64_t stream) {
     hipLaunchKernelGGL(r4dx_tp_ar_flag_bf16_generic_kernel, dim3(static_cast<unsigned>(a->nb)),
                        dim3(static_cast<unsigned>(nt)), 0, (hipStream_t)stream, typed_args(*a));
   }
+  R4DX_HIP_CHECK(hipGetLastError());
+}
+
+void r4dx_tp_ar_flag_f32(const R4dxTpArArgs* a, int nt, int64_t stream) {
+  static const char* kWho = "r4dx_tp_ar_flag_f32";
+  if (a == nullptr) Bad(std::string(kWho) + ": null args");
+  if (a->buf == 0 || a->peer_mbox == 0 || a->my_mbox == 0 || a->peer_flags == 0 || a->my_flags == 0 ||
+      a->my_abort == 0 || a->peer_abort == 0 || a->seq == 0 || a->status == 0)
+    Bad(std::string(kWho) + ": null pointer argument");
+  if (a->n16 < 1 || a->nb < 1 || a->nb > static_cast<int>(kR4dxTpNbMax) || a->w < 1 ||
+      static_cast<int64_t>(a->nb - 1) * a->w >= a->n16 || static_cast<int64_t>(a->nb) * a->w < a->n16)
+    Bad(std::string(kWho) + ": bad chunking");
+  if (a->timeout_ticks == 0) Bad(std::string(kWho) + ": timeout_ticks is 0");
+  CheckNt(kWho, nt);
+  if (nt > 256) Bad(std::string(kWho) + ": nt must be <= 256");
+  hipLaunchKernelGGL(r4dx_tp_ar_flag_f32_kernel, dim3(static_cast<unsigned>(a->nb)), dim3(static_cast<unsigned>(nt)),
+                     0, (hipStream_t)stream, typed_args(*a));
+  R4DX_HIP_CHECK(hipGetLastError());
+}
+
+void r4dx_tp_ar_argmax_pair(const R4dxTpArArgs* a, int32_t row_offset, int64_t out_tok, int64_t stream) {
+  static const char* kWho = "r4dx_tp_ar_argmax_pair";
+  if (a == nullptr || a->buf == 0 || out_tok == 0 || a->peer_mbox == 0 || a->my_mbox == 0 || a->peer_flags == 0 ||
+      a->my_flags == 0 || a->my_abort == 0 || a->peer_abort == 0 || a->seq == 0 || a->status == 0 ||
+      a->timeout_ticks == 0)
+    Bad(std::string(kWho) + ": invalid argument");
+  hipLaunchKernelGGL(r4dx_tp_ar_argmax_pair_kernel, dim3(1), dim3(32), 0, (hipStream_t)stream, typed_args(*a),
+                     row_offset, (int32_t*)out_tok);
   R4DX_HIP_CHECK(hipGetLastError());
 }
 

@@ -129,8 +129,9 @@ class Inkling2Model {
                 bool graph_long_ctx = true, bool capture_conv_hist = false);
   void Attention(const Inkling2Visit& v, const uint16_t* xq, const uint16_t* xk, const uint16_t* xv, uint16_t* out,
                  int64_t T, SpanAccumulator* prof, bool use_pos_dev = false, bool graph_long_ctx = true,
-                 bool capture_conv_hist = false);
-  void Moe(int64_t layer, const uint16_t* x, uint16_t* out, int64_t T, int visit, SpanAccumulator* prof);
+                 bool capture_conv_hist = false, float* out_f32 = nullptr);
+  void Moe(int64_t layer, const uint16_t* x, uint16_t* out, int64_t T, int visit, SpanAccumulator* prof,
+           float* out_f32 = nullptr);
   void MsgGate(const Inkling2MsgGateWeights& g, const float* x, const float* m, float* out, int64_t T);
   void MsgGate3AttnNormBf16(const Inkling2LayerWeights& w, const float* a_src, const float* m_all, uint16_t* xq,
                             uint16_t* xk, uint16_t* xv, int64_t T);
@@ -139,6 +140,10 @@ class Inkling2Model {
   float* ConvHist(int slot, int which);
   int32_t LmHeadArgmaxFromBf16(const uint16_t* h_bf16);
   int32_t DsparkLogitsArgmax(const uint16_t* base_bf16, const uint16_t* delta_bf16, const uint16_t* bias_bf16);
+  void DsparkLogitsArgmaxAsync(const uint16_t* base_bf16, const uint16_t* delta_bf16, const uint16_t* bias_bf16,
+                               int32_t* out_tok_dev);
+  void DsparkLogitsSummary(const uint16_t* base_bf16, const uint16_t* delta_bf16, const uint16_t* bias_bf16,
+                           float inv_temp, kernels::RowSummary* out);
   void Head(const float* h_row, const std::vector<const float*>& blocks, SpanAccumulator* prof);
   int32_t MergeGreedyPair();
   int32_t MergeGreedyPairAt(const int32_t* dev_pair);

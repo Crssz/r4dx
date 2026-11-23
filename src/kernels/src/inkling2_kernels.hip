@@ -580,6 +580,111 @@ __global__ __launch_bounds__(32) void SconvKvPagedBf16Kernel(
   }
 }
 
+// Batched 2-way small dense GEMM (for full-layer K/V dynamic conv projections): blockIdx.z == 0 -> K, 1 -> V.
+__global__ __launch_bounds__(32) void Dense2Bf16DecodeKernel(
+    const uint16_t* __restrict__ x0, const uint16_t* __restrict__ x1, const uint16_t* __restrict__ w0,
+    const uint16_t* __restrict__ w1, float* __restrict__ out0, float* __restrict__ out1, int N, int K) {
+  const int n = static_cast<int>(blockIdx.x);
+  const int m = static_cast<int>(blockIdx.y);
+  const bool is_v = (blockIdx.z != 0);
+  const int lane = threadIdx.x;
+  const uint16_t* xr = (is_v ? x1 : x0) + static_cast<int64_t>(m) * K;
+  const uint16_t* wr = (is_v ? w1 : w0) + static_cast<int64_t>(n) * K;
+  float a = 0.0f;
+  for (int k = lane; k < K; k += 32) {
+    a += r4dx::core::Bf16ToFloat(xr[k]) * r4dx::core::Bf16ToFloat(wr[k]);
+  }
+  a = WaveSum(a);
+  if (lane == 0) (is_v ? out1 : out0)[static_cast<int64_t>(m) * N + n] = a;
+}
+
+// Fused full-layer dynamic KV short-conv + K head_clip + V head_rms + paged KV write (bf16 or fp8).
+__global__ __launch_bounds__(32) void SconvDynKvPagedKernel(
+    const uint16_t* __restrict__ xk, const uint16_t* __restrict__ xv, const float* __restrict__ dyn_k,
+    const float* __restrict__ dyn_v, const float* __restrict__ sw_k, const float* __restrict__ sw_v,
+    float* __restrict__ state_k, float* __restrict__ state_v, float* __restrict__ hist_k, float* __restrict__ hist_v,
+    float qk_clip, float eps, int64_t pos0_host, const int32_t* __restrict__ pos_dev, void* __restrict__ kv_out,
+    int out_fp8, const int32_t* __restrict__ block_table, int block_size, int64_t kv_block_stride,
+    int64_t kv_head_stride, int T, int kv_heads) {
+  constexpr int kHd = 128;
+  const int h = static_cast<int>(blockIdx.x);
+  const bool is_v = (blockIdx.y != 0);
+  const int lane = threadIdx.x;
+  const int C = kv_heads * kHd;
+  const uint16_t* x = is_v ? xv : xk;
+  const float* dyn = is_v ? dyn_v : dyn_k;
+  const float* sw = is_v ? sw_v : sw_k;
+  float* state = is_v ? state_v : state_k;
+  float* hist = is_v ? hist_v : hist_k;
+  const int64_t pos0 = (pos_dev != nullptr) ? static_cast<int64_t>(*pos_dev) : pos0_host;
+  const int col_offset = is_v ? kHd : 0;
+
+  float h0[4], h1[4], h2[4];
+  float s0[4], s1[4], s2[4], s3[4];
+#pragma unroll
+  for (int j = 0; j < 4; ++j) {
+    const int c = h * kHd + lane + 32 * j;
+    h0[j] = state[c];
+    h1[j] = state[C + c];
+    h2[j] = state[2 * C + c];
+    s0[j] = sw[c];
+    s1[j] = sw[C + c];
+    s2[j] = sw[2 * C + c];
+    s3[j] = sw[3 * C + c];
+  }
+  for (int t = 0; t < T; ++t) {
+    const int64_t di = static_cast<int64_t>(t) * kv_heads * 4 + h * 4;
+    const float d0 = dyn[di + 0], d1 = dyn[di + 1], d2 = dyn[di + 2], d3 = dyn[di + 3];
+    float v[4];
+    float ss = 0.0f;
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+      const int c = h * kHd + lane + 32 * j;
+      const int64_t idx = static_cast<int64_t>(t) * C + c;
+      const float xt = r4dx::core::Bf16ToFloat(x[idx]);
+      if (hist != nullptr) hist[idx] = xt;
+      const float sum = xt * (s0[j] + d0) + h2[j] * (s1[j] + d1) + h1[j] * (s2[j] + d2) + h0[j] * (s3[j] + d3);
+      const float y = (sum + xt) / 3.0f;
+      v[j] = y;
+      ss += y * y;
+      h0[j] = h1[j];
+      h1[j] = h2[j];
+      h2[j] = xt;
+    }
+    ss = WaveSum(ss);
+    const float f = is_v ? (1.0f / sqrtf(ss / static_cast<float>(kHd) + eps))
+                         : fminf(1.0f, qk_clip / (sqrtf(ss) + 1e-6f));
+    const int64_t p = pos0 + t;
+    const int64_t base = static_cast<int64_t>(block_table[p / block_size]) * kv_block_stride +
+                         static_cast<int64_t>(h) * kv_head_stride + (p % block_size) * (2 * kHd) + col_offset;
+    if (out_fp8) {
+      uint8_t* dst = reinterpret_cast<uint8_t*>(kv_out) + base;
+#pragma unroll
+      for (int j = 0; j < 4; ++j) dst[lane + 32 * j] = FloatToFp8E4m3Fn(v[j] * f);
+    } else {
+      uint16_t* dst = reinterpret_cast<uint16_t*>(kv_out) + base;
+#pragma unroll
+      for (int j = 0; j < 4; ++j) dst[lane + 32 * j] = r4dx::core::FloatToBf16(v[j] * f);
+    }
+  }
+#pragma unroll
+  for (int j = 0; j < 4; ++j) {
+    const int c = h * kHd + lane + 32 * j;
+    state[c] = h0[j];
+    state[C + c] = h1[j];
+    state[2 * C + c] = h2[j];
+  }
+}
+
+__global__ __launch_bounds__(kThreads) void DsparkFillMaskKernel(uint16_t* __restrict__ resid,
+                                                                 const uint16_t* __restrict__ mask_embed, int B,
+                                                                 int H) {
+  const int r = static_cast<int>(blockIdx.y) + 1;
+  const int h = static_cast<int>(blockIdx.x) * kThreads + threadIdx.x;
+  if (r >= B || h >= H) return;
+  resid[static_cast<int64_t>(r) * H + h] = mask_embed[h];
+}
+
 // Fused Q (bf16 out) + R (fp32 out) HeadClip: blockIdx.y == 0 -> Q, blockIdx.y == 1 -> R.
 __global__ __launch_bounds__(kThreads) void HeadClipQRKernel(
     const uint16_t* __restrict__ q_in, int64_t q_in_stride, const float* __restrict__ q_scale, float q_thresh,
@@ -2430,6 +2535,52 @@ void r4dx_inkling2_sconv_kv_paged_bf16(int64_t x_k, int64_t x_v, int64_t w_k, in
   CheckLaunch(fn);
 }
 
+void r4dx_inkling2_dense2_bf16(int64_t x0, int64_t x1, int64_t w0, int64_t w1, int64_t out0, int64_t out1, int M, int N,
+                               int K, int64_t stream) {
+  const char* fn = "r4dx_inkling2_dense2_bf16";
+  if (M <= 0 || N <= 0) return;
+  if (x0 == 0 || x1 == 0 || w0 == 0 || w1 == 0 || out0 == 0 || out1 == 0 || K < 1) Fail(fn, "invalid args");
+  hipLaunchKernelGGL(Dense2Bf16DecodeKernel, dim3(static_cast<unsigned>(N), static_cast<unsigned>(M), 2u), dim3(32), 0,
+                     reinterpret_cast<hipStream_t>(stream), reinterpret_cast<const uint16_t*>(x0),
+                     reinterpret_cast<const uint16_t*>(x1), reinterpret_cast<const uint16_t*>(w0),
+                     reinterpret_cast<const uint16_t*>(w1), reinterpret_cast<float*>(out0),
+                     reinterpret_cast<float*>(out1), N, K);
+  CheckLaunch(fn);
+}
+
+void r4dx_inkling2_sconv_dyn_kv_paged(int64_t x_k, int64_t x_v, int64_t dyn_k, int64_t dyn_v, int64_t sw_k,
+                                      int64_t sw_v, int64_t state_k, int64_t state_v, int64_t hist_k, int64_t hist_v,
+                                      float qk_clip, float eps, int64_t pos0, int64_t pos_dev, int64_t kv_out,
+                                      int out_fp8, int64_t block_table, int block_size, int64_t kv_block_stride,
+                                      int64_t kv_head_stride, int T, int kv_heads, int64_t stream) {
+  const char* fn = "r4dx_inkling2_sconv_dyn_kv_paged";
+  if (T <= 0 || kv_heads <= 0) return;
+  if (x_k == 0 || x_v == 0 || dyn_k == 0 || dyn_v == 0 || sw_k == 0 || sw_v == 0 || state_k == 0 || state_v == 0 ||
+      kv_out == 0 || block_table == 0 || block_size <= 0)
+    Fail(fn, "null pointer or invalid block_size");
+  hipLaunchKernelGGL(SconvDynKvPagedKernel, dim3(static_cast<unsigned>(kv_heads), 2u), dim3(32), 0,
+                     reinterpret_cast<hipStream_t>(stream), reinterpret_cast<const uint16_t*>(x_k),
+                     reinterpret_cast<const uint16_t*>(x_v), reinterpret_cast<const float*>(dyn_k),
+                     reinterpret_cast<const float*>(dyn_v), reinterpret_cast<const float*>(sw_k),
+                     reinterpret_cast<const float*>(sw_v), reinterpret_cast<float*>(state_k),
+                     reinterpret_cast<float*>(state_v), reinterpret_cast<float*>(hist_k),
+                     reinterpret_cast<float*>(hist_v), qk_clip, eps, pos0, reinterpret_cast<const int32_t*>(pos_dev),
+                     reinterpret_cast<void*>(kv_out), out_fp8, reinterpret_cast<const int32_t*>(block_table),
+                     block_size, kv_block_stride, kv_head_stride, T, kv_heads);
+  CheckLaunch(fn);
+}
+
+void r4dx_inkling2_dspark_fill_mask_bf16(int64_t resid, int64_t mask_embed, int B, int H, int64_t stream) {
+  const char* fn = "r4dx_inkling2_dspark_fill_mask_bf16";
+  if (B <= 1 || H <= 0) return;
+  if (resid == 0 || mask_embed == 0) Fail(fn, "null pointer");
+  hipLaunchKernelGGL(DsparkFillMaskKernel,
+                     dim3(static_cast<unsigned>((H + kThreads - 1) / kThreads), static_cast<unsigned>(B - 1)),
+                     dim3(kThreads), 0, reinterpret_cast<hipStream_t>(stream), reinterpret_cast<uint16_t*>(resid),
+                     reinterpret_cast<const uint16_t*>(mask_embed), B, H);
+  CheckLaunch(fn);
+}
+
 void r4dx_inkling2_head_clip_qr(int64_t q_in, int64_t q_in_stride, int64_t q_scale, float q_thresh, int64_t q_out,
                                 int q_d, int64_t r_in, int64_t r_in_stride, int64_t r_scale, float r_thresh,
                                 int64_t r_out, int r_d, int64_t pos0, int64_t pos_dev, float log_alpha, float log_floor,
@@ -3078,6 +3229,26 @@ __global__ __launch_bounds__(kThreads) void DsparkMarkovPrepKernel(
   }
 }
 
+__global__ __launch_bounds__(kThreads) void DsparkMarkovPrepDevKernel(
+    uint16_t* __restrict__ rnn_in, const uint16_t* __restrict__ markov_w1, const int32_t* __restrict__ prev_tok_dev,
+    int64_t vocab_size, const uint16_t* __restrict__ head_h, const uint16_t* __restrict__ f_rnn, int zero_state, int R,
+    int H) {
+  const int i = blockIdx.x * kThreads + threadIdx.x;
+  const int total = 2 * R + 2 * H;
+  if (i >= total) return;
+  if (i < R) {
+    if (zero_state != 0) rnn_in[i] = 0;
+  } else if (i < 2 * R) {
+    int64_t tok = static_cast<int64_t>(prev_tok_dev[0]);
+    if (tok < 0 || tok >= vocab_size) tok = 0;
+    rnn_in[i] = markov_w1[tok * R + (i - R)];
+  } else if (i < 2 * R + H) {
+    if (head_h != nullptr) rnn_in[i] = head_h[i - 2 * R];
+  } else {
+    if (f_rnn != nullptr) rnn_in[i] = f_rnn[i - 2 * R - H];
+  }
+}
+
 __global__ __launch_bounds__(kThreads) void DsparkTransposeBf16Kernel(
     const uint16_t* __restrict__ in, uint16_t* __restrict__ out, int64_t rows, int64_t cols) {
   const int64_t idx = static_cast<int64_t>(blockIdx.x) * kThreads + threadIdx.x;
@@ -3304,6 +3475,21 @@ void r4dx_inkling2_dspark_markov_prep_bf16(int64_t rnn_in, int64_t prev_emb, int
                      dim3(kThreads), 0, reinterpret_cast<hipStream_t>(stream), reinterpret_cast<uint16_t*>(rnn_in),
                      reinterpret_cast<const uint16_t*>(prev_emb), reinterpret_cast<const uint16_t*>(head_h),
                      reinterpret_cast<const uint16_t*>(f_rnn), zero_state, R, H);
+  CheckLaunch(fn);
+}
+
+void r4dx_inkling2_dspark_markov_prep_dev_bf16(int64_t rnn_in, int64_t markov_w1_dev, int64_t prev_tok_dev,
+                                               int64_t vocab_size, int64_t head_h, int64_t f_rnn, int zero_state, int R,
+                                               int H, int64_t stream) {
+  const char* fn = "r4dx_inkling2_dspark_markov_prep_dev_bf16";
+  if (rnn_in == 0 || markov_w1_dev == 0 || prev_tok_dev == 0 || vocab_size < 1 || R < 1 || H < 1)
+    Fail(fn, "invalid args");
+  const int total = 2 * R + 2 * H;
+  hipLaunchKernelGGL(DsparkMarkovPrepDevKernel, dim3(static_cast<unsigned>((total + kThreads - 1) / kThreads)),
+                     dim3(kThreads), 0, reinterpret_cast<hipStream_t>(stream), reinterpret_cast<uint16_t*>(rnn_in),
+                     reinterpret_cast<const uint16_t*>(markov_w1_dev), reinterpret_cast<const int32_t*>(prev_tok_dev),
+                     vocab_size, reinterpret_cast<const uint16_t*>(head_h), reinterpret_cast<const uint16_t*>(f_rnn),
+                     zero_state, R, H);
   CheckLaunch(fn);
 }
 

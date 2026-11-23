@@ -169,12 +169,45 @@ Inkling2DsparkDraft Inkling2DsparkDraft::Load(const std::string& safetensors_pat
     L.q_norm = r.ReadDevBf16(p + "self_attn.q_norm.weight", {c.head_dim});
     L.k_norm = r.ReadDevBf16(p + "self_attn.k_norm.weight", {c.head_dim});
     L.k_norm_ctx = r.ReadDevBf16(p + "self_attn.k_norm_ctx.weight", {c.head_dim});
-    L.q_proj = r.ReadDraftLinear(p + "self_attn.q_proj.weight", Q, H, use_mxfp8);
-    L.k_proj = r.ReadDraftLinear(p + "self_attn.k_proj.weight", KV, H, use_mxfp8);
-    L.v_proj = r.ReadDraftLinear(p + "self_attn.v_proj.weight", KV, H, use_mxfp8);
+    // Stack q_proj + k_proj + v_proj into qkv_proj [Q + 2*KV, H]
+    {
+      const std::vector<uint16_t> qw = r.ReadBf16(p + "self_attn.q_proj.weight", {Q, H});
+      const std::vector<uint16_t> kw = r.ReadBf16(p + "self_attn.k_proj.weight", {KV, H});
+      const std::vector<uint16_t> vw = r.ReadBf16(p + "self_attn.v_proj.weight", {KV, H});
+      std::vector<uint16_t> qkv;
+      qkv.reserve(qw.size() + kw.size() + vw.size());
+      qkv.insert(qkv.end(), qw.begin(), qw.end());
+      qkv.insert(qkv.end(), kw.begin(), kw.end());
+      qkv.insert(qkv.end(), vw.begin(), vw.end());
+      if (use_mxfp8) {
+        L.qkv_proj = SafetensorsReader::MakeMxfp8LinearFromBf16(qkv, Q + 2 * KV, H, (p + "self_attn.qkv_proj").c_str());
+      } else {
+        L.qkv_proj.layout = Layout::kBf16;
+        L.qkv_proj.N = Q + 2 * KV;
+        L.qkv_proj.K = H;
+        L.qkv_proj.bf16_w = core::DeviceBuffer<uint16_t>(qkv.size());
+        L.qkv_proj.bf16_w.CopyFromHost(qkv);
+      }
+    }
     L.o_proj = r.ReadDraftLinear(p + "self_attn.o_proj.weight", H, Q, use_mxfp8);
-    L.k_proj_ctx = r.ReadDraftLinear(p + "self_attn.k_proj_ctx.weight", KV, H, use_mxfp8);
-    L.v_proj_ctx = r.ReadDraftLinear(p + "self_attn.v_proj_ctx.weight", KV, H, use_mxfp8);
+    // Stack k_proj_ctx + v_proj_ctx into kv_proj_ctx [2*KV, H]
+    {
+      const std::vector<uint16_t> kw = r.ReadBf16(p + "self_attn.k_proj_ctx.weight", {KV, H});
+      const std::vector<uint16_t> vw = r.ReadBf16(p + "self_attn.v_proj_ctx.weight", {KV, H});
+      std::vector<uint16_t> kvc;
+      kvc.reserve(kw.size() + vw.size());
+      kvc.insert(kvc.end(), kw.begin(), kw.end());
+      kvc.insert(kvc.end(), vw.begin(), vw.end());
+      if (use_mxfp8) {
+        L.kv_proj_ctx = SafetensorsReader::MakeMxfp8LinearFromBf16(kvc, 2 * KV, H, (p + "self_attn.kv_proj_ctx").c_str());
+      } else {
+        L.kv_proj_ctx.layout = Layout::kBf16;
+        L.kv_proj_ctx.N = 2 * KV;
+        L.kv_proj_ctx.K = H;
+        L.kv_proj_ctx.bf16_w = core::DeviceBuffer<uint16_t>(kvc.size());
+        L.kv_proj_ctx.bf16_w.CopyFromHost(kvc);
+      }
+    }
     // Stack gate_proj + up_proj into gate_up_proj [2*I, H]
     {
       const std::vector<uint16_t> gp = r.ReadBf16(p + "mlp.gate_proj.weight", {I, H});
@@ -423,8 +456,9 @@ void Inkling2DsparkDraft::InjectTaps(const uint16_t* tap0, const uint16_t* tap1,
   const int64_t H = cfg_.hidden_size, KV = cfg_.num_key_value_heads * cfg_.head_dim;
   const size_t mark = arena.Mark();
   uint16_t* ctx = arena.Alloc<uint16_t>(static_cast<size_t>(n * H), 16);
-  uint16_t* k = arena.Alloc<uint16_t>(static_cast<size_t>(n * KV), 16);
-  uint16_t* v = arena.Alloc<uint16_t>(static_cast<size_t>(n * KV), 16);
+  uint16_t* kv_cat = arena.Alloc<uint16_t>(static_cast<size_t>(n * 2 * KV), 16);
+  uint16_t* k = (n == 1) ? kv_cat : arena.Alloc<uint16_t>(static_cast<size_t>(n * KV), 16);
+  uint16_t* v = (n == 1) ? (kv_cat + KV) : arena.Alloc<uint16_t>(static_cast<size_t>(n * KV), 16);
 
   for (int64_t l = 0; l < cfg_.num_layers; ++l) {
     Layer& L = layers_[static_cast<size_t>(l)];
@@ -432,8 +466,11 @@ void Inkling2DsparkDraft::InjectTaps(const uint16_t* tap0, const uint16_t* tap1,
     r4dx_inkling2_dspark_mix_rmsnorm_bf16(P(tap0), P(tap1), P(tap2), P(tap3), al[0], al[1], al[2], al[3],
                                           P(L.dflare_norm.data()), P(ctx), static_cast<int>(n), static_cast<int>(H),
                                           cfg_.rms_norm_eps, s);
-    ApplyLinear(sr, arena, L.k_proj_ctx, ctx, k, n);
-    ApplyLinear(sr, arena, L.v_proj_ctx, ctx, v, n);
+    ApplyLinear(sr, arena, L.kv_proj_ctx, ctx, kv_cat, n);
+    if (n > 1) {
+      r4dx_inkling2_qgrkv_split_bf16(P(kv_cat), 2 * KV, P(k), 0, KV, P(v), KV, KV, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+                                     static_cast<int>(n), s);
+    }
     r4dx_inkling2_dspark_head_norm_rope_bf16(P(k), KV, P(L.k_norm_ctx.data()), static_cast<int>(n),
                                              static_cast<int>(cfg_.num_key_value_heads), static_cast<int>(cfg_.head_dim),
                                              pos0, cfg_.rope_theta, cfg_.rms_norm_eps, s);
@@ -462,7 +499,8 @@ std::vector<int32_t> Inkling2DsparkDraft::DraftGreedy(int32_t anchor_token, int6
                                                       const DsparkAnchorEmbedFn& embed_anchor,
                                                       const DsparkLmHeadArgmaxFn& lm_head_argmax,
                                                       const DsparkLmHeadBatchFn& lm_head_batch,
-                                                      const DsparkLogitsArgmaxFn& logits_argmax) {
+                                                      const DsparkLogitsArgmaxFn& logits_argmax,
+                                                      const DsparkLogitsArgmaxAsyncFn& logits_argmax_async) {
   const hipStream_t sr = stream.get();
   const int64_t s = P(sr);
   const int64_t B = cfg_.block_size;
@@ -485,6 +523,7 @@ std::vector<int32_t> Inkling2DsparkDraft::DraftGreedy(int32_t anchor_token, int6
   auto run_body = [&](bool use_pos_dev) {
     const size_t body_mark = arena.Mark();
     uint16_t* x = arena.Alloc<uint16_t>(static_cast<size_t>(B * H), 16);
+    uint16_t* qkv = arena.Alloc<uint16_t>(static_cast<size_t>(B * (Q + 2 * KV)), 16);
     uint16_t* q = arena.Alloc<uint16_t>(static_cast<size_t>(B * Q), 16);
     uint16_t* k = arena.Alloc<uint16_t>(static_cast<size_t>(B * KV), 16);
     uint16_t* v = arena.Alloc<uint16_t>(static_cast<size_t>(B * KV), 16);
@@ -492,16 +531,13 @@ std::vector<int32_t> Inkling2DsparkDraft::DraftGreedy(int32_t anchor_token, int6
     uint16_t* o = arena.Alloc<uint16_t>(static_cast<size_t>(B * H), 16);
     uint16_t* gu = arena.Alloc<uint16_t>(static_cast<size_t>(B * 2 * I), 16);
     uint16_t* act = arena.Alloc<uint16_t>(static_cast<size_t>(B * I), 16);
-    for (int64_t r = 1; r < B; ++r) {
-      R4DX_HIP_CHECK(hipMemcpyAsync(resid + r * H, mask_embed_.data(), static_cast<size_t>(H) * 2,
-                                    hipMemcpyDeviceToDevice, sr));
-    }
+    r4dx_inkling2_dspark_fill_mask_bf16(P(resid), P(mask_embed_.data()), static_cast<int>(B), static_cast<int>(H), s);
     for (int64_t l = 0; l < cfg_.num_layers; ++l) {
       const Layer& L = layers_[static_cast<size_t>(l)];
       r4dx_rmsnorm_plain_bf16(P(resid), P(L.input_layernorm.data()), P(x), B, H, cfg_.rms_norm_eps, 0, s);
-      ApplyLinear(sr, arena, L.q_proj, x, q, B);
-      ApplyLinear(sr, arena, L.k_proj, x, k, B);
-      ApplyLinear(sr, arena, L.v_proj, x, v, B);
+      ApplyLinear(sr, arena, L.qkv_proj, x, qkv, B);
+      r4dx_inkling2_qgrkv_split_bf16(P(qkv), Q + 2 * KV, P(q), 0, Q, P(k), Q, KV, P(v), Q + KV, KV, 0, 0, 0, 0, 0, 0,
+                                     static_cast<int>(B), s);
       if (use_pos_dev) {
         r4dx_inkling2_dspark_head_norm_rope_posdev_bf16(P(q), Q, P(L.q_norm.data()), static_cast<int>(B),
                                                         static_cast<int>(cfg_.num_attention_heads),
@@ -609,6 +645,29 @@ std::vector<int32_t> Inkling2DsparkDraft::DraftGreedy(int32_t anchor_token, int6
 
   std::vector<int32_t> drafted;
   drafted.reserve(static_cast<size_t>(n_steps));
+
+  // Zero-sync async Markov loop when markov_w1 is in VRAM and caller provides device-side argmax (TP=1 or TP=2 mailbox).
+  if (use_folded && !markov_w1_dev_.empty() && static_cast<bool>(logits_argmax_async)) {
+    int32_t* drafted_dev = arena.Alloc<int32_t>(static_cast<size_t>(n_steps + 1), 16);
+    R4DX_HIP_CHECK(hipMemcpyAsync(drafted_dev, &anchor_token, sizeof(int32_t), hipMemcpyHostToDevice, sr));
+    for (int64_t i = 0; i < n_steps; ++i) {
+      r4dx_inkling2_dspark_markov_prep_dev_bf16(P(rnn_in), P(markov_w1_dev_.data()), P(drafted_dev + i),
+                                                cfg_.vocab_size, P(head_h + (i + 1) * H), i == 0 ? P(f_rnn_.data()) : 0,
+                                                i == 0 ? 1 : 0, static_cast<int>(R), static_cast<int>(H), s);
+      ApplyLinear(sr, arena, rnn_proj_, rnn_in, raw_bf16, 1);
+      r4dx_inkling2_dspark_markov_gate_bf16(P(raw_bf16), P(rnn_bias_bf16_.data()), P(rnn_in), P(rnn_in), P(latent),
+                                            static_cast<int>(R), s);
+      ApplyLinear(sr, arena, fold_w_, latent, delta_lg, 1);
+      logits_argmax_async(base_lg + i * fold_vl_, delta_lg, fold_b_.data(), drafted_dev + i + 1);
+    }
+    drafted.resize(static_cast<size_t>(n_steps));
+    R4DX_HIP_CHECK(hipMemcpyAsync(drafted.data(), drafted_dev + 1, static_cast<size_t>(n_steps) * sizeof(int32_t),
+                                  hipMemcpyDeviceToHost, sr));
+    stream.Synchronize();
+    arena.Rewind(mark);
+    return drafted;
+  }
+
   int32_t prev = anchor_token;
 
   for (int64_t i = 0; i < n_steps; ++i) {

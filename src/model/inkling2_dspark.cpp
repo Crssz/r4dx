@@ -151,6 +151,7 @@ Inkling2DsparkDraft Inkling2DsparkDraft::Load(const std::string& safetensors_pat
 
   const char* bf16_env = std::getenv("R4DX_INK_DSPARK_BF16");
   const bool use_mxfp8 = !(bf16_env != nullptr && std::strcmp(bf16_env, "1") == 0);
+  d.use_mxfp8_ = use_mxfp8;
 
   d.layers_.resize(static_cast<size_t>(c.num_layers));
   for (int64_t l = 0; l < c.num_layers; ++l) {
@@ -198,7 +199,13 @@ Inkling2DsparkDraft Inkling2DsparkDraft::Load(const std::string& safetensors_pat
 
   // Recurrent Markov head
   d.markov_dflare_norm_ = r.ReadDevBf16("markov_head.dflare_norm.weight", {H});
-  d.markov_w1_host_ = r.ReadBf16("markov_head.markov_w1.weight", {c.vocab_size, R});
+  const char* mk_host_env = std::getenv("R4DX_INK_DSPARK_MARKOV_HOST");
+  const bool markov_on_host = (mk_host_env != nullptr && std::strcmp(mk_host_env, "1") == 0);
+  if (markov_on_host) {
+    d.markov_w1_host_ = r.ReadBf16("markov_head.markov_w1.weight", {c.vocab_size, R});
+  } else {
+    d.markov_w1_dev_ = r.ReadDevBf16("markov_head.markov_w1.weight", {c.vocab_size, R});
+  }
   d.rnn_proj_ = r.ReadBf16Linear("markov_head.rnn_proj.weight", 3 * R, 2 * R + 2 * H);
   d.rnn_bias_bf16_ = r.ReadDevBf16("markov_head.rnn_proj.bias", {3 * R});
   {
@@ -217,12 +224,103 @@ Inkling2DsparkDraft Inkling2DsparkDraft::Load(const std::string& safetensors_pat
   d.f_rnn_ = core::DeviceBuffer<uint16_t>(static_cast<size_t>(H));
   d.f_rnn_.Zero();
   d.prev_emb_host_ = core::PinnedBuffer<uint16_t>(static_cast<size_t>(R));
+  d.draft_pos_dev_ = core::DeviceBuffer<int64_t>(1);
+  d.draft_resid_ = core::DeviceBuffer<uint16_t>(static_cast<size_t>(c.block_size * H));
+  d.draft_head_h_ = core::DeviceBuffer<uint16_t>(static_cast<size_t>(c.block_size * H));
 
   std::cerr << "[r4dx::model::Inkling2DsparkDraft] loaded " << safetensors_path << " (3 layers "
             << (use_mxfp8 ? "mxfp8" : "bf16") << ", block " << c.block_size
-            << ", markov_rank " << R << ", markov_w1 host-resident 103 MB, KV slots " << d.layers_[0].slots << "/"
+            << ", markov_rank " << R << ", markov_w1 " << (markov_on_host ? "host" : "vram")
+            << " 103 MB, KV slots " << d.layers_[0].slots << "/"
             << d.layers_[1].slots << "/" << d.layers_[2].slots << ")\n";
   return d;
+}
+
+void Inkling2DsparkDraft::ReleaseDraftGraph() {
+  if (draft_graph_exec_ != nullptr) {
+    (void)hipGraphExecDestroy(reinterpret_cast<hipGraphExec_t>(draft_graph_exec_));
+    draft_graph_exec_ = nullptr;
+  }
+  if (draft_graph_ != nullptr) {
+    (void)hipGraphDestroy(reinterpret_cast<hipGraph_t>(draft_graph_));
+    draft_graph_ = nullptr;
+  }
+  draft_graph_attempted_ = false;
+}
+
+Inkling2DsparkDraft::~Inkling2DsparkDraft() { ReleaseDraftGraph(); }
+
+Inkling2DsparkDraft::Inkling2DsparkDraft(Inkling2DsparkDraft&& other) noexcept
+    : cfg_(other.cfg_),
+      fuse_alpha_(other.fuse_alpha_),
+      mask_embed_(std::move(other.mask_embed_)),
+      norm_(std::move(other.norm_)),
+      layers_(std::move(other.layers_)),
+      markov_dflare_norm_(std::move(other.markov_dflare_norm_)),
+      markov_w1_host_(std::move(other.markov_w1_host_)),
+      markov_w1_dev_(std::move(other.markov_w1_dev_)),
+      rnn_proj_(std::move(other.rnn_proj_)),
+      rnn_bias_bf16_(std::move(other.rnn_bias_bf16_)),
+      hidden_out_w_(std::move(other.hidden_out_w_)),
+      hidden_out_w_t_host_(std::move(other.hidden_out_w_t_host_)),
+      hidden_out_b_(std::move(other.hidden_out_b_)),
+      has_folded_lm_head_(other.has_folded_lm_head_),
+      use_mxfp8_(other.use_mxfp8_),
+      fold_vl_(other.fold_vl_),
+      fold_w_(std::move(other.fold_w_)),
+      fold_b_(std::move(other.fold_b_)),
+      f_rnn_(std::move(other.f_rnn_)),
+      f_rnn_ckpt_(std::move(other.f_rnn_ckpt_)),
+      prev_emb_host_(std::move(other.prev_emb_host_)),
+      draft_pos_dev_(std::move(other.draft_pos_dev_)),
+      draft_resid_(std::move(other.draft_resid_)),
+      draft_head_h_(std::move(other.draft_head_h_)),
+      draft_graph_(other.draft_graph_),
+      draft_graph_exec_(other.draft_graph_exec_),
+      draft_graph_attempted_(other.draft_graph_attempted_),
+      n_injected_(other.n_injected_),
+      ckpt_injected_(other.ckpt_injected_) {
+  other.draft_graph_ = nullptr;
+  other.draft_graph_exec_ = nullptr;
+  other.draft_graph_attempted_ = false;
+}
+
+Inkling2DsparkDraft& Inkling2DsparkDraft::operator=(Inkling2DsparkDraft&& other) noexcept {
+  if (this == &other) return *this;
+  ReleaseDraftGraph();
+  cfg_ = other.cfg_;
+  fuse_alpha_ = other.fuse_alpha_;
+  mask_embed_ = std::move(other.mask_embed_);
+  norm_ = std::move(other.norm_);
+  layers_ = std::move(other.layers_);
+  markov_dflare_norm_ = std::move(other.markov_dflare_norm_);
+  markov_w1_host_ = std::move(other.markov_w1_host_);
+  markov_w1_dev_ = std::move(other.markov_w1_dev_);
+  rnn_proj_ = std::move(other.rnn_proj_);
+  rnn_bias_bf16_ = std::move(other.rnn_bias_bf16_);
+  hidden_out_w_ = std::move(other.hidden_out_w_);
+  hidden_out_w_t_host_ = std::move(other.hidden_out_w_t_host_);
+  hidden_out_b_ = std::move(other.hidden_out_b_);
+  has_folded_lm_head_ = other.has_folded_lm_head_;
+  use_mxfp8_ = other.use_mxfp8_;
+  fold_vl_ = other.fold_vl_;
+  fold_w_ = std::move(other.fold_w_);
+  fold_b_ = std::move(other.fold_b_);
+  f_rnn_ = std::move(other.f_rnn_);
+  f_rnn_ckpt_ = std::move(other.f_rnn_ckpt_);
+  prev_emb_host_ = std::move(other.prev_emb_host_);
+  draft_pos_dev_ = std::move(other.draft_pos_dev_);
+  draft_resid_ = std::move(other.draft_resid_);
+  draft_head_h_ = std::move(other.draft_head_h_);
+  draft_graph_ = other.draft_graph_;
+  draft_graph_exec_ = other.draft_graph_exec_;
+  draft_graph_attempted_ = other.draft_graph_attempted_;
+  n_injected_ = other.n_injected_;
+  ckpt_injected_ = other.ckpt_injected_;
+  other.draft_graph_ = nullptr;
+  other.draft_graph_exec_ = nullptr;
+  other.draft_graph_attempted_ = false;
+  return *this;
 }
 
 void Inkling2DsparkDraft::Reset() {
@@ -277,16 +375,23 @@ void Inkling2DsparkDraft::InitFoldedLmHead(int64_t vl, core::Stream& stream, cor
   uint16_t* tmp_fold_t = arena.Alloc<uint16_t>(static_cast<size_t>(R * vl), 16);
   lm_head_batch(w_t_dev, R, tmp_fold_t);
 
-  fold_w_.layout = Layout::kBf16;
-  fold_w_.N = vl;
-  fold_w_.K = R;
-  fold_w_.bf16_w = core::DeviceBuffer<uint16_t>(static_cast<size_t>(vl * R));
-  r4dx_inkling2_dspark_transpose_bf16(P(tmp_fold_t), P(fold_w_.bf16_w.data()), R, vl, s);
+  core::DeviceBuffer<uint16_t> fold_bf16(static_cast<size_t>(vl * R));
+  r4dx_inkling2_dspark_transpose_bf16(P(tmp_fold_t), P(fold_bf16.data()), R, vl, s);
 
   fold_b_ = core::DeviceBuffer<uint16_t>(static_cast<size_t>(vl));
   lm_head_batch(hidden_out_b_.data(), 1, fold_b_.data());
 
   stream.Synchronize();
+  if (use_mxfp8_) {
+    std::vector<uint16_t> fold_h(static_cast<size_t>(vl * R));
+    R4DX_HIP_CHECK(hipMemcpy(fold_h.data(), fold_bf16.data(), fold_bf16.bytes(), hipMemcpyDeviceToHost));
+    fold_w_ = SafetensorsReader::MakeMxfp8LinearFromBf16(fold_h, vl, R, "dspark.fold_w");
+  } else {
+    fold_w_.layout = Layout::kBf16;
+    fold_w_.N = vl;
+    fold_w_.K = R;
+    fold_w_.bf16_w = std::move(fold_bf16);
+  }
   arena.Rewind(mark);
   std::vector<uint16_t>().swap(hidden_out_w_t_host_);
   fold_vl_ = vl;
@@ -346,52 +451,104 @@ std::vector<int32_t> Inkling2DsparkDraft::DraftGreedy(int32_t anchor_token, int6
   const float scale = 1.0f / std::sqrt(static_cast<float>(cfg_.head_dim));
   const size_t mark = arena.Mark();
 
-  // 1. Build input block x[0..B-1]: row 0 = embed_norm(embed_tokens(anchor)), rows 1..B-1 = mask_embed.
-  uint16_t* resid = arena.Alloc<uint16_t>(static_cast<size_t>(B * H), 16);
-  uint16_t* x = arena.Alloc<uint16_t>(static_cast<size_t>(B * H), 16);
+  // 1-3. Run 3 dense RoPE layers + final RMSNorm -> draft_head_h_ (captured into draft_graph_ when n_injected_ == anchor_pos).
+  const bool graph_ok = [] {
+    const char* e = std::getenv("R4DX_INK_DSPARK_GRAPH");
+    return !(e != nullptr && (std::strcmp(e, "0") == 0 || std::strcmp(e, "off") == 0));
+  }();
+  uint16_t* resid = draft_resid_.data();
+  uint16_t* head_h = draft_head_h_.data();
   embed_anchor(anchor_token, resid);
-  for (int64_t r = 1; r < B; ++r) {
-    R4DX_HIP_CHECK(hipMemcpyAsync(resid + r * H, mask_embed_.data(), static_cast<size_t>(H) * 2,
-                                  hipMemcpyDeviceToDevice, sr));
+
+  auto run_body = [&](bool use_pos_dev) {
+    const size_t body_mark = arena.Mark();
+    uint16_t* x = arena.Alloc<uint16_t>(static_cast<size_t>(B * H), 16);
+    uint16_t* q = arena.Alloc<uint16_t>(static_cast<size_t>(B * Q), 16);
+    uint16_t* k = arena.Alloc<uint16_t>(static_cast<size_t>(B * KV), 16);
+    uint16_t* v = arena.Alloc<uint16_t>(static_cast<size_t>(B * KV), 16);
+    uint16_t* ao = arena.Alloc<uint16_t>(static_cast<size_t>(B * Q), 16);
+    uint16_t* o = arena.Alloc<uint16_t>(static_cast<size_t>(B * H), 16);
+    uint16_t* gu = arena.Alloc<uint16_t>(static_cast<size_t>(B * 2 * I), 16);
+    uint16_t* act = arena.Alloc<uint16_t>(static_cast<size_t>(B * I), 16);
+    for (int64_t r = 1; r < B; ++r) {
+      R4DX_HIP_CHECK(hipMemcpyAsync(resid + r * H, mask_embed_.data(), static_cast<size_t>(H) * 2,
+                                    hipMemcpyDeviceToDevice, sr));
+    }
+    for (int64_t l = 0; l < cfg_.num_layers; ++l) {
+      const Layer& L = layers_[static_cast<size_t>(l)];
+      r4dx_rmsnorm_plain_bf16(P(resid), P(L.input_layernorm.data()), P(x), B, H, cfg_.rms_norm_eps, 0, s);
+      ApplyLinear(sr, arena, L.q_proj, x, q, B);
+      ApplyLinear(sr, arena, L.k_proj, x, k, B);
+      ApplyLinear(sr, arena, L.v_proj, x, v, B);
+      if (use_pos_dev) {
+        r4dx_inkling2_dspark_head_norm_rope_posdev_bf16(P(q), Q, P(L.q_norm.data()), static_cast<int>(B),
+                                                        static_cast<int>(cfg_.num_attention_heads),
+                                                        static_cast<int>(cfg_.head_dim), P(draft_pos_dev_.data()),
+                                                        cfg_.rope_theta, cfg_.rms_norm_eps, s);
+        r4dx_inkling2_dspark_head_norm_rope_posdev_bf16(P(k), KV, P(L.k_norm.data()), static_cast<int>(B),
+                                                        static_cast<int>(cfg_.num_key_value_heads),
+                                                        static_cast<int>(cfg_.head_dim), P(draft_pos_dev_.data()),
+                                                        cfg_.rope_theta, cfg_.rms_norm_eps, s);
+        r4dx_inkling2_dspark_attn_posdev_bf16(P(q), P(k), P(v), P(L.k_store.data()), P(L.v_store.data()), P(ao),
+                                              static_cast<int>(B), static_cast<int>(cfg_.num_attention_heads),
+                                              static_cast<int>(cfg_.num_key_value_heads),
+                                              static_cast<int>(cfg_.head_dim), P(draft_pos_dev_.data()), L.window,
+                                              L.slots, scale, s);
+      } else {
+        r4dx_inkling2_dspark_head_norm_rope_bf16(P(q), Q, P(L.q_norm.data()), static_cast<int>(B),
+                                                 static_cast<int>(cfg_.num_attention_heads),
+                                                 static_cast<int>(cfg_.head_dim), anchor_pos, cfg_.rope_theta,
+                                                 cfg_.rms_norm_eps, s);
+        r4dx_inkling2_dspark_head_norm_rope_bf16(P(k), KV, P(L.k_norm.data()), static_cast<int>(B),
+                                                 static_cast<int>(cfg_.num_key_value_heads),
+                                                 static_cast<int>(cfg_.head_dim), anchor_pos, cfg_.rope_theta,
+                                                 cfg_.rms_norm_eps, s);
+        r4dx_inkling2_dspark_attn_bf16(P(q), P(k), P(v), P(L.k_store.data()), P(L.v_store.data()), P(ao),
+                                       static_cast<int>(B), static_cast<int>(cfg_.num_attention_heads),
+                                       static_cast<int>(cfg_.num_key_value_heads), static_cast<int>(cfg_.head_dim),
+                                       static_cast<int>(n_injected_), L.window, L.slots, scale, s);
+      }
+      ApplyLinear(sr, arena, L.o_proj, ao, o, B);
+      r4dx_residual_add_bf16(P(resid), P(o), P(resid), B * H, s);
+      r4dx_rmsnorm_plain_bf16(P(resid), P(L.post_attention_layernorm.data()), P(x), B, H, cfg_.rms_norm_eps, 0, s);
+      ApplyLinear(sr, arena, L.gate_up_proj, x, gu, B);
+      r4dx_silu_mul_bf16(P(gu), P(act), B, I, 2 * I, s);
+      ApplyLinear(sr, arena, L.down_proj, act, o, B);
+      r4dx_residual_add_bf16(P(resid), P(o), P(resid), B * H, s);
+    }
+    r4dx_rmsnorm_plain_bf16(P(resid), P(norm_.data()), P(head_h), B, H, cfg_.rms_norm_eps, 0, s);
+    arena.Rewind(body_mark);
+  };
+
+  if (graph_ok && n_injected_ == anchor_pos && mark == 0) {
+    R4DX_HIP_CHECK(hipMemcpyAsync(draft_pos_dev_.data(), &anchor_pos, sizeof(int64_t), hipMemcpyHostToDevice, sr));
+    if (draft_graph_exec_ != nullptr) {
+      R4DX_HIP_CHECK(hipGraphLaunch(reinterpret_cast<hipGraphExec_t>(draft_graph_exec_), sr));
+    } else if (!draft_graph_attempted_) {
+      draft_graph_attempted_ = true;
+      hipGraph_t g = nullptr;
+      hipGraphExec_t ge = nullptr;
+      const hipError_t berr = hipStreamBeginCapture(sr, hipStreamCaptureModeRelaxed);
+      if (berr == hipSuccess) {
+        run_body(true);
+        const hipError_t eerr = hipStreamEndCapture(sr, &g);
+        if (eerr == hipSuccess && g != nullptr && hipGraphInstantiate(&ge, g, nullptr, nullptr, 0) == hipSuccess) {
+          draft_graph_ = reinterpret_cast<void*>(g);
+          draft_graph_exec_ = reinterpret_cast<void*>(ge);
+          R4DX_HIP_CHECK(hipGraphLaunch(ge, sr));
+        } else {
+          if (g != nullptr) (void)hipGraphDestroy(g);
+          run_body(false);
+        }
+      } else {
+        run_body(false);
+      }
+    } else {
+      run_body(false);
+    }
+  } else {
+    run_body(false);
   }
-
-  // 2. Run 3 dense RoPE layers with bidirectional block attention over [context KV, block KV].
-  uint16_t* q = arena.Alloc<uint16_t>(static_cast<size_t>(B * Q), 16);
-  uint16_t* k = arena.Alloc<uint16_t>(static_cast<size_t>(B * KV), 16);
-  uint16_t* v = arena.Alloc<uint16_t>(static_cast<size_t>(B * KV), 16);
-  uint16_t* ao = arena.Alloc<uint16_t>(static_cast<size_t>(B * Q), 16);
-  uint16_t* o = arena.Alloc<uint16_t>(static_cast<size_t>(B * H), 16);
-  uint16_t* gu = arena.Alloc<uint16_t>(static_cast<size_t>(B * 2 * I), 16);
-  uint16_t* act = arena.Alloc<uint16_t>(static_cast<size_t>(B * I), 16);
-
-  for (int64_t l = 0; l < cfg_.num_layers; ++l) {
-    const Layer& L = layers_[static_cast<size_t>(l)];
-    r4dx_rmsnorm_plain_bf16(P(resid), P(L.input_layernorm.data()), P(x), B, H, cfg_.rms_norm_eps, 0, s);
-    ApplyLinear(sr, arena, L.q_proj, x, q, B);
-    ApplyLinear(sr, arena, L.k_proj, x, k, B);
-    ApplyLinear(sr, arena, L.v_proj, x, v, B);
-    r4dx_inkling2_dspark_head_norm_rope_bf16(P(q), Q, P(L.q_norm.data()), static_cast<int>(B),
-                                             static_cast<int>(cfg_.num_attention_heads), static_cast<int>(cfg_.head_dim),
-                                             anchor_pos, cfg_.rope_theta, cfg_.rms_norm_eps, s);
-    r4dx_inkling2_dspark_head_norm_rope_bf16(P(k), KV, P(L.k_norm.data()), static_cast<int>(B),
-                                             static_cast<int>(cfg_.num_key_value_heads), static_cast<int>(cfg_.head_dim),
-                                             anchor_pos, cfg_.rope_theta, cfg_.rms_norm_eps, s);
-    r4dx_inkling2_dspark_attn_bf16(P(q), P(k), P(v), P(L.k_store.data()), P(L.v_store.data()), P(ao),
-                                   static_cast<int>(B), static_cast<int>(cfg_.num_attention_heads),
-                                   static_cast<int>(cfg_.num_key_value_heads), static_cast<int>(cfg_.head_dim),
-                                   static_cast<int>(n_injected_), L.window, L.slots, scale, s);
-    ApplyLinear(sr, arena, L.o_proj, ao, o, B);
-    r4dx_residual_add_bf16(P(resid), P(o), P(resid), B * H, s);
-    r4dx_rmsnorm_plain_bf16(P(resid), P(L.post_attention_layernorm.data()), P(x), B, H, cfg_.rms_norm_eps, 0, s);
-    ApplyLinear(sr, arena, L.gate_up_proj, x, gu, B);
-    r4dx_silu_mul_bf16(P(gu), P(act), B, I, 2 * I, s);
-    ApplyLinear(sr, arena, L.down_proj, act, o, B);
-    r4dx_residual_add_bf16(P(resid), P(o), P(resid), B * H, s);
-  }
-
-  // 3. Final RMSNorm -> head_hidden[0..B-1]. We sample rows 1..B-1 (sample_from_anchor == false).
-  uint16_t* head_h = arena.Alloc<uint16_t>(static_cast<size_t>(B * H), 16);
-  r4dx_rmsnorm_plain_bf16(P(resid), P(norm_.data()), P(head_h), B, H, cfg_.rms_norm_eps, 0, s);
 
   // 4. Sequential recurrent Markov loop over steps i = 0..n_steps-1.
   // rnn_in = [state (R), prev_emb (R), head_h[1+i] (H), f_rnn (H)] -> [2*R + 2*H] bf16.
@@ -424,9 +581,14 @@ std::vector<int32_t> Inkling2DsparkDraft::DraftGreedy(int32_t anchor_token, int6
 
   for (int64_t i = 0; i < n_steps; ++i) {
     const int64_t clamped = (prev >= 0 && prev < cfg_.vocab_size) ? prev : 0;
-    std::memcpy(prev_emb_host_.data(), markov_w1_host_.data() + clamped * R, static_cast<size_t>(R) * 2);
-    R4DX_HIP_CHECK(hipMemcpyAsync(rnn_in + R, prev_emb_host_.data(), static_cast<size_t>(R) * 2,
-                                  hipMemcpyHostToDevice, sr));
+    if (!markov_w1_dev_.empty()) {
+      R4DX_HIP_CHECK(hipMemcpyAsync(rnn_in + R, markov_w1_dev_.data() + clamped * R, static_cast<size_t>(R) * 2,
+                                    hipMemcpyDeviceToDevice, sr));
+    } else {
+      std::memcpy(prev_emb_host_.data(), markov_w1_host_.data() + clamped * R, static_cast<size_t>(R) * 2);
+      R4DX_HIP_CHECK(hipMemcpyAsync(rnn_in + R, prev_emb_host_.data(), static_cast<size_t>(R) * 2,
+                                    hipMemcpyHostToDevice, sr));
+    }
     R4DX_HIP_CHECK(hipMemcpyAsync(rnn_in + 2 * R, head_h + (i + 1) * H, static_cast<size_t>(H) * 2,
                                   hipMemcpyDeviceToDevice, sr));
     ApplyLinear(sr, arena, rnn_proj_, rnn_in, raw_bf16, 1);

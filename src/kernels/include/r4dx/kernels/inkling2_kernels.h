@@ -203,6 +203,14 @@ void r4dx_inkling2_dspark_attn_bf16(int64_t q, int64_t k_block, int64_t v_block,
                                     int64_t out, int T, int q_heads, int kv_heads, int head_dim, int n_injected,
                                     int window, int slots, float scale, int64_t stream);
 
+// Graph-capturable variants reading pos0 / n_injected from device int64_t* `pos_dev`.
+void r4dx_inkling2_dspark_head_norm_rope_posdev_bf16(int64_t x, int64_t x_row_stride, int64_t weight, int T, int heads,
+                                                     int head_dim, int64_t pos_dev, float rope_theta, float eps,
+                                                     int64_t stream);
+void r4dx_inkling2_dspark_attn_posdev_bf16(int64_t q, int64_t k_block, int64_t v_block, int64_t k_store, int64_t v_store,
+                                           int64_t out, int T, int q_heads, int kv_heads, int head_dim, int64_t pos_dev,
+                                           int window, int slots, float scale, int64_t stream);
+
 // Write n rows of [n, kv_heads, head_dim] bf16 K/V into ring store [slots, kv_heads, head_dim] at positions pos0..pos0+n-1.
 void r4dx_inkling2_dspark_kv_write_bf16(int64_t k_in, int64_t v_in, int64_t k_store, int64_t v_store, int n,
                                         int kv_heads, int head_dim, int64_t pos0, int slots, int64_t stream);

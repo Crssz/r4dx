@@ -1436,12 +1436,13 @@ __global__ __launch_bounds__(kThreads) void DsparkMixRmsNormKernel(
 
 __global__ __launch_bounds__(64) void DsparkHeadNormRopeKernel(
     uint16_t* __restrict__ x, int64_t row_stride, const uint16_t* __restrict__ w, int heads, int head_dim,
-    int64_t pos0, float rope_theta, float eps) {
+    int64_t pos0, const int64_t* __restrict__ pos_dev, float rope_theta, float eps) {
   const int t = static_cast<int>(blockIdx.y);
   const int h = static_cast<int>(blockIdx.x);
   const int lane = threadIdx.x;  // 0..head_dim/2 - 1 (64 threads for head_dim=128)
   const int half = head_dim >> 1;
   if (lane >= half) return;
+  const int64_t p0 = (pos_dev != nullptr) ? *pos_dev : pos0;
   uint16_t* row = x + static_cast<int64_t>(t) * row_stride + static_cast<int64_t>(h) * head_dim;
   float x1 = r4dx::core::Bf16ToFloat(row[lane]);
   float x2 = r4dx::core::Bf16ToFloat(row[half + lane]);
@@ -1456,7 +1457,7 @@ __global__ __launch_bounds__(64) void DsparkHeadNormRopeKernel(
     x1 = r4dx::core::Bf16ToFloat(r4dx::core::FloatToBf16(x1 * inv * r4dx::core::Bf16ToFloat(w[lane])));
     x2 = r4dx::core::Bf16ToFloat(r4dx::core::FloatToBf16(x2 * inv * r4dx::core::Bf16ToFloat(w[half + lane])));
   }
-  const float pos = static_cast<float>(pos0 + t);
+  const float pos = static_cast<float>(p0 + t);
   const float inv_freq = powf(rope_theta, -2.0f * static_cast<float>(lane) / static_cast<float>(head_dim));
   const float angle = pos * inv_freq;
   float s, c;
@@ -1528,7 +1529,9 @@ __global__ __launch_bounds__(kThreads) void DsparkKvWriteKernel(
 __global__ __launch_bounds__(128) void DsparkAttnKernel(
     const uint16_t* __restrict__ q_ptr, const uint16_t* __restrict__ kb_ptr, const uint16_t* __restrict__ vb_ptr,
     const uint16_t* __restrict__ ks_ptr, const uint16_t* __restrict__ vs_ptr, uint16_t* __restrict__ out_ptr,
-    int T, int q_heads, int kv_heads, int n_injected, int window, int slots, float scale) {
+    int T, int q_heads, int kv_heads, int n_injected, const int64_t* __restrict__ pos_dev, int window, int slots,
+    float scale) {
+  const int n_inj = (pos_dev != nullptr) ? static_cast<int>(*pos_dev) : n_injected;
   __shared__ float sm[4];
   __shared__ float sl[4];
   __shared__ float so[4][128];
@@ -1547,8 +1550,8 @@ __global__ __launch_bounds__(128) void DsparkAttnKernel(
   float mv = -INFINITY, lv = 0.0f;
   float o0 = 0.0f, o1 = 0.0f, o2 = 0.0f, o3 = 0.0f;
 
-  const int k_begin = (window > 0 && n_injected > window) ? (n_injected - window) : 0;
-  const int ctx_len = n_injected - k_begin;
+  const int k_begin = (window > 0 && n_inj > window) ? (n_inj - window) : 0;
+  const int ctx_len = n_inj - k_begin;
   const int total_k = ctx_len + T;
 
   for (int idx = wave; idx < total_k; idx += 4) {
@@ -1636,7 +1639,21 @@ void r4dx_inkling2_dspark_head_norm_rope_bf16(int64_t x, int64_t x_row_stride, i
   if (x == 0 || head_dim != 128) Fail(fn, "null x or head_dim != 128");
   hipLaunchKernelGGL(DsparkHeadNormRopeKernel, dim3(static_cast<unsigned>(heads), static_cast<unsigned>(T)), dim3(64),
                      0, reinterpret_cast<hipStream_t>(stream), reinterpret_cast<uint16_t*>(x), x_row_stride,
-                     reinterpret_cast<const uint16_t*>(weight), heads, head_dim, pos0, rope_theta, eps);
+                     reinterpret_cast<const uint16_t*>(weight), heads, head_dim, pos0,
+                     static_cast<const int64_t*>(nullptr), rope_theta, eps);
+  CheckLaunch(fn);
+}
+
+void r4dx_inkling2_dspark_head_norm_rope_posdev_bf16(int64_t x, int64_t x_row_stride, int64_t weight, int T, int heads,
+                                                     int head_dim, int64_t pos_dev, float rope_theta, float eps,
+                                                     int64_t stream) {
+  const char* fn = "r4dx_inkling2_dspark_head_norm_rope_posdev_bf16";
+  if (T <= 0 || heads <= 0) return;
+  if (x == 0 || pos_dev == 0 || head_dim != 128) Fail(fn, "null x/pos_dev or head_dim != 128");
+  hipLaunchKernelGGL(DsparkHeadNormRopeKernel, dim3(static_cast<unsigned>(heads), static_cast<unsigned>(T)), dim3(64),
+                     0, reinterpret_cast<hipStream_t>(stream), reinterpret_cast<uint16_t*>(x), x_row_stride,
+                     reinterpret_cast<const uint16_t*>(weight), heads, head_dim, int64_t{0},
+                     reinterpret_cast<const int64_t*>(pos_dev), rope_theta, eps);
   CheckLaunch(fn);
 }
 
@@ -1700,7 +1717,26 @@ void r4dx_inkling2_dspark_attn_bf16(int64_t q, int64_t k_block, int64_t v_block,
                      reinterpret_cast<hipStream_t>(stream), reinterpret_cast<const uint16_t*>(q),
                      reinterpret_cast<const uint16_t*>(k_block), reinterpret_cast<const uint16_t*>(v_block),
                      reinterpret_cast<const uint16_t*>(k_store), reinterpret_cast<const uint16_t*>(v_store),
-                     reinterpret_cast<uint16_t*>(out), T, q_heads, kv_heads, n_injected, window, slots, scale);
+                     reinterpret_cast<uint16_t*>(out), T, q_heads, kv_heads, n_injected,
+                     static_cast<const int64_t*>(nullptr), window, slots, scale);
+  CheckLaunch(fn);
+}
+
+void r4dx_inkling2_dspark_attn_posdev_bf16(int64_t q, int64_t k_block, int64_t v_block, int64_t k_store, int64_t v_store,
+                                           int64_t out, int T, int q_heads, int kv_heads, int head_dim, int64_t pos_dev,
+                                           int window, int slots, float scale, int64_t stream) {
+  const char* fn = "r4dx_inkling2_dspark_attn_posdev_bf16";
+  if (T <= 0) return;
+  if (q == 0 || k_block == 0 || v_block == 0 || out == 0 || pos_dev == 0 || head_dim != 128 || kv_heads <= 0 ||
+      q_heads % kv_heads != 0) {
+    Fail(fn, "invalid args");
+  }
+  hipLaunchKernelGGL(DsparkAttnKernel, dim3(static_cast<unsigned>(q_heads), static_cast<unsigned>(T)), dim3(128), 0,
+                     reinterpret_cast<hipStream_t>(stream), reinterpret_cast<const uint16_t*>(q),
+                     reinterpret_cast<const uint16_t*>(k_block), reinterpret_cast<const uint16_t*>(v_block),
+                     reinterpret_cast<const uint16_t*>(k_store), reinterpret_cast<const uint16_t*>(v_store),
+                     reinterpret_cast<uint16_t*>(out), T, q_heads, kv_heads, 0,
+                     reinterpret_cast<const int64_t*>(pos_dev), window, slots, scale);
   CheckLaunch(fn);
 }
 

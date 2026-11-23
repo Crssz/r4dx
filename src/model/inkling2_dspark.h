@@ -55,8 +55,11 @@ class Inkling2DsparkDraft {
   static Inkling2DsparkDraft Load(const std::string& safetensors_path, int64_t max_ctx);
 
   Inkling2DsparkDraft() = default;
-  Inkling2DsparkDraft(Inkling2DsparkDraft&&) = default;
-  Inkling2DsparkDraft& operator=(Inkling2DsparkDraft&&) = default;
+  ~Inkling2DsparkDraft();
+  Inkling2DsparkDraft(Inkling2DsparkDraft&& other) noexcept;
+  Inkling2DsparkDraft& operator=(Inkling2DsparkDraft&& other) noexcept;
+  Inkling2DsparkDraft(const Inkling2DsparkDraft&) = delete;
+  Inkling2DsparkDraft& operator=(const Inkling2DsparkDraft&) = delete;
 
   const Inkling2DsparkConfig& Config() const { return cfg_; }
   int64_t InjectedCount() const { return n_injected_; }
@@ -108,7 +111,8 @@ class Inkling2DsparkDraft {
 
   // Recurrent Markov head
   core::DeviceBuffer<uint16_t> markov_dflare_norm_;
-  std::vector<uint16_t> markov_w1_host_;  // [vocab_size, markov_rank] bf16 on host (0 VRAM)
+  std::vector<uint16_t> markov_w1_host_;          // [vocab_size, markov_rank] bf16 on host (fallback)
+  core::DeviceBuffer<uint16_t> markov_w1_dev_;    // [vocab_size, markov_rank] bf16 in VRAM (default, 103 MB)
   QuantLinear rnn_proj_;                  // [3*R, 2*R + 2*H] bf16
   core::DeviceBuffer<uint16_t> rnn_bias_bf16_;  // [3*R] bf16
   core::DeviceBuffer<uint16_t> hidden_out_w_;   // [H, R] bf16 (fallback if lm_head not folded)
@@ -117,16 +121,25 @@ class Inkling2DsparkDraft {
 
   // Folded lm_head @ hidden_out (populated by InitFoldedLmHead).
   bool has_folded_lm_head_ = false;
+  bool use_mxfp8_ = true;
   int64_t fold_vl_ = 0;
-  QuantLinear fold_w_;                    // [vl, R] bf16
+  QuantLinear fold_w_;                    // [vl, R] mxfp8 (or bf16)
   core::DeviceBuffer<uint16_t> fold_b_;   // [vl] bf16
 
-  // Persistent draft state
+  // Persistent draft state + HIP graph for the 3-layer DSpark transformer block
   core::DeviceBuffer<uint16_t> f_rnn_;          // [H] bf16 (last committed token's markov context)
   core::DeviceBuffer<uint16_t> f_rnn_ckpt_;
   core::PinnedBuffer<uint16_t> prev_emb_host_;  // [R] bf16
+  core::DeviceBuffer<int64_t> draft_pos_dev_;   // [1] anchor_pos (= n_injected_) for draft_graph_
+  core::DeviceBuffer<uint16_t> draft_resid_;    // [B, H] persistent input for draft_graph_
+  core::DeviceBuffer<uint16_t> draft_head_h_;   // [B, H] persistent output for draft_graph_
+  void* draft_graph_ = nullptr;                 // hipGraph_t
+  void* draft_graph_exec_ = nullptr;            // hipGraphExec_t
+  bool draft_graph_attempted_ = false;
   int64_t n_injected_ = 0;
   int64_t ckpt_injected_ = -1;
+
+  void ReleaseDraftGraph();
 };
 
 }  // namespace r4dx::model

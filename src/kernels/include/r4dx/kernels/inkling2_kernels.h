@@ -46,6 +46,32 @@ void r4dx_inkling2_sconv_static_hist_norm_f32(int64_t x, int x_bf16, int64_t wei
                                               int64_t out, int64_t hist, int64_t inv_out, int T, int C, float eps,
                                               int64_t stream);
 
+// Paired K and V static short convolution in a single kernel launch (x_k, x_v: [T, C] bf16 or fp32).
+void r4dx_inkling2_sconv_static_pair_hist_f32(int64_t x_k, int64_t x_v, int x_bf16, int64_t w_k, int64_t w_v,
+                                              int64_t state_k, int64_t state_v, int64_t out_k, int64_t out_v,
+                                              int64_t hist_k, int64_t hist_v, int T, int C, int64_t stream);
+
+// Batched 3-gate (Q, K, V) MsgGate prep, down GEMM, apply, and RMSNorm -> bf16 in 4 launches instead of 12.
+// If x_stride == 0 (sliding layers), all 3 gates share the single [T, H] input `x`; if x_stride == T * H (full layers),
+// gate g reads `x + g * T * H`. `m_all` is `[3, T, H]` fp32 contiguous (`msg(0..2)`).
+void r4dx_inkling2_msg_gate_prep3_bf16(int64_t x, int64_t x_gate_stride, int64_t m_all, int64_t out_cat, int T, int H,
+                                       float eps, int64_t stream);
+void r4dx_inkling2_dense3_bf16(int64_t x_all, int64_t w0, int64_t w1, int64_t w2, int64_t out_all, int M, int N, int K,
+                               int64_t stream);
+void r4dx_inkling2_msg_gate_apply3_f32(int64_t x, int64_t x_gate_stride, int64_t m_all, int64_t g_all, int64_t forget0,
+                                       int64_t forget1, int64_t forget2, int64_t gain0, int64_t gain1, int64_t gain2,
+                                       int64_t out_all, int T, int H, int R, int64_t stream);
+void r4dx_inkling2_rmsnorm3_f32in_bf16(int64_t x_all, int64_t w0, int64_t w1, int64_t w2, int64_t out0, int64_t out1,
+                                       int64_t out2, int T, int H, float eps, int64_t stream);
+
+// Dedicated Inkling2 MoE sort, uint4-vectorized gather, and uint4-vectorized combine (separated from LFM2).
+void r4dx_inkling2_moe_sort(int64_t ids, int T, int top_k, int n_experts, int64_t expert_counts,
+                            int64_t expert_offsets, int64_t sorted_pairs, int64_t pos_of_pair, int64_t stream);
+void r4dx_inkling2_moe_gather_bf16(int64_t x, int64_t sorted_pairs, int64_t out, int n_pairs, int top_k, int hidden,
+                                   int64_t x_row_stride, int64_t valid_pairs, int64_t stream);
+void r4dx_inkling2_moe_combine_bf16(int64_t y, int64_t pos_of_pair, int64_t w, int64_t out, int T, int top_k,
+                                    int hidden, int64_t stream);
+
 // ---- static short convolution (inkling2_ref::SconvStatic) ---------------------------------------------------------
 // out_t = [residual_t +] (w0 x_{t-3} + w1 x_{t-2} + w2 x_{t-1} + w3 x_t + x_t) / sqrt(5), per channel, fp32.
 // x: [T, C] bf16 (x_bf16 != 0) or fp32, row stride C. weight: fp32 [C, 4] (tap 3 = current). state: fp32 [3, C]

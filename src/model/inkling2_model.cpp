@@ -422,6 +422,31 @@ void Inkling2Model::MsgGate(const Inkling2MsgGateWeights& g, const float* x, con
                                    static_cast<int>(H), static_cast<int>(R), s);
 }
 
+void Inkling2Model::MsgGate3AttnNormBf16(const Inkling2LayerWeights& w, const float* a_src, const float* m_all,
+                                         uint16_t* xq, uint16_t* xk, uint16_t* xv, int64_t T) {
+  const Inkling2Config& cfg = container_.Config();
+  const int64_t H = cfg.hidden_size, R = cfg.gate_rank;
+  const int64_t s = P(stream_.get());
+  const float eps = static_cast<float>(cfg.rms_norm_eps);
+  const int64_t x_stride = (w.full && w.n_attn_queries == 3) ? (T * H) : 0;
+  uint16_t* cat = arena_.Alloc<uint16_t>(static_cast<size_t>(3 * T * 2 * H), 16);
+  float* gv = arena_.Alloc<float>(static_cast<size_t>(3 * T * R), 16);
+  float* tmp = arena_.Alloc<float>(static_cast<size_t>(3 * T * H), 16);
+  r4dx_inkling2_msg_gate_prep3_bf16(P(a_src), x_stride, P(m_all), P(cat), static_cast<int>(T), static_cast<int>(H), eps,
+                                    s);
+  r4dx_inkling2_dense3_bf16(P(cat), P(w.msg[0].down.data()), P(w.msg[1].down.data()), P(w.msg[2].down.data()), P(gv),
+                            static_cast<int>(T), static_cast<int>(R), static_cast<int>(2 * H), s);
+  r4dx_inkling2_msg_gate_apply3_f32(P(a_src), x_stride, P(m_all), P(gv), P(w.msg[0].forget.data()),
+                                    P(w.msg[1].forget.data()), P(w.msg[2].forget.data()), P(w.msg[0].gain.data()),
+                                    P(w.msg[1].gain.data()), P(w.msg[2].gain.data()), P(tmp), static_cast<int>(T),
+                                    static_cast<int>(H), static_cast<int>(R), s);
+  const uint16_t* nw0 = w.full ? w.q_norm.data() : w.attn_norm.data();
+  const uint16_t* nw1 = w.full ? w.k_norm.data() : w.attn_norm.data();
+  const uint16_t* nw2 = w.full ? w.v_norm.data() : w.attn_norm.data();
+  r4dx_inkling2_rmsnorm3_f32in_bf16(P(tmp), P(nw0), P(nw1), P(nw2), P(xq), P(xk), P(xv), static_cast<int>(T),
+                                    static_cast<int>(H), eps, s);
+}
+
 void Inkling2Model::Attention(const Inkling2Visit& v, const uint16_t* xq, const uint16_t* xk, const uint16_t* xv,
                               uint16_t* out, int64_t T, SpanAccumulator* prof, bool use_pos_dev, bool graph_long_ctx,
                               bool capture_conv_hist) {
@@ -557,10 +582,9 @@ void Inkling2Model::Attention(const Inkling2Visit& v, const uint16_t* xq, const 
                                            P(vc), vhist, static_cast<int>(T), static_cast<int>(C),
                                            static_cast<int>(kvl), s);
     } else {
-      r4dx_inkling2_sconv_static_hist_f32(P(klin), 1, P(a.k_conv.data()), P(ConvState(slot, 0)), 0, P(kc), khist,
-                                          static_cast<int>(T), static_cast<int>(C), s);
-      r4dx_inkling2_sconv_static_hist_f32(P(vlin), 1, P(a.v_conv.data()), P(ConvState(slot, 1)), 0, P(vc), vhist,
-                                          static_cast<int>(T), static_cast<int>(C), s);
+      r4dx_inkling2_sconv_static_pair_hist_f32(P(klin), P(vlin), 1, P(a.k_conv.data()), P(a.v_conv.data()),
+                                               P(ConvState(slot, 0)), P(ConvState(slot, 1)), P(kc), P(vc), khist,
+                                               vhist, static_cast<int>(T), static_cast<int>(C), s);
     }
     R4dxInkling2HeadOut paged{};
     paged.kind = 1;
@@ -760,7 +784,8 @@ void Inkling2Model::Moe(int64_t layer, const uint16_t* x, uint16_t* out, int64_t
       }
     }
     ProfiledCall(prof, sr, "moe.combine", [&] {
-      r4dx_lfm2_moe_combine_bf16(P(ys), 0, P(wts), P(out), static_cast<int>(T), static_cast<int>(K), static_cast<int>(H), s);
+      r4dx_inkling2_moe_combine_bf16(P(ys), 0, P(wts), P(out), static_cast<int>(T), static_cast<int>(K),
+                                     static_cast<int>(H), s);
     });
   } else {
     int32_t* counts = arena_.Alloc<int32_t>(static_cast<size_t>(E), 16);
@@ -769,10 +794,10 @@ void Inkling2Model::Moe(int64_t layer, const uint16_t* x, uint16_t* out, int64_t
     int32_t* pos_of_pair = arena_.Alloc<int32_t>(static_cast<size_t>(Pn), 16);
     uint16_t* xs = arena_.Alloc<uint16_t>(static_cast<size_t>(Pn * H), 16);
     ProfiledCall(prof, sr, "moe.sort", [&] {
-      r4dx_lfm2_moe_sort(P(ids), static_cast<int>(T), static_cast<int>(K), static_cast<int>(E), P(counts), P(offsets),
-                         P(sorted), P(pos_of_pair), s);
-      r4dx_lfm2_moe_gather_bf16(P(x), P(sorted), P(xs), static_cast<int>(Pn), static_cast<int>(K), static_cast<int>(H), H,
-                                P(offsets + E), s);
+      r4dx_inkling2_moe_sort(P(ids), static_cast<int>(T), static_cast<int>(K), static_cast<int>(E), P(counts),
+                             P(offsets), P(sorted), P(pos_of_pair), s);
+      r4dx_inkling2_moe_gather_bf16(P(x), P(sorted), P(xs), static_cast<int>(Pn), static_cast<int>(K),
+                                    static_cast<int>(H), H, P(offsets + E), s);
     });
     const bool grouped_nv4_pf = w.nvfp4_experts && !w.gate_up_ptrs0.empty() && !w.down_ptrs0.empty();
     const bool grouped_mx_pf = !grouped_nv4_pf && MoeGroupedPrefillEnabled() && !w.gate_up_ptrs0.empty() &&
@@ -851,8 +876,8 @@ void Inkling2Model::Moe(int64_t layer, const uint16_t* x, uint16_t* out, int64_t
       }
     }
     ProfiledCall(prof, sr, "moe.combine", [&] {
-      r4dx_lfm2_moe_combine_bf16(P(ys), P(pos_of_pair), P(wts), P(out), static_cast<int>(T), static_cast<int>(K),
-                                 static_cast<int>(H), s);
+      r4dx_inkling2_moe_combine_bf16(P(ys), P(pos_of_pair), P(wts), P(out), static_cast<int>(T), static_cast<int>(K),
+                                     static_cast<int>(H), s);
     });
   }
   if (comm_ != nullptr) ProfiledCall(prof, sr, "tp.allreduce", [&] { comm_->AllReduceSumBf16Rows(out, T, H, sr); });
@@ -917,20 +942,20 @@ void Inkling2Model::RunVisit(const Inkling2Visit& v, Chunk& c, int64_t T, SpanAc
       r4dx_inkling2_attnres_prenorm_f32(st_ptrs, st_inv, n_st, P(w.attn_query.data()), w.n_attn_queries, P(a), 0, 0,
                                         static_cast<int>(T), static_cast<int>(H), eps, s);
     }
+    if (msgs) {
+      MsgGate3AttnNormBf16(w, a != nullptr ? a : h, msg(0), xq, xk, xv, T);
+      return;
+    }
     const auto src = [&](int m) -> const float* {
       if (a == nullptr) return h;  // layer 0: no attention residual
       return w.full ? a + static_cast<int64_t>(m) * T * H : a;
     };
-    float* tmp = msgs ? arena_.Alloc<float>(n, 16) : nullptr;
     uint16_t* xs[3] = {xq, xk, xv};
     for (int m = 0; m < 3; ++m) {
       const uint16_t* norm = w.full ? (m == 0 ? w.q_norm.data() : m == 1 ? w.k_norm.data() : w.v_norm.data())
                                     : w.attn_norm.data();
       const float* in = src(m);
-      if (msgs) {
-        MsgGate(w.msg[m], in, msg(m), tmp, T);
-        in = tmp;
-      } else if (!w.full && m > 0) {
+      if (!w.full && m > 0) {
         xs[m] = xq;  // one input for q, k, v
         continue;
       }

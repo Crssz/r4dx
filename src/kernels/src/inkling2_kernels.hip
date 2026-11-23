@@ -402,25 +402,72 @@ __global__ __launch_bounds__(kThreads) void RowInvRmsKernel(const float* __restr
 }
 
 // Fused decode (T == 1) static short convolution + residual add + row inverse RMS in a single 256-thread block.
+// Vectorized with float4 when C % 4 == 0 (cuts global load/store instructions by 4x).
 __global__ __launch_bounds__(kThreads) void SconvStaticDecodeNormKernel(
     const void* __restrict__ x, int x_bf16, const float* __restrict__ w, float* __restrict__ state,
     const float* residual, float* out, float* hist, float* __restrict__ inv_out, int C, float eps) {
   __shared__ float red[kWaves];
   const float inv5 = sqrtf(5.0f);
   float ss = 0.0f;
-  for (int c = threadIdx.x; c < C; c += kThreads) {
-    const float h0 = state[c], h1 = state[C + c], h2 = state[2 * C + c];
-    const float4 wv = reinterpret_cast<const float4*>(w)[c];
-    const float xt = LoadF(x, c, x_bf16);
-    if (hist != nullptr) hist[c] = xt;
-    const float conv = wv.x * h0 + wv.y * h1 + wv.z * h2 + wv.w * xt;
-    float y = (conv + xt) / inv5;
-    if (residual != nullptr) y = residual[c] + y;
-    out[c] = y;
-    state[c] = h1;
-    state[C + c] = h2;
-    state[2 * C + c] = xt;
-    ss += y * y;
+  if ((C & 3) == 0 && (reinterpret_cast<uintptr_t>(state) & 15) == 0 && (reinterpret_cast<uintptr_t>(out) & 15) == 0 &&
+      (residual == nullptr || (reinterpret_cast<uintptr_t>(residual) & 15) == 0) &&
+      (hist == nullptr || (reinterpret_cast<uintptr_t>(hist) & 15) == 0)) {
+    const int C4 = C >> 2;
+    float4* st0 = reinterpret_cast<float4*>(state);
+    float4* st1 = reinterpret_cast<float4*>(state + C);
+    float4* st2 = reinterpret_cast<float4*>(state + 2 * C);
+    const float4* res4 = residual != nullptr ? reinterpret_cast<const float4*>(residual) : nullptr;
+    float4* out4 = reinterpret_cast<float4*>(out);
+    float4* hist4 = hist != nullptr ? reinterpret_cast<float4*>(hist) : nullptr;
+    const float4* w4 = reinterpret_cast<const float4*>(w);
+    for (int c4 = threadIdx.x; c4 < C4; c4 += kThreads) {
+      const float4 h0 = st0[c4], h1 = st1[c4], h2 = st2[c4];
+      float4 xt;
+      if (x_bf16) {
+        const uint2 xb = reinterpret_cast<const uint2*>(x)[c4];
+        xt.x = r4dx::core::Bf16ToFloat(static_cast<uint16_t>(xb.x & 0xFFFFu));
+        xt.y = r4dx::core::Bf16ToFloat(static_cast<uint16_t>(xb.x >> 16));
+        xt.z = r4dx::core::Bf16ToFloat(static_cast<uint16_t>(xb.y & 0xFFFFu));
+        xt.w = r4dx::core::Bf16ToFloat(static_cast<uint16_t>(xb.y >> 16));
+      } else {
+        xt = reinterpret_cast<const float4*>(x)[c4];
+      }
+      if (hist4 != nullptr) hist4[c4] = xt;
+      const int c0 = c4 << 2;
+      const float4 wv0 = w4[c0 + 0], wv1 = w4[c0 + 1], wv2 = w4[c0 + 2], wv3 = w4[c0 + 3];
+      float4 y;
+      y.x = ((wv0.x * h0.x + wv0.y * h1.x + wv0.z * h2.x + wv0.w * xt.x) + xt.x) / inv5;
+      y.y = ((wv1.x * h0.y + wv1.y * h1.y + wv1.z * h2.y + wv1.w * xt.y) + xt.y) / inv5;
+      y.z = ((wv2.x * h0.z + wv2.y * h1.z + wv2.z * h2.z + wv2.w * xt.z) + xt.z) / inv5;
+      y.w = ((wv3.x * h0.w + wv3.y * h1.w + wv3.z * h2.w + wv3.w * xt.w) + xt.w) / inv5;
+      if (res4 != nullptr) {
+        const float4 rv = res4[c4];
+        y.x = rv.x + y.x;
+        y.y = rv.y + y.y;
+        y.z = rv.z + y.z;
+        y.w = rv.w + y.w;
+      }
+      out4[c4] = y;
+      st0[c4] = h1;
+      st1[c4] = h2;
+      st2[c4] = xt;
+      ss += (y.x * y.x + y.y * y.y) + (y.z * y.z + y.w * y.w);
+    }
+  } else {
+    for (int c = threadIdx.x; c < C; c += kThreads) {
+      const float h0 = state[c], h1 = state[C + c], h2 = state[2 * C + c];
+      const float4 wv = reinterpret_cast<const float4*>(w)[c];
+      const float xt = LoadF(x, c, x_bf16);
+      if (hist != nullptr) hist[c] = xt;
+      const float conv = wv.x * h0 + wv.y * h1 + wv.z * h2 + wv.w * xt;
+      float y = (conv + xt) / inv5;
+      if (residual != nullptr) y = residual[c] + y;
+      out[c] = y;
+      state[c] = h1;
+      state[C + c] = h2;
+      state[2 * C + c] = xt;
+      ss += y * y;
+    }
   }
   ss = WaveSum(ss);
   if ((threadIdx.x & 31) == 0) red[threadIdx.x >> 5] = ss;
@@ -431,6 +478,37 @@ __global__ __launch_bounds__(kThreads) void SconvStaticDecodeNormKernel(
     for (int i = 1; i < kWaves; ++i) total += red[i];
     inv_out[0] = rsqrtf(total / static_cast<float>(C) + eps);
   }
+}
+
+// Paired K and V static short convolution in a single launch: blockIdx.y == 0 -> K, blockIdx.y == 1 -> V.
+__global__ __launch_bounds__(kThreads) void SconvStaticPairKernel(
+    const void* __restrict__ xk, const void* __restrict__ xv, int x_bf16, const float* __restrict__ wk,
+    const float* __restrict__ wv, float* __restrict__ state_k, float* __restrict__ state_v, float* __restrict__ out_k,
+    float* __restrict__ out_v, float* __restrict__ hist_k, float* __restrict__ hist_v, int T, int C) {
+  const int c = blockIdx.x * kThreads + threadIdx.x;
+  if (c >= C) return;
+  const bool is_v = (blockIdx.y != 0);
+  const void* x = is_v ? xv : xk;
+  const float* w = is_v ? wv : wk;
+  float* state = is_v ? state_v : state_k;
+  float* out = is_v ? out_v : out_k;
+  float* hist = is_v ? hist_v : hist_k;
+  const float inv = sqrtf(5.0f);
+  float h0 = state[c], h1 = state[C + c], h2 = state[2 * C + c];
+  const float4 wc = reinterpret_cast<const float4*>(w)[c];
+  for (int t = 0; t < T; ++t) {
+    const int64_t i = static_cast<int64_t>(t) * C + c;
+    const float xt = LoadF(x, i, x_bf16);
+    if (hist != nullptr) hist[i] = xt;
+    const float conv = wc.x * h0 + wc.y * h1 + wc.z * h2 + wc.w * xt;
+    out[i] = (conv + xt) / inv;
+    h0 = h1;
+    h1 = h2;
+    h2 = xt;
+  }
+  state[c] = h0;
+  state[C + c] = h1;
+  state[2 * C + c] = h2;
 }
 
 // ---- short convolutions -----------------------------------------------------------------------------------------
@@ -595,9 +673,21 @@ __global__ __launch_bounds__(kThreads) void MsgPrepKernel(const float* __restric
   const float* xr = x + t * H;
   const float* mr = m + t * H;
   float sx = 0.0f, sm = 0.0f;
-  for (int h = threadIdx.x; h < H; h += kThreads) {
-    sx += xr[h] * xr[h];
-    sm += mr[h] * mr[h];
+  if ((H & 3) == 0) {
+    const int H4 = H >> 2;
+    const float4* xr4 = reinterpret_cast<const float4*>(xr);
+    const float4* mr4 = reinterpret_cast<const float4*>(mr);
+    for (int h4 = threadIdx.x; h4 < H4; h4 += kThreads) {
+      const float4 xv = xr4[h4];
+      const float4 mv = mr4[h4];
+      sx += (xv.x * xv.x + xv.y * xv.y) + (xv.z * xv.z + xv.w * xv.w);
+      sm += (mv.x * mv.x + mv.y * mv.y) + (mv.z * mv.z + mv.w * mv.w);
+    }
+  } else {
+    for (int h = threadIdx.x; h < H; h += kThreads) {
+      sx += xr[h] * xr[h];
+      sm += mr[h] * mr[h];
+    }
   }
   sx = BlockSum(sx, red);
   sm = BlockSum(sm, red);
@@ -629,6 +719,117 @@ __device__ __forceinline__ float HalfWaveMax(float v) {
   v = fmaxf(v, __shfl_xor(v, 2, 32));
   v = fmaxf(v, __shfl_xor(v, 1, 32));
   return v;
+}
+
+// Batched 3-gate (Q, K, V) MsgGate kernels: grid.z = 3 (gates 0, 1, 2) -> 288 blocks across 64 WGPs instead of 1!
+struct Ptr3F32 {
+  const float* p[3];
+};
+struct Ptr3U16 {
+  const uint16_t* p[3];
+};
+struct OutPtr3U16 {
+  uint16_t* p[3];
+};
+
+__global__ __launch_bounds__(kThreads) void MsgPrep3Kernel(const float* __restrict__ x, int64_t x_gate_stride,
+                                                           const float* __restrict__ m_all,
+                                                           uint16_t* __restrict__ out_cat, int T, int H, float eps) {
+  __shared__ float red[kWaves];
+  const int64_t t = blockIdx.x;
+  const int gate = static_cast<int>(blockIdx.y);
+  const float* xr = x + static_cast<int64_t>(gate) * x_gate_stride + t * H;
+  const float* mr = m_all + (static_cast<int64_t>(gate) * T + t) * H;
+  float sx = 0.0f, sm = 0.0f;
+  if ((H & 3) == 0) {
+    const int H4 = H >> 2;
+    const float4* xr4 = reinterpret_cast<const float4*>(xr);
+    const float4* mr4 = reinterpret_cast<const float4*>(mr);
+    for (int h4 = threadIdx.x; h4 < H4; h4 += kThreads) {
+      const float4 xv = xr4[h4];
+      const float4 mv = mr4[h4];
+      sx += (xv.x * xv.x + xv.y * xv.y) + (xv.z * xv.z + xv.w * xv.w);
+      sm += (mv.x * mv.x + mv.y * mv.y) + (mv.z * mv.z + mv.w * mv.w);
+    }
+  } else {
+    for (int h = threadIdx.x; h < H; h += kThreads) {
+      sx += xr[h] * xr[h];
+      sm += mr[h] * mr[h];
+    }
+  }
+  sx = BlockSum(sx, red);
+  sm = BlockSum(sm, red);
+  const float ix = 1.0f / sqrtf(sx / static_cast<float>(H) + eps);
+  const float im = 1.0f / sqrtf(sm / static_cast<float>(H) + eps);
+  uint16_t* o = out_cat + (static_cast<int64_t>(gate) * T + t) * (2 * H);
+  for (int h = threadIdx.x; h < H; h += kThreads) {
+    o[h] = r4dx::core::FloatToBf16(xr[h] * ix);
+    o[H + h] = r4dx::core::FloatToBf16(mr[h] * im);
+  }
+}
+
+__global__ __launch_bounds__(128) void MsgApply3Vec4Kernel(
+    const float* __restrict__ x, int64_t x_gate_stride, const float* __restrict__ m_all,
+    const float* __restrict__ g_all, Ptr3F32 forget, Ptr3F32 gain, float* __restrict__ out_all, int T, int H, int R) {
+  __shared__ float gs[kMaxRank];
+  const int64_t t = blockIdx.y;
+  const int gate = static_cast<int>(blockIdx.z);
+  const int tid = threadIdx.x;
+  const int64_t gt_row = static_cast<int64_t>(gate) * T + t;
+  for (int r = tid; r < R; r += 128) gs[r] = g_all[gt_row * R + r];
+  __syncthreads();
+  const int sub = tid >> 4;
+  const int lane16 = tid & 15;
+  const int h = static_cast<int>(blockIdx.x) * 8 + sub;
+  if (h >= H) return;
+  const int R4 = R >> 2;
+  const float4* fr = reinterpret_cast<const float4*>(forget.p[gate] + static_cast<int64_t>(h) * R);
+  const float4* gr = reinterpret_cast<const float4*>(gain.p[gate] + static_cast<int64_t>(h) * R);
+  const float4* g4 = reinterpret_cast<const float4*>(gs);
+  float f = 0.0f, a = 0.0f;
+  for (int r4 = lane16; r4 < R4; r4 += 16) {
+    const float4 gv = g4[r4];
+    const float4 fv = fr[r4];
+    const float4 av = gr[r4];
+    f += gv.x * fv.x; f += gv.y * fv.y; f += gv.z * fv.z; f += gv.w * fv.w;
+    a += gv.x * av.x; a += gv.y * av.y; a += gv.z * av.z; a += gv.w * av.w;
+  }
+  f = HalfWaveSum(f);
+  a = HalfWaveSum(a);
+  if (lane16 == 0) {
+    const float xv = x[static_cast<int64_t>(gate) * x_gate_stride + t * H + h];
+    const float mv = m_all[gt_row * H + h];
+    out_all[gt_row * H + h] = (1.0f - tanhf(f)) * xv + tanhf(a) * mv;
+  }
+}
+
+__global__ __launch_bounds__(kThreads) void RmsNorm3F32InBf16Kernel(
+    const float* __restrict__ x_all, Ptr3U16 nw, OutPtr3U16 out, int T, int H, float eps) {
+  __shared__ float red[kWaves];
+  const int64_t t = blockIdx.x;
+  const int gate = static_cast<int>(blockIdx.y);
+  const float* xr = x_all + (static_cast<int64_t>(gate) * T + t) * H;
+  const uint16_t* w = nw.p[gate];
+  uint16_t* dst = out.p[gate] + t * H;
+  float ss = 0.0f;
+  if ((H & 3) == 0) {
+    const int H4 = H >> 2;
+    const float4* xr4 = reinterpret_cast<const float4*>(xr);
+    for (int h4 = threadIdx.x; h4 < H4; h4 += kThreads) {
+      const float4 v = xr4[h4];
+      ss += (v.x * v.x + v.y * v.y) + (v.z * v.z + v.w * v.w);
+    }
+  } else {
+    for (int h = threadIdx.x; h < H; h += kThreads) {
+      const float v = xr[h];
+      ss += v * v;
+    }
+  }
+  ss = BlockSum(ss, red);
+  const float rstd = rsqrtf(ss / static_cast<float>(H) + eps);
+  for (int h = threadIdx.x; h < H; h += kThreads) {
+    dst[h] = r4dx::core::FloatToBf16(xr[h] * rstd * r4dx::core::Bf16ToFloat(w[h]));
+  }
 }
 
 __global__ __launch_bounds__(128) void MsgApplyVec4Kernel(
@@ -940,6 +1141,170 @@ __global__ __launch_bounds__(32) void RouterTopkKernel(
     const float tot = __shfl(sum, 0, 32);
     ids[t * K + lane] = sel_id[lane];
     wout[t * K + lane] = sel_s[lane] / (tot + 1e-20f) * scale;
+  }
+}
+
+// ---- dedicated Inkling2 MoE sort, uint4 gather, and uint2 combine -------------------------------------------------
+constexpr int kInkSortMaxExperts = 256;
+constexpr int kInkSortMaxPairs = 16384;
+
+// Segmented parallel deterministic counting sort (256 threads):
+// When n_experts <= 128 and P >= 32, assigns 2 threads per expert (seg 0 = [0, P/2), seg 1 = [P/2, P))
+// so all 256 threads are active and scan half the array in uint32 chunks (4x fewer LDS reads per thread).
+__global__ __launch_bounds__(kInkSortMaxExperts) void Inkling2MoeSortKernel(
+    const int32_t* __restrict__ ids, int P, int n_experts, int32_t* __restrict__ counts,
+    int32_t* __restrict__ offsets, int32_t* __restrict__ sorted_pairs, int32_t* __restrict__ pos_of_pair) {
+  __shared__ uint8_t id_s[kInkSortMaxPairs];
+  __shared__ int32_t seg_cnt[2][kInkSortMaxExperts];
+  __shared__ int32_t off_s[kInkSortMaxExperts + 1];
+  for (int p = threadIdx.x; p < P; p += blockDim.x) {
+    const int32_t e = ids[p];
+    const bool ok = e >= 0 && e < n_experts;
+    id_s[p] = ok ? static_cast<uint8_t>(e) : static_cast<uint8_t>(255);
+    if (!ok) pos_of_pair[p] = -1;
+  }
+  __syncthreads();
+
+  if (n_experts <= 128 && P >= 32) {
+    const int e = threadIdx.x & 127;
+    const int seg = threadIdx.x >> 7;  // 0 or 1
+    const int mid = (P >> 1) & ~3;
+    const int p0 = (seg == 0) ? 0 : mid;
+    const int p1 = (seg == 0) ? mid : P;
+    int cnt = 0;
+    if (e < n_experts) {
+      const uint8_t eb = static_cast<uint8_t>(e);
+      int p = p0;
+      for (; p + 4 <= p1; p += 4) {
+        const uint32_t w = *reinterpret_cast<const uint32_t*>(&id_s[p]);
+        cnt += ((w & 0xFFu) == eb) + (((w >> 8) & 0xFFu) == eb) + (((w >> 16) & 0xFFu) == eb) + ((w >> 24) == eb);
+      }
+      for (; p < p1; ++p) cnt += (id_s[p] == eb);
+      seg_cnt[seg][e] = cnt;
+    }
+    __syncthreads();
+    if (seg == 0 && e < n_experts) {
+      const int total_e = seg_cnt[0][e] + seg_cnt[1][e];
+      counts[e] = total_e;
+      off_s[e] = total_e;
+    }
+    __syncthreads();
+    if (threadIdx.x == 0) {
+      int run = 0;
+      for (int i = 0; i < n_experts; ++i) {
+        const int c = off_s[i];
+        off_s[i] = run;
+        run += c;
+      }
+      off_s[n_experts] = run;
+    }
+    __syncthreads();
+    if (e < n_experts) {
+      if (seg == 0) offsets[e] = off_s[e];
+      int pos = off_s[e] + (seg == 1 ? seg_cnt[0][e] : 0);
+      const uint8_t eb = static_cast<uint8_t>(e);
+      for (int p = p0; p < p1; ++p) {
+        if (id_s[p] == eb) {
+          sorted_pairs[pos] = p;
+          pos_of_pair[p] = pos;
+          ++pos;
+        }
+      }
+    }
+    if (threadIdx.x == 0) offsets[n_experts] = off_s[n_experts];
+    return;
+  }
+
+  const int e = threadIdx.x;
+  int cnt = 0;
+  if (e < n_experts) {
+    for (int p = 0; p < P; ++p) cnt += (id_s[p] == e) ? 1 : 0;
+    counts[e] = cnt;
+    off_s[e] = cnt;
+  }
+  __syncthreads();
+  if (threadIdx.x == 0) {
+    int run = 0;
+    for (int i = 0; i < n_experts; ++i) {
+      const int c = off_s[i];
+      off_s[i] = run;
+      run += c;
+    }
+    off_s[n_experts] = run;
+  }
+  __syncthreads();
+  if (e < n_experts) {
+    offsets[e] = off_s[e];
+    int pos = off_s[e];
+    for (int p = 0; p < P; ++p) {
+      if (id_s[p] == e) {
+        sorted_pairs[pos] = p;
+        pos_of_pair[p] = pos;
+        ++pos;
+      }
+    }
+  }
+  if (e == 0) offsets[n_experts] = off_s[n_experts];
+}
+
+// uint4-vectorized (128-bit, 8x bf16 per load/store) MoE gather.
+__global__ __launch_bounds__(256) void Inkling2MoeGatherKernel(
+    const uint16_t* __restrict__ x, const int32_t* __restrict__ sorted_pairs, uint16_t* __restrict__ out, int n_pairs,
+    int top_k, int hidden, int64_t x_stride, const int32_t* __restrict__ valid_pairs) {
+  const int64_t i = blockIdx.x;
+  const int n_valid = valid_pairs ? valid_pairs[0] : n_pairs;
+  if (i >= n_valid) return;
+  const int64_t tok = sorted_pairs[i] / top_k;
+  const uint16_t* src = x + tok * x_stride;
+  uint16_t* dst = out + i * hidden;
+  if ((hidden & 7) == 0 && (x_stride & 7) == 0 && (reinterpret_cast<uintptr_t>(src) & 15) == 0 &&
+      (reinterpret_cast<uintptr_t>(dst) & 15) == 0) {
+    const int H8 = hidden >> 3;
+    const uint4* src8 = reinterpret_cast<const uint4*>(src);
+    uint4* dst8 = reinterpret_cast<uint4*>(dst);
+    for (int k8 = threadIdx.x; k8 < H8; k8 += 256) dst8[k8] = src8[k8];
+  } else {
+    for (int k = threadIdx.x; k < hidden; k += 256) dst[k] = src[k];
+  }
+}
+
+// uint2-vectorized (4x bf16 per thread) MoE combine.
+__global__ __launch_bounds__(256) void Inkling2MoeCombineKernel(
+    const uint16_t* __restrict__ y, const int32_t* __restrict__ pos_of_pair, const float* __restrict__ w,
+    uint16_t* __restrict__ out, int top_k, int hidden) {
+  const int64_t t = blockIdx.x;
+  if ((hidden & 3) == 0 && (reinterpret_cast<uintptr_t>(y) & 7) == 0 && (reinterpret_cast<uintptr_t>(out) & 7) == 0) {
+    const int H4 = hidden >> 2;
+    const int k4 = blockIdx.y * 256 + threadIdx.x;
+    if (k4 >= H4) return;
+    float a0 = 0.0f, a1 = 0.0f, a2 = 0.0f, a3 = 0.0f;
+    for (int s = 0; s < top_k; ++s) {
+      const int64_t p = t * top_k + s;
+      const int64_t row = pos_of_pair ? static_cast<int64_t>(pos_of_pair[p]) : p;
+      if (row < 0) continue;
+      const float wp = w[p];
+      const uint2 yv = reinterpret_cast<const uint2*>(y + row * hidden)[k4];
+      a0 += wp * r4dx::core::Bf16ToFloat(static_cast<uint16_t>(yv.x & 0xFFFFu));
+      a1 += wp * r4dx::core::Bf16ToFloat(static_cast<uint16_t>(yv.x >> 16));
+      a2 += wp * r4dx::core::Bf16ToFloat(static_cast<uint16_t>(yv.y & 0xFFFFu));
+      a3 += wp * r4dx::core::Bf16ToFloat(static_cast<uint16_t>(yv.y >> 16));
+    }
+    const uint32_t o01 =
+        static_cast<uint32_t>(r4dx::core::FloatToBf16(a0)) | (static_cast<uint32_t>(r4dx::core::FloatToBf16(a1)) << 16);
+    const uint32_t o23 =
+        static_cast<uint32_t>(r4dx::core::FloatToBf16(a2)) | (static_cast<uint32_t>(r4dx::core::FloatToBf16(a3)) << 16);
+    reinterpret_cast<uint2*>(out + t * hidden)[k4] = make_uint2(o01, o23);
+    return;
+  }
+  for (int k = blockIdx.y * 256 + threadIdx.x; k < hidden; k += gridDim.y * 256) {
+    float acc = 0.0f;
+    for (int s = 0; s < top_k; ++s) {
+      const int64_t p = t * top_k + s;
+      const int64_t row = pos_of_pair ? static_cast<int64_t>(pos_of_pair[p]) : p;
+      if (row < 0) continue;
+      acc += w[p] * r4dx::core::Bf16ToFloat(y[row * hidden + k]);
+    }
+    out[t * hidden + k] = r4dx::core::FloatToBf16(acc);
   }
 }
 
@@ -1673,6 +2038,29 @@ __global__ __launch_bounds__(128) void Inkling2AttnPrefillWmmaKernel(const R4dxI
 }
 
 // ---- small dense GEMM: uint4 vectorized (8x bf16/load) + 4-row prefill tiling ----------
+__global__ __launch_bounds__(32) void Dense3Bf16DecodeKernel(const uint16_t* __restrict__ x_all, Ptr3U16 w,
+                                                             float* __restrict__ out_all, int M, int N, int K) {
+  const int64_t m = blockIdx.y;
+  const int gate = static_cast<int>(blockIdx.z);
+  const int n = static_cast<int>(blockIdx.x);
+  const int lane = threadIdx.x;
+  if (n >= N) return;
+  const int64_t gm = static_cast<int64_t>(gate) * M + m;
+  const uint16_t* xr = x_all + gm * K;
+  const uint16_t* wr = w.p[gate] + static_cast<int64_t>(n) * K;
+  float a = 0.0f;
+  if ((K & 7) == 0) {
+    const int K8 = K >> 3;
+    const uint4* x8 = reinterpret_cast<const uint4*>(xr);
+    const uint4* w8 = reinterpret_cast<const uint4*>(wr);
+    for (int k = lane; k < K8; k += 32) a += Dot8Bf16(x8[k], w8[k]);
+  } else {
+    for (int k = lane; k < K; k += 32) a += r4dx::core::Bf16ToFloat(xr[k]) * r4dx::core::Bf16ToFloat(wr[k]);
+  }
+  a = WaveSum(a);
+  if (lane == 0) out_all[gm * N + n] = a;
+}
+
 __global__ __launch_bounds__(32) void DenseBf16DecodeKernel(const uint16_t* __restrict__ x, int64_t xs,
                                                             const uint16_t* __restrict__ w, void* __restrict__ out,
                                                             int out_bf16, int64_t os, int N, int K) {
@@ -1859,6 +2247,140 @@ void r4dx_inkling2_sconv_static_hist_f32(int64_t x, int x_bf16, int64_t weight, 
 void r4dx_inkling2_sconv_static_f32(int64_t x, int x_bf16, int64_t weight, int64_t state, int64_t residual,
                                     int64_t out, int T, int C, int64_t stream) {
   r4dx_inkling2_sconv_static_hist_f32(x, x_bf16, weight, state, residual, out, 0, T, C, stream);
+}
+
+void r4dx_inkling2_sconv_static_pair_hist_f32(int64_t x_k, int64_t x_v, int x_bf16, int64_t w_k, int64_t w_v,
+                                              int64_t state_k, int64_t state_v, int64_t out_k, int64_t out_v,
+                                              int64_t hist_k, int64_t hist_v, int T, int C, int64_t stream) {
+  const char* fn = "r4dx_inkling2_sconv_static_pair_hist_f32";
+  if (T <= 0 || C <= 0) return;
+  if (x_k == 0 || x_v == 0 || w_k == 0 || w_v == 0 || state_k == 0 || state_v == 0 || out_k == 0 || out_v == 0)
+    Fail(fn, "null pointer");
+  hipLaunchKernelGGL(SconvStaticPairKernel, dim3(static_cast<unsigned>((C + kThreads - 1) / kThreads), 2u),
+                     dim3(kThreads), 0, reinterpret_cast<hipStream_t>(stream), reinterpret_cast<const void*>(x_k),
+                     reinterpret_cast<const void*>(x_v), x_bf16, reinterpret_cast<const float*>(w_k),
+                     reinterpret_cast<const float*>(w_v), reinterpret_cast<float*>(state_k),
+                     reinterpret_cast<float*>(state_v), reinterpret_cast<float*>(out_k),
+                     reinterpret_cast<float*>(out_v), reinterpret_cast<float*>(hist_k),
+                     reinterpret_cast<float*>(hist_v), T, C);
+  CheckLaunch(fn);
+}
+
+void r4dx_inkling2_msg_gate_prep3_bf16(int64_t x, int64_t x_gate_stride, int64_t m_all, int64_t out_cat, int T, int H,
+                                       float eps, int64_t stream) {
+  const char* fn = "r4dx_inkling2_msg_gate_prep3_bf16";
+  if (T <= 0) return;
+  if (x == 0 || m_all == 0 || out_cat == 0 || H < 1) Fail(fn, "null pointer or H < 1");
+  hipLaunchKernelGGL(MsgPrep3Kernel, dim3(static_cast<unsigned>(T), 3u), dim3(kThreads), 0,
+                     reinterpret_cast<hipStream_t>(stream), reinterpret_cast<const float*>(x), x_gate_stride,
+                     reinterpret_cast<const float*>(m_all), reinterpret_cast<uint16_t*>(out_cat), T, H, eps);
+  CheckLaunch(fn);
+}
+
+void r4dx_inkling2_dense3_bf16(int64_t x_all, int64_t w0, int64_t w1, int64_t w2, int64_t out_all, int M, int N, int K,
+                               int64_t stream) {
+  const char* fn = "r4dx_inkling2_dense3_bf16";
+  if (M <= 0 || N <= 0) return;
+  if (x_all == 0 || w0 == 0 || w1 == 0 || w2 == 0 || out_all == 0) Fail(fn, "null pointer");
+  if (M <= 4 && N >= 16) {
+    Ptr3U16 w{{reinterpret_cast<const uint16_t*>(w0), reinterpret_cast<const uint16_t*>(w1),
+               reinterpret_cast<const uint16_t*>(w2)}};
+    hipLaunchKernelGGL(Dense3Bf16DecodeKernel, dim3(static_cast<unsigned>(N), static_cast<unsigned>(M), 3u), dim3(32),
+                       0, reinterpret_cast<hipStream_t>(stream), reinterpret_cast<const uint16_t*>(x_all), w,
+                       reinterpret_cast<float*>(out_all), M, N, K);
+    CheckLaunch(fn);
+    return;
+  }
+  const int64_t x_step = static_cast<int64_t>(M) * K * sizeof(uint16_t);
+  const int64_t o_step = static_cast<int64_t>(M) * N * sizeof(float);
+  r4dx_inkling2_dense_bf16(x_all, K, w0, out_all, 0, N, M, N, K, stream);
+  r4dx_inkling2_dense_bf16(x_all + x_step, K, w1, out_all + o_step, 0, N, M, N, K, stream);
+  r4dx_inkling2_dense_bf16(x_all + 2 * x_step, K, w2, out_all + 2 * o_step, 0, N, M, N, K, stream);
+}
+
+void r4dx_inkling2_msg_gate_apply3_f32(int64_t x, int64_t x_gate_stride, int64_t m_all, int64_t g_all, int64_t forget0,
+                                       int64_t forget1, int64_t forget2, int64_t gain0, int64_t gain1, int64_t gain2,
+                                       int64_t out_all, int T, int H, int R, int64_t stream) {
+  const char* fn = "r4dx_inkling2_msg_gate_apply3_f32";
+  if (T <= 0) return;
+  if (x == 0 || m_all == 0 || g_all == 0 || forget0 == 0 || forget1 == 0 || forget2 == 0 || gain0 == 0 || gain1 == 0 ||
+      gain2 == 0 || out_all == 0)
+    Fail(fn, "null pointer");
+  if ((R & 3) == 0) {
+    Ptr3F32 fg{{reinterpret_cast<const float*>(forget0), reinterpret_cast<const float*>(forget1),
+                reinterpret_cast<const float*>(forget2)}};
+    Ptr3F32 gn{{reinterpret_cast<const float*>(gain0), reinterpret_cast<const float*>(gain1),
+                reinterpret_cast<const float*>(gain2)}};
+    const unsigned bx = static_cast<unsigned>((H + 7) / 8);
+    hipLaunchKernelGGL(MsgApply3Vec4Kernel, dim3(bx, static_cast<unsigned>(T), 3u), dim3(128), 0,
+                       reinterpret_cast<hipStream_t>(stream), reinterpret_cast<const float*>(x), x_gate_stride,
+                       reinterpret_cast<const float*>(m_all), reinterpret_cast<const float*>(g_all), fg, gn,
+                       reinterpret_cast<float*>(out_all), T, H, R);
+    CheckLaunch(fn);
+    return;
+  }
+  const int64_t f_step = static_cast<int64_t>(T) * H * sizeof(float);
+  const int64_t g_step = static_cast<int64_t>(T) * R * sizeof(float);
+  const int64_t x_step = x_gate_stride * static_cast<int64_t>(sizeof(float));
+  r4dx_inkling2_msg_gate_apply_f32(x, m_all, g_all, 0, forget0, gain0, out_all, T, H, R, stream);
+  r4dx_inkling2_msg_gate_apply_f32(x + x_step, m_all + f_step, g_all + g_step, 0, forget1, gain1, out_all + f_step, T,
+                                   H, R, stream);
+  r4dx_inkling2_msg_gate_apply_f32(x + 2 * x_step, m_all + 2 * f_step, g_all + 2 * g_step, 0, forget2, gain2,
+                                   out_all + 2 * f_step, T, H, R, stream);
+}
+
+void r4dx_inkling2_rmsnorm3_f32in_bf16(int64_t x_all, int64_t w0, int64_t w1, int64_t w2, int64_t out0, int64_t out1,
+                                       int64_t out2, int T, int H, float eps, int64_t stream) {
+  const char* fn = "r4dx_inkling2_rmsnorm3_f32in_bf16";
+  if (T <= 0) return;
+  if (x_all == 0 || w0 == 0 || w1 == 0 || w2 == 0 || out0 == 0 || out1 == 0 || out2 == 0) Fail(fn, "null pointer");
+  Ptr3U16 nw{{reinterpret_cast<const uint16_t*>(w0), reinterpret_cast<const uint16_t*>(w1),
+              reinterpret_cast<const uint16_t*>(w2)}};
+  OutPtr3U16 out{{reinterpret_cast<uint16_t*>(out0), reinterpret_cast<uint16_t*>(out1),
+                  reinterpret_cast<uint16_t*>(out2)}};
+  hipLaunchKernelGGL(RmsNorm3F32InBf16Kernel, dim3(static_cast<unsigned>(T), 3u), dim3(kThreads), 0,
+                     reinterpret_cast<hipStream_t>(stream), reinterpret_cast<const float*>(x_all), nw, out, T, H, eps);
+  CheckLaunch(fn);
+}
+
+void r4dx_inkling2_moe_sort(int64_t ids, int T, int top_k, int n_experts, int64_t expert_counts,
+                            int64_t expert_offsets, int64_t sorted_pairs, int64_t pos_of_pair, int64_t stream) {
+  const char* fn = "r4dx_inkling2_moe_sort";
+  if (T <= 0 || top_k <= 0) return;
+  const int64_t P = static_cast<int64_t>(T) * top_k;
+  if (n_experts < 1 || n_experts > kInkSortMaxExperts) Fail(fn, "n_experts must be 1..256");
+  if (P > kInkSortMaxPairs) Fail(fn, "T * top_k must be <= 16384");
+  hipLaunchKernelGGL(Inkling2MoeSortKernel, dim3(1), dim3(kInkSortMaxExperts), 0,
+                     reinterpret_cast<hipStream_t>(stream), reinterpret_cast<const int32_t*>(ids), static_cast<int>(P),
+                     n_experts, reinterpret_cast<int32_t*>(expert_counts), reinterpret_cast<int32_t*>(expert_offsets),
+                     reinterpret_cast<int32_t*>(sorted_pairs), reinterpret_cast<int32_t*>(pos_of_pair));
+  CheckLaunch(fn);
+}
+
+void r4dx_inkling2_moe_gather_bf16(int64_t x, int64_t sorted_pairs, int64_t out, int n_pairs, int top_k, int hidden,
+                                   int64_t x_row_stride, int64_t valid_pairs, int64_t stream) {
+  const char* fn = "r4dx_inkling2_moe_gather_bf16";
+  if (n_pairs <= 0 || hidden <= 0) return;
+  if (top_k <= 0) Fail(fn, "top_k must be >= 1");
+  hipLaunchKernelGGL(Inkling2MoeGatherKernel, dim3(static_cast<unsigned>(n_pairs)), dim3(256), 0,
+                     reinterpret_cast<hipStream_t>(stream), reinterpret_cast<const uint16_t*>(x),
+                     reinterpret_cast<const int32_t*>(sorted_pairs), reinterpret_cast<uint16_t*>(out), n_pairs, top_k,
+                     hidden, x_row_stride, reinterpret_cast<const int32_t*>(valid_pairs));
+  CheckLaunch(fn);
+}
+
+void r4dx_inkling2_moe_combine_bf16(int64_t y, int64_t pos_of_pair, int64_t w, int64_t out, int T, int top_k,
+                                    int hidden, int64_t stream) {
+  const char* fn = "r4dx_inkling2_moe_combine_bf16";
+  if (T <= 0 || hidden <= 0) return;
+  if (top_k <= 0) Fail(fn, "top_k must be >= 1");
+  const unsigned gy = ((hidden & 3) == 0) ? static_cast<unsigned>(((hidden >> 2) + 255) / 256)
+                                          : static_cast<unsigned>((hidden + 255) / 256);
+  hipLaunchKernelGGL(Inkling2MoeCombineKernel, dim3(static_cast<unsigned>(T), gy), dim3(256), 0,
+                     reinterpret_cast<hipStream_t>(stream), reinterpret_cast<const uint16_t*>(y),
+                     reinterpret_cast<const int32_t*>(pos_of_pair), reinterpret_cast<const float*>(w),
+                     reinterpret_cast<uint16_t*>(out), top_k, hidden);
+  CheckLaunch(fn);
 }
 
 void r4dx_inkling2_sconv_dynamic_hist_f32(int64_t x, int x_bf16, int64_t dyn, int dyn_bf16, int64_t static_w,

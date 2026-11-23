@@ -132,6 +132,8 @@ class Inkling2Model {
                  bool capture_conv_hist = false);
   void Moe(int64_t layer, const uint16_t* x, uint16_t* out, int64_t T, int visit, SpanAccumulator* prof);
   void MsgGate(const Inkling2MsgGateWeights& g, const float* x, const float* m, float* out, int64_t T);
+  void MsgGate3AttnNormBf16(const Inkling2LayerWeights& w, const float* a_src, const float* m_all, uint16_t* xq,
+                            uint16_t* xk, uint16_t* xv, int64_t T);
   void Lin(const QuantLinear& w, const uint16_t* x, uint16_t* y, int64_t M);
   float* ConvState(int slot, int which);  // which: 0 k, 1 v, 2 post-attention, 3 post-MLP
   float* ConvHist(int slot, int which);

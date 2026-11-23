@@ -321,6 +321,33 @@ void TestRelGateMsg() {
     const double e = RelErr(Host(od, want.size()), want, 1e-2);
     Check(e < 1e-4, "msg_gate_apply (rel " + std::to_string(e) + ")");
   }
+  {  // dedicated Inkling2 MoE sort + gather + combine
+    const int T = 64, K = 8, E = 128, H = 2304, Pn = T * K;
+    std::vector<int32_t> ids(static_cast<size_t>(Pn));
+    for (int p = 0; p < Pn; ++p) ids[static_cast<size_t>(p)] = (p * 37 + 13) % E;
+    std::vector<int32_t> ref_cnt(static_cast<size_t>(E), 0), ref_off(static_cast<size_t>(E + 1), 0),
+        ref_sorted(static_cast<size_t>(Pn), 0), ref_pos(static_cast<size_t>(Pn), 0);
+    for (int e = 0; e < E; ++e) {
+      for (int p = 0; p < Pn; ++p)
+        if (ids[static_cast<size_t>(p)] == e) ++ref_cnt[static_cast<size_t>(e)];
+      ref_off[static_cast<size_t>(e + 1)] = ref_off[static_cast<size_t>(e)] + ref_cnt[static_cast<size_t>(e)];
+    }
+    for (int e = 0; e < E; ++e) {
+      int pos = ref_off[static_cast<size_t>(e)];
+      for (int p = 0; p < Pn; ++p) {
+        if (ids[static_cast<size_t>(p)] == e) {
+          ref_sorted[static_cast<size_t>(pos)] = p;
+          ref_pos[static_cast<size_t>(p)] = pos;
+          ++pos;
+        }
+      }
+    }
+    DeviceBuffer<int32_t> id_d = Dev(ids), cnt_d(E), off_d(E + 1), sort_d(Pn), pos_d(Pn);
+    r4dx_inkling2_moe_sort(P(id_d.data()), T, K, E, P(cnt_d.data()), P(off_d.data()), P(sort_d.data()), P(pos_d.data()), 0);
+    Check(Host(cnt_d, E) == ref_cnt && Host(off_d, E + 1) == ref_off && Host(sort_d, Pn) == ref_sorted &&
+              Host(pos_d, Pn) == ref_pos,
+          "inkling2_moe_sort bit-exact (T=64, K=8, E=128)");
+  }
 }
 
 void TestRouterSwigluSoftcapDense() {

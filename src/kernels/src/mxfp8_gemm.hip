@@ -600,25 +600,31 @@ void r4dx_gemm_mxfp8_moe_prefill(int64_t a_bf16, int64_t wq_ptrs, int64_t ws_ptr
 namespace {
 
 // ---- Native NVFP4 (FP4 E2M1 + F8_E4M3 per-16 scales + per-expert fp32 factor) grouped MoE GEMMs -------------------
+__device__ __forceinline__ unsigned short fp4_to_f16_bits(unsigned nib) {
+  const unsigned s = (nib & 8u) << 12;
+  const unsigned m = nib & 7u;
+  // FP4 E2M1 magnitudes -> FP16: 0->0x0000, 1->0x3800 (0.5), 2..7->0x3800+(m<<9) (1.0,1.5,2.0,3.0,4.0,6.0).
+  const unsigned mag = (m == 0u) ? 0u : ((m == 1u) ? 0x3800u : (0x3800u + (m << 9)));
+  return static_cast<unsigned short>(s | mag);
+}
+
 __device__ __forceinline__ v8h dequant8_fp4(unsigned d) {
-  static constexpr unsigned short kLut[16] = {
-      0x0000, 0x3800, 0x3C00, 0x3E00, 0x4000, 0x4200, 0x4400, 0x4600,
-      0x8000, 0xB800, 0xBC00, 0xBE00, 0xC000, 0xC200, 0xC400, 0xC600};
   union { unsigned short h[8]; v8h f; } x;
-  x.h[0] = kLut[(d >>  0) & 0xFu];
-  x.h[1] = kLut[(d >>  4) & 0xFu];
-  x.h[2] = kLut[(d >>  8) & 0xFu];
-  x.h[3] = kLut[(d >> 12) & 0xFu];
-  x.h[4] = kLut[(d >> 16) & 0xFu];
-  x.h[5] = kLut[(d >> 20) & 0xFu];
-  x.h[6] = kLut[(d >> 24) & 0xFu];
-  x.h[7] = kLut[(d >> 28) & 0xFu];
+  x.h[0] = fp4_to_f16_bits(d & 0xFu);
+  x.h[1] = fp4_to_f16_bits((d >> 4) & 0xFu);
+  x.h[2] = fp4_to_f16_bits((d >> 8) & 0xFu);
+  x.h[3] = fp4_to_f16_bits((d >> 12) & 0xFu);
+  x.h[4] = fp4_to_f16_bits((d >> 16) & 0xFu);
+  x.h[5] = fp4_to_f16_bits((d >> 20) & 0xFu);
+  x.h[6] = fp4_to_f16_bits((d >> 24) & 0xFu);
+  x.h[7] = fp4_to_f16_bits((d >> 28) & 0xFu);
   return x.f;
 }
 
-__device__ __forceinline__ float e4m3_to_f32(unsigned b) {
-  const unsigned u = e4m3x2_scaled(b, 0x0C0C000Cu);
-  return __half2float(__ushort_as_half(static_cast<unsigned short>(u & 0xFFFFu))) * 256.0f;
+__device__ __forceinline__ void e4m3x2_to_f32(unsigned b0, unsigned b1, float& f0, float& f1) {
+  const unsigned u = e4m3x2_scaled((b0 & 0xFFu) | ((b1 & 0xFFu) << 8), 0x010C000Cu);
+  f0 = __half2float(__ushort_as_half(static_cast<unsigned short>(u & 0xFFFFu))) * 256.0f;
+  f1 = __half2float(__ushort_as_half(static_cast<unsigned short>(u >> 16))) * 256.0f;
 }
 
 template <int NPW>
@@ -685,8 +691,7 @@ __global__ __launch_bounds__(1024) void nvfp4_gemm_moe_decode_kernel(
       for (int j = 0; j < NPW; j++) {
         const size_t o = (size_t)g * kWave;
         wv[j] = NT ? __builtin_nontemporal_load(&pw[j][o]) : pw[j][o];
-        sc0[j] = e4m3_to_f32(ps[j][(size_t)(2 * g + 0) * 16]);
-        sc1[j] = e4m3_to_f32(ps[j][(size_t)(2 * g + 1) * 16]);
+        e4m3x2_to_f32(ps[j][(size_t)(2 * g + 0) * 16], ps[j][(size_t)(2 * g + 1) * 16], sc0[j], sc1[j]);
       }
       group_step_nvfp4<NPW>(acc, wv, sc0, sc1, pa, 2 * g);
     }
@@ -761,8 +766,7 @@ __global__ __launch_bounds__(1024) void nvfp4_gemm_moe_prefill_kernel(
       for (int j = 0; j < NPW; j++) {
         const size_t o = (size_t)g * kWave;
         wv[j] = NT ? __builtin_nontemporal_load(&pw[j][o]) : pw[j][o];
-        sc0[j] = e4m3_to_f32(ps[j][(size_t)(2 * g + 0) * 16]);
-        sc1[j] = e4m3_to_f32(ps[j][(size_t)(2 * g + 1) * 16]);
+        e4m3x2_to_f32(ps[j][(size_t)(2 * g + 0) * 16], ps[j][(size_t)(2 * g + 1) * 16], sc0[j], sc1[j]);
       }
       group_step_nvfp4<NPW>(acc, wv, sc0, sc1, pa, 2 * g);
     }

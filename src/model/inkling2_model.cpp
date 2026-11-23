@@ -39,6 +39,39 @@ bool InkEnvFlag(const char* name, bool default_val) {
   return true;
 }
 
+bool ParseNv4TuneEnv(const char* name, LinearTuning& out) {
+  const char* v = std::getenv(name);
+  if (v == nullptr || v[0] == '\0') return false;
+  int wv = 0, sk = 0, npw = 0, nt = 0;
+  if (std::sscanf(v, "%d,%d,%d,%d", &wv, &sk, &npw, &nt) == 4 && wv >= 1 && sk >= 1 && (npw == 1 || npw == 4)) {
+    out.WV = wv;
+    out.SK = sk;
+    out.NPW = npw;
+    out.NT = nt;
+    return true;
+  }
+  return false;
+}
+
+LinearTuning PickNvfp4MoeTuning(int64_t N, int64_t K, int64_t M, bool is_down) {
+  LinearTuning t = PickTuning(Layout::kMxfp8, N, K, M);
+  // Dedicated R9700 NVFP4 MoE rows (9 K-blocks/wave, NPW=4): measured +3.7 tok/s on TP=2 DSpark (104.5 -> 108.2).
+  if (N >= 64 && (N % 64) == 0) {
+    if (K == 2304) {
+      t.WV = 1; t.SK = 8; t.NPW = 4; t.NT = (M <= 4 ? 1 : 0);
+    } else if (K == 1152) {
+      t.WV = 1; t.SK = 4; t.NPW = 4; t.NT = (M <= 4 ? 1 : 0);
+    } else if (K == 576) {
+      t.WV = 1; t.SK = 2; t.NPW = 4; t.NT = (M <= 4 ? 1 : 0);
+    }
+  }
+  LinearTuning ov = t;
+  if (ParseNv4TuneEnv(is_down ? "R4DX_INK_NV4_DN" : "R4DX_INK_NV4_GU", ov) && (K % (ov.SK * 32) == 0)) {
+    return ov;
+  }
+  return t;
+}
+
 bool MoeGroupedDecodeEnabled() {
   static const bool kEnabled = InkEnvFlag("R4DX_INK_MOE_DECODE", true);
   return kEnabled;
@@ -646,8 +679,8 @@ void Inkling2Model::Moe(int64_t layer, const uint16_t* x, uint16_t* out, int64_t
     if (grouped_nv4) {
       uint16_t* gu = arena_.Alloc<uint16_t>(static_cast<size_t>(K * 2 * I), 16);
       uint16_t* act = arena_.Alloc<uint16_t>(static_cast<size_t>(K * I), 16);
-      const LinearTuning t_gu = PickTuning(Layout::kMxfp8, 2 * I, H, 1);
-      const LinearTuning t_dn = PickTuning(Layout::kMxfp8, H, I, 1);
+      const LinearTuning t_gu = PickNvfp4MoeTuning(2 * I, H, 1, false);
+      const LinearTuning t_dn = PickNvfp4MoeTuning(H, I, 1, true);
       ProfiledCall(prof, sr, "gemm:moe.gate_up", [&] {
         r4dx_gemm_nvfp4_moe_decode(P(x), P(w.gate_up_ptrs0.data()), P(w.gate_up_ptrs1.data()),
                                    P(w.gate_up_factors.data()), P(ids), P(gu), static_cast<int>(K), static_cast<int>(K),
@@ -723,8 +756,8 @@ void Inkling2Model::Moe(int64_t layer, const uint16_t* x, uint16_t* out, int64_t
       uint16_t* gu = arena_.Alloc<uint16_t>(static_cast<size_t>(Pn * 2 * I), 16);
       uint16_t* act = arena_.Alloc<uint16_t>(static_cast<size_t>(Pn * I), 16);
       const int64_t m_tune = std::min<int64_t>(T, 64);
-      const LinearTuning t_gu = PickTuning(Layout::kMxfp8, 2 * I, H, m_tune);
-      const LinearTuning t_dn = PickTuning(Layout::kMxfp8, H, I, m_tune);
+      const LinearTuning t_gu = PickNvfp4MoeTuning(2 * I, H, m_tune, false);
+      const LinearTuning t_dn = PickNvfp4MoeTuning(H, I, m_tune, true);
       ProfiledCall(prof, sr, "gemm:moe.gate_up", [&] {
         r4dx_gemm_nvfp4_moe_prefill(P(xs), P(w.gate_up_ptrs0.data()), P(w.gate_up_ptrs1.data()),
                                     P(w.gate_up_factors.data()), P(offsets), P(gu), static_cast<int>(Pn),

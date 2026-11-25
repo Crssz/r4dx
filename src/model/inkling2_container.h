@@ -53,7 +53,7 @@ struct Inkling2AttnWeights {
 
 struct Inkling2MsgGateWeights {
   core::DeviceBuffer<uint16_t> down;          // bf16 [rank, 2H]
-  core::DeviceBuffer<float> forget, gain;     // fp32 [H, rank]
+  core::DeviceBuffer<uint16_t> forget, gain;  // bf16 [H, rank]
 };
 
 struct Inkling2LayerWeights {

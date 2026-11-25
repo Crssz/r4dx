@@ -410,6 +410,37 @@ __device__ __forceinline__ bool ResolveMxfp8MoePrefillTile(const int32_t* __rest
   return false;
 }
 
+// Cooperatively caches offsets[0..n_experts] in the unused reduction LDS buffer (at least 1024 B)
+// so lane 0 resolves (e, row_start, m_rows) once per block instead of every thread scanning global memory.
+__device__ __forceinline__ bool ResolveMxfp8MoePrefillTileCached(
+    float* red_lds, const int32_t* __restrict__ offsets, int n_experts, int n_pairs, int tile_idx,
+    int& out_e, int& out_row_start, int& out_m_rows) {
+  if (n_experts <= 251) {
+    int32_t* lds = reinterpret_cast<int32_t*>(red_lds);
+    const int tid = static_cast<int>(threadIdx.x);
+    for (int i = tid; i <= n_experts; i += static_cast<int>(blockDim.x)) {
+      lds[i] = offsets[i];
+    }
+    __syncthreads();
+    if (tid == 0) {
+      int e = -1, r0 = 0, mr = 0;
+      const bool ok = ResolveMxfp8MoePrefillTile(lds, n_experts, n_pairs, tile_idx, e, r0, mr);
+      lds[252] = ok ? 1 : 0;
+      lds[253] = e;
+      lds[254] = r0;
+      lds[255] = mr;
+    }
+    __syncthreads();
+    const bool ok = (lds[252] != 0);
+    out_e = lds[253];
+    out_row_start = lds[254];
+    out_m_rows = lds[255];
+    __syncthreads();
+    return ok;
+  }
+  return ResolveMxfp8MoePrefillTile(offsets, n_experts, n_pairs, tile_idx, out_e, out_row_start, out_m_rows);
+}
+
 template <int NPW, bool NT>
 __global__ __launch_bounds__(1024) void mxfp8_gemm_moe_prefill_kernel(
     const unsigned short* __restrict__ A, const uint64_t* __restrict__ wq_ptrs,
@@ -417,7 +448,8 @@ __global__ __launch_bounds__(1024) void mxfp8_gemm_moe_prefill_kernel(
     __hip_bfloat16* __restrict__ C, int n_pairs, int n_experts, int K, int N, int WV, int SK) {
   extern __shared__ float red[];  // WV*NPW*SK*256 floats
   int e = -1, row_start = 0, m_rows = 0;
-  if (!ResolveMxfp8MoePrefillTile(offsets, n_experts, n_pairs, static_cast<int>(blockIdx.y), e, row_start, m_rows)) {
+  if (!ResolveMxfp8MoePrefillTileCached(red, offsets, n_experts, n_pairs, static_cast<int>(blockIdx.y), e,
+                                        row_start, m_rows)) {
     return;
   }
   const unsigned char* Wq = reinterpret_cast<const unsigned char*>(wq_ptrs[e]);
@@ -731,7 +763,8 @@ __global__ __launch_bounds__(1024) void nvfp4_gemm_moe_prefill_kernel(
     int n_experts, int K, int N, int WV, int SK) {
   extern __shared__ float red[];
   int e = 0, row_start = 0, m_rows = 0;
-  if (!ResolveMxfp8MoePrefillTile(offsets, n_experts, n_pairs, static_cast<int>(blockIdx.y), e, row_start, m_rows)) {
+  if (!ResolveMxfp8MoePrefillTileCached(red, offsets, n_experts, n_pairs, static_cast<int>(blockIdx.y), e,
+                                        row_start, m_rows)) {
     return;
   }
   const unsigned char* Wq = reinterpret_cast<const unsigned char*>(wq_ptrs[e]);

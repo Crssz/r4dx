@@ -27,6 +27,8 @@
 #pragma once
 
 #include <cstdint>
+#include <functional>
+#include <hip/hip_runtime.h>
 #include <memory>
 #include <random>
 #include <string>
@@ -97,6 +99,7 @@ class Inkling2Model {
   std::vector<float> PrefillMultimodal(const std::vector<int32_t>& token_ids, const std::vector<ImageSpan>& images);
   std::vector<float> DecodeStep(int32_t token_id);
   int32_t DecodeStepGreedy(int32_t token_id);
+  int32_t DecodeStepGreedyOverlap(int32_t token_id, const std::function<void()>& while_busy);
   int32_t DecodeStepSampled(int32_t token_id, const kernels::SampleParams& params, std::mt19937_64& rng);
   std::vector<int32_t> DecodeStepDflashGreedy(int32_t token_id, int64_t draft_k, int64_t* walk_len_out = nullptr);
   std::vector<int32_t> DecodeStepDflashSampled(int32_t token_id, int64_t draft_k, const kernels::SampleParams& params,
@@ -124,7 +127,8 @@ class Inkling2Model {
                               bool verify_conv_hist = false, std::vector<int32_t>* verify_greedy_out = nullptr,
                               float verify_inv_temp = 0.0f,
                               std::vector<kernels::RowSummary>* verify_summaries_out = nullptr,
-                              const std::vector<ImageSpan>* chunk_images = nullptr);
+                              const std::vector<ImageSpan>* chunk_images = nullptr,
+                              const std::function<void()>* while_busy = nullptr);
   void RunVisit(const Inkling2Visit& v, Chunk& c, int64_t T, SpanAccumulator* prof, bool use_pos_dev = false,
                 bool graph_long_ctx = true, bool capture_conv_hist = false);
   void Attention(const Inkling2Visit& v, const uint16_t* xq, const uint16_t* xk, const uint16_t* xv, uint16_t* out,
@@ -144,10 +148,13 @@ class Inkling2Model {
                                int32_t* out_tok_dev);
   void DsparkLogitsSummary(const uint16_t* base_bf16, const uint16_t* delta_bf16, const uint16_t* bias_bf16,
                            float inv_temp, kernels::RowSummary* out);
-  void Head(const float* h_row, const std::vector<const float*>& blocks, SpanAccumulator* prof);
+  void Head(const float* h_row, const std::vector<const float*>& blocks, SpanAccumulator* prof,
+            bool materialize_f32_logits = true);
   int32_t MergeGreedyPair();
   int32_t MergeGreedyPairAt(const int32_t* dev_pair);
+  void MergeVerifyPairs(const int32_t* pairs_host, int64_t rows, std::vector<int32_t>* out);
   void MergeSummary(kernels::RowSummary* out);
+  void MergeVerifySummaries(int64_t rows, std::vector<kernels::RowSummary>* out);
   void GatherVocabRow(std::vector<float>* full);
   void GatherVerifyVocabRow(int64_t row, std::vector<float>* full);
   void FetchRowSummary(float inv_temperature, kernels::RowSummary* out);
@@ -209,18 +216,45 @@ class Inkling2Model {
   };
   using GraphExecPtr = std::unique_ptr<void, GraphExecDeleter>;
 
+  struct StepEvent {
+    hipEvent_t e = nullptr;
+    StepEvent() = default;
+    ~StepEvent() {
+      if (e != nullptr) (void)hipEventDestroy(e);
+    }
+    StepEvent(const StepEvent&) = delete;
+    StepEvent& operator=(const StepEvent&) = delete;
+    StepEvent(StepEvent&& o) noexcept : e(o.e) { o.e = nullptr; }
+    StepEvent& operator=(StepEvent&& o) noexcept {
+      if (this != &o) {
+        if (e != nullptr) (void)hipEventDestroy(e);
+        e = o.e;
+        o.e = nullptr;
+      }
+      return *this;
+    }
+  };
+
   core::PinnedBuffer<int32_t> ids_host_, pos_host_;
   core::DeviceBuffer<int32_t> ids_dev_, pos_dev_;
+  StepEvent step_done_;
   GraphExecPtr decode_graph_short_, decode_graph_long_;
   std::array<GraphExecPtr, 9> verify_graphs_;  // indexed by verify window T in [2..8]
   int64_t dspark_adapt_k_ = 3;
   bool decode_graph_eligible_ = false;
   bool decode_graph_disabled_ = false;
   int64_t decode_steps_seen_ = 0;
+  core::DeviceBuffer<uint16_t> lg_bf16_dev_;  // [8 * HeadRowsLocal] persistent bf16 logits
+  core::DeviceBuffer<uint8_t> softcap_argmax_ws_;  // [8 * 1024]
   core::DeviceBuffer<float> logits_dev_;  // [HeadRowsLocal]
   core::DeviceBuffer<int32_t> argmax_dev_, argmax_pair_dev_, summary_ids_dev_;
   core::DeviceBuffer<float> summary_vals_dev_, summary_lse_dev_;
   core::DeviceBuffer<uint8_t> topk_lse_ws_;
+  core::PinnedBuffer<int32_t> argmax_host_, argmax_pair_host_;
+  core::PinnedBuffer<int32_t> verify_argmax_host_, verify_pairs_host_;
+  core::PinnedBuffer<int32_t> summary_ids_host_, verify_summary_ids_host_;
+  core::PinnedBuffer<float> summary_vals_host_, summary_lse_host_;
+  core::PinnedBuffer<float> verify_summary_vals_host_, verify_summary_lse_host_;
   int64_t vocab_local_valid_ = 0;  // this rank's logit columns below unpadded_vocab_size
   std::vector<float> gather_host_, sampled_row_scratch_;
 };

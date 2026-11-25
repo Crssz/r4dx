@@ -248,41 +248,124 @@ Inkling2Container Inkling2Container::Load(const std::string& path, const Inkling
     w.mlp_conv = Upload(HostBf16AsF32(r, b + "mlp_conv", H * 4));
 
     Inkling2AttnWeights& a = w.attn;
-    a.q = lin(b + "attn.q", g.QDim(), H, RowRule({g.QDim()}));
-    a.gate = lin(b + "attn.gate", g.QDim(), H, RowRule({g.QDim()}));
-    a.k = lin(b + "attn.k", g.KvDim(), H, RowRule({g.KvDim()}));
-    a.v = lin(b + "attn.v", g.KvDim(), H, RowRule({g.KvDim()}));
-    a.o = lin(b + "attn.o", H, g.QDim(), ColRule(g.QDim()));
-    a.rel = lin(b + "attn.rel", g.num_attention_heads * g.d_rel, H, Replicated());
-    // S4.1: concatenate [q, gate, rel, k, v] into one contiguous MXFP8 buffer (zero duplicate VRAM).
+    // S4.1 + P5.2: assemble [q, gate, rel, k, v] on host in one buffer when all 5 are kMxfp8, avoiding 10 H2D+D2D copies/layer.
     const bool concat_qkv = [] {
       const char* e = std::getenv("R4DX_INK_CONCAT_QKV");
       return !(e != nullptr && (std::strcmp(e, "0") == 0 || std::strcmp(e, "off") == 0));
     }();
-    if (concat_qkv && a.q.layout == Layout::kMxfp8 && a.gate.layout == Layout::kMxfp8 && a.rel.layout == Layout::kMxfp8 &&
-        a.k.layout == Layout::kMxfp8 && a.v.layout == Layout::kMxfp8 && a.q.K == H && a.gate.K == H && a.rel.K == H &&
-        a.k.K == H && a.v.K == H && (a.q.N % 16) == 0 && (a.gate.N % 16) == 0 && (a.rel.N % 16) == 0 &&
-        (a.k.N % 16) == 0 && (a.v.N % 16) == 0) {
-      QuantLinear* parts[5] = {&a.q, &a.gate, &a.rel, &a.k, &a.v};
-      int64_t* row0s[5] = {&a.q_row0, &a.gate_row0, &a.rel_row0, &a.k_row0, &a.v_row0};
-      int64_t total_n = 0;
+    const std::string q_base = b + "attn.q", g_base = b + "attn.gate", r_base = b + "attn.rel",
+                      k_base = b + "attn.k", v_base = b + "attn.v";
+    const struct {
+      std::string base;
+      int64_t N;
+      tp::ShardRule rule;
+      QuantLinear* dst;
+      int64_t* row0;
+    } qkv_specs[5] = {
+        {q_base, g.QDim(), RowRule({g.QDim()}), &a.q, &a.q_row0},
+        {g_base, g.QDim(), RowRule({g.QDim()}), &a.gate, &a.gate_row0},
+        {r_base, g.num_attention_heads * g.d_rel, Replicated(), &a.rel, &a.rel_row0},
+        {k_base, g.KvDim(), RowRule({g.KvDim()}), &a.k, &a.k_row0},
+        {v_base, g.KvDim(), RowRule({g.KvDim()}), &a.v, &a.v_row0},
+    };
+    bool can_host_qgrkv = concat_qkv && o.layout == Layout::kMxfp8 && meta.mxfp8;
+    std::vector<tp::Range> part_rows[5];
+    int64_t part_local_n[5] = {};
+    int64_t total_n = 0;
+    if (can_host_qgrkv) {
       for (int p = 0; p < 5; ++p) {
-        *row0s[p] = total_n;
-        total_n += parts[p]->N;
+        if (!HasLayout(r, meta, qkv_specs[p].base, Layout::kMxfp8)) {
+          can_host_qgrkv = false;
+          break;
+        }
+        int64_t ln = qkv_specs[p].N;
+        if (W > 1 && qkv_specs[p].rule.split == tp::Split::kRows) {
+          part_rows[p] = tp::RankRows(qkv_specs[p].rule, W, R);
+          ln = 0;
+          for (const tp::Range& rng : part_rows[p]) ln += rng.count;
+        }
+        if ((ln % 16) != 0) {
+          can_host_qgrkv = false;
+          break;
+        }
+        part_local_n[p] = ln;
+        total_n += ln;
+      }
+    }
+    if (can_host_qgrkv) {
+      std::vector<uint8_t> host_wq(static_cast<size_t>(total_n * H));
+      std::vector<uint8_t> host_ws(static_cast<size_t>(total_n * (H / 32)));
+      size_t off_wq = 0, off_ws = 0;
+      for (int p = 0; p < 5; ++p) {
+        const auto& sp = qkv_specs[p];
+        CheckMxfp8Shape(r, sp.base, sp.N, H);
+        *sp.row0 = static_cast<int64_t>(off_wq / static_cast<size_t>(H));
+        sp.dst->layout = Layout::kMxfp8;
+        sp.dst->N = part_local_n[p];
+        sp.dst->K = H;
+        const std::string wq_name = sp.base + r4dx_convert::mxfp8::kWqSuffix;
+        const std::string ws_name = sp.base + r4dx_convert::mxfp8::kWsSuffix;
+        if (W == 1 || sp.rule.split == tp::Split::kReplicate) {
+          const size_t nb_wq = static_cast<size_t>(part_local_n[p] * H);
+          const size_t nb_ws = static_cast<size_t>(part_local_n[p] * (H / 32));
+          std::memcpy(host_wq.data() + off_wq, r.Data(wq_name), nb_wq);
+          std::memcpy(host_ws.data() + off_ws, r.Data(ws_name), nb_ws);
+          off_wq += nb_wq;
+          off_ws += nb_ws;
+        } else {
+          tp::PartShape sq{tp::Part::kW8Wq, sp.N, H, 32};
+          tp::PartShape ss{tp::Part::kMxfp8Ws, sp.N, H, 32};
+          const auto runs_wq = tp::PlanRows(sq, part_rows[p]);
+          const auto runs_ws = tp::PlanRows(ss, part_rows[p]);
+          const uint8_t* src_wq = r.Data(wq_name);
+          const uint8_t* src_ws = r.Data(ws_name);
+          for (const tp::ByteRun& run : runs_wq) {
+            std::memcpy(host_wq.data() + off_wq, src_wq + run.src_off, run.bytes);
+            off_wq += run.bytes;
+          }
+          for (const tp::ByteRun& run : runs_ws) {
+            std::memcpy(host_ws.data() + off_ws, src_ws + run.src_off, run.bytes);
+            off_ws += run.bytes;
+          }
+        }
       }
       a.qgr_n = a.q.N + a.gate.N + a.rel.N;
       a.qgrkv_n = total_n;
-      a.qgrkv_wq = core::DeviceBuffer<uint8_t>(static_cast<size_t>(total_n * H));
-      a.qgrkv_ws = core::DeviceBuffer<uint8_t>(static_cast<size_t>(total_n * (H / 32)));
-      for (int p = 0; p < 5; ++p) {
-        R4DX_HIP_CHECK(hipMemcpy(a.qgrkv_wq.data() + static_cast<size_t>(*row0s[p] * H), parts[p]->mx_wq.data(),
-                                 parts[p]->mx_wq.bytes(), hipMemcpyDeviceToDevice));
-        R4DX_HIP_CHECK(hipMemcpy(a.qgrkv_ws.data() + static_cast<size_t>(*row0s[p] * (H / 32)), parts[p]->mx_ws.data(),
-                                 parts[p]->mx_ws.bytes(), hipMemcpyDeviceToDevice));
-        parts[p]->mx_wq = {};
-        parts[p]->mx_ws = {};
+      a.qgrkv_wq = Upload(host_wq);
+      a.qgrkv_ws = Upload(host_ws);
+    } else {
+      a.q = lin(q_base, g.QDim(), H, RowRule({g.QDim()}));
+      a.gate = lin(g_base, g.QDim(), H, RowRule({g.QDim()}));
+      a.k = lin(k_base, g.KvDim(), H, RowRule({g.KvDim()}));
+      a.v = lin(v_base, g.KvDim(), H, RowRule({g.KvDim()}));
+      a.o = lin(b + "attn.o", H, g.QDim(), ColRule(g.QDim()));
+      a.rel = lin(r_base, g.num_attention_heads * g.d_rel, H, Replicated());
+      if (concat_qkv && a.q.layout == Layout::kMxfp8 && a.gate.layout == Layout::kMxfp8 && a.rel.layout == Layout::kMxfp8 &&
+          a.k.layout == Layout::kMxfp8 && a.v.layout == Layout::kMxfp8 && a.q.K == H && a.gate.K == H && a.rel.K == H &&
+          a.k.K == H && a.v.K == H && (a.q.N % 16) == 0 && (a.gate.N % 16) == 0 && (a.rel.N % 16) == 0 &&
+          (a.k.N % 16) == 0 && (a.v.N % 16) == 0) {
+        QuantLinear* parts[5] = {&a.q, &a.gate, &a.rel, &a.k, &a.v};
+        int64_t* row0s[5] = {&a.q_row0, &a.gate_row0, &a.rel_row0, &a.k_row0, &a.v_row0};
+        int64_t tn = 0;
+        for (int p = 0; p < 5; ++p) {
+          *row0s[p] = tn;
+          tn += parts[p]->N;
+        }
+        a.qgr_n = a.q.N + a.gate.N + a.rel.N;
+        a.qgrkv_n = tn;
+        a.qgrkv_wq = core::DeviceBuffer<uint8_t>(static_cast<size_t>(tn * H));
+        a.qgrkv_ws = core::DeviceBuffer<uint8_t>(static_cast<size_t>(tn * (H / 32)));
+        for (int p = 0; p < 5; ++p) {
+          R4DX_HIP_CHECK(hipMemcpy(a.qgrkv_wq.data() + static_cast<size_t>(*row0s[p] * H), parts[p]->mx_wq.data(),
+                                   parts[p]->mx_wq.bytes(), hipMemcpyDeviceToDevice));
+          R4DX_HIP_CHECK(hipMemcpy(a.qgrkv_ws.data() + static_cast<size_t>(*row0s[p] * (H / 32)), parts[p]->mx_ws.data(),
+                                   parts[p]->mx_ws.bytes(), hipMemcpyDeviceToDevice));
+          parts[p]->mx_wq = {};
+          parts[p]->mx_ws = {};
+        }
       }
     }
+    if (can_host_qgrkv) a.o = lin(b + "attn.o", H, g.QDim(), ColRule(g.QDim()));
     a.sink = Upload(Rows(HostBf16(r, b + "attn.sink", g.num_attention_heads * H), H, h0, hl));
     a.q_scale = Upload(Rows(HostBf16AsF32(r, b + "attn.q_scale", g.num_attention_heads * hd), hd, h0, hl));
     a.rel_scale = Upload(Rows(HostBf16AsF32(r, b + "attn.rel_scale", g.num_attention_heads * g.d_rel), g.d_rel, h0, hl));
@@ -301,8 +384,8 @@ Inkling2Container Inkling2Container::Load(const std::string& path, const Inkling
       for (int m = 0; m < 4; ++m) {
         const std::string mb = b + "msg." + names[m] + ".";
         w.msg[m].down = Upload(HostBf16(r, mb + "down", g.gate_rank * 2 * H));
-        w.msg[m].forget = Upload(HostBf16AsF32(r, mb + "forget", H * g.gate_rank));
-        w.msg[m].gain = Upload(HostBf16AsF32(r, mb + "gain", H * g.gate_rank));
+        w.msg[m].forget = Upload(HostBf16(r, mb + "forget", H * g.gate_rank));
+        w.msg[m].gain = Upload(HostBf16(r, mb + "gain", H * g.gate_rank));
       }
     }
     w.router = Upload(HostBf16(r, b + "moe.router", g.num_experts * H));

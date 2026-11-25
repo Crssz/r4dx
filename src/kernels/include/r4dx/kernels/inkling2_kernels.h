@@ -244,6 +244,8 @@ struct R4dxInkling2AttnFusedArgs {
   int64_t pos_dev;      // optional device int32* holding pos0 (0 = use host ctx - q_len)
   int kv_fp8;           // 1 = kv cache stores fp8 e4m3fn (uint8), 0 = bf16 (uint16)
   int64_t gate;         // optional [q_len, q_heads, 128] bf16 output gate (0 = none; fuses out *= sigmoid(gate))
+  int64_t q_row_stride;     // optional q row stride in bf16 elements (0 = q_heads * 128)
+  int64_t gate_row_stride;  // optional gate row stride in bf16 elements (0 = q_heads * 128)
 };
 int r4dx_inkling2_attn_fused_bf16kv(const R4dxInkling2AttnFusedArgs* a, int64_t stream);
 
@@ -365,5 +367,75 @@ void r4dx_inkling2_vit_attn_bf16(int64_t q, int64_t k, int64_t v, int64_t out, i
                                  float scale, int64_t stream);
 // Drop CLS row 0 and 2x2 spatial merge [1 + gh*gw, D] -> [(gh/2)*(gw/2), 4*D] bf16 (dy in {0,1}, dx in {0,1}).
 void r4dx_inkling2_vit_merge2x2_bf16(int64_t in_with_cls, int64_t out, int gh, int gw, int D, int64_t stream);
+
+// ---- Inkling2 P1-P5 speedup kernels ---------------------------------------------------------------------------------
+// Fused multi-row bf16 softcap argmax: finds local (idx, val) per row on bf16 logits (monotone softcap > 0),
+// writing int32 out_pairs_or_idx[2*r + 0..1] when write_pair != 0 else out_pairs_or_idx[r]. ws >= rows * 1024 bytes.
+void r4dx_inkling2_softcap_argmax_rows_bf16(int64_t logits_bf16, int64_t row_stride, int rows, int n,
+                                            float softcap, int64_t ws, int64_t out_pairs_or_idx,
+                                            int write_pair, int64_t stream);
+
+// Single-launch in-loop DSpark Markov step: markov_w1[prev_tok] + [state_in, emb] @ W_rnn_2r^T + head_proj + frnn_proj
+// -> optional rnn_bias -> Markov gate -> state_out[R], latent_out[R] bf16.
+void r4dx_inkling2_dspark_markov_step_bf16(int64_t markov_w1_dev, int64_t prev_tok_dev, int64_t vocab_size,
+                                           int64_t state_in, int64_t head_proj_f32, int64_t frnn_proj_f32,
+                                           int64_t w_rnn2r, int64_t rnn_bias, int64_t state_out,
+                                           int64_t latent_out, int R, int64_t stream);
+
+// Fused 4-output DSpark InjectTaps mix + RMSNorm (runs 4 weighted sums + RMSNorms in 1 launch).
+void r4dx_inkling2_dspark_mix4_rmsnorm_bf16(int64_t tap0, int64_t tap1, int64_t tap2, int64_t tap3,
+                                            const float* coeffs_16, const int64_t* weights_4,
+                                            const int64_t* outs_4, int T, int H, float eps, int64_t stream);
+
+// Fused multi-layer DSpark context KV split + K norm/RoPE + ring-buffer write (bf16 or fp8) in 1 launch.
+struct R4dxInkling2DsparkCtxKvArgs {
+  int n_layers;         // 1..4
+  int T, kv_heads, head_dim;
+  int slots[4];
+  int kv_fp8[4];
+  int64_t pos0;
+  float rope_theta, eps;
+  int64_t kv_in[4];     // [T, 2 * kv_heads * head_dim] bf16 per layer
+  int64_t k_norm[4];    // optional [head_dim] bf16 per layer (0 = none)
+  int64_t v_norm[4];    // optional [head_dim] bf16 per layer (0 = none)
+  int64_t k_store[4];   // [slots[l], kv_heads, head_dim] bf16 or uint8
+  int64_t v_store[4];   // [slots[l], kv_heads, head_dim] bf16 or uint8
+};
+void r4dx_inkling2_dspark_ctx_kv_write(const R4dxInkling2DsparkCtxKvArgs* a, int64_t stream);
+
+// Strided sigmoid-gate multiply for zero-copy prefill qgrkv projection: out[t, c] = o[t, c] * sigmoid(g[t * g_stride + c]).
+void r4dx_inkling2_sigmoid_gate_mul_strided_bf16(int64_t o, int64_t g, int64_t g_row_stride, int64_t out,
+                                                 int T, int row_n, int64_t stream);
+
+// Strided short-conv variants reading x directly from concatenated qgrkv projection rows (hist remains contiguous [T, C]).
+void r4dx_inkling2_sconv_static_pair_strided_hist_f32(int64_t x_k, int64_t xk_row_stride, int64_t x_v,
+                                                      int64_t xv_row_stride, int x_bf16, int64_t w_k, int64_t w_v,
+                                                      int64_t state_k, int64_t state_v, int64_t out_k, int64_t out_v,
+                                                      int64_t hist_k, int64_t hist_v, int T, int C, int64_t stream);
+void r4dx_inkling2_sconv_dynamic_strided_hist_f32(int64_t x, int64_t x_row_stride, int x_bf16, int64_t dyn,
+                                                  int dyn_bf16, int64_t static_w, int64_t state, int64_t out,
+                                                  int64_t hist, int T, int C, int heads, int64_t stream);
+
+// Message-gate apply with bf16 forget/gain weights [H, R] (halves VRAM storage and read bandwidth).
+void r4dx_inkling2_msg_gate_apply_bf16w_f32(int64_t x, int64_t m, int64_t g, int g_bf16, int64_t forget_bf16,
+                                            int64_t gain_bf16, int64_t out, int T, int H, int R, int64_t stream);
+void r4dx_inkling2_msg_gate_apply3_bf16w_f32(int64_t x, int64_t x_gate_stride, int64_t m_all, int64_t g_all,
+                                             int64_t forget0, int64_t forget1, int64_t forget2, int64_t gain0,
+                                             int64_t gain1, int64_t gain2, int64_t out_all, int T, int H, int R,
+                                             int64_t stream);
+
+// Single-launch fused router (dots + sigmoid + bias + top-k + normalize) for T <= 8.
+void r4dx_inkling2_router_fused_f32(int64_t x, int64_t gate_w, int64_t bias, int64_t ids, int64_t w, int T, int H,
+                                    int E, int top_k, float route_scale, int64_t x_row_stride, int64_t logits_out,
+                                    int64_t stream);
+
+// Batched full-layer small dense GEMMs: out_sink = xq @ w_sink^T, out_dk = xk @ w_k^T, out_dv = xv @ w_v^T.
+void r4dx_inkling2_dense_sink_kvconv_bf16(int64_t xq, int64_t xk, int64_t xv, int64_t w_sink, int64_t w_k,
+                                          int64_t w_v, int64_t out_sink, int64_t out_dk, int64_t out_dv, int M,
+                                          int N_sink, int N_kv, int K, int64_t stream);
+
+// GPU MXFP8 quantizer + fragment packer: src_bf16 [N, K] (N % 16 == 0, K % 32 == 0) -> wq [N*K], ws [N*K/32].
+void r4dx_inkling2_quantize_pack_mxfp8_bf16(int64_t src_bf16, int64_t wq_u8, int64_t ws_u8, int N, int K,
+                                            int64_t stream);
 
 }  // extern "C"

@@ -107,11 +107,33 @@ class TpComm {
   virtual bool IsGraphCapturable() const { return false; }
   // Record `count` all-reduce calls of `bytes` each executed by a replayed HIP graph (keeps stats and heartbeat current).
   virtual void NoteGraphReplay(size_t /*bytes*/, int64_t /*count*/) {}
+  // Optional device-side bf16-in -> fp32-out all-reduce (returns false if unsupported).
+  virtual bool AllReduceSumBf16ToF32(const uint16_t* /*src_bf16*/, float* /*dst_f32*/, int64_t /*n*/,
+                                     hipStream_t /*stream*/) {
+    return false;
+  }
+  bool AllReduceSumBf16ToF32Rows(const uint16_t* src_bf16, float* dst_f32, int64_t rows, int64_t hidden,
+                                 hipStream_t stream) {
+    const int64_t max_rows = (static_cast<int64_t>(MaxAllReduceBytes()) / 2) / hidden;
+    const int64_t per = max_rows > 0 ? max_rows : 1;
+    for (int64_t r0 = 0; r0 < rows; r0 += per) {
+      const int64_t n = rows - r0 < per ? rows - r0 : per;
+      if (!AllReduceSumBf16ToF32(src_bf16 + r0 * hidden, dst_f32 + r0 * hidden, n * hidden, stream)) {
+        return false;
+      }
+    }
+    return true;
+  }
   // Optional device-side fp32 all-reduce (returns false if unsupported, e.g. EmulatedComm/NoopComm).
   virtual bool AllReduceSumF32(float* /*buf*/, int64_t /*n*/, hipStream_t /*stream*/) { return false; }
   // Optional device-side argmax-pair merge across ranks (zero host sync; returns false if unsupported).
   virtual bool AllReduceArgmaxPair(int32_t* /*pair_dev*/, int32_t /*row_offset*/, int32_t* /*out_tok_dev*/,
                                    hipStream_t /*stream*/) {
+    return false;
+  }
+  // Optional device-side batched argmax-pair merge across ranks (zero host sync; returns false if unsupported).
+  virtual bool AllReduceArgmaxRows(int32_t* /*pairs_dev*/, int32_t /*row_offset*/, int /*rows*/,
+                                   int32_t* /*out_tok_dev*/, hipStream_t /*stream*/) {
     return false;
   }
 };

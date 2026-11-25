@@ -61,6 +61,8 @@ bool ParseNv4TuneEnv(const char* name, LinearTuning& out) {
 
 LinearTuning PickNvfp4MoeTuning(int64_t N, int64_t K, int64_t M, bool is_down) {
     LinearTuning t = PickTuning(Layout::kMxfp8, N, K, M);
+    static const bool kVerifyNt8 = InkEnvFlag("R4DX_INK_NV4_VERIFY_NT", false);
+    const int nt_max_m = kVerifyNt8 ? 8 : 4;
     // Dedicated R9700 NVFP4 MoE rows (9 K-blocks/wave, NPW=4): measured +3.7 tok/s on TP=2 DSpark
     // (104.5 -> 108.2).
     if (N >= 64 && (N % 64) == 0) {
@@ -68,17 +70,17 @@ LinearTuning PickNvfp4MoeTuning(int64_t N, int64_t K, int64_t M, bool is_down) {
             t.WV = 1;
             t.SK = 8;
             t.NPW = 4;
-            t.NT = (M <= 4 ? 1 : 0);
+            t.NT = (M <= nt_max_m ? 1 : 0);
         } else if (K == 1152) {
             t.WV = 1;
             t.SK = 4;
             t.NPW = 4;
-            t.NT = (M <= 4 ? 1 : 0);
+            t.NT = (M <= nt_max_m ? 1 : 0);
         } else if (K == 576) {
             t.WV = 1;
             t.SK = 2;
             t.NPW = 4;
-            t.NT = (M <= 4 ? 1 : 0);
+            t.NT = (M <= nt_max_m ? 1 : 0);
         }
     }
     LinearTuning ov = t;
@@ -87,6 +89,48 @@ LinearTuning PickNvfp4MoeTuning(int64_t N, int64_t K, int64_t M, bool is_down) {
         return ov;
     }
     return t;
+}
+
+int64_t MoeDecodeMaxT() {
+    static const int64_t v = []() -> int64_t {
+        const char* e = std::getenv("R4DX_INK_MOE_DECODE_MAX_T");
+        if (e == nullptr || *e == '\0') return 4;
+        char* end = nullptr;
+        const long parsed = std::strtol(e, &end, 10);
+        if (end == e || *end != '\0') return 4;
+        return std::clamp<int64_t>(parsed, 1, 8);
+    }();
+    return v;
+}
+
+bool FastArgmaxEnabled() {
+    static const bool v = InkEnvFlag("R4DX_INK_FAST_ARGMAX", true);
+    return v;
+}
+
+bool AsyncPostVerifyEnabled() {
+    static const bool v = InkEnvFlag("R4DX_INK_ASYNC_POST_VERIFY", true);
+    return v;
+}
+
+bool FuseRouterEnabled() {
+    static const bool v = InkEnvFlag("R4DX_INK_FUSE_ROUTER", false);
+    return v;
+}
+
+bool BatchSinkKvEnabled() {
+    static const bool v = InkEnvFlag("R4DX_INK_BATCH_SINK_KV", true);
+    return v;
+}
+
+bool ArBf16ToF32Enabled() {
+    static const bool v = InkEnvFlag("R4DX_INK_AR_BF16_TO_F32", true);
+    return v;
+}
+
+bool StridedPrefillQkvEnabled() {
+    static const bool v = InkEnvFlag("R4DX_INK_STRIDED_PREFILL_QKV", true);
+    return v;
 }
 
 bool DsparkAdaptEnabled() {
@@ -478,13 +522,28 @@ Inkling2Model Inkling2Model::Load(const Inkling2ModelOptions& opts) {
     }
     const int64_t vl = cfg.HeadRowsLocal();
     m.logits_dev_ = core::DeviceBuffer<float>(static_cast<size_t>(vl));
+    m.lg_bf16_dev_ = core::DeviceBuffer<uint16_t>(static_cast<size_t>(kVerifyMaxT * vl));
+    m.softcap_argmax_ws_ = core::DeviceBuffer<uint8_t>(static_cast<size_t>(kVerifyMaxT) * 1024);
     m.vocab_local_valid_ =
         std::max<int64_t>(0, std::min<int64_t>(vl, cfg.unpadded_vocab_size - cfg.HeadRowBegin()));
     m.argmax_dev_ = core::DeviceBuffer<int32_t>(1);
     m.argmax_pair_dev_ = core::DeviceBuffer<int32_t>(2);
+    m.argmax_host_ = core::PinnedBuffer<int32_t>(1);
+    m.argmax_pair_host_ = core::PinnedBuffer<int32_t>(2);
+    m.verify_argmax_host_ = core::PinnedBuffer<int32_t>(static_cast<size_t>(kVerifyMaxT));
+    m.verify_pairs_host_ = core::PinnedBuffer<int32_t>(static_cast<size_t>(kVerifyMaxT * 2));
     m.summary_ids_dev_ = core::DeviceBuffer<int32_t>(R4DX_TOPK_LSE_K);
     m.summary_vals_dev_ = core::DeviceBuffer<float>(R4DX_TOPK_LSE_K);
     m.summary_lse_dev_ = core::DeviceBuffer<float>(1);
+    m.summary_ids_host_ = core::PinnedBuffer<int32_t>(R4DX_TOPK_LSE_K);
+    m.summary_vals_host_ = core::PinnedBuffer<float>(R4DX_TOPK_LSE_K);
+    m.summary_lse_host_ = core::PinnedBuffer<float>(1);
+    m.verify_summary_ids_host_ =
+        core::PinnedBuffer<int32_t>(static_cast<size_t>(kVerifyMaxT * R4DX_TOPK_LSE_K));
+    m.verify_summary_vals_host_ =
+        core::PinnedBuffer<float>(static_cast<size_t>(kVerifyMaxT * R4DX_TOPK_LSE_K));
+    m.verify_summary_lse_host_ = core::PinnedBuffer<float>(static_cast<size_t>(kVerifyMaxT));
+    R4DX_HIP_CHECK(hipEventCreateWithFlags(&m.step_done_.e, hipEventDisableTiming));
     if (is_tp)
         m.topk_lse_ws_ =
             core::DeviceBuffer<uint8_t>(static_cast<size_t>(r4dx_topk_lse_workspace_bytes()));
@@ -629,9 +688,9 @@ void Inkling2Model::MsgGate(const Inkling2MsgGateWeights& g, const float* x, con
                                      eps, s);
     r4dx_inkling2_dense_bf16(P(cat), 2 * H, P(g.down.data()), P(gv), 0, R, static_cast<int>(T),
                              static_cast<int>(R), static_cast<int>(2 * H), s);
-    r4dx_inkling2_msg_gate_apply_f32(P(x), P(m), P(gv), 0, P(g.forget.data()), P(g.gain.data()),
-                                     P(out), static_cast<int>(T), static_cast<int>(H),
-                                     static_cast<int>(R), s);
+    r4dx_inkling2_msg_gate_apply_bf16w_f32(P(x), P(m), P(gv), 0, P(g.forget.data()), P(g.gain.data()),
+                                           P(out), static_cast<int>(T), static_cast<int>(H),
+                                           static_cast<int>(R), s);
 }
 
 void Inkling2Model::MsgGate3AttnNormBf16(const Inkling2LayerWeights& w, const float* a_src,
@@ -650,7 +709,7 @@ void Inkling2Model::MsgGate3AttnNormBf16(const Inkling2LayerWeights& w, const fl
     r4dx_inkling2_dense3_bf16(P(cat), P(w.msg[0].down.data()), P(w.msg[1].down.data()),
                               P(w.msg[2].down.data()), P(gv), static_cast<int>(T),
                               static_cast<int>(R), static_cast<int>(2 * H), s);
-    r4dx_inkling2_msg_gate_apply3_f32(
+    r4dx_inkling2_msg_gate_apply3_bf16w_f32(
         P(a_src), x_stride, P(m_all), P(gv), P(w.msg[0].forget.data()), P(w.msg[1].forget.data()),
         P(w.msg[2].forget.data()), P(w.msg[0].gain.data()), P(w.msg[1].gain.data()),
         P(w.msg[2].gain.data()), P(tmp), static_cast<int>(T), static_cast<int>(H),
@@ -703,6 +762,12 @@ void Inkling2Model::Attention(const Inkling2Visit& v, const uint16_t* xq, const 
     const bool has_concat = !a.qgrkv_wq.empty();
     const bool concat_all5 = has_concat && xk == xq && xv == xq;
     const bool concat_qgr = has_concat && !concat_all5;
+    const int64_t gqa = hl / kvl;
+    const bool use_fused_attn =
+        AttnFusedEnabled() && hd == 128 && drel <= 32 && hl % kvl == 0 &&
+        (gqa == 1 || gqa == 2 || gqa == 3 || gqa == 4 || gqa == 6 || gqa == 8);
+    const bool strided_prefill =
+        use_fused_attn && hd == 128 && T > 16 && StridedPrefillQkvEnabled();
 
     const int64_t rel_all = g.num_attention_heads * drel;
     uint16_t* qlin = nullptr;
@@ -710,15 +775,25 @@ void Inkling2Model::Attention(const Inkling2Visit& v, const uint16_t* xq, const 
     uint16_t* vlin = nullptr;
     uint16_t* rlin = nullptr;
     uint16_t* gt = nullptr;
+    int64_t q_in_stride = hl * hd;
+    int64_t g_in_stride = hl * hd;
+    int64_t r_in_stride = rel_all;
+    int64_t kv_in_stride = C;
     if (concat_all5) {
         uint16_t* all = arena_.Alloc<uint16_t>(static_cast<size_t>(T * a.qgrkv_n), 16);
         ProfiledCall(prof, sr, "gemm:attn.q", [&] { lin_slice(0, a.qgrkv_n, xq, all); });
-        if (T == 1) {
+        if (T == 1 || strided_prefill) {
             qlin = all + a.q_row0;
             gt = all + a.gate_row0;
             rlin = all + a.rel_row0;
             klin = all + a.k_row0;
             vlin = all + a.v_row0;
+            if (T > 1) {
+                q_in_stride = a.qgrkv_n;
+                g_in_stride = a.qgrkv_n;
+                r_in_stride = a.qgrkv_n;
+                kv_in_stride = a.qgrkv_n;
+            }
         } else {
             qlin = arena_.Alloc<uint16_t>(static_cast<size_t>(T * hl * hd), 16);
             gt = arena_.Alloc<uint16_t>(static_cast<size_t>(T * hl * hd), 16);
@@ -733,10 +808,15 @@ void Inkling2Model::Attention(const Inkling2Visit& v, const uint16_t* xq, const 
     } else if (concat_qgr) {
         uint16_t* qgr = arena_.Alloc<uint16_t>(static_cast<size_t>(T * a.qgr_n), 16);
         ProfiledCall(prof, sr, "gemm:attn.q", [&] { lin_slice(0, a.qgr_n, xq, qgr); });
-        if (T == 1) {
+        if (T == 1 || strided_prefill) {
             qlin = qgr + a.q_row0;
             gt = qgr + a.gate_row0;
             rlin = qgr + a.rel_row0;
+            if (T > 1) {
+                q_in_stride = a.qgr_n;
+                g_in_stride = a.qgr_n;
+                r_in_stride = a.qgr_n;
+            }
         } else {
             qlin = arena_.Alloc<uint16_t>(static_cast<size_t>(T * hl * hd), 16);
             gt = arena_.Alloc<uint16_t>(static_cast<size_t>(T * hl * hd), 16);
@@ -775,10 +855,7 @@ void Inkling2Model::Attention(const Inkling2Visit& v, const uint16_t* xq, const 
     }
 
     const int64_t pos_dev_ptr = use_pos_dev ? P(pos_dev_.data()) : 0;
-    const int64_t gqa = hl / kvl;
-    const bool use_fused_attn =
-        AttnFusedEnabled() && hd == 128 && drel <= 32 && hl % kvl == 0 &&
-        (gqa == 1 || gqa == 2 || gqa == 3 || gqa == 4 || gqa == 6 || gqa == 8);
+    const bool batch_sink_kv = full && hd == 128 && T <= 16 && BatchSinkKvEnabled();
     uint16_t* q = arena_.Alloc<uint16_t>(static_cast<size_t>(T * hl * hd), 16);
     float* r = arena_.Alloc<float>(static_cast<size_t>(T * hl * drel), 16);
     float* rel =
@@ -793,9 +870,9 @@ void Inkling2Model::Attention(const Inkling2Visit& v, const uint16_t* xq, const 
                 Lin(a.rel, xq, rlin, T);
         }
         if (hd <= 128 && drel <= 128) {
-            r4dx_inkling2_head_clip_qr(P(qlin), hl * hd, P(a.q_scale.data()),
+            r4dx_inkling2_head_clip_qr(P(qlin), q_in_stride, P(a.q_scale.data()),
                                        static_cast<float>(cfg.qk_clip), P(q), static_cast<int>(hd),
-                                       P(rlin + cfg.tp_rank * hl * drel), rel_all,
+                                       P(rlin + cfg.tp_rank * hl * drel), r_in_stride,
                                        P(a.rel_scale.data()), static_cast<float>(cfg.rel_clip),
                                        P(r), static_cast<int>(drel), pos0, pos_dev_ptr, log_alpha,
                                        log_floor, static_cast<int>(T), static_cast<int>(hl), s);
@@ -806,7 +883,7 @@ void Inkling2Model::Attention(const Inkling2Visit& v, const uint16_t* xq, const 
             dense_q.out = P(q);
             dense_q.out_row_stride = hl * hd;
             dense_q.pos_dev = pos_dev_ptr;
-            r4dx_inkling2_head_clip(P(qlin), 1, hl * hd, P(a.q_scale.data()),
+            r4dx_inkling2_head_clip(P(qlin), 1, q_in_stride, P(a.q_scale.data()),
                                     static_cast<float>(cfg.qk_clip), pos0, log_alpha, log_floor,
                                     &dense_q, static_cast<int>(T), static_cast<int>(hl),
                                     static_cast<int>(hd), s);
@@ -816,7 +893,7 @@ void Inkling2Model::Attention(const Inkling2Visit& v, const uint16_t* xq, const 
             dense_r.out = P(r);
             dense_r.out_row_stride = hl * drel;
             dense_r.pos_dev = pos_dev_ptr;
-            r4dx_inkling2_head_clip(P(rlin + cfg.tp_rank * hl * drel), 1, rel_all,
+            r4dx_inkling2_head_clip(P(rlin + cfg.tp_rank * hl * drel), 1, r_in_stride,
                                     P(a.rel_scale.data()), static_cast<float>(cfg.rel_clip), pos0,
                                     log_alpha, log_floor, &dense_r, static_cast<int>(T),
                                     static_cast<int>(hl), static_cast<int>(drel), s);
@@ -826,8 +903,10 @@ void Inkling2Model::Attention(const Inkling2Visit& v, const uint16_t* xq, const 
                                          static_cast<int>(T * hl), static_cast<int>(drel),
                                          static_cast<int>(ext), s);
         }
-        r4dx_inkling2_dense_bf16(P(xq), H, P(a.sink.data()), P(sink), 0, hl, static_cast<int>(T),
-                                 static_cast<int>(hl), static_cast<int>(H), s);
+        if (!batch_sink_kv) {
+            r4dx_inkling2_dense_bf16(P(xq), H, P(a.sink.data()), P(sink), 0, hl, static_cast<int>(T),
+                                     static_cast<int>(hl), static_cast<int>(H), s);
+        }
     });
     // k, v: short conv -> clip / rms -> the paged cache
     ProfiledCall(prof, sr, "attn.kv_conv", [&] {
@@ -845,9 +924,16 @@ void Inkling2Model::Attention(const Inkling2Visit& v, const uint16_t* xq, const 
         if (full && hd == 128 && T <= 16) {
             float* dk = arena_.Alloc<float>(static_cast<size_t>(T * kvl * 4), 16);
             float* dv = arena_.Alloc<float>(static_cast<size_t>(T * kvl * 4), 16);
-            r4dx_inkling2_dense2_bf16(P(xk), P(xv), P(a.k_conv_proj.data()),
-                                      P(a.v_conv_proj.data()), P(dk), P(dv), static_cast<int>(T),
-                                      static_cast<int>(kvl * 4), static_cast<int>(H), s);
+            if (batch_sink_kv) {
+                r4dx_inkling2_dense_sink_kvconv_bf16(
+                    P(xq), P(xk), P(xv), P(a.sink.data()), P(a.k_conv_proj.data()),
+                    P(a.v_conv_proj.data()), P(sink), P(dk), P(dv), static_cast<int>(T),
+                    static_cast<int>(hl), static_cast<int>(kvl * 4), static_cast<int>(H), s);
+            } else {
+                r4dx_inkling2_dense2_bf16(P(xk), P(xv), P(a.k_conv_proj.data()),
+                                          P(a.v_conv_proj.data()), P(dk), P(dv), static_cast<int>(T),
+                                          static_cast<int>(kvl * 4), static_cast<int>(H), s);
+            }
             r4dx_inkling2_sconv_dyn_kv_paged(
                 P(klin), P(vlin), P(dk), P(dv), P(a.k_conv_static.data()),
                 P(a.v_conv_static.data()), P(ConvState(slot, 0)), P(ConvState(slot, 1)), khist,
@@ -867,12 +953,28 @@ void Inkling2Model::Attention(const Inkling2Visit& v, const uint16_t* xq, const 
             r4dx_inkling2_dense_bf16(P(xv), H, P(a.v_conv_proj.data()), P(dv), 0, kvl * 4,
                                      static_cast<int>(T), static_cast<int>(kvl * 4),
                                      static_cast<int>(H), s);
-            r4dx_inkling2_sconv_dynamic_hist_f32(
-                P(klin), 1, P(dk), 0, P(a.k_conv_static.data()), P(ConvState(slot, 0)), P(kc),
-                khist, static_cast<int>(T), static_cast<int>(C), static_cast<int>(kvl), s);
-            r4dx_inkling2_sconv_dynamic_hist_f32(
-                P(vlin), 1, P(dv), 0, P(a.v_conv_static.data()), P(ConvState(slot, 1)), P(vc),
-                vhist, static_cast<int>(T), static_cast<int>(C), static_cast<int>(kvl), s);
+            if (kv_in_stride != C) {
+                r4dx_inkling2_sconv_dynamic_strided_hist_f32(
+                    P(klin), kv_in_stride, 1, P(dk), 0, P(a.k_conv_static.data()),
+                    P(ConvState(slot, 0)), P(kc), khist, static_cast<int>(T), static_cast<int>(C),
+                    static_cast<int>(kvl), s);
+                r4dx_inkling2_sconv_dynamic_strided_hist_f32(
+                    P(vlin), kv_in_stride, 1, P(dv), 0, P(a.v_conv_static.data()),
+                    P(ConvState(slot, 1)), P(vc), vhist, static_cast<int>(T), static_cast<int>(C),
+                    static_cast<int>(kvl), s);
+            } else {
+                r4dx_inkling2_sconv_dynamic_hist_f32(
+                    P(klin), 1, P(dk), 0, P(a.k_conv_static.data()), P(ConvState(slot, 0)), P(kc),
+                    khist, static_cast<int>(T), static_cast<int>(C), static_cast<int>(kvl), s);
+                r4dx_inkling2_sconv_dynamic_hist_f32(
+                    P(vlin), 1, P(dv), 0, P(a.v_conv_static.data()), P(ConvState(slot, 1)), P(vc),
+                    vhist, static_cast<int>(T), static_cast<int>(C), static_cast<int>(kvl), s);
+            }
+        } else if (kv_in_stride != C) {
+            r4dx_inkling2_sconv_static_pair_strided_hist_f32(
+                P(klin), kv_in_stride, P(vlin), kv_in_stride, 1, P(a.k_conv.data()),
+                P(a.v_conv.data()), P(ConvState(slot, 0)), P(ConvState(slot, 1)), P(kc), P(vc),
+                khist, vhist, static_cast<int>(T), static_cast<int>(C), s);
         } else {
             r4dx_inkling2_sconv_static_pair_hist_f32(
                 P(klin), P(vlin), 1, P(a.k_conv.data()), P(a.v_conv.data()), P(ConvState(slot, 0)),
@@ -931,6 +1033,7 @@ void Inkling2Model::Attention(const Inkling2Visit& v, const uint16_t* xq, const 
             af.pos_dev = pos_dev_ptr;
             af.kv_fp8 = slot_fp8 ? 1 : 0;
             af.gate = fused_gate ? P(gt) : 0;
+            af.gate_row_stride = fused_gate ? g_in_stride : 0;
             const int rc = r4dx_inkling2_attn_fused_bf16kv(&af, s);
             if (rc != 0)
                 throw std::runtime_error(
@@ -970,19 +1073,28 @@ void Inkling2Model::Attention(const Inkling2Visit& v, const uint16_t* xq, const 
                 Lin(a.gate, xq, gt, T);
         }
         if (!fused_gate) {
-            r4dx_inkling2_sigmoid_gate_mul_bf16(P(ao), P(gt), P(ao), T * hl * hd, s);
+            if (g_in_stride != hl * hd) {
+                r4dx_inkling2_sigmoid_gate_mul_strided_bf16(
+                    P(ao), P(gt), g_in_stride, P(ao), static_cast<int>(T),
+                    static_cast<int>(hl * hd), s);
+            } else {
+                r4dx_inkling2_sigmoid_gate_mul_bf16(P(ao), P(gt), P(ao), T * hl * hd, s);
+            }
         }
         Lin(a.o, ao, out, T);
     });
     if (comm_ != nullptr) {
         ProfiledCall(prof, sr, "tp.allreduce", [&] {
             if (out_f32 != nullptr) {
-                r4dx_inkling2_sconv_capture_x_f32(P(out), 1, P(out_f32), static_cast<int>(T),
-                                                  static_cast<int>(H), s);
-                if (!comm_->AllReduceSumF32(out_f32, T * H, sr)) {
-                    comm_->AllReduceSumBf16Rows(out, T, H, sr);
+                if (!(ArBf16ToF32Enabled() &&
+                      comm_->AllReduceSumBf16ToF32Rows(out, out_f32, T, H, sr))) {
                     r4dx_inkling2_sconv_capture_x_f32(P(out), 1, P(out_f32), static_cast<int>(T),
                                                       static_cast<int>(H), s);
+                    if (!comm_->AllReduceSumF32(out_f32, T * H, sr)) {
+                        comm_->AllReduceSumBf16Rows(out, T, H, sr);
+                        r4dx_inkling2_sconv_capture_x_f32(
+                            P(out), 1, P(out_f32), static_cast<int>(T), static_cast<int>(H), s);
+                    }
                 }
             } else {
                 comm_->AllReduceSumBf16Rows(out, T, H, sr);
@@ -1003,13 +1115,23 @@ void Inkling2Model::Moe(int64_t layer, const uint16_t* x, uint16_t* out, int64_t
     int32_t* ids = arena_.Alloc<int32_t>(static_cast<size_t>(Pn), 16);
     float* wts = arena_.Alloc<float>(static_cast<size_t>(Pn), 16);
     uint16_t* ys = arena_.Alloc<uint16_t>(static_cast<size_t>(Pn * H), 16);
+    const bool use_fused_router = FuseRouterEnabled() && T <= 8;
     float* router_logits =
-        MoeGroupedDecodeEnabled() ? arena_.Alloc<float>(static_cast<size_t>(T * E), 16) : nullptr;
+        (!use_fused_router && MoeGroupedDecodeEnabled()) || trace_.enabled
+            ? arena_.Alloc<float>(static_cast<size_t>(T * E), 16)
+            : nullptr;
     ProfiledCall(prof, sr, "moe.router", [&] {
-        r4dx_inkling2_router_f32(P(x), P(w.router.data()), P(w.bias.data()), P(ids), P(wts),
-                                 static_cast<int>(T), static_cast<int>(H), static_cast<int>(E),
-                                 static_cast<int>(K), static_cast<float>(cfg.route_scale), H,
-                                 P(router_logits), s);
+        if (use_fused_router) {
+            r4dx_inkling2_router_fused_f32(P(x), P(w.router.data()), P(w.bias.data()), P(ids), P(wts),
+                                           static_cast<int>(T), static_cast<int>(H), static_cast<int>(E),
+                                           static_cast<int>(K), static_cast<float>(cfg.route_scale), H,
+                                           P(router_logits), s);
+        } else {
+            r4dx_inkling2_router_f32(P(x), P(w.router.data()), P(w.bias.data()), P(ids), P(wts),
+                                     static_cast<int>(T), static_cast<int>(H), static_cast<int>(E),
+                                     static_cast<int>(K), static_cast<float>(cfg.route_scale), H,
+                                     P(router_logits), s);
+        }
     });
     if (trace_.enabled) {
         std::vector<int32_t> h(static_cast<size_t>(Pn));
@@ -1021,53 +1143,54 @@ void Inkling2Model::Moe(int64_t layer, const uint16_t* x, uint16_t* out, int64_t
         auto& dst = trace_.ids[static_cast<size_t>(visit)];
         dst.insert(dst.end(), h.begin(), h.end());
     }
-    if (T == 1) {
-        const bool grouped_nv4 =
-            w.nvfp4_experts && !w.gate_up_ptrs0.empty() && !w.down_ptrs0.empty();
-        const bool grouped_mx = !grouped_nv4 && MoeGroupedDecodeEnabled() &&
-                                !w.gate_up_ptrs0.empty() && !w.gate_up_ptrs1.empty() &&
-                                !w.down_ptrs0.empty() && !w.down_ptrs1.empty() &&
-                                !w.gate_up.empty() && w.gate_up[0].layout == Layout::kMxfp8 &&
-                                w.down[0].layout == Layout::kMxfp8;
+    const bool grouped_nv4 =
+        w.nvfp4_experts && !w.gate_up_ptrs0.empty() && !w.down_ptrs0.empty();
+    const bool grouped_mx = !grouped_nv4 && MoeGroupedDecodeEnabled() &&
+                            !w.gate_up_ptrs0.empty() && !w.gate_up_ptrs1.empty() &&
+                            !w.down_ptrs0.empty() && !w.down_ptrs1.empty() &&
+                            !w.gate_up.empty() && w.gate_up[0].layout == Layout::kMxfp8 &&
+                            w.down[0].layout == Layout::kMxfp8;
+    const bool use_moe_decode = (T == 1) || (T <= MoeDecodeMaxT() && (grouped_nv4 || grouped_mx));
+    if (use_moe_decode) {
         if (grouped_nv4) {
-            uint16_t* gu = arena_.Alloc<uint16_t>(static_cast<size_t>(K * 2 * I), 16);
-            uint16_t* act = arena_.Alloc<uint16_t>(static_cast<size_t>(K * I), 16);
+            uint16_t* gu = arena_.Alloc<uint16_t>(static_cast<size_t>(Pn * 2 * I), 16);
+            uint16_t* act = arena_.Alloc<uint16_t>(static_cast<size_t>(Pn * I), 16);
             const LinearTuning t_gu = PickNvfp4MoeTuning(2 * I, H, 1, false);
             const LinearTuning t_dn = PickNvfp4MoeTuning(H, I, 1, true);
             ProfiledCall(prof, sr, "gemm:moe.gate_up", [&] {
                 r4dx_gemm_nvfp4_moe_decode(
                     P(x), P(w.gate_up_ptrs0.data()), P(w.gate_up_ptrs1.data()),
-                    P(w.gate_up_factors.data()), P(ids), P(gu), static_cast<int>(K),
+                    P(w.gate_up_factors.data()), P(ids), P(gu), static_cast<int>(Pn),
                     static_cast<int>(K), static_cast<int>(E), static_cast<int>(H),
                     static_cast<int>(2 * I), t_gu.WV, t_gu.SK, t_gu.NPW, t_gu.NT, s);
             });
             ProfiledCall(prof, sr, "moe.act",
-                         [&] { r4dx_inkling2_swiglu_softcap_bf16(P(gu), P(act), K, I, 2 * I, s); });
+                         [&] { r4dx_inkling2_swiglu_softcap_bf16(P(gu), P(act), Pn, I, 2 * I, s); });
             ProfiledCall(prof, sr, "gemm:moe.down", [&] {
                 r4dx_gemm_nvfp4_moe_decode(P(act), P(w.down_ptrs0.data()), P(w.down_ptrs1.data()),
                                            P(w.down_factors.data()), P(ids), P(ys),
-                                           static_cast<int>(K), 1, static_cast<int>(E),
+                                           static_cast<int>(Pn), 1, static_cast<int>(E),
                                            static_cast<int>(I), static_cast<int>(H), t_dn.WV,
                                            t_dn.SK, t_dn.NPW, t_dn.NT, s);
             });
         } else if (grouped_mx) {
-            uint16_t* gu = arena_.Alloc<uint16_t>(static_cast<size_t>(K * 2 * I), 16);
-            uint16_t* act = arena_.Alloc<uint16_t>(static_cast<size_t>(K * I), 16);
+            uint16_t* gu = arena_.Alloc<uint16_t>(static_cast<size_t>(Pn * 2 * I), 16);
+            uint16_t* act = arena_.Alloc<uint16_t>(static_cast<size_t>(Pn * I), 16);
             const LinearTuning t_gu = PickTuning(Layout::kMxfp8, w.gate_up[0].N, w.gate_up[0].K, 1);
             const LinearTuning t_dn = PickTuning(Layout::kMxfp8, w.down[0].N, w.down[0].K, 1);
             ProfiledCall(prof, sr, "gemm:moe.gate_up", [&] {
                 r4dx_gemm_mxfp8_moe_decode(
                     P(x), P(w.gate_up_ptrs0.data()), P(w.gate_up_ptrs1.data()), P(ids), P(gu),
-                    static_cast<int>(K), static_cast<int>(K), static_cast<int>(E),
+                    static_cast<int>(Pn), static_cast<int>(K), static_cast<int>(E),
                     static_cast<int>(w.gate_up[0].K), static_cast<int>(w.gate_up[0].N), t_gu.WV,
                     t_gu.SK, t_gu.NPW, t_gu.NT, s);
             });
             ProfiledCall(prof, sr, "moe.act",
-                         [&] { r4dx_inkling2_swiglu_softcap_bf16(P(gu), P(act), K, I, 2 * I, s); });
+                         [&] { r4dx_inkling2_swiglu_softcap_bf16(P(gu), P(act), Pn, I, 2 * I, s); });
             ProfiledCall(prof, sr, "gemm:moe.down", [&] {
                 r4dx_gemm_mxfp8_moe_decode(
                     P(act), P(w.down_ptrs0.data()), P(w.down_ptrs1.data()), P(ids), P(ys),
-                    static_cast<int>(K), 1, static_cast<int>(E), static_cast<int>(w.down[0].K),
+                    static_cast<int>(Pn), 1, static_cast<int>(E), static_cast<int>(w.down[0].K),
                     static_cast<int>(w.down[0].N), t_dn.WV, t_dn.SK, t_dn.NPW, t_dn.NT, s);
             });
         } else {
@@ -1217,12 +1340,15 @@ void Inkling2Model::Moe(int64_t layer, const uint16_t* x, uint16_t* out, int64_t
     if (comm_ != nullptr) {
         ProfiledCall(prof, sr, "tp.allreduce", [&] {
             if (out_f32 != nullptr) {
-                r4dx_inkling2_sconv_capture_x_f32(P(out), 1, P(out_f32), static_cast<int>(T),
-                                                  static_cast<int>(H), s);
-                if (!comm_->AllReduceSumF32(out_f32, T * H, sr)) {
-                    comm_->AllReduceSumBf16Rows(out, T, H, sr);
+                if (!(ArBf16ToF32Enabled() &&
+                      comm_->AllReduceSumBf16ToF32Rows(out, out_f32, T, H, sr))) {
                     r4dx_inkling2_sconv_capture_x_f32(P(out), 1, P(out_f32), static_cast<int>(T),
                                                       static_cast<int>(H), s);
+                    if (!comm_->AllReduceSumF32(out_f32, T * H, sr)) {
+                        comm_->AllReduceSumBf16Rows(out, T, H, sr);
+                        r4dx_inkling2_sconv_capture_x_f32(
+                            P(out), 1, P(out_f32), static_cast<int>(T), static_cast<int>(H), s);
+                    }
                 }
             } else {
                 comm_->AllReduceSumBf16Rows(out, T, H, sr);
@@ -1386,13 +1512,13 @@ void Inkling2Model::RunVisit(const Inkling2Visit& v, Chunk& c, int64_t T, SpanAc
 // ------------------------------------------------------------------------------------------------------
 
 void Inkling2Model::Head(const float* h_row, const std::vector<const float*>& blocks,
-                         SpanAccumulator* prof) {
+                         SpanAccumulator* prof, bool materialize_f32_logits) {
     const Inkling2Config& cfg = container_.Config();
     const hipStream_t sr = stream_.get();
     const int64_t s = P(sr);
     const int64_t H = cfg.hidden_size, vl = cfg.HeadRowsLocal();
     uint16_t* xn = arena_.Alloc<uint16_t>(static_cast<size_t>(H), 16);
-    uint16_t* lg = arena_.Alloc<uint16_t>(static_cast<size_t>(vl), 16);
+    uint16_t* lg = lg_bf16_dev_.data();
     ProfiledCall(prof, sr, "final", [&] {
         int64_t st[6]{};
         int k = 0;
@@ -1404,16 +1530,19 @@ void Inkling2Model::Head(const float* h_row, const std::vector<const float*>& bl
                                           s);
     });
     ProfiledCall(prof, sr, "gemm:lm_head", [&] { Lin(container_.LmHead(), xn, lg, 1); });
-    ProfiledCall(prof, sr, "lm_head.softcap", [&] {
-        r4dx_inkling2_logit_softcap_f32(P(lg), 1, vl, P(logits_dev_.data()), vl, 1,
-                                        static_cast<int>(vl),
-                                        static_cast<float>(cfg.final_logit_softcap), s);
-        if (vocab_local_valid_ < vl) {
-            R4DX_HIP_CHECK(hipMemsetD32Async(
-                reinterpret_cast<hipDeviceptr_t>(logits_dev_.data() + vocab_local_valid_),
-                static_cast<int>(kNegInfBits), static_cast<size_t>(vl - vocab_local_valid_), sr));
-        }
-    });
+    if (materialize_f32_logits) {
+        ProfiledCall(prof, sr, "lm_head.softcap", [&] {
+            r4dx_inkling2_logit_softcap_f32(P(lg), 1, vl, P(logits_dev_.data()), vl, 1,
+                                            static_cast<int>(vl),
+                                            static_cast<float>(cfg.final_logit_softcap), s);
+            if (vocab_local_valid_ < vl) {
+                R4DX_HIP_CHECK(hipMemsetD32Async(
+                    reinterpret_cast<hipDeviceptr_t>(logits_dev_.data() + vocab_local_valid_),
+                    static_cast<int>(kNegInfBits), static_cast<size_t>(vl - vocab_local_valid_),
+                    sr));
+            }
+        });
+    }
 }
 
 std::vector<float> Inkling2Model::RunChunk(const std::vector<int32_t>& token_ids, bool want_logits,
@@ -1422,7 +1551,8 @@ std::vector<float> Inkling2Model::RunChunk(const std::vector<int32_t>& token_ids
                                            std::vector<int32_t>* verify_greedy_out,
                                            float verify_inv_temp,
                                            std::vector<kernels::RowSummary>* verify_summaries_out,
-                                           const std::vector<ImageSpan>* chunk_images) {
+                                           const std::vector<ImageSpan>* chunk_images,
+                                           const std::function<void()>* while_busy) {
     const int64_t T = static_cast<int64_t>(token_ids.size());
     if (T < 1 || T > max_chunk_)
         throw std::runtime_error("Inkling2Model::RunChunk: token_ids.size() must be in [1, " +
@@ -1495,12 +1625,9 @@ std::vector<float> Inkling2Model::RunChunk(const std::vector<int32_t>& token_ids
 
         for (const Inkling2Visit& v : visits_) {
             if (v.phase == Inkling2Visit::Phase::kLoop && v.pass >= 1 && v.loop_j == 0) {
-                // A pass restarts from the pre-loop state and receives the previous pass's last
-                // block(s) and output.
                 c.Release(c.prev_h);
                 for (int b : c.prev_B) c.Release(b);
                 c.prev_B.assign(c.B.begin() + static_cast<std::ptrdiff_t>(c.n_pre + 1), c.B.end());
-                // B[n_pre] is h_pre (appended at the first loop layer): it stays alive as h_pre.
                 c.prev_h = c.h;
                 c.B = c.B_pre;
                 c.h = c.h_pre;
@@ -1553,37 +1680,23 @@ std::vector<float> Inkling2Model::RunChunk(const std::vector<int32_t>& token_ids
 
         const bool is_verify = (verify_greedy_out != nullptr || verify_summaries_out != nullptr);
         if (is_verify) {
-            const int64_t vl = cfg.HeadRowsLocal();
-            uint16_t* lg = arena_.Alloc<uint16_t>(static_cast<size_t>(T * vl), 16);
-            Lin(container_.LmHead(), dspark_taps_[3].data(), lg, T);
-            r4dx_inkling2_logit_softcap_f32(P(lg), 1, vl, P(verify_logits_dev_.data()), vl,
-                                            static_cast<int>(T), static_cast<int>(vl),
-                                            static_cast<float>(cfg.final_logit_softcap), s);
-            if (vocab_local_valid_ < vl) {
-                for (int64_t r = 0; r < T; ++r) {
-                    R4DX_HIP_CHECK(hipMemsetD32Async(
-                        reinterpret_cast<hipDeviceptr_t>(verify_logits_dev_.data() + r * vl +
-                                                         vocab_local_valid_),
-                        static_cast<int>(kNegInfBits), static_cast<size_t>(vl - vocab_local_valid_),
-                        sr));
-                }
-            }
+            Lin(container_.LmHead(), dspark_taps_[3].data(), lg_bf16_dev_.data(), T);
         } else if (want_logits) {
             std::vector<const float*> blocks;
             for (int b : c.B) blocks.push_back(pool_[static_cast<size_t>(b)].data() + (T - 1) * H);
-            Head(pool_[static_cast<size_t>(c.h)].data() + (T - 1) * H, blocks, prof);
+            Head(pool_[static_cast<size_t>(c.h)].data() + (T - 1) * H, blocks, prof,
+                 /*materialize_f32_logits=*/prof != nullptr);
         }
         arena_.Reset();
     };
 
     const bool is_verify = (verify_greedy_out != nullptr || verify_summaries_out != nullptr);
     const bool try_graph = T == 1 && want_logits && prof == nullptr && !trace_.enabled &&
-                           decode_graph_eligible_ && !decode_graph_disabled_ && !is_verify &&
-                           !dspark_;
-    const bool try_verify_graph = T > 1 && T <= 8 && is_verify && prof == nullptr &&
-                                  !trace_.enabled && decode_graph_eligible_ &&
-                                  !decode_graph_disabled_ && MoeGroupedPrefillEnabled() &&
-                                  !MoeCheckOffsetsEnabled();
+                           decode_graph_eligible_ && !decode_graph_disabled_ && !is_verify;
+    const bool try_verify_graph =
+        T > 1 && T <= 8 && is_verify && prof == nullptr && !trace_.enabled &&
+        decode_graph_eligible_ && !decode_graph_disabled_ &&
+        (T <= MoeDecodeMaxT() || MoeGroupedPrefillEnabled()) && !MoeCheckOffsetsEnabled();
     bool launched_graph = false;
     bool just_captured = false;
     if (try_graph) {
@@ -1639,61 +1752,175 @@ std::vector<float> Inkling2Model::RunChunk(const std::vector<int32_t>& token_ids
     if (!launched_graph) {
         run_body(/*use_pos_dev=*/false, /*graph_long_ctx=*/true);
     }
+
+    const int64_t vl = cfg.HeadRowsLocal();
+    const bool fast_argmax = FastArgmaxEnabled();
+    bool verify_tp_fast = false;
+    bool single_tp_fast = false;
+
+    const auto materialize_verify_f32 = [&] {
+        r4dx_inkling2_logit_softcap_f32(P(lg_bf16_dev_.data()), 1, vl, P(verify_logits_dev_.data()),
+                                        vl, static_cast<int>(T), static_cast<int>(vl),
+                                        static_cast<float>(cfg.final_logit_softcap), s);
+        if (vocab_local_valid_ < vl) {
+            for (int64_t r = 0; r < T; ++r) {
+                R4DX_HIP_CHECK(hipMemsetD32Async(
+                    reinterpret_cast<hipDeviceptr_t>(verify_logits_dev_.data() + r * vl +
+                                                     vocab_local_valid_),
+                    static_cast<int>(kNegInfBits), static_cast<size_t>(vl - vocab_local_valid_),
+                    sr));
+            }
+        }
+    };
+    const auto materialize_single_f32 = [&] {
+        r4dx_inkling2_logit_softcap_f32(P(lg_bf16_dev_.data()), 1, vl, P(logits_dev_.data()), vl, 1,
+                                        static_cast<int>(vl),
+                                        static_cast<float>(cfg.final_logit_softcap), s);
+        if (vocab_local_valid_ < vl) {
+            R4DX_HIP_CHECK(hipMemsetD32Async(
+                reinterpret_cast<hipDeviceptr_t>(logits_dev_.data() + vocab_local_valid_),
+                static_cast<int>(kNegInfBits), static_cast<size_t>(vl - vocab_local_valid_), sr));
+        }
+    };
+
     if (verify_greedy_out != nullptr) {
-        const int64_t vl = cfg.HeadRowsLocal();
-        if (comm_ != nullptr) {
-            r4dx_argmax_rows_f32(P(verify_logits_dev_.data()), vl,
-                                 P(verify_argmax_pair_dev_.data()),
-                                 P(verify_argmax_pair_dev_.data() + 1), 2, T, vl, s);
+        if (fast_argmax) {
+            r4dx_inkling2_softcap_argmax_rows_bf16(
+                P(lg_bf16_dev_.data()), vl, static_cast<int>(T), static_cast<int>(vocab_local_valid_),
+                static_cast<float>(cfg.final_logit_softcap), P(softcap_argmax_ws_.data()),
+                comm_ != nullptr ? P(verify_argmax_pair_dev_.data()) : P(verify_argmax_dev_.data()),
+                comm_ != nullptr ? 1 : 0, s);
         } else {
-            r4dx_argmax_rows_f32(P(verify_logits_dev_.data()), vl, P(verify_argmax_dev_.data()), 0,
-                                 1, T, vocab_local_valid_, s);
+            materialize_verify_f32();
+            if (comm_ != nullptr) {
+                r4dx_argmax_rows_f32(P(verify_logits_dev_.data()), vl,
+                                     P(verify_argmax_pair_dev_.data()),
+                                     P(verify_argmax_pair_dev_.data() + 1), 2, T, vl, s);
+            } else {
+                r4dx_argmax_rows_f32(P(verify_logits_dev_.data()), vl,
+                                     P(verify_argmax_dev_.data()), 0, 1, T, vocab_local_valid_, s);
+            }
+        }
+        if (comm_ != nullptr) {
+            verify_tp_fast = comm_->AllReduceArgmaxRows(
+                verify_argmax_pair_dev_.data(), static_cast<int32_t>(cfg.HeadRowBegin()),
+                static_cast<int>(T), verify_argmax_dev_.data(), sr);
+            if (verify_tp_fast) {
+                R4DX_HIP_CHECK(hipMemcpyAsync(verify_argmax_host_.data(), verify_argmax_dev_.data(),
+                                              static_cast<size_t>(T) * sizeof(int32_t),
+                                              hipMemcpyDeviceToHost, sr));
+            } else {
+                R4DX_HIP_CHECK(hipMemcpyAsync(
+                    verify_pairs_host_.data(), verify_argmax_pair_dev_.data(),
+                    static_cast<size_t>(2 * T) * sizeof(int32_t), hipMemcpyDeviceToHost, sr));
+            }
+        } else {
+            R4DX_HIP_CHECK(hipMemcpyAsync(verify_argmax_host_.data(), verify_argmax_dev_.data(),
+                                          static_cast<size_t>(T) * sizeof(int32_t),
+                                          hipMemcpyDeviceToHost, sr));
         }
     } else if (verify_summaries_out != nullptr) {
-        const int64_t vl = cfg.HeadRowsLocal();
+        materialize_verify_f32();
         r4dx_topk_lse_f32_ws(P(verify_logits_dev_.data()), P(verify_summary_ids_dev_.data()),
                              P(verify_summary_vals_dev_.data()), P(verify_summary_lse_dev_.data()),
                              static_cast<int>(T), comm_ != nullptr ? vl : vocab_local_valid_,
                              verify_inv_temp, s, comm_ != nullptr ? P(topk_lse_ws_.data()) : 0);
+        R4DX_HIP_CHECK(hipMemcpyAsync(verify_summary_ids_host_.data(),
+                                      verify_summary_ids_dev_.data(),
+                                      static_cast<size_t>(T * R4DX_TOPK_LSE_K) * sizeof(int32_t),
+                                      hipMemcpyDeviceToHost, sr));
+        R4DX_HIP_CHECK(hipMemcpyAsync(verify_summary_vals_host_.data(),
+                                      verify_summary_vals_dev_.data(),
+                                      static_cast<size_t>(T * R4DX_TOPK_LSE_K) * sizeof(float),
+                                      hipMemcpyDeviceToHost, sr));
+        R4DX_HIP_CHECK(hipMemcpyAsync(verify_summary_lse_host_.data(),
+                                      verify_summary_lse_dev_.data(),
+                                      static_cast<size_t>(T) * sizeof(float),
+                                      hipMemcpyDeviceToHost, sr));
     }
-    if (want_logits && !is_verify) {
-        const int64_t vl = cfg.HeadRowsLocal();
-        if (greedy_out != nullptr && comm_ != nullptr) {
-            r4dx_argmax_val_f32(P(logits_dev_.data()), P(argmax_pair_dev_.data()),
-                                P(argmax_pair_dev_.data() + 1), vl, s);
-        } else if (greedy_out != nullptr) {
-            r4dx_argmax_f32(P(logits_dev_.data()), P(argmax_dev_.data()), vocab_local_valid_, s);
-        } else if (summary != nullptr) {
-            r4dx_topk_lse_f32_ws(
-                P(logits_dev_.data()), P(summary_ids_dev_.data()), P(summary_vals_dev_.data()),
-                P(summary_lse_dev_.data()), 1, comm_ != nullptr ? vl : vocab_local_valid_,
-                summary->inv_temperature, s, comm_ != nullptr ? P(topk_lse_ws_.data()) : 0);
+
+    if (want_logits && !is_verify && prof == nullptr) {
+        if (greedy_out != nullptr && fast_argmax) {
+            r4dx_inkling2_softcap_argmax_rows_bf16(
+                P(lg_bf16_dev_.data()), vl, 1, static_cast<int>(vocab_local_valid_),
+                static_cast<float>(cfg.final_logit_softcap), P(softcap_argmax_ws_.data()),
+                comm_ != nullptr ? P(argmax_pair_dev_.data()) : P(argmax_dev_.data()),
+                comm_ != nullptr ? 1 : 0, s);
+            if (comm_ != nullptr) {
+                single_tp_fast = comm_->AllReduceArgmaxPair(
+                    argmax_pair_dev_.data(), static_cast<int32_t>(cfg.HeadRowBegin()),
+                    argmax_dev_.data(), sr);
+                if (single_tp_fast) {
+                    R4DX_HIP_CHECK(hipMemcpyAsync(argmax_host_.data(), argmax_dev_.data(),
+                                                  sizeof(int32_t), hipMemcpyDeviceToHost, sr));
+                } else {
+                    R4DX_HIP_CHECK(hipMemcpyAsync(argmax_pair_host_.data(), argmax_pair_dev_.data(),
+                                                  2 * sizeof(int32_t), hipMemcpyDeviceToHost, sr));
+                }
+            } else {
+                R4DX_HIP_CHECK(hipMemcpyAsync(argmax_host_.data(), argmax_dev_.data(), sizeof(int32_t),
+                                              hipMemcpyDeviceToHost, sr));
+            }
+        } else {
+            materialize_single_f32();
+            if (greedy_out != nullptr && comm_ != nullptr) {
+                r4dx_argmax_val_f32(P(logits_dev_.data()), P(argmax_pair_dev_.data()),
+                                    P(argmax_pair_dev_.data() + 1), vl, s);
+                R4DX_HIP_CHECK(hipMemcpyAsync(argmax_pair_host_.data(), argmax_pair_dev_.data(),
+                                              2 * sizeof(int32_t), hipMemcpyDeviceToHost, sr));
+            } else if (greedy_out != nullptr) {
+                r4dx_argmax_f32(P(logits_dev_.data()), P(argmax_dev_.data()), vocab_local_valid_, s);
+                R4DX_HIP_CHECK(hipMemcpyAsync(argmax_host_.data(), argmax_dev_.data(), sizeof(int32_t),
+                                              hipMemcpyDeviceToHost, sr));
+            } else if (summary != nullptr) {
+                r4dx_topk_lse_f32_ws(
+                    P(logits_dev_.data()), P(summary_ids_dev_.data()), P(summary_vals_dev_.data()),
+                    P(summary_lse_dev_.data()), 1, comm_ != nullptr ? vl : vocab_local_valid_,
+                    summary->inv_temperature, s, comm_ != nullptr ? P(topk_lse_ws_.data()) : 0);
+                R4DX_HIP_CHECK(hipMemcpyAsync(summary_ids_host_.data(), summary_ids_dev_.data(),
+                                              R4DX_TOPK_LSE_K * sizeof(int32_t),
+                                              hipMemcpyDeviceToHost, sr));
+                R4DX_HIP_CHECK(hipMemcpyAsync(summary_vals_host_.data(), summary_vals_dev_.data(),
+                                              R4DX_TOPK_LSE_K * sizeof(float),
+                                              hipMemcpyDeviceToHost, sr));
+                R4DX_HIP_CHECK(hipMemcpyAsync(summary_lse_host_.data(), summary_lse_dev_.data(),
+                                              sizeof(float), hipMemcpyDeviceToHost, sr));
+            }
         }
     }
+
     if (capture_taps && !is_verify) {
         dspark_->InjectTaps(dspark_taps_[0].data(), dspark_taps_[1].data(), dspark_taps_[2].data(),
                             dspark_taps_[3].data(), T, pos_, stream_, arena_);
     }
-    if (prof == nullptr)
+
+    if (while_busy != nullptr && prof == nullptr) {
+        R4DX_HIP_CHECK(hipEventRecord(step_done_.e, sr));
+        try {
+            (*while_busy)();
+        } catch (...) {
+            (void)hipEventSynchronize(step_done_.e);
+            throw;
+        }
+        R4DX_HIP_CHECK(hipEventSynchronize(step_done_.e));
+    } else if (prof == nullptr) {
         stream_.Synchronize();
+    }
 
     if (verify_greedy_out != nullptr) {
         verify_greedy_out->resize(static_cast<size_t>(T));
         if (comm_ != nullptr) {
-            for (int64_t r = 0; r < T; ++r) {
-                (*verify_greedy_out)[static_cast<size_t>(r)] =
-                    MergeGreedyPairAt(verify_argmax_pair_dev_.data() + r * 2);
+            if (verify_tp_fast) {
+                std::memcpy(verify_greedy_out->data(), verify_argmax_host_.data(),
+                            static_cast<size_t>(T) * sizeof(int32_t));
+            } else {
+                MergeVerifyPairs(verify_pairs_host_.data(), T, verify_greedy_out);
             }
         } else {
-            verify_argmax_dev_.CopyToHost(verify_greedy_out->data(), static_cast<size_t>(T));
+            std::memcpy(verify_greedy_out->data(), verify_argmax_host_.data(),
+                        static_cast<size_t>(T) * sizeof(int32_t));
         }
     } else if (verify_summaries_out != nullptr) {
-        std::vector<int32_t> ids(static_cast<size_t>(T * R4DX_TOPK_LSE_K));
-        std::vector<float> vals(static_cast<size_t>(T * R4DX_TOPK_LSE_K));
-        std::vector<float> lses(static_cast<size_t>(T));
-        verify_summary_ids_dev_.CopyToHost(ids.data(), ids.size());
-        verify_summary_vals_dev_.CopyToHost(vals.data(), vals.size());
-        verify_summary_lse_dev_.CopyToHost(lses.data(), lses.size());
         verify_summaries_out->resize(static_cast<size_t>(T));
         const int64_t row_vocab = comm_ != nullptr ? cfg.HeadRowsLocal() : vocab_local_valid_;
         for (int64_t r = 0; r < T; ++r) {
@@ -1701,31 +1928,55 @@ std::vector<float> Inkling2Model::RunChunk(const std::vector<int32_t>& token_ids
             rs.k = R4DX_TOPK_LSE_K;
             rs.vocab = row_vocab;
             rs.inv_temperature = verify_inv_temp;
-            rs.lse = lses[static_cast<size_t>(r)];
+            rs.lse = verify_summary_lse_host_.data()[r];
             for (int j = 0; j < R4DX_TOPK_LSE_K; ++j) {
-                rs.ids[j] = ids[static_cast<size_t>(r * R4DX_TOPK_LSE_K + j)];
-                rs.vals[j] = vals[static_cast<size_t>(r * R4DX_TOPK_LSE_K + j)];
+                rs.ids[j] = verify_summary_ids_host_.data()[r * R4DX_TOPK_LSE_K + j];
+                rs.vals[j] = verify_summary_vals_host_.data()[r * R4DX_TOPK_LSE_K + j];
             }
-            if (comm_ != nullptr)
-                MergeSummary(&rs);
         }
+        if (comm_ != nullptr)
+            MergeVerifySummaries(T, verify_summaries_out);
     }
 
     std::vector<float> logits;
     if (want_logits && prof == nullptr) {
         if (comm_ != nullptr) {
             if (greedy_out != nullptr) {
-                *greedy_out = MergeGreedyPair();
+                if (single_tp_fast) {
+                    *greedy_out = argmax_host_.data()[0];
+                } else {
+                    tp::ArgmaxPair mine{};
+                    std::memcpy(&mine, argmax_pair_host_.data(), sizeof(mine));
+                    if (mine.idx != 0x7fffffff)
+                        mine.idx += static_cast<int32_t>(container_.Config().HeadRowBegin());
+                    std::array<tp::ArgmaxPair, 2> all{};
+                    comm_->HostAllGather(&mine, sizeof(mine), all.data());
+                    *greedy_out = tp::MergeArgmax(all.data(), comm_->World());
+                }
             } else if (summary != nullptr) {
-                FetchRowSummary(summary->inv_temperature, summary->out);
+                summary->out->k = R4DX_TOPK_LSE_K;
+                summary->out->vocab = container_.Config().HeadRowsLocal();
+                summary->out->inv_temperature = summary->inv_temperature;
+                summary->out->lse = summary_lse_host_.data()[0];
+                for (int j = 0; j < R4DX_TOPK_LSE_K; ++j) {
+                    summary->out->ids[j] = summary_ids_host_.data()[j];
+                    summary->out->vals[j] = summary_vals_host_.data()[j];
+                }
                 MergeSummary(summary->out);
             } else {
                 GatherVocabRow(&logits);
             }
         } else if (greedy_out != nullptr) {
-            argmax_dev_.CopyToHost(greedy_out, 1);
+            *greedy_out = argmax_host_.data()[0];
         } else if (summary != nullptr) {
-            FetchRowSummary(summary->inv_temperature, summary->out);
+            summary->out->k = R4DX_TOPK_LSE_K;
+            summary->out->vocab = vocab_local_valid_;
+            summary->out->inv_temperature = summary->inv_temperature;
+            summary->out->lse = summary_lse_host_.data()[0];
+            for (int j = 0; j < R4DX_TOPK_LSE_K; ++j) {
+                summary->out->ids[j] = summary_ids_host_.data()[j];
+                summary->out->vals[j] = summary_vals_host_.data()[j];
+            }
         } else {
             logits.resize(static_cast<size_t>(Vocab()));
             logits_dev_.CopyToHost(logits.data(), logits.size());
@@ -1737,19 +1988,22 @@ std::vector<float> Inkling2Model::RunChunk(const std::vector<int32_t>& token_ids
 }
 
 void Inkling2Model::FetchRowSummary(float inv_temperature, kernels::RowSummary* out) {
-    std::vector<int32_t> ids(R4DX_TOPK_LSE_K);
-    std::vector<float> vals(R4DX_TOPK_LSE_K);
-    float lse = 0.0f;
-    summary_ids_dev_.CopyToHost(ids.data(), ids.size());
-    summary_vals_dev_.CopyToHost(vals.data(), vals.size());
-    summary_lse_dev_.CopyToHost(&lse, 1);
+    R4DX_HIP_CHECK(hipMemcpyAsync(summary_ids_host_.data(), summary_ids_dev_.data(),
+                                  R4DX_TOPK_LSE_K * sizeof(int32_t), hipMemcpyDeviceToHost,
+                                  stream_.get()));
+    R4DX_HIP_CHECK(hipMemcpyAsync(summary_vals_host_.data(), summary_vals_dev_.data(),
+                                  R4DX_TOPK_LSE_K * sizeof(float), hipMemcpyDeviceToHost,
+                                  stream_.get()));
+    R4DX_HIP_CHECK(hipMemcpyAsync(summary_lse_host_.data(), summary_lse_dev_.data(), sizeof(float),
+                                  hipMemcpyDeviceToHost, stream_.get()));
+    stream_.Synchronize();
     out->k = R4DX_TOPK_LSE_K;
     out->vocab = comm_ != nullptr ? container_.Config().HeadRowsLocal() : vocab_local_valid_;
     out->inv_temperature = inv_temperature;
-    out->lse = lse;
+    out->lse = summary_lse_host_.data()[0];
     for (int j = 0; j < R4DX_TOPK_LSE_K; ++j) {
-        out->ids[j] = ids[static_cast<size_t>(j)];
-        out->vals[j] = vals[static_cast<size_t>(j)];
+        out->ids[j] = summary_ids_host_.data()[j];
+        out->vals[j] = summary_vals_host_.data()[j];
     }
 }
 
@@ -1825,6 +2079,18 @@ int32_t Inkling2Model::DecodeStepGreedy(int32_t token_id) {
     return next;
 }
 
+int32_t Inkling2Model::DecodeStepGreedyOverlap(int32_t token_id,
+                                               const std::function<void()>& while_busy) {
+    if (comm_ != nullptr || !InkEnvFlag("R4DX_INK_HOST_OVERLAP", true)) {
+        while_busy();
+        return DecodeStepGreedy(token_id);
+    }
+    int32_t next = -1;
+    RunChunk({token_id}, true, &next, nullptr, nullptr, false, nullptr, 0.0f, nullptr, nullptr,
+             &while_busy);
+    return next;
+}
+
 int32_t Inkling2Model::DecodeStepSampled(int32_t token_id, const kernels::SampleParams& params,
                                          std::mt19937_64& rng) {
     if (params.temperature <= 0.0f)
@@ -1866,10 +2132,25 @@ int32_t Inkling2Model::MergeGreedyPairAt(const int32_t* dev_pair) {
     static_assert(sizeof(tp::ArgmaxPair) == 2 * sizeof(int32_t),
                   "{idx, value} pair is two 32-bit words");
     R4DX_HIP_CHECK(hipMemcpy(&mine, dev_pair, sizeof(mine), hipMemcpyDeviceToHost));
-    mine.idx += static_cast<int32_t>(container_.Config().HeadRowBegin());
+    if (mine.idx != 0x7fffffff) mine.idx += static_cast<int32_t>(container_.Config().HeadRowBegin());
     std::array<tp::ArgmaxPair, 2> all{};
     comm_->HostAllGather(&mine, sizeof(mine), all.data());
     return tp::MergeArgmax(all.data(), comm_->World());
+}
+
+void Inkling2Model::MergeVerifyPairs(const int32_t* pairs_host, int64_t rows,
+                                     std::vector<int32_t>* out) {
+    const int32_t row_off = static_cast<int32_t>(container_.Config().HeadRowBegin());
+    std::vector<tp::ArgmaxPair> mine(static_cast<size_t>(rows));
+    for (int64_t r = 0; r < rows; ++r) {
+        mine[static_cast<size_t>(r)].idx =
+            (pairs_host[2 * r] == 0x7fffffff) ? 0x7fffffff : (pairs_host[2 * r] + row_off);
+        std::memcpy(&mine[static_cast<size_t>(r)].val, &pairs_host[2 * r + 1], sizeof(float));
+    }
+    std::vector<tp::ArgmaxPair> gathered(static_cast<size_t>(comm_->World() * rows));
+    comm_->HostAllGather(mine.data(), mine.size() * sizeof(tp::ArgmaxPair), gathered.data());
+    out->resize(static_cast<size_t>(rows));
+    tp::MergeArgmaxRows(gathered.data(), comm_->World(), static_cast<int>(rows), out->data());
 }
 
 int32_t Inkling2Model::MergeGreedyPair() {
@@ -1884,48 +2165,72 @@ int32_t Inkling2Model::LmHeadArgmaxFromBf16(const uint16_t* h_bf16) {
     const size_t mark = arena_.Mark();
     uint16_t* lg = arena_.Alloc<uint16_t>(static_cast<size_t>(vl), 16);
     Lin(container_.LmHead(), h_bf16, lg, 1);
-    r4dx_inkling2_logit_softcap_f32(P(lg), 1, vl, P(logits_dev_.data()), vl, 1,
-                                    static_cast<int>(vl),
-                                    static_cast<float>(cfg.final_logit_softcap), s);
-    if (vocab_local_valid_ < vl) {
-        R4DX_HIP_CHECK(hipMemsetD32Async(
-            reinterpret_cast<hipDeviceptr_t>(logits_dev_.data() + vocab_local_valid_),
-            static_cast<int>(kNegInfBits), static_cast<size_t>(vl - vocab_local_valid_), sr));
-    }
-    if (comm_ != nullptr) {
-        r4dx_argmax_val_f32(P(logits_dev_.data()), P(argmax_pair_dev_.data()),
-                            P(argmax_pair_dev_.data() + 1), vl, s);
+    bool tp_fast = false;
+    if (FastArgmaxEnabled()) {
+        r4dx_inkling2_softcap_argmax_rows_bf16(
+            P(lg), vl, 1, static_cast<int>(vocab_local_valid_),
+            static_cast<float>(cfg.final_logit_softcap), P(softcap_argmax_ws_.data()),
+            comm_ != nullptr ? P(argmax_pair_dev_.data()) : P(argmax_dev_.data()),
+            comm_ != nullptr ? 1 : 0, s);
+        if (comm_ != nullptr) {
+            tp_fast = comm_->AllReduceArgmaxPair(
+                argmax_pair_dev_.data(), static_cast<int32_t>(cfg.HeadRowBegin()),
+                argmax_dev_.data(), sr);
+        }
     } else {
-        r4dx_argmax_f32(P(logits_dev_.data()), P(argmax_dev_.data()), vocab_local_valid_, s);
+        r4dx_inkling2_logit_softcap_f32(P(lg), 1, vl, P(logits_dev_.data()), vl, 1,
+                                        static_cast<int>(vl),
+                                        static_cast<float>(cfg.final_logit_softcap), s);
+        if (vocab_local_valid_ < vl) {
+            R4DX_HIP_CHECK(hipMemsetD32Async(
+                reinterpret_cast<hipDeviceptr_t>(logits_dev_.data() + vocab_local_valid_),
+                static_cast<int>(kNegInfBits), static_cast<size_t>(vl - vocab_local_valid_), sr));
+        }
+        if (comm_ != nullptr) {
+            r4dx_argmax_val_f32(P(logits_dev_.data()), P(argmax_pair_dev_.data()),
+                                P(argmax_pair_dev_.data() + 1), vl, s);
+        } else {
+            r4dx_argmax_f32(P(logits_dev_.data()), P(argmax_dev_.data()), vocab_local_valid_, s);
+        }
+    }
+    if (comm_ == nullptr || tp_fast) {
+        R4DX_HIP_CHECK(hipMemcpyAsync(argmax_host_.data(), argmax_dev_.data(), sizeof(int32_t),
+                                      hipMemcpyDeviceToHost, sr));
     }
     arena_.Rewind(mark);
     stream_.Synchronize();
-    if (comm_ != nullptr)
+    if (comm_ != nullptr && !tp_fast)
         return MergeGreedyPair();
-    int32_t tok = -1;
-    argmax_dev_.CopyToHost(&tok, 1);
-    return tok;
+    return argmax_host_.data()[0];
 }
 
 int32_t Inkling2Model::DsparkLogitsArgmax(const uint16_t* base_bf16, const uint16_t* delta_bf16,
                                           const uint16_t* bias_bf16) {
     const hipStream_t sr = stream_.get();
     const int64_t s = P(sr);
+    bool tp_fast = false;
     if (comm_ != nullptr) {
         r4dx_inkling2_dspark_add_argmax_bf16(
             P(base_bf16), P(delta_bf16), P(bias_bf16), P(dspark_argmax_ws_.data()),
             P(argmax_pair_dev_.data()), P(argmax_pair_dev_.data() + 1), vocab_local_valid_, s);
+        tp_fast = comm_->AllReduceArgmaxPair(
+            argmax_pair_dev_.data(), static_cast<int32_t>(container_.Config().HeadRowBegin()),
+            argmax_dev_.data(), sr);
+        if (tp_fast) {
+            R4DX_HIP_CHECK(hipMemcpyAsync(argmax_host_.data(), argmax_dev_.data(), sizeof(int32_t),
+                                          hipMemcpyDeviceToHost, sr));
+        }
     } else {
         r4dx_inkling2_dspark_add_argmax_bf16(P(base_bf16), P(delta_bf16), P(bias_bf16),
                                              P(dspark_argmax_ws_.data()), P(argmax_dev_.data()), 0,
                                              vocab_local_valid_, s);
+        R4DX_HIP_CHECK(hipMemcpyAsync(argmax_host_.data(), argmax_dev_.data(), sizeof(int32_t),
+                                      hipMemcpyDeviceToHost, sr));
     }
     stream_.Synchronize();
-    if (comm_ != nullptr)
+    if (comm_ != nullptr && !tp_fast)
         return MergeGreedyPair();
-    int32_t tok = -1;
-    argmax_dev_.CopyToHost(&tok, 1);
-    return tok;
+    return argmax_host_.data()[0];
 }
 
 void Inkling2Model::DsparkLogitsArgmaxAsync(const uint16_t* base_bf16, const uint16_t* delta_bf16,
@@ -2023,9 +2328,13 @@ std::vector<int32_t> Inkling2Model::DecodeStepDflashGreedy(int32_t token_id, int
             DsparkLogitsArgmaxAsync(base_bf16, delta_bf16, bias_bf16, out_tok_dev);
         };
     }
+    bool replayed_full = false;
     std::vector<int32_t> drafted =
         dspark_->DraftGreedy(token_id, pos_, k, stream_, arena_, embed_anchor, lm_argmax, lm_batch,
-                             lg_argmax, lg_argmax_async);
+                             lg_argmax, lg_argmax_async, &replayed_full);
+    if (replayed_full && comm_ != nullptr) {
+        comm_->NoteGraphReplay(16, static_cast<int64_t>(drafted.size()));
+    }
 
     // 2. Snapshot short-conv states before running the [token_id, d_0..d_{k-1}] verify window.
     R4DX_HIP_CHECK(hipMemcpyAsync(conv_verify_bak_.data(), conv_.data(), conv_.bytes(),
@@ -2066,7 +2375,7 @@ std::vector<int32_t> Inkling2Model::DecodeStepDflashGreedy(int32_t token_id, int
     // 5. Inject the n_keep committed taps into the DSpark context KV cache.
     dspark_->InjectTaps(dspark_taps_[0].data(), dspark_taps_[1].data(), dspark_taps_[2].data(),
                         dspark_taps_[3].data(), n_keep, pos_before, stream_, arena_);
-    stream_.Synchronize();
+    if (!AsyncPostVerifyEnabled()) stream_.Synchronize();
     if (adapt) {
         if (n_keep == 1 + k)
             dspark_adapt_k_ = std::min<int64_t>(k + 1, k_max);
@@ -2150,9 +2459,13 @@ std::vector<int32_t> Inkling2Model::DecodeStepDflashSampled(int32_t token_id, in
             DsparkLogitsArgmaxAsync(base_bf16, delta_bf16, bias_bf16, out_tok_dev);
         };
     }
+    bool replayed_full = false;
     std::vector<int32_t> drafted =
         dspark_->DraftGreedy(token_id, pos_, k, stream_, arena_, embed_anchor, lm_argmax, lm_batch,
-                             lg_step, lg_argmax_async);
+                             lg_step, lg_argmax_async, &replayed_full);
+    if (replayed_full && comm_ != nullptr) {
+        comm_->NoteGraphReplay(16, static_cast<int64_t>(drafted.size()));
+    }
 
     // 2. Snapshot short-conv states and verify [token_id, d_0..d_{k-1}] -> per-row top-K + LSE
     // summaries.
@@ -2286,7 +2599,7 @@ std::vector<int32_t> Inkling2Model::DecodeStepDflashSampled(int32_t token_id, in
     // 5. Inject the n_keep committed taps into the DSpark context KV cache.
     dspark_->InjectTaps(dspark_taps_[0].data(), dspark_taps_[1].data(), dspark_taps_[2].data(),
                         dspark_taps_[3].data(), n_keep, pos_before, stream_, arena_);
-    stream_.Synchronize();
+    if (!AsyncPostVerifyEnabled()) stream_.Synchronize();
     if (adapt) {
         if (n_keep == 1 + k)
             dspark_adapt_k_ = std::min<int64_t>(k + 1, k_max);
@@ -2306,6 +2619,28 @@ void Inkling2Model::MergeSummary(kernels::RowSummary* out) {
     std::array<kernels::RowSummary, 2> all{};
     comm_->HostAllGather(out, sizeof(kernels::RowSummary), all.data());
     *out = tp::MergeRowSummaries(all.data(), comm_->World(), Vocab());
+}
+
+void Inkling2Model::MergeVerifySummaries(int64_t rows, std::vector<kernels::RowSummary>* out) {
+    static_assert(std::is_trivially_copyable_v<kernels::RowSummary>,
+                  "row summaries cross the host exchange as raw bytes");
+    const int32_t row_off = static_cast<int32_t>(container_.Config().HeadRowBegin());
+    for (int64_t r = 0; r < rows; ++r) {
+        kernels::RowSummary& rs = (*out)[static_cast<size_t>(r)];
+        for (int j = 0; j < rs.k; ++j) rs.ids[j] += row_off;
+    }
+    const int w = comm_->World();
+    std::vector<kernels::RowSummary> all(static_cast<size_t>(w * rows));
+    comm_->HostAllGather(out->data(), static_cast<size_t>(rows) * sizeof(kernels::RowSummary),
+                         all.data());
+    std::array<kernels::RowSummary, 2> per_rank{};
+    for (int64_t r = 0; r < rows; ++r) {
+        for (int rank = 0; rank < w; ++rank) {
+            per_rank[static_cast<size_t>(rank)] =
+                all[static_cast<size_t>(rank * rows + r)];
+        }
+        (*out)[static_cast<size_t>(r)] = tp::MergeRowSummaries(per_rank.data(), w, Vocab());
+    }
 }
 
 void Inkling2Model::GatherVocabRow(std::vector<float>* full) {

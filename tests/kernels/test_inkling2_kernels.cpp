@@ -23,6 +23,7 @@
 #include "r4dx/core/error.hpp"
 #include "r4dx/kernels/inkling2_kernels.h"
 #include "r4dx/kernels/inkling2_ref.hpp"
+#include "r4dx_convert/quant_mxfp8.hpp"
 
 using r4dx::core::Bf16ToFloat;
 using r4dx::core::DeviceBuffer;
@@ -752,6 +753,418 @@ void TestDsparkKernels() {
   }
 }
 
+void TestSpeedupKernels() {
+  // 1. softcap_argmax_rows_bf16 (write_pair=1, write_pair=0, ties, and n=0 sentinel)
+  {
+    const int rows = 3, stride = 300, n = 275;
+    const float softcap = 30.0f;
+    std::vector<float> f(rows * stride, -5.0f);
+    // Row 0: tie between idx 5 and 200 -> lower index 5 must win.
+    f[0 * stride + 5] = 40.0f;
+    f[0 * stride + 200] = 40.0f;
+    // Row 1: clear winner at 274 (last element).
+    f[1 * stride + 274] = 12.5f;
+    // Row 2: negative winner at 10.
+    f[2 * stride + 10] = -0.25f;
+    const std::vector<uint16_t> bf = ToBf16(f);
+    DeviceBuffer<uint16_t> d_in = Dev(bf);
+    DeviceBuffer<uint8_t> d_ws(static_cast<size_t>(rows) * 1024);
+    DeviceBuffer<int32_t> d_pairs(rows * 2), d_idx(rows);
+    r4dx_inkling2_softcap_argmax_rows_bf16(P(d_in.data()), stride, rows, n, softcap, P(d_ws.data()),
+                                           P(d_pairs.data()), 1, 0);
+    r4dx_inkling2_softcap_argmax_rows_bf16(P(d_in.data()), stride, rows, n, softcap, P(d_ws.data()),
+                                           P(d_idx.data()), 0, 0);
+    const std::vector<int32_t> pairs = Host(d_pairs, rows * 2);
+    const std::vector<int32_t> idx = Host(d_idx, rows);
+    auto to_f = [](int32_t bits) {
+      float v = 0.0f;
+      std::memcpy(&v, &bits, sizeof(v));
+      return v;
+    };
+    const bool pair_ok =
+        pairs[0] == 5 && std::fabs(to_f(pairs[1]) - softcap * std::tanh(Bf16ToFloat(bf[5]) / softcap)) < 1e-4f &&
+        pairs[2] == 274 &&
+        std::fabs(to_f(pairs[3]) - softcap * std::tanh(Bf16ToFloat(bf[stride + 274]) / softcap)) < 1e-4f &&
+        pairs[4] == 10 &&
+        std::fabs(to_f(pairs[5]) - softcap * std::tanh(Bf16ToFloat(bf[2 * stride + 10]) / softcap)) < 1e-4f;
+    Check(pair_ok, "softcap_argmax_rows_bf16 write_pair=1");
+    Check(idx[0] == 5 && idx[1] == 274 && idx[2] == 10, "softcap_argmax_rows_bf16 write_pair=0");
+
+    DeviceBuffer<int32_t> d_empty(4);
+    r4dx_inkling2_softcap_argmax_rows_bf16(0, 0, 2, 0, softcap, 0, P(d_empty.data()), 1, 0);
+    const std::vector<int32_t> emp = Host(d_empty, 4);
+    Check(emp[0] == 0x7fffffff && emp[2] == 0x7fffffff && std::isinf(to_f(emp[1])) && to_f(emp[1]) < 0.0f,
+          "softcap_argmax_rows_bf16 n=0 sentinel");
+  }
+
+  // 2. dspark_markov_step_bf16 vs separate markov_prep_dev + W@x + add_f32 + markov_gate
+  {
+    const int R = 64, V = 8;
+    const std::vector<uint16_t> w1 = ToBf16(Rand(V * R, 0.3f));
+    const std::vector<uint16_t> st_in = ToBf16(Rand(R, 0.4f));
+    const std::vector<uint16_t> w_rnn2r = ToBf16(Rand(3 * R * 2 * R, 0.2f));
+    const std::vector<uint16_t> bias = ToBf16(Rand(3 * R, 0.1f));
+    const std::vector<float> head_proj = Rand(3 * R, 0.2f);
+    const std::vector<float> frnn_proj = Rand(3 * R, 0.2f);
+    const std::vector<int32_t> prev_tok = {3};
+    DeviceBuffer<uint16_t> dw1 = Dev(w1), dst_in = Dev(st_in), dwrnn = Dev(w_rnn2r), dbias = Dev(bias);
+    DeviceBuffer<float> dhp = Dev(head_proj), dfp = Dev(frnn_proj);
+    DeviceBuffer<int32_t> dtok = Dev(prev_tok);
+    DeviceBuffer<uint16_t> d_st_got(R), d_lat_got(R);
+    r4dx_inkling2_dspark_markov_step_bf16(P(dw1.data()), P(dtok.data()), V, P(dst_in.data()), P(dhp.data()),
+                                          P(dfp.data()), P(dwrnn.data()), P(dbias.data()), P(d_st_got.data()),
+                                          P(d_lat_got.data()), R, 0);
+
+    std::vector<uint16_t> x2r(2 * R);
+    for (int i = 0; i < R; ++i) {
+      x2r[i] = st_in[i];
+      x2r[R + i] = w1[3 * R + i];
+    }
+    std::vector<uint16_t> raw_ref(3 * R);
+    for (int r = 0; r < 3 * R; ++r) {
+      float acc = 0.0f;
+      for (int c = 0; c < 2 * R; ++c) {
+        acc += Bf16ToFloat(w_rnn2r[r * (2 * R) + c]) * Bf16ToFloat(x2r[c]);
+      }
+      acc += head_proj[r] + frnn_proj[r];
+      raw_ref[r] = FloatToBf16(acc);
+    }
+    DeviceBuffer<uint16_t> draw = Dev(raw_ref), d_st_ref(R), d_lat_ref(R);
+    r4dx_inkling2_dspark_markov_gate_bf16(P(draw.data()), P(dbias.data()), P(dst_in.data()), P(d_st_ref.data()),
+                                          P(d_lat_ref.data()), R, 0);
+    Check(Bf16Close(HostBf16(d_st_got, R), HostBf16(d_st_ref, R), 2) &&
+              Bf16Close(HostBf16(d_lat_got, R), HostBf16(d_lat_ref, R), 2),
+          "dspark_markov_step_bf16");
+  }
+
+  // 3. dspark_mix4_rmsnorm_bf16 vs 4x dspark_mix_rmsnorm_bf16
+  {
+    const int T = 3, H = 128;
+    const float eps = 1e-6f;
+    std::array<std::vector<uint16_t>, 4> taps, weights;
+    std::array<DeviceBuffer<uint16_t>, 4> dtaps, dweights, douts_got, douts_ref;
+    for (int i = 0; i < 4; ++i) {
+      taps[i] = ToBf16(Rand(T * H, 0.5f));
+      weights[i] = ToBf16(Rand(H, 0.8f));
+      dtaps[i] = Dev(taps[i]);
+      dweights[i] = Dev(weights[i]);
+      douts_got[i] = DeviceBuffer<uint16_t>(T * H);
+      douts_ref[i] = DeviceBuffer<uint16_t>(T * H);
+    }
+    const std::vector<float> coeffs = Rand(16, 0.4f);
+    std::array<int64_t, 4> w_ptrs{P(dweights[0].data()), P(dweights[1].data()), P(dweights[2].data()),
+                                  P(dweights[3].data())};
+    std::array<int64_t, 4> o_ptrs{P(douts_got[0].data()), P(douts_got[1].data()), P(douts_got[2].data()),
+                                  P(douts_got[3].data())};
+    r4dx_inkling2_dspark_mix4_rmsnorm_bf16(P(dtaps[0].data()), P(dtaps[1].data()), P(dtaps[2].data()),
+                                           P(dtaps[3].data()), coeffs.data(), w_ptrs.data(), o_ptrs.data(), T, H, eps,
+                                           0);
+    bool mix_ok = true;
+    for (int l = 0; l < 4; ++l) {
+      r4dx_inkling2_dspark_mix_rmsnorm_bf16(P(dtaps[0].data()), P(dtaps[1].data()), P(dtaps[2].data()),
+                                            P(dtaps[3].data()), coeffs[l * 4 + 0], coeffs[l * 4 + 1],
+                                            coeffs[l * 4 + 2], coeffs[l * 4 + 3], w_ptrs[l], P(douts_ref[l].data()), T,
+                                            H, eps, 0);
+      if (Host(douts_got[l], T * H) != Host(douts_ref[l], T * H)) mix_ok = false;
+    }
+    Check(mix_ok, "dspark_mix4_rmsnorm_bf16 bit-exact");
+  }
+
+  // 4. dspark_ctx_kv_write (layer 0 bf16 + layer 1 fp8) vs head_norm_rope + kv_write_bf16/fp8
+  {
+    const int T = 3, kv_heads = 2, hd = 128, slots0 = 8, slots1 = 16;
+    const int64_t pos0 = 5;
+    const float rope_theta = 10000.0f, eps = 1e-6f;
+    const int kv_stride = kv_heads * hd;
+    const std::vector<uint16_t> kv0 = ToBf16(Rand(T * 2 * kv_stride, 0.7f));
+    const std::vector<uint16_t> kv1 = ToBf16(Rand(T * 2 * kv_stride, 0.7f));
+    const std::vector<uint16_t> kn0 = ToBf16(Rand(hd, 0.8f)), vn0 = ToBf16(Rand(hd, 0.8f));
+    DeviceBuffer<uint16_t> dkv0 = Dev(kv0), dkv1 = Dev(kv1), dkn0 = Dev(kn0), dvn0 = Dev(vn0);
+    DeviceBuffer<uint16_t> ks0_got(slots0 * kv_stride), vs0_got(slots0 * kv_stride);
+    DeviceBuffer<uint8_t> ks1_got(slots1 * kv_stride), vs1_got(slots1 * kv_stride);
+    ks0_got.Zero();
+    vs0_got.Zero();
+    ks1_got.Zero();
+    vs1_got.Zero();
+
+    R4dxInkling2DsparkCtxKvArgs args{};
+    args.n_layers = 2;
+    args.T = T;
+    args.kv_heads = kv_heads;
+    args.head_dim = hd;
+    args.slots[0] = slots0;
+    args.slots[1] = slots1;
+    args.kv_fp8[0] = 0;
+    args.kv_fp8[1] = 1;
+    args.pos0 = pos0;
+    args.rope_theta = rope_theta;
+    args.eps = eps;
+    args.kv_in[0] = P(dkv0.data());
+    args.kv_in[1] = P(dkv1.data());
+    args.k_norm[0] = P(dkn0.data());
+    args.v_norm[0] = P(dvn0.data());
+    args.k_store[0] = P(ks0_got.data());
+    args.v_store[0] = P(vs0_got.data());
+    args.k_store[1] = P(ks1_got.data());
+    args.v_store[1] = P(vs1_got.data());
+    r4dx_inkling2_dspark_ctx_kv_write(&args, 0);
+
+    // Reference: separate split + head_norm_rope + kv_write
+    DeviceBuffer<uint16_t> ks0_ref(slots0 * kv_stride), vs0_ref(slots0 * kv_stride);
+    DeviceBuffer<uint8_t> ks1_ref(slots1 * kv_stride), vs1_ref(slots1 * kv_stride);
+    ks0_ref.Zero();
+    vs0_ref.Zero();
+    ks1_ref.Zero();
+    vs1_ref.Zero();
+    std::vector<uint16_t> k0_sep(T * kv_stride), v0_sep(T * kv_stride), k1_sep(T * kv_stride), v1_sep(T * kv_stride);
+    for (int t = 0; t < T; ++t) {
+      std::memcpy(k0_sep.data() + t * kv_stride, kv0.data() + t * 2 * kv_stride, kv_stride * 2);
+      std::memcpy(v0_sep.data() + t * kv_stride, kv0.data() + (t * 2 + 1) * kv_stride, kv_stride * 2);
+      std::memcpy(k1_sep.data() + t * kv_stride, kv1.data() + t * 2 * kv_stride, kv_stride * 2);
+      std::memcpy(v1_sep.data() + t * kv_stride, kv1.data() + (t * 2 + 1) * kv_stride, kv_stride * 2);
+    }
+    DeviceBuffer<uint16_t> dk0 = Dev(k0_sep), dv0 = Dev(v0_sep), dv0_norm(T * kv_stride), dk1 = Dev(k1_sep),
+                           dv1 = Dev(v1_sep);
+    r4dx_inkling2_dspark_head_norm_rope_bf16(P(dk0.data()), kv_stride, P(dkn0.data()), T, kv_heads, hd, pos0,
+                                             rope_theta, eps, 0);
+    // Reference V norm using rmsnorm per head [T*kv_heads, hd]
+    r4dx_inkling2_dspark_mix_rmsnorm_bf16(P(dv0.data()), P(dv0.data()), P(dv0.data()), P(dv0.data()), 1.0f, 0.0f, 0.0f,
+                                          0.0f, P(dvn0.data()), P(dv0_norm.data()), T * kv_heads, hd, eps, 0);
+    r4dx_inkling2_dspark_kv_write_bf16(P(dk0.data()), P(dv0_norm.data()), P(ks0_ref.data()), P(vs0_ref.data()), T,
+                                       kv_heads, hd, pos0, slots0, 0);
+    r4dx_inkling2_dspark_head_norm_rope_bf16(P(dk1.data()), kv_stride, 0, T, kv_heads, hd, pos0, rope_theta, eps, 0);
+    r4dx_inkling2_dspark_kv_write_fp8(P(dk1.data()), P(dv1.data()), P(ks1_ref.data()), P(vs1_ref.data()), T, kv_heads,
+                                      hd, pos0, slots1, 0);
+    const bool ks0_ok = Host(ks0_got, slots0 * kv_stride) == Host(ks0_ref, slots0 * kv_stride);
+    const bool vs0_ok = Bf16Close(HostBf16(vs0_got, slots0 * kv_stride), HostBf16(vs0_ref, slots0 * kv_stride), 2);
+    const bool ks1_ok = Host(ks1_got, slots1 * kv_stride) == Host(ks1_ref, slots1 * kv_stride);
+    const bool vs1_ok = Host(vs1_got, slots1 * kv_stride) == Host(vs1_ref, slots1 * kv_stride);
+    if (!ks0_ok || !vs0_ok || !ks1_ok || !vs1_ok) {
+      std::printf("    dspark_ctx_kv_write detail: ks0=%d vs0=%d ks1=%d vs1=%d\n",
+                  ks0_ok, vs0_ok, ks1_ok, vs1_ok);
+    }
+    Check(ks0_ok && vs0_ok && ks1_ok && vs1_ok, "dspark_ctx_kv_write bf16+fp8");
+  }
+
+  // 5. strided attn_fused + sigmoid_gate_mul_strided + sconv_*_strided_hist
+  {
+    const int T = 3, qh = 4, kvh = 2, hd = 128, row_n = qh * hd, big_stride = row_n + 640;
+    const int block_size = 16, n_blocks = 4, ctx = 12;
+    const std::vector<uint16_t> big = ToBf16(Rand(T * big_stride, 0.5f));
+    std::vector<uint16_t> q_contig(T * row_n), g_contig(T * row_n);
+    for (int t = 0; t < T; ++t) {
+      std::memcpy(q_contig.data() + t * row_n, big.data() + t * big_stride, row_n * 2);
+      std::memcpy(g_contig.data() + t * row_n, big.data() + t * big_stride + row_n + 128, row_n * 2);
+    }
+    const std::vector<uint16_t> kv_pool = ToBf16(Rand(n_blocks * kvh * block_size * 2 * hd, 0.3f));
+    const std::vector<int32_t> btbl = {2, 0};
+    DeviceBuffer<uint16_t> dbig = Dev(big), dq = Dev(q_contig), dg = Dev(g_contig), dkv = Dev(kv_pool);
+    DeviceBuffer<int32_t> dbt = Dev(btbl);
+    DeviceBuffer<uint16_t> dout_strided(T * row_n), dout_contig(T * row_n);
+    DeviceBuffer<float> dws(T * qh * 32 * (hd + 2));
+
+    for (int qlen : {1, T}) {
+      R4dxInkling2AttnFusedArgs a{};
+      a.q = P(dbig.data());
+      a.gate = P(dbig.data() + row_n + 128);
+      a.q_row_stride = big_stride;
+      a.gate_row_stride = big_stride;
+      a.kv = P(dkv.data());
+      a.block_table = P(dbt.data());
+      a.out = P(dout_strided.data());
+      a.workspace = P(dws.data());
+      a.q_len = qlen;
+      a.q_heads = qh;
+      a.kv_heads = kvh;
+      a.head_dim = hd;
+      a.block_size = block_size;
+      a.ctx = ctx;
+      a.max_splits = 32;
+      a.scale = 1.0f / std::sqrt(static_cast<float>(hd));
+      a.kv_block_stride = static_cast<int64_t>(kvh) * block_size * (2 * hd);
+      a.kv_head_stride = static_cast<int64_t>(block_size) * (2 * hd);
+      r4dx_inkling2_attn_fused_bf16kv(&a, 0);
+
+      R4dxInkling2AttnFusedArgs b = a;
+      b.q = P(dq.data());
+      b.gate = P(dg.data());
+      b.q_row_stride = 0;
+      b.gate_row_stride = 0;
+      b.out = P(dout_contig.data());
+      r4dx_inkling2_attn_fused_bf16kv(&b, 0);
+      Check(Host(dout_strided, qlen * row_n) == Host(dout_contig, qlen * row_n),
+            "attn_fused strided bit-exact q_len=" + std::to_string(qlen));
+    }
+
+    // sigmoid_gate_mul_strided_bf16
+    DeviceBuffer<uint16_t> dsg_got(T * row_n), dsg_ref(T * row_n);
+    r4dx_inkling2_sigmoid_gate_mul_strided_bf16(P(dq.data()), P(dbig.data() + row_n + 128), big_stride,
+                                                P(dsg_got.data()), T, row_n, 0);
+    r4dx_inkling2_sigmoid_gate_mul_bf16(P(dq.data()), P(dg.data()), P(dsg_ref.data()), T * row_n, 0);
+    Check(Host(dsg_got, T * row_n) == Host(dsg_ref, T * row_n), "sigmoid_gate_mul_strided_bf16 bit-exact");
+
+    // sconv_static_pair_strided_hist_f32 & sconv_dynamic_strided_hist_f32
+    const int C = 128, sc_stride = C + 256;
+    const std::vector<uint16_t> sc_big = ToBf16(Rand(T * sc_stride, 0.5f));
+    std::vector<uint16_t> xk_sep(T * C), xv_sep(T * C);
+    for (int t = 0; t < T; ++t) {
+      std::memcpy(xk_sep.data() + t * C, sc_big.data() + t * sc_stride, C * 2);
+      std::memcpy(xv_sep.data() + t * C, sc_big.data() + t * sc_stride + C, C * 2);
+    }
+    const std::vector<float> wk = Rand(4 * C, 0.3f), wv = Rand(4 * C, 0.3f), st0 = Rand(3 * C, 0.2f);
+    DeviceBuffer<uint16_t> dsc_big = Dev(sc_big), dxk = Dev(xk_sep), dxv = Dev(xv_sep);
+    DeviceBuffer<float> dwk = Dev(wk), dwv = Dev(wv);
+    DeviceBuffer<float> dsk_got = Dev(st0), dsv_got = Dev(st0), dsk_ref = Dev(st0), dsv_ref = Dev(st0);
+    DeviceBuffer<float> dok_got(T * C), dov_got(T * C), dok_ref(T * C), dov_ref(T * C);
+    DeviceBuffer<float> dhk_got(T * C), dhv_got(T * C), dhk_ref(T * C), dhv_ref(T * C);
+    r4dx_inkling2_sconv_static_pair_strided_hist_f32(
+        P(dsc_big.data()), sc_stride, P(dsc_big.data() + C), sc_stride, 1, P(dwk.data()), P(dwv.data()),
+        P(dsk_got.data()), P(dsv_got.data()), P(dok_got.data()), P(dov_got.data()), P(dhk_got.data()),
+        P(dhv_got.data()), T, C, 0);
+    r4dx_inkling2_sconv_static_hist_f32(P(dxk.data()), 1, P(dwk.data()), P(dsk_ref.data()), 0, P(dok_ref.data()),
+                                        P(dhk_ref.data()), T, C, 0);
+    r4dx_inkling2_sconv_static_hist_f32(P(dxv.data()), 1, P(dwv.data()), P(dsv_ref.data()), 0, P(dov_ref.data()),
+                                        P(dhv_ref.data()), T, C, 0);
+    Check(Host(dok_got, T * C) == Host(dok_ref, T * C) && Host(dov_got, T * C) == Host(dov_ref, T * C) &&
+              Host(dhk_got, T * C) == Host(dhk_ref, T * C) && Host(dhv_got, T * C) == Host(dhv_ref, T * C),
+          "sconv_static_pair_strided_hist_f32 bit-exact");
+
+    const int heads = 4;
+    const std::vector<float> dyn = Rand(T * heads * 4, 0.2f);
+    DeviceBuffer<float> ddyn = Dev(dyn), dsd_got = Dev(st0), dsd_ref = Dev(st0);
+    DeviceBuffer<float> dod_got(T * C), dod_ref(T * C), dhd_got(T * C), dhd_ref(T * C);
+    r4dx_inkling2_sconv_dynamic_strided_hist_f32(P(dsc_big.data()), sc_stride, 1, P(ddyn.data()), 0, P(dwk.data()),
+                                                 P(dsd_got.data()), P(dod_got.data()), P(dhd_got.data()), T, C, heads,
+                                                 0);
+    r4dx_inkling2_sconv_dynamic_hist_f32(P(dxk.data()), 1, P(ddyn.data()), 0, P(dwk.data()), P(dsd_ref.data()),
+                                         P(dod_ref.data()), P(dhd_ref.data()), T, C, heads, 0);
+    Check(Host(dod_got, T * C) == Host(dod_ref, T * C) && Host(dhd_got, T * C) == Host(dhd_ref, T * C),
+          "sconv_dynamic_strided_hist_f32 bit-exact");
+  }
+
+  // 6. msg_gate_apply_bf16w_f32 & msg_gate_apply3_bf16w_f32
+  {
+    const int T = 5, H = 128, R = 64, x_stride = (T + 2) * H;
+    std::vector<float> x_strided(3 * x_stride, 0.0f);
+    std::array<std::vector<float>, 3> xg_f;
+    std::vector<float> m_all(3 * T * H), g_all(3 * T * R);
+    m_all = Rand(3 * T * H, 0.5f);
+    g_all = Rand(3 * T * R, 0.5f);
+    std::array<std::vector<uint16_t>, 3> fg_bf, gn_bf;
+    std::array<std::vector<float>, 3> fg_f, gn_f;
+    for (int gate = 0; gate < 3; ++gate) {
+      xg_f[gate] = Rand(T * H, 0.5f);
+      std::memcpy(x_strided.data() + gate * x_stride, xg_f[gate].data(), T * H * sizeof(float));
+      fg_bf[gate] = ToBf16(Rand(H * R, 0.2f));
+      gn_bf[gate] = ToBf16(Rand(H * R, 0.2f));
+      fg_f[gate].resize(H * R);
+      gn_f[gate].resize(H * R);
+      for (int i = 0; i < H * R; ++i) {
+        fg_f[gate][i] = Bf16ToFloat(fg_bf[gate][i]);
+        gn_f[gate][i] = Bf16ToFloat(gn_bf[gate][i]);
+      }
+    }
+    DeviceBuffer<float> dx_s = Dev(x_strided), dm = Dev(m_all), dg = Dev(g_all), dout3(3 * T * H);
+    std::array<DeviceBuffer<uint16_t>, 3> dfg_bf{Dev(fg_bf[0]), Dev(fg_bf[1]), Dev(fg_bf[2])};
+    std::array<DeviceBuffer<uint16_t>, 3> dgn_bf{Dev(gn_bf[0]), Dev(gn_bf[1]), Dev(gn_bf[2])};
+    r4dx_inkling2_msg_gate_apply3_bf16w_f32(
+        P(dx_s.data()), x_stride, P(dm.data()), P(dg.data()), P(dfg_bf[0].data()), P(dfg_bf[1].data()),
+        P(dfg_bf[2].data()), P(dgn_bf[0].data()), P(dgn_bf[1].data()), P(dgn_bf[2].data()), P(dout3.data()), T, H, R,
+        0);
+    const std::vector<float> got3 = Host(dout3, 3 * T * H);
+
+    // Compare single apply_bf16w and apply3_bf16w against existing fp32 msg_gate_apply_f32
+    bool msg_ok = true;
+    for (int gate = 0; gate < 3; ++gate) {
+      DeviceBuffer<float> dxg = Dev(xg_f[gate]);
+      DeviceBuffer<float> dfg = Dev(fg_f[gate]), dgn = Dev(gn_f[gate]);
+      DeviceBuffer<float> dout1(T * H), dout_ref(T * H);
+      r4dx_inkling2_msg_gate_apply_bf16w_f32(P(dxg.data()), P(dm.data() + gate * T * H), P(dg.data() + gate * T * R),
+                                             0, P(dfg_bf[gate].data()), P(dgn_bf[gate].data()), P(dout1.data()), T, H,
+                                             R, 0);
+      r4dx_inkling2_msg_gate_apply_f32(P(dxg.data()), P(dm.data() + gate * T * H), P(dg.data() + gate * T * R), 0,
+                                       P(dfg.data()), P(dgn.data()), P(dout_ref.data()), T, H, R, 0);
+      const std::vector<float> ref_v = Host(dout_ref, T * H);
+      const std::vector<float> got1 = Host(dout1, T * H);
+      const std::vector<float> g3_slice(got3.begin() + gate * T * H, got3.begin() + (gate + 1) * T * H);
+      const double rel = RelErr(got1, ref_v, 1e-2);
+      const bool eq13 = (got1 == g3_slice);
+      if (rel >= 1e-4 || !eq13) {
+        std::printf("    msg_gate_apply gate=%d rel=%.6g eq13=%d\n", gate, rel, eq13);
+        msg_ok = false;
+      }
+    }
+    Check(msg_ok, "msg_gate_apply{_bf16w,3_bf16w}_f32");
+  }
+
+  // 7. router_fused_f32 vs router_f32
+  {
+    const int T = 4, H = 256, E = 128, top_k = 8, stride = 320;
+    const float route_scale = 1.75f;
+    const std::vector<uint16_t> x = ToBf16(Rand(T * stride, 0.5f));
+    const std::vector<uint16_t> gw = ToBf16(Rand(E * H, 0.3f));
+    const std::vector<float> bias = Rand(E, 0.1f);
+    DeviceBuffer<uint16_t> dx = Dev(x), dgw = Dev(gw);
+    DeviceBuffer<float> dbias = Dev(bias);
+    DeviceBuffer<int32_t> dids_got(T * top_k), dids_ref(T * top_k);
+    DeviceBuffer<float> dw_got(T * top_k), dw_ref(T * top_k), dlog_got(T * E), dlog_ref(T * E);
+    r4dx_inkling2_router_fused_f32(P(dx.data()), P(dgw.data()), P(dbias.data()), P(dids_got.data()), P(dw_got.data()),
+                                   T, H, E, top_k, route_scale, stride, P(dlog_got.data()), 0);
+    r4dx_inkling2_router_f32(P(dx.data()), P(dgw.data()), P(dbias.data()), P(dids_ref.data()), P(dw_ref.data()), T, H, E,
+                             top_k, route_scale, stride, P(dlog_ref.data()), 0);
+    Check(Host(dids_got, T * top_k) == Host(dids_ref, T * top_k) &&
+              RelErr(Host(dw_got, T * top_k), Host(dw_ref, T * top_k), 1e-4) < 1e-4 &&
+              RelErr(Host(dlog_got, T * E), Host(dlog_ref, T * E), 1e-4) < 1e-4,
+          "router_fused_f32");
+  }
+
+  // 8. dense_sink_kvconv_bf16
+  {
+    const int M = 4, N_sink = 32, N_kv = 16, K = 256;
+    const std::vector<uint16_t> xq = ToBf16(Rand(M * K, 0.4f)), xk = ToBf16(Rand(M * K, 0.4f)),
+                                xv = ToBf16(Rand(M * K, 0.4f));
+    const std::vector<uint16_t> ws = ToBf16(Rand(N_sink * K, 0.3f)), wk = ToBf16(Rand(N_kv * K, 0.3f)),
+                                wv = ToBf16(Rand(N_kv * K, 0.3f));
+    DeviceBuffer<uint16_t> dxq = Dev(xq), dxk = Dev(xk), dxv = Dev(xv), dws = Dev(ws), dwk = Dev(wk), dwv = Dev(wv);
+    DeviceBuffer<float> dos(M * N_sink), dok(M * N_kv), dov(M * N_kv);
+    r4dx_inkling2_dense_sink_kvconv_bf16(P(dxq.data()), P(dxk.data()), P(dxv.data()), P(dws.data()), P(dwk.data()),
+                                         P(dwv.data()), P(dos.data()), P(dok.data()), P(dov.data()), M, N_sink, N_kv,
+                                         K, 0);
+    auto cpu_mm = [&](const std::vector<uint16_t>& a, const std::vector<uint16_t>& b, int N) {
+      std::vector<float> out(M * N, 0.0f);
+      for (int m = 0; m < M; ++m)
+        for (int n = 0; n < N; ++n) {
+          float s = 0.0f;
+          for (int k = 0; k < K; ++k) s += Bf16ToFloat(a[m * K + k]) * Bf16ToFloat(b[n * K + k]);
+          out[m * N + n] = s;
+        }
+      return out;
+    };
+    Check(RelErr(Host(dos, M * N_sink), cpu_mm(xq, ws, N_sink), 1e-3) < 1e-4 &&
+              RelErr(Host(dok, M * N_kv), cpu_mm(xk, wk, N_kv), 1e-3) < 1e-4 &&
+              RelErr(Host(dov, M * N_kv), cpu_mm(xv, wv, N_kv), 1e-3) < 1e-4,
+          "dense_sink_kvconv_bf16");
+  }
+
+  // 9. quantize_pack_mxfp8_bf16 bit-exact vs r4dx_convert::QuantizeMxfp8 + PackMxfp8*
+  {
+    const int N = 64, K = 256;
+    const std::vector<uint16_t> src_bf = ToBf16(Rand(N * K, 2.0f));
+    std::vector<float> src_f(N * K);
+    for (int i = 0; i < N * K; ++i) src_f[i] = Bf16ToFloat(src_bf[i]);
+    std::vector<uint8_t> codes, scales;
+    r4dx_convert::QuantizeMxfp8(src_f.data(), N, K, 1, codes, scales, "test_mxfp8");
+    const std::vector<uint8_t> wq_ref = r4dx_convert::PackMxfp8Codes(codes, N, K, 1);
+    const std::vector<uint8_t> ws_ref = r4dx_convert::PackMxfp8Scales(scales, N, K);
+
+    DeviceBuffer<uint16_t> d_src = Dev(src_bf);
+    DeviceBuffer<uint8_t> d_wq(N * K), d_ws(N * K / 32);
+    r4dx_inkling2_quantize_pack_mxfp8_bf16(P(d_src.data()), P(d_wq.data()), P(d_ws.data()), N, K, 0);
+    Check(Host(d_wq, N * K) == wq_ref && Host(d_ws, N * K / 32) == ws_ref,
+          "quantize_pack_mxfp8_bf16 bit-exact");
+  }
+}
+
 }  // namespace
 
 int main() {
@@ -769,6 +1182,7 @@ int main() {
   TestAttention();
   TestFusedAttention();
   TestDsparkKernels();
+  TestSpeedupKernels();
   if (g_fail != 0) {
     std::printf("%d check(s) FAILED\n", g_fail);
     return 1;

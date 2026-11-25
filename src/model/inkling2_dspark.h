@@ -102,7 +102,8 @@ class Inkling2DsparkDraft {
                                    const DsparkLmHeadArgmaxFn& lm_head_argmax,
                                    const DsparkLmHeadBatchFn& lm_head_batch = {},
                                    const DsparkLogitsArgmaxFn& logits_argmax = {},
-                                   const DsparkLogitsArgmaxAsyncFn& logits_argmax_async = {});
+                                   const DsparkLogitsArgmaxAsyncFn& logits_argmax_async = {},
+                                   bool* replayed_full_graph_out = nullptr);
 
   private:
     struct Layer {
@@ -146,16 +147,33 @@ class Inkling2DsparkDraft {
     QuantLinear fold_w_;                   // [vl, R] mxfp8 (or bf16)
     core::DeviceBuffer<uint16_t> fold_b_;  // [vl] bf16
 
+    // Column-split Markov RNN projections: [3*R, 2*R], [3*R, H], [3*R, H] bf16
+    core::DeviceBuffer<uint16_t> rnn_w2r_;
+    core::DeviceBuffer<uint16_t> rnn_whead_;
+    core::DeviceBuffer<uint16_t> rnn_wfrnn_;
+    core::DeviceBuffer<uint16_t> zero_state_;   // [R] bf16 zeros
+    core::DeviceBuffer<float> frnn_proj_;       // [3*R] fp32 cached W_frnn @ f_rnn_
+    core::DeviceBuffer<float> frnn_proj_ckpt_;
+    bool frnn_proj_valid_ = false;
+    bool ckpt_frnn_proj_valid_ = false;
+
     // Persistent draft state + HIP graph for the 3-layer DSpark transformer block
     core::DeviceBuffer<uint16_t> f_rnn_;  // [H] bf16 (last committed token's markov context)
     core::DeviceBuffer<uint16_t> f_rnn_ckpt_;
-    core::PinnedBuffer<uint16_t> prev_emb_host_;  // [R] bf16
-    core::DeviceBuffer<int64_t> draft_pos_dev_;   // [1] anchor_pos (= n_injected_) for draft_graph_
-    core::DeviceBuffer<uint16_t> draft_resid_;    // [B, H] persistent input for draft_graph_
-    core::DeviceBuffer<uint16_t> draft_head_h_;   // [B, H] persistent output for draft_graph_
-    void* draft_graph_ = nullptr;                 // hipGraph_t
-    void* draft_graph_exec_ = nullptr;            // hipGraphExec_t
+    core::PinnedBuffer<uint16_t> prev_emb_host_;   // [R] bf16
+    core::PinnedBuffer<int64_t> draft_pos_host_;   // [1] pinned anchor_pos
+    core::PinnedBuffer<int32_t> draft_anchor_host_;  // [1] pinned anchor_token
+    core::DeviceBuffer<int32_t> drafted_dev_;      // [B] persistent drafted token ids (0 = anchor)
+    core::PinnedBuffer<int32_t> drafted_host_;     // [B] pinned readback of drafted_dev_
+    core::DeviceBuffer<int64_t> draft_pos_dev_;    // [1] anchor_pos (= n_injected_) for draft_graph_
+    core::DeviceBuffer<uint16_t> draft_resid_;     // [B, H] persistent input for draft_graph_
+    core::DeviceBuffer<uint16_t> draft_head_h_;    // [B, H] persistent output for draft_graph_
+    void* draft_graph_ = nullptr;                  // hipGraph_t
+    void* draft_graph_exec_ = nullptr;             // hipGraphExec_t
     bool draft_graph_attempted_ = false;
+    std::array<void*, 9> draft_full_graph_{};
+    std::array<void*, 9> draft_full_exec_{};
+    std::array<bool, 9> draft_full_attempted_{};
     int64_t n_injected_ = 0;
     int64_t ckpt_injected_ = -1;
 

@@ -170,6 +170,9 @@ enum class GgmlType : uint32_t {
   kF32 = 0,
   kF16 = 1,
   kQ8_0 = 8,
+  kQ5_K = 13,
+  kIQ3_S = 21,
+  kIQ4_XS = 23,
   kI8 = 24,
   kI16 = 25,
   kI32 = 26,
@@ -183,6 +186,10 @@ inline int64_t GgmlBlockSize(GgmlType t) {
   switch (t) {
     case GgmlType::kQ8_0:
       return 32;
+    case GgmlType::kQ5_K:
+    case GgmlType::kIQ3_S:
+    case GgmlType::kIQ4_XS:
+      return 256;
     default:
       return 1;
   }
@@ -204,7 +211,13 @@ inline int64_t GgmlTypeSize(GgmlType t) {
     case GgmlType::kF64:
       return 8;
     case GgmlType::kQ8_0:
-      return 34;  // 2 (f16 scale) + 32 (int8) per block of 32 elements
+      return 34;   // 2 (f16 scale) + 32 (int8) per block of 32 elements
+    case GgmlType::kQ5_K:
+      return 176;  // 2 (d) + 2 (dmin) + 12 (scales) + 32 (qh) + 128 (qs) per 256 elements
+    case GgmlType::kIQ3_S:
+      return 110;  // 2 (d) + 64 (qs) + 8 (qh) + 32 (signs) + 4 (scales) per 256 elements
+    case GgmlType::kIQ4_XS:
+      return 136;  // 2 (d) + 2 (scales_h) + 4 (scales_l) + 128 (qs) per 256 elements
     default:
       throw std::runtime_error("GgmlTypeSize: unsupported/unknown ggml_type " +
                                 std::to_string(static_cast<uint32_t>(t)));
@@ -217,6 +230,9 @@ inline const char* GgmlTypeName(GgmlType t) {
     case GgmlType::kF16: return "F16";
     case GgmlType::kBF16: return "BF16";
     case GgmlType::kQ8_0: return "Q8_0";
+    case GgmlType::kQ5_K: return "Q5_K";
+    case GgmlType::kIQ3_S: return "IQ3_S";
+    case GgmlType::kIQ4_XS: return "IQ4_XS";
     case GgmlType::kI8: return "I8";
     case GgmlType::kI16: return "I16";
     case GgmlType::kI32: return "I32";
@@ -388,11 +404,75 @@ class GgufReader {
         DequantQ8_0ToF32(data, n, out.data());
         break;
       }
+      case GgmlType::kQ5_K: {
+        DequantQ5_KToF32(data, n, out.data());
+        break;
+      }
+      case GgmlType::kIQ3_S: {
+        DequantIQ3_SToF32(data, n, out.data());
+        break;
+      }
+      case GgmlType::kIQ4_XS: {
+        DequantIQ4_XSToF32(data, n, out.data());
+        break;
+      }
       default:
         throw std::runtime_error(std::string("gguf: DequantToF32 unsupported ggml_type ") +
                                   GgmlTypeName(info.type) + " for '" + name + "'");
     }
     return out;
+  }
+
+  // Dequantize one contiguous slice (e.g. expert `slice_idx` of a 3D `[K, N, E]` tensor) to float32.
+  std::vector<float> DequantSliceToF32(const std::string& name, int64_t slice_idx, int64_t slice_elems) const {
+    const GgufTensorInfo& info = TensorInfo(name);
+    const int64_t total = info.ElemCount();
+    if (slice_idx < 0 || slice_elems <= 0 || (slice_idx + 1) * slice_elems > total) {
+      throw std::runtime_error("gguf: DequantSliceToF32 out of range for '" + name + "'");
+    }
+    const int64_t block = GgmlBlockSize(info.type);
+    if (slice_elems % block != 0) {
+      throw std::runtime_error("gguf: DequantSliceToF32 slice_elems not divisible by block size for '" + name + "'");
+    }
+    const uint64_t slice_bytes = static_cast<uint64_t>((slice_elems / block) * GgmlTypeSize(info.type));
+    const uint8_t* data = TensorData(name) + static_cast<size_t>(slice_idx) * slice_bytes;
+    std::vector<float> out(static_cast<size_t>(slice_elems));
+    DequantRawToF32(info.type, data, slice_elems, out.data(), name);
+    return out;
+  }
+
+  static void DequantRawToF32(GgmlType type, const uint8_t* data, int64_t n, float* out,
+                              const std::string& name_for_err = "") {
+    switch (type) {
+      case GgmlType::kF32:
+        std::memcpy(out, data, static_cast<size_t>(n) * 4);
+        break;
+      case GgmlType::kF16: {
+        const uint16_t* src = reinterpret_cast<const uint16_t*>(data);
+        for (int64_t i = 0; i < n; ++i) out[static_cast<size_t>(i)] = r4dx::core::F16ToFloat(src[i]);
+        break;
+      }
+      case GgmlType::kBF16: {
+        const uint16_t* src = reinterpret_cast<const uint16_t*>(data);
+        for (int64_t i = 0; i < n; ++i) out[static_cast<size_t>(i)] = r4dx::core::Bf16ToFloat(src[i]);
+        break;
+      }
+      case GgmlType::kQ8_0:
+        DequantQ8_0ToF32(data, n, out);
+        break;
+      case GgmlType::kQ5_K:
+        DequantQ5_KToF32(data, n, out);
+        break;
+      case GgmlType::kIQ3_S:
+        DequantIQ3_SToF32(data, n, out);
+        break;
+      case GgmlType::kIQ4_XS:
+        DequantIQ4_XSToF32(data, n, out);
+        break;
+      default:
+        throw std::runtime_error(std::string("gguf: DequantRawToF32 unsupported ggml_type ") +
+                                 GgmlTypeName(type) + " for '" + name_for_err + "'");
+    }
   }
 
   // Same, but rounds to bf16 (round-to-nearest-even via r4dx::core::FloatToBf16) instead of
@@ -428,6 +508,176 @@ class GgufReader {
       const int8_t* qs = reinterpret_cast<const int8_t*>(block + 2);
       float* row_out = out + b * 32;
       for (int k = 0; k < 32; ++k) row_out[k] = d * static_cast<float>(qs[k]);
+    }
+  }
+
+  static void DequantQ5_KToF32(const uint8_t* data, int64_t n_elems, float* out) {
+    if (n_elems % 256 != 0)
+      throw std::runtime_error("gguf: Q5_K element count not a multiple of 256");
+    const int64_t n_blocks = n_elems / 256;
+    auto get_scale_min_k4 = [](int j, const uint8_t* q, uint8_t& d, uint8_t& m) {
+      if (j < 4) {
+        d = q[j] & 63;
+        m = q[j + 4] & 63;
+      } else {
+        d = static_cast<uint8_t>((q[j + 4] & 0xF) | ((q[j - 4] >> 6) << 4));
+        m = static_cast<uint8_t>((q[j + 4] >> 4) | ((q[j] >> 6) << 4));
+      }
+    };
+    for (int64_t b = 0; b < n_blocks; ++b) {
+      const uint8_t* blk = data + static_cast<size_t>(b) * 176;
+      uint16_t d16, dmin16;
+      std::memcpy(&d16, blk, 2);
+      std::memcpy(&dmin16, blk + 2, 2);
+      const float d = r4dx::core::F16ToFloat(d16);
+      const float dmin = r4dx::core::F16ToFloat(dmin16);
+      const uint8_t* scales = blk + 4;
+      const uint8_t* qh = blk + 16;
+      const uint8_t* ql = blk + 48;
+      float* y = out + b * 256;
+      int is = 0;
+      uint8_t u1 = 1, u2 = 2;
+      for (int j = 0; j < 256; j += 64) {
+        uint8_t sc, m;
+        get_scale_min_k4(is + 0, scales, sc, m);
+        const float d1 = d * sc, m1 = dmin * m;
+        get_scale_min_k4(is + 1, scales, sc, m);
+        const float d2 = d * sc, m2 = dmin * m;
+        for (int l = 0; l < 32; ++l) *y++ = d1 * static_cast<float>((ql[l] & 0xF) + ((qh[l] & u1) ? 16 : 0)) - m1;
+        for (int l = 0; l < 32; ++l) *y++ = d2 * static_cast<float>((ql[l] >> 4) + ((qh[l] & u2) ? 16 : 0)) - m2;
+        ql += 32;
+        is += 2;
+        u1 <<= 2;
+        u2 <<= 2;
+      }
+    }
+  }
+
+  static void DequantIQ4_XSToF32(const uint8_t* data, int64_t n_elems, float* out) {
+    if (n_elems % 256 != 0)
+      throw std::runtime_error("gguf: IQ4_XS element count not a multiple of 256");
+    static constexpr int8_t kIq4nl[16] = {-127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113};
+    const int64_t n_blocks = n_elems / 256;
+    for (int64_t b = 0; b < n_blocks; ++b) {
+      const uint8_t* blk = data + static_cast<size_t>(b) * 136;
+      uint16_t d16, scales_h;
+      std::memcpy(&d16, blk, 2);
+      std::memcpy(&scales_h, blk + 2, 2);
+      const float d = r4dx::core::F16ToFloat(d16);
+      const uint8_t* scales_l = blk + 4;
+      const uint8_t* qs = blk + 8;
+      float* y = out + b * 256;
+      for (int ib = 0; ib < 8; ++ib) {
+        const int ls = ((scales_l[ib / 2] >> (4 * (ib % 2))) & 0xf) | (((scales_h >> (2 * ib)) & 3) << 4);
+        const float dl = d * static_cast<float>(ls - 32);
+        for (int j = 0; j < 16; ++j) {
+          y[j + 0] = dl * static_cast<float>(kIq4nl[qs[j] & 0xf]);
+          y[j + 16] = dl * static_cast<float>(kIq4nl[qs[j] >> 4]);
+        }
+        y += 32;
+        qs += 16;
+      }
+    }
+  }
+
+  static void DequantIQ3_SToF32(const uint8_t* data, int64_t n_elems, float* out) {
+    if (n_elems % 256 != 0)
+      throw std::runtime_error("gguf: IQ3_S element count not a multiple of 256");
+    static const uint32_t* grid = []() -> const uint32_t* {
+      static uint32_t tbl[512];
+      static constexpr uint8_t kMap[8] = {0x01, 0x03, 0x05, 0x07, 0x09, 0x0b, 0x0d, 0x0f};
+      static const char kHex[] =
+          "0000010002000500070010001100120014001600200021002500330040004200"
+          "4500470051005300600062007100740077000001010102010401100111011501"
+          "2001230127013101350144016101650172010002010205020702100213021602"
+          "2102250230023402420245024702510253027002730203031103150320032203"
+          "3103330336034403500352036703710375030004130417042104240432044004"
+          "4304510470040205040520052205260533054105450547056605730506061106"
+          "1306310652067106000702070407200722072607330750075407001001100210"
+          "0410101011101310151017102010221031103410361054105610611072100011"
+          "0111031106111011141121113011331141115011521170117611001212121512"
+          "1712201224123212401243125512601272120113041307131013131321132713"
+          "3013341341136213701303140514121414143114331442144614501454140115"
+          "1015131521153015321551152016241627164416461601170317101712172117"
+          "3517411762177017002001200320052007201020122014201620212023202720"
+          "3020322041204320452050205220672070207320752000210221102113211721"
+          "2221252131213421422151210122042207222122232230223722412253225722"
+          "7122742200230223052311232223242331233323422350236623012407242024"
+          "2324322435244124722475240425112522253725402553257025002602260726"
+          "2126552661260527112726273027432750270230113013301530173022303130"
+          "3330353042304430473051306330713001310331053114312131233140316031"
+          "7231763100321232203232323432503201331033143321332333273330334133"
+          "4333473355337333033411341634223431345234603464340135103512352535"
+          "3235443556357335163641360137033720372237353700400440124020402440"
+          "2740324041405040704002410741114113412241304135414341514155410142"
+          "0342104215422142334240425742624270420443114313432043224331433543"
+          "0044024424443744404471440545074521456245134634466046104715473047"
+          "4347514702501050145022504050445047505250665074500151035105511251"
+          "2151325172510052115223523052365253520253075310532753445351536553"
+          "7353015404542054325446541255265551555355425602570457225711601360"
+          "1560316033606060006120612761646112623462426255626262706200631463"
+          "2163406325644364626400650365346560650566406611671367007004700770"
+          "2070227036704070547062700271117124714371457101720472107216722172"
+          "3072517202733273357353730174057413742074507422754275027631760077";
+      auto hex = [](char c) -> uint8_t {
+        if (c >= '0' && c <= '9') return static_cast<uint8_t>(c - '0');
+        return static_cast<uint8_t>(c - 'a' + 10);
+      };
+      for (int i = 0; i < 512; ++i) {
+        const uint8_t b0 = static_cast<uint8_t>((hex(kHex[4 * i + 0]) << 4) | hex(kHex[4 * i + 1]));
+        const uint8_t b1 = static_cast<uint8_t>((hex(kHex[4 * i + 2]) << 4) | hex(kHex[4 * i + 3]));
+        const uint8_t g0 = kMap[b0 & 7];
+        const uint8_t g1 = kMap[(b0 >> 4) & 7];
+        const uint8_t g2 = kMap[b1 & 7];
+        const uint8_t g3 = kMap[(b1 >> 4) & 7];
+        tbl[i] = static_cast<uint32_t>(g0) | (static_cast<uint32_t>(g1) << 8) |
+                 (static_cast<uint32_t>(g2) << 16) | (static_cast<uint32_t>(g3) << 24);
+      }
+      return tbl;
+    }();
+    static constexpr uint8_t kmask[8] = {0x01, 0x02, 0x04, 0x08, 0x10, 0x20, 0x40, 0x80};
+    const int64_t n_blocks = n_elems / 256;
+    for (int64_t b = 0; b < n_blocks; ++b) {
+      const uint8_t* blk = data + static_cast<size_t>(b) * 110;
+      uint16_t d16;
+      std::memcpy(&d16, blk, 2);
+      const float d = r4dx::core::F16ToFloat(d16);
+      const uint8_t* qs = blk + 2;
+      const uint8_t* qh = blk + 66;
+      const uint8_t* signs = blk + 74;
+      const uint8_t* scales = blk + 106;
+      float* y = out + b * 256;
+      for (int ib32 = 0; ib32 < 8; ib32 += 2) {
+        const float db1 = d * static_cast<float>(1 + 2 * (scales[ib32 / 2] & 0xf));
+        const float db2 = d * static_cast<float>(1 + 2 * (scales[ib32 / 2] >> 4));
+        for (int l = 0; l < 4; ++l) {
+          const uint32_t g1 = grid[qs[2 * l + 0] | ((qh[0] << (8 - 2 * l)) & 256)];
+          const uint32_t g2 = grid[qs[2 * l + 1] | ((qh[0] << (7 - 2 * l)) & 256)];
+          for (int j = 0; j < 4; ++j) {
+            const float v1 = static_cast<float>((g1 >> (8 * j)) & 0xff);
+            const float v2 = static_cast<float>((g2 >> (8 * j)) & 0xff);
+            y[j + 0] = db1 * v1 * ((signs[l] & kmask[j + 0]) ? -1.0f : 1.0f);
+            y[j + 4] = db1 * v2 * ((signs[l] & kmask[j + 4]) ? -1.0f : 1.0f);
+          }
+          y += 8;
+        }
+        qs += 8;
+        signs += 4;
+        for (int l = 0; l < 4; ++l) {
+          const uint32_t g1 = grid[qs[2 * l + 0] | ((qh[1] << (8 - 2 * l)) & 256)];
+          const uint32_t g2 = grid[qs[2 * l + 1] | ((qh[1] << (7 - 2 * l)) & 256)];
+          for (int j = 0; j < 4; ++j) {
+            const float v1 = static_cast<float>((g1 >> (8 * j)) & 0xff);
+            const float v2 = static_cast<float>((g2 >> (8 * j)) & 0xff);
+            y[j + 0] = db2 * v1 * ((signs[l] & kmask[j + 0]) ? -1.0f : 1.0f);
+            y[j + 4] = db2 * v2 * ((signs[l] & kmask[j + 4]) ? -1.0f : 1.0f);
+          }
+          y += 8;
+        }
+        qh += 2;
+        qs += 8;
+        signs += 4;
+      }
     }
   }
 

@@ -51,7 +51,11 @@ add_library(r4dx_convert_inkling2 STATIC inkling2_layout.cpp)
 target_include_directories(r4dx_convert_inkling2 PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(r4dx_convert_inkling2 PUBLIC r4dx_convert)
 
+add_library(r4dx_convert_hy_v3 STATIC hy_v3_gguf.cpp)
+target_include_directories(r4dx_convert_hy_v3 PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
+target_link_libraries(r4dx_convert_hy_v3 PUBLIC r4dx_convert)
+
 if(R4DX_BUILD_CONVERT)
   add_executable(r4dx-convert main.cpp)
-  target_link_libraries(r4dx-convert PRIVATE r4dx_convert r4dx_convert_gemma r4dx_convert_lfm2 r4dx_convert_llama r4dx_convert_qwen4exp r4dx_convert_qwen35moe r4dx_convert_inkling2)
+  target_link_libraries(r4dx-convert PRIVATE r4dx_convert r4dx_convert_gemma r4dx_convert_lfm2 r4dx_convert_llama r4dx_convert_qwen4exp r4dx_convert_qwen35moe r4dx_convert_inkling2 r4dx_convert_hy_v3)
 endif()

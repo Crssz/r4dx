@@ -270,4 +270,6 @@ std::unique_ptr<TextModel> LoadQwen35MoeTextModel(const ModelOptions& opts, cons
 // (docs/inkling2-plan.md 5): tp.world == 1 -> Inkling2LocalTextModel, tp.world == 2 -> Inkling2TpModel.
 std::unique_ptr<TextModel> LoadInkling2TextModel(const ModelOptions& opts, const TpOptions& tp);
 
+std::unique_ptr<TextModel> LoadHyV3TextModel(const ModelOptions& opts, const TpOptions& tp);
+
 }  // namespace r4dx::model

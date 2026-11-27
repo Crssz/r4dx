@@ -21,7 +21,7 @@
 
 namespace r4dx::server {
 
-enum class DialectKind { kQwen35, kGemma4, kLfm2, kQwen4Exp, kNanbeige, kInkling2 };
+enum class DialectKind { kQwen35, kGemma4, kLfm2, kQwen4Exp, kNanbeige, kInkling2, kHyV3 };
 
 // The historical tokenizer directory (server_args.h / src/cli/cli_args.h defaults), <R4DX_MODELS_ROOT>\Huihui-Qwen3.8-27B-abliterated (root default E:\models): what an empty
 // --tokenizer-dir resolves to for the Qwen dialect, whose ModelDialect::default_tokenizer_dir is empty.
@@ -114,6 +114,7 @@ const ModelDialect& NanbeigeDialect();
 // [0, 0.99]; enable_thinking=false means effort "none"), and it has NO generation prompt: the prompt ends after the last message and
 // the model emits its own <|message_model|>, so CheckpointSuffix is always empty (see its definition for why).
 const ModelDialect& Inkling2Dialect();
+const ModelDialect& HyV3Dialect();
 const ModelDialect& DialectFor(DialectKind kind);
 
 // "qwen35" / "gemma4" / "lfm2" / "qwen4_exp" / "nanbeige" / "inkling2" (case-sensitive). Returns false for anything else (including "auto").

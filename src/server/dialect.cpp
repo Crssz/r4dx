@@ -130,6 +130,25 @@ ModelDialect MakeInkling2() {
   return d;
 }
 
+ModelDialect MakeHyV3() {
+  ModelDialect d;
+  d.kind = DialectKind::kHyV3;
+  d.name = "hy_v3";
+  d.reasoning.open = "";
+  d.reasoning.close = "</think>";
+  d.reasoning.skip_blank_after_close = false;
+  d.prompt_reasoning_open = "<think>";
+  d.prompt_reasoning_closed = "<think></think>";
+  d.tool_open = "<tool_calls>";
+  d.tool_close = "</tool_calls>";
+  d.chat_template_polyfills = false;
+  d.bos_on_raw_prompt = true;
+  d.has_reasoning_effort = true;
+  d.eos_ids = {120025};  // <eos:6124c78e>
+  d.default_tokenizer_dir = r4dx::ModelsPath("orcarouter/Hy-MT3-30B-A3B-tok");
+  return d;
+}
+
 }  // namespace
 
 const ModelDialect& Qwen35Dialect() {
@@ -162,6 +181,11 @@ const ModelDialect& Inkling2Dialect() {
   return d;
 }
 
+const ModelDialect& HyV3Dialect() {
+  static const ModelDialect d = MakeHyV3();
+  return d;
+}
+
 const ModelDialect& DialectFor(DialectKind kind) {
   switch (kind) {
     case DialectKind::kGemma4:
@@ -174,6 +198,8 @@ const ModelDialect& DialectFor(DialectKind kind) {
       return NanbeigeDialect();
     case DialectKind::kInkling2:
       return Inkling2Dialect();
+    case DialectKind::kHyV3:
+      return HyV3Dialect();
     case DialectKind::kQwen35:
       break;
   }
@@ -203,6 +229,10 @@ bool ParseDialectName(std::string_view s, DialectKind* out) {
   }
   if (s == "inkling2") {
     if (out) *out = DialectKind::kInkling2;
+    return true;
+  }
+  if (s == "hy_v3") {
+    if (out) *out = DialectKind::kHyV3;
     return true;
   }
   return false;
@@ -260,12 +290,16 @@ DialectKind ResolveDialectKindForArch(std::optional<DialectKind> requested, cons
   if (tokenizer_dir.empty()) {
     if (container_arch == "llama") return DialectKind::kNanbeige;
     if (ArchNameIsInkling2(container_arch)) return DialectKind::kInkling2;
+    if (container_arch == "hy_v3") return DialectKind::kHyV3;
     return container_is_gemma ? DialectKind::kGemma4 : container_is_lfm2 ? DialectKind::kLfm2 : qwen_kind;
   }
   const std::string config = ReadFileIfPresent(JoinPath(tokenizer_dir, "tokenizer_config.json"));
   // The (tens of MB) vocab is only scanned when the config alone did not say Gemma.
   if (DetectDialect(config, /*has_turn_token=*/false) == DialectKind::kGemma4) return DialectKind::kGemma4;
   const std::string vocab = ReadFileIfPresent(JoinPath(tokenizer_dir, "tokenizer.json"));
+  if (container_arch == "hy_v3" || vocab.find("<｜hy_begin▁of▁sentence｜>") != std::string::npos) {
+    return DialectKind::kHyV3;
+  }
   const bool has_turn_token = vocab.find("\"<|turn>\"") != std::string::npos;
   const bool has_tool_call_token = vocab.find("\"<|tool_call_start|>\"") != std::string::npos;
   const bool has_inkling2_tokens = vocab.find("\"<|message_model|>\"") != std::string::npos &&
@@ -354,6 +388,13 @@ std::string CheckDialectAgainstArch(const ModelDialect& d, std::string_view mode
   }
   if (d.kind != DialectKind::kInkling2 && arch_is_inkling2) {
     return std::string("dialect ") + d.name + " does not match model architecture 'inkling2_loop' (pass --dialect inkling2)";
+  }
+  const bool arch_is_hy_v3 = model_arch == "hy_v3";
+  if (d.kind == DialectKind::kHyV3 && !arch_is_hy_v3) {
+    return std::string("dialect hy_v3 does not match model architecture '") + std::string(model_arch) + "'";
+  }
+  if (d.kind != DialectKind::kHyV3 && arch_is_hy_v3) {
+    return std::string("dialect ") + d.name + " does not match model architecture 'hy_v3' (pass --dialect hy_v3)";
   }
   return "";
 }

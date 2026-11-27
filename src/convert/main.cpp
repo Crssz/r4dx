@@ -265,6 +265,7 @@
 #include "r4dx_convert/container_writer.hpp"
 #include "r4dx_convert/dflash2_container.hpp"
 #include "r4dx_convert/dflash2_hf.hpp"
+#include "hy_v3_gguf.hpp"
 #include "r4dx_convert/gguf_reader.hpp"
 #include "r4dx_convert/hessian_store.hpp"
 #include "r4dx_convert/keep_bf16.hpp"
@@ -441,6 +442,7 @@ struct AppArgs {
   // requested layout per run (no automatic bf16 companion -- pass --layout bf16 for an
   // exact-precision container), not the HF mode's "every layout side by side" model.
   std::string dflash_gguf;
+  std::string model_gguf;
   std::string dflash_out;
   std::string dflash_layout = "w4a16";  // one of w4a16, bf16 (--dflash-hf defaults to bf16 instead)
   bool dflash_layout_set = false;
@@ -581,6 +583,7 @@ AppArgs ParseArgs(int argc, char** argv) {
     else if (arg == "--kv-calib") a.kv_calib = next(i);
     else if (arg == "--draft-vocab-ids") a.draft_vocab_ids = next(i);
     else if (arg == "--dflash-gguf") a.dflash_gguf = next(i);
+    else if (arg == "--gguf") a.model_gguf = next(i);
     else if (arg == "--out") a.dflash_out = next(i);
     else if (arg == "--layout") { a.dflash_layout = next(i); a.dflash_layout_set = true; }
     else if (arg == "--dflash-hf") a.dflash_hf = next(i);
@@ -3914,12 +3917,49 @@ int RunDflashHfConvert(const AppArgs& args) {
   return 0;
 }
 
+int RunModelGgufConvert(const AppArgs& args) {
+  using namespace r4dx_convert;
+  HyV3GgufOptions o;
+  o.gguf_path = args.model_gguf;
+  o.out_path = !args.dflash_out.empty() ? args.dflash_out : args.output;
+  if (o.out_path.empty()) throw std::runtime_error("--gguf requires --out (or --output)");
+  const std::string layout_name = args.dflash_layout_set ? args.dflash_layout : "w4a16";
+  o.body_layouts = LayoutSet{};
+  o.body_layouts.bf16 = false;
+  if (layout_name == "bf16") o.body_layouts.bf16 = true;
+  else if (layout_name == "w4a16") o.body_layouts.w4a16 = true;
+  else if (layout_name == "w8a16") o.body_layouts.w8a16 = true;
+  else if (layout_name == "mxfp8") o.body_layouts.mxfp8 = true;
+  else throw std::runtime_error("--gguf --layout must be bf16, w4a16, w8a16, or mxfp8; got '" + layout_name + "'");
+
+  if (args.lm_head_spec_explicit) {
+    o.lm_head_layouts = ParseLayoutList(args.lm_head_spec, /*is_body=*/false);
+  } else {
+    o.lm_head_layouts = LayoutSet{};
+    o.lm_head_layouts.bf16 = false;
+    if (layout_name == "bf16") o.lm_head_layouts.bf16 = true;
+    else if (layout_name == "w4a16") o.lm_head_layouts.w8a16 = true;  // 247 MB for 120832x2048, cleaner logits than 4-bit
+    else if (layout_name == "w8a16") o.lm_head_layouts.w8a16 = true;
+    else if (layout_name == "mxfp8") o.lm_head_layouts.mxfp8 = true;
+  }
+  o.quant_mode = ParseQuantMode(args.quant);
+  o.layers = args.layers;
+  o.threads = ResolveThreads(args.threads);
+  o.quant_metadata = BuildQuantMetadata(
+      nlohmann::json::object(),
+      (o.body_layouts.w8a16 || o.lm_head_layouts.w8a16) ? args.w8a16_group : 0,
+      o.body_layouts.mxfp8 || o.lm_head_layouts.mxfp8);
+  ConvertHyV3Gguf(o);
+  return 0;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
   try {
     ValidateKernelGroupSizes();
     AppArgs args = ParseArgs(argc, argv);
+    if (!args.model_gguf.empty()) return RunModelGgufConvert(args);
     if (!args.dflash_gguf.empty()) return RunDflashConvert(args);
     if (!args.dflash_hf.empty()) return RunDflashHfConvert(args);
     if (args.selftest) {

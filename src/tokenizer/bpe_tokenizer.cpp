@@ -45,6 +45,7 @@
 #include <unordered_map>
 #include <unordered_set>
 
+#include "hy_v3_split.h"
 #include "nlohmann/json.hpp"
 #include "o200k_split.h"
 #include "vendor/llamacpp_unicode/unicode.h"
@@ -175,6 +176,8 @@ struct Tokenizer::Impl {
     std::string split_trigger;
     // Inkling-2: the o200k-style regex with its own splitter (o200k_split.h); split_trigger is unused then.
     bool o200k = false;
+    // Hy-MT3 / hy_v3: 3-stage Isolated Split + ByteLevel (hy_v3_split.h).
+    bool hy_v3 = false;
 
     // Added tokens for fragment splitting, sorted longest-surface-text-first (ties broken by
     // ascending id) so a longer added token is never shadowed by a shorter one that happens to be
@@ -719,11 +722,18 @@ void validate_pretokenizer(const json& root, const Tokenizer::Options& options) 
         throw std::runtime_error("Tokenizer: pre_tokenizer.pretokenizers[0] is not a Regex Split");
     }
     const std::string regex = split["pattern"]["Regex"].get<std::string>();
-    if (regex != kQwen2SplitExpected && regex != kQwen35SplitExpected && regex != kLlama3SplitExpected &&
-        regex != kO200kInkling2Regex) {
+    const bool is_hy_v3 =
+        pretoks.size() == 4 && regex == kHyV3SplitRegex0 &&
+        pretoks[1].value("type", "") == "Split" && pretoks[1].contains("pattern") &&
+        pretoks[1]["pattern"].value("Regex", "") == kHyV3SplitRegex1 &&
+        pretoks[2].value("type", "") == "Split" && pretoks[2].contains("pattern") &&
+        pretoks[2]["pattern"].value("Regex", "") == kHyV3SplitRegex2 &&
+        pretoks[3].value("type", "") == "ByteLevel";
+    if (!is_hy_v3 && regex != kQwen2SplitExpected && regex != kQwen35SplitExpected &&
+        regex != kLlama3SplitExpected && regex != kO200kInkling2Regex) {
         throw std::runtime_error(
             "Tokenizer: pre_tokenizer regex does not match any pattern this tokenizer "
-            "implements (Qwen2, Qwen3.5, Llama-3 or the Inkling-2 o200k variant; got: " +
+            "implements (Qwen2, Qwen3.5, Llama-3, Inkling-2 o200k, or hy_v3; got: " +
             regex + ")");
     }
     // Split.behavior must be Isolated (every regex match its own piece; the regexes tile the text,
@@ -744,7 +754,7 @@ void validate_pretokenizer(const json& root, const Tokenizer::Options& options) 
                                       "encode() does not)");
         }
     }
-    const json& byte_level = pretoks[1];
+    const json& byte_level = pretoks.back();
     if (byte_level.value("type", "") != "ByteLevel") {
         throw std::runtime_error("Tokenizer: pre_tokenizer.pretokenizers[1] is not ByteLevel");
     }
@@ -1061,6 +1071,7 @@ Tokenizer::Impl load_impl(const std::string& tokenizer_json_path, const std::str
     if (!spm) {
         const std::string regex =
             root["pre_tokenizer"]["pretokenizers"][0]["pattern"]["Regex"].get<std::string>();
+        impl.hy_v3 = (root["pre_tokenizer"]["pretokenizers"].size() == 4 && regex == kHyV3SplitRegex0);
         impl.o200k = (regex == kO200kInkling2Regex);
         impl.split_trigger = (regex == kQwen2SplitExpected)   ? kQwen2SplitTrigger
                              : (regex == kLlama3SplitExpected) ? kLlama3SplitTrigger
@@ -1172,7 +1183,7 @@ Tokenizer::Impl load_impl(const std::string& tokenizer_json_path, const std::str
             }
         }
     }
-    if (!spm && !impl.o200k) verify_split_dispatch(impl.split_trigger);
+    if (!spm && !impl.o200k && !impl.hy_v3) verify_split_dispatch(impl.split_trigger);
 
     if (!tc_bos_text.empty()) impl.bos = impl.lookup(tc_bos_text);
     if (!tc_eos_text.empty()) impl.eos = impl.lookup(tc_eos_text);
@@ -1267,7 +1278,9 @@ std::vector<TokenId> Tokenizer::encode(std::string_view text, bool parse_special
             continue;
         }
         const std::string chunk(frag.text);
-        if (impl_->o200k) {
+        if (impl_->hy_v3) {
+            for (const std::string& word : hy_v3_split_byte_encoded(chunk)) bpe_merge_word(*impl_, word, out);
+        } else if (impl_->o200k) {
             for (const std::string& word : o200k_split_byte_encoded(chunk)) bpe_merge_word(*impl_, word, out);
             continue;
         }

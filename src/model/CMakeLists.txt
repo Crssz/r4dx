@@ -136,6 +136,9 @@ set(R4DX_MODEL_SOURCES
   # LoadLlamaTextModel dispatch, and the TP=2 facade.
   llama_container.cpp
   llama_model.cpp
+  hy_v3_container.cpp
+  hy_v3_model.cpp
+  hy_v3_local_text_model.cpp
   llama_local_text_model.cpp
   llama_tp_model.cpp
   # inkling2_loop (docs/inkling2-plan.md 5): the container loader (TP=1 and the rank shard), the engine (48-visit table),

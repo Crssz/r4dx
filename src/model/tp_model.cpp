@@ -1330,6 +1330,11 @@ std::unique_ptr<TextModel> LoadTextModel(const ModelOptions& opts, const TpOptio
     }
     return LoadLlamaTextModel(opts, tp);
   }
+  if (arch == Arch::kHyV3) {
+    if (pp_on) throw std::invalid_argument("LoadTextModel: --pp 2 does not support hy_v3");
+    if (opts.batch_slots > 0) throw std::invalid_argument("LoadTextModel: --batch does not support hy_v3");
+    return LoadHyV3TextModel(opts, tp);
+  }
   if (pp_on) {
     // `--tp 2 --pp 2` is the hybrid serving mode (docs/pp-tp2-hybrid.md): the TP=2 group with the PP-2 prefill stages next to its ranks.
     // `--hybrid off` / R4DX_HYBRID=0 leaves plain --tp 2 (TpModel::Load says so).

@@ -26,6 +26,7 @@ enum class Arch {
   kQwen35Moe, // qwen3_5_moe (Ornith-1.5-122B): the Qwen3.5 GDN + full-attention hybrid with a 256-expert top-8 MoE FFN
   kLlama,     // llama (Nanbeige4.3-33B): dense, every layer full GQA attention + SwiGLU MLP, untied head
   kInkling2Loop,  // inkling2_loop (Inkling-2-Mini): 24 stored layers, 6-17 looped 3x (48 visits), no RoPE, AttnRes, 128-expert MoE
+  kHyV3,      // hy_v3 (Hy-MT3-30B-A3B): full GQA attention + qk_norm, dense layer 0 then 128-expert MoE + shared expert, untied head
 };
 
 // Stable on-disk / log spelling: `__metadata__.model_arch` for Gemma, LFM2 and qwen4_exp, "qwen3_5"
@@ -47,6 +48,8 @@ inline const char* ArchName(Arch a) {
       return "llama";
     case Arch::kInkling2Loop:
       return "inkling2_loop";
+    case Arch::kHyV3:
+      return "hy_v3";
   }
   return "qwen3_5";  // unreachable: every enumerator is handled above
 }

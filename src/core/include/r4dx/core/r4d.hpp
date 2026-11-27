@@ -172,6 +172,32 @@ inline void AttnDecodeH128Fp8Kv(const Args& a, hipStream_t stream) {
   R4DX_R4D_CHECK("attn_decode_h128_gqa7_fp8kv", r4d_attn_decode_h128_gqa7_fp8kv(&a, stream));
 }
 
+// ---- attention: head_dim 128, gqa 8, bf16 or fp8 KV (hy_v3; r4d_attn_paged_h128_gqa8.hip) ----
+inline void AttnPrefillH128Gqa8Bf16Kv(const Args& a, hipStream_t stream) {
+  R4DX_R4D_CHECK("attn_prefill_h128_gqa8_bf16kv", r4d_attn_prefill_h128_gqa8_bf16kv(&a, stream));
+}
+inline void AttnPrefillSplitKvH128Gqa8Bf16Kv(const Args& a, hipStream_t stream) {
+  R4DX_R4D_CHECK("attn_prefill_splitkv_h128_gqa8_bf16kv", r4d_attn_prefill_splitkv_h128_gqa8_bf16kv(&a, stream));
+}
+inline int64_t AttnPrefillSplitKvH128Gqa8ScratchBytes(const Args& a) {
+  return r4d_attn_prefill_splitkv_h128_gqa8_scratch_bytes(&a);
+}
+inline void AttnDecodeH128Gqa8Bf16Kv(const Args& a, hipStream_t stream) {
+  R4DX_R4D_CHECK("attn_decode_h128_gqa8_bf16kv", r4d_attn_decode_h128_gqa8_bf16kv(&a, stream));
+}
+inline int64_t AttnDecodeH128Gqa8ScratchBytes(const Args& a) {
+  return r4d_attn_decode_h128_gqa8_scratch_bytes(&a);
+}
+inline void AttnPrefillH128Gqa8Fp8Kv(const Args& a, hipStream_t stream) {
+  R4DX_R4D_CHECK("attn_prefill_h128_gqa8_fp8kv", r4d_attn_prefill_h128_gqa8_fp8kv(&a, stream));
+}
+inline void AttnPrefillSplitKvH128Gqa8Fp8Kv(const Args& a, hipStream_t stream) {
+  R4DX_R4D_CHECK("attn_prefill_splitkv_h128_gqa8_fp8kv", r4d_attn_prefill_splitkv_h128_gqa8_fp8kv(&a, stream));
+}
+inline void AttnDecodeH128Gqa8Fp8Kv(const Args& a, hipStream_t stream) {
+  R4DX_R4D_CHECK("attn_decode_h128_gqa8_fp8kv", r4d_attn_decode_h128_gqa8_fp8kv(&a, stream));
+}
+
 // Every attention geometry the build serves (r4d_attn_dims reports the gqa6 one only), for validating
 // a model's layer types against all of them at load.
 inline std::vector<R4DAttnGeom> GetAttnGeoms() {

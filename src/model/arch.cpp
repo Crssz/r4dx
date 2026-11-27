@@ -1,6 +1,7 @@
 #include "arch.h"
 
 #include "gemma_config.h"
+#include "hy_v3_config.h"
 #include "inkling2_config.h"
 #include "lfm2_config.h"
 #include "llama_config.h"
@@ -50,6 +51,12 @@ bool IsInkling2Name(const nlohmann::json& v) {
   return s == "inkling2_loop" || s == "Inkling2LoopForConditionalGeneration" || s == "Inkling2LoopForCausalLM";
 }
 
+bool IsHyV3Name(const nlohmann::json& v) {
+  if (!v.is_string()) return false;
+  const std::string s = v.get<std::string>();
+  return s == "hy_v3" || s == "HYV3ForCausalLM" || s == "HYV3SpeechForCausalLM";
+}
+
 }  // namespace
 
 Arch DetectArchFromMetadata(const nlohmann::json& metadata) {
@@ -63,10 +70,11 @@ Arch DetectArchFromMetadata(const nlohmann::json& metadata) {
     if (s == ArchName(Arch::kQwen35Moe)) return Arch::kQwen35Moe;
     if (s == ArchName(Arch::kLlama)) return Arch::kLlama;
     if (s == ArchName(Arch::kInkling2Loop)) return Arch::kInkling2Loop;
+    if (s == ArchName(Arch::kHyV3)) return Arch::kHyV3;
     if (s == ArchName(Arch::kQwen35)) return Arch::kQwen35;
     throw std::runtime_error("r4dx::model::DetectArch: unknown __metadata__.model_arch " + a.dump() +
                              " (this build knows 'gemma4_unified', 'lfm2_moe', 'qwen4_exp', 'qwen3_5_moe', 'llama', "
-                             "'inkling2_loop' and 'qwen3_5')");
+                             "'inkling2_loop', 'hy_v3' and 'qwen3_5')");
   }
   if (metadata.contains("model_config") && metadata.at("model_config").is_object()) {
     const nlohmann::json& mc = metadata.at("model_config");
@@ -76,7 +84,10 @@ Arch DetectArchFromMetadata(const nlohmann::json& metadata) {
     if (mc.contains("model_type") && IsQwen35MoeName(mc.at("model_type"))) return Arch::kQwen35Moe;
     if (mc.contains("model_type") && IsLlamaName(mc.at("model_type"))) return Arch::kLlama;
     if (mc.contains("model_type") && IsInkling2Name(mc.at("model_type"))) return Arch::kInkling2Loop;
+    if (mc.contains("model_type") && IsHyV3Name(mc.at("model_type"))) return Arch::kHyV3;
     if (mc.contains("architectures") && mc.at("architectures").is_array()) {
+      for (const auto& a : mc.at("architectures"))
+        if (IsHyV3Name(a)) return Arch::kHyV3;
       for (const auto& a : mc.at("architectures"))
         if (IsInkling2Name(a)) return Arch::kInkling2Loop;
       for (const auto& a : mc.at("architectures")) {
@@ -144,6 +155,12 @@ int64_t ResolveContainerMaxCtx(const std::string& container_path, Arch arch, boo
   if (arch == Arch::kInkling2Loop) {
     // The bound is the KV budget, not the config: no config field is needed (docs/inkling2-plan.md 0.4).
     return Inkling2Config::ResolveMaxCtx(requested_given ? requested : 0);
+  }
+  if (arch == Arch::kHyV3) {
+    const nlohmann::json meta = ReadContainerMetadata(container_path);
+    if (!meta.is_object() || !meta.contains("model_config"))
+      throw std::runtime_error("ResolveContainerMaxCtx: " + container_path + " has no __metadata__.model_config");
+    return HyV3Config::FromModelConfig(meta.at("model_config")).ResolveMaxCtx(requested_given ? requested : 0);
   }
   // kQwen35, kQwen4Exp and kQwen35Moe keep the caller's value (arch.h); only Gemma (and LFM2, Llama above) derive a default.
   if (arch != Arch::kGemma4) return requested;

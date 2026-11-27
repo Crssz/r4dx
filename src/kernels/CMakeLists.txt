@@ -292,3 +292,21 @@ add_custom_command(
 )
 set_source_files_properties("${R4DX_INKLING2_OBJ}" PROPERTIES EXTERNAL_OBJECT TRUE GENERATED TRUE)
 target_sources(r4dx_kernels PRIVATE "${R4DX_INKLING2_OBJ}")
+
+set(R4DX_HYV3_SRC "${CMAKE_CURRENT_SOURCE_DIR}/src/hy_v3_kernels.hip")
+set(R4DX_HYV3_OBJ "${R4DX_KERNELS_OBJ_DIR}/hy_v3_kernels.obj")
+add_custom_command(
+  OUTPUT "${R4DX_HYV3_OBJ}"
+  COMMAND "${CMAKE_COMMAND}" -E env "PATH=${R4DX_KERNELS_HIPCC_PATH}"
+          "${R4DX_HIPCC}" ${R4DX_KERNELS_FLAGS} -c "${R4DX_HYV3_SRC}" -o "${R4DX_HYV3_OBJ}"
+  DEPENDS "${R4DX_HYV3_SRC}"
+          "${CMAKE_CURRENT_SOURCE_DIR}/include/r4dx/kernels/hy_v3_kernels.h"
+          "${CMAKE_CURRENT_SOURCE_DIR}/include/r4dx/kernels/kernels.h"
+          "${CMAKE_CURRENT_SOURCE_DIR}/../core/include/r4dx/core/dtype.hpp"
+          "${CMAKE_CURRENT_SOURCE_DIR}/../core/include/r4dx/core/error.hpp"
+          "${CMAKE_CURRENT_SOURCE_DIR}/../../third_party/libr4d/r4d_gdn_wmma.h"
+  COMMENT "hipcc (${R4D_GFX_ARCH}) hy_v3_kernels.obj"
+  VERBATIM
+)
+set_source_files_properties("${R4DX_HYV3_OBJ}" PROPERTIES EXTERNAL_OBJECT TRUE GENERATED TRUE)
+target_sources(r4dx_kernels PRIVATE "${R4DX_HYV3_OBJ}")

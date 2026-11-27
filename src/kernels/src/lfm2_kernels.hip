@@ -21,8 +21,9 @@ namespace {
 
 constexpr int kConvThreads = 128;
 constexpr int kConvTile = 16;       // time steps per thread; T <= kConvTile is a single launch
-constexpr int kRouterThreads = 1024;  // 32 waves of 32 (2 experts per wave at n_experts = 64)
-constexpr int kMaxExperts = 64;
+constexpr int kRouterThreads = 1024;  // 32 waves of 32 (up to 256 experts)
+constexpr int kMaxExperts = 256;
+constexpr int kMaxRouterGroups = kMaxExperts / 32;
 constexpr int kMaxTopK = 8;
 constexpr int kSortMaxExperts = 256;
 constexpr int kSortMaxPairs = 16384;
@@ -150,15 +151,20 @@ __global__ __launch_bounds__(kRouterThreads) void RouterKernel(
   __syncthreads();
 
   if (wave == 0) {
-    // lane l owns experts l and l + 32
-    float sc0 = (lane < n_experts) ? sig[lane] + bias[lane] : -INFINITY;
-    float sc1 = (lane + 32 < n_experts) ? sig[lane + 32] + bias[lane + 32] : -INFINITY;
+    // lane l owns experts l + g*32 for g in [0, kMaxRouterGroups)
+    float sc[kMaxRouterGroups];
+    for (int g = 0; g < kMaxRouterGroups; ++g) {
+      const int e = lane + g * 32;
+      sc[g] = (e < n_experts) ? sig[e] + bias[e] : -INFINITY;
+    }
     for (int r = 0; r < top_k; ++r) {
-      float best = sc0;
+      float best = -INFINITY;
       int bi = lane;
-      if (sc1 > sc0) {  // strict: an equal score keeps the lower index (lane < lane + 32)
-        best = sc1;
-        bi = lane + 32;
+      for (int g = 0; g < kMaxRouterGroups; ++g) {
+        if (sc[g] > best) {
+          best = sc[g];
+          bi = lane + g * 32;
+        }
       }
       for (int o = 16; o; o >>= 1) {
         const float os = __shfl_xor(best, o, 32);
@@ -169,8 +175,9 @@ __global__ __launch_bounds__(kRouterThreads) void RouterKernel(
         }
       }
       if (lane == 0) sel[r] = bi;
-      if (bi == lane) sc0 = -INFINITY;
-      if (bi == lane + 32) sc1 = -INFINITY;
+      for (int g = 0; g < kMaxRouterGroups; ++g) {
+        if (bi == lane + g * 32) sc[g] = -INFINITY;
+      }
     }
     if (lane == 0) {
       float sum = 0.0f;
@@ -555,7 +562,7 @@ void r4dx_lfm2_router_f32(int64_t x, int64_t gate_w, int64_t expert_bias, int64_
                            int64_t x_row_stride, int64_t stream) {
   if (T <= 0) return;
   if (n_experts < 1 || n_experts > kMaxExperts) {
-    Fail("r4dx_lfm2_router_f32", "n_experts must be in [1, 64], got " + std::to_string(n_experts));
+    Fail("r4dx_lfm2_router_f32", "n_experts must be in [1, 256], got " + std::to_string(n_experts));
   }
   if (top_k < 1 || top_k > kMaxTopK || top_k > n_experts) {
     Fail("r4dx_lfm2_router_f32", "top_k must be in [1, min(8, n_experts)], got " + std::to_string(top_k));
